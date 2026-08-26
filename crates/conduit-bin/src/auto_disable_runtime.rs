@@ -870,7 +870,7 @@ mod tests {
                 .await?
                 .is_none()
         );
-        let (status, disabled_count) = sqlx::query_as::<_, (String, i64)>(
+        let (status, disabled_count) = sqlx::query_as::<_, (String, i32)>(
             "SELECT status,jsonb_array_length(disabled_api_keys) FROM channels WHERE id=$1",
         )
         .bind(channel_id)
