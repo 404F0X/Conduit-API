@@ -1,0 +1,149 @@
+# Conduit API Rust config skeleton.
+# Merge order: defaults < config.yml < CONDUIT_* environment < CLI flags.
+server:
+  name: conduit
+  host: 127.0.0.1
+  public_url: ""
+  port: 8090
+  base_path: ""
+  request_timeout: 30s
+  llm_request_timeout: 600s
+  read_timeout: 30s
+  write_timeout: 30s          # Rust-only (no Go server.Config counterpart)
+  graceful_shutdown_timeout: 10s  # Rust-only (no Go server.Config counterpart)
+  trace:
+    thread_header: Conduit-Thread-Id
+    trace_header: Conduit-Trace-Id
+    request_header: ""
+    extra_trace_headers: []
+    extra_trace_body_fields: []
+    claude_code_trace_enabled: false
+    codex_trace_enabled: false
+    opencode_trace_enabled: false
+  dashboard:
+    all_time_token_stats_soft_ttl: 1h
+    all_time_token_stats_hard_ttl: 24h
+  debug: false
+  disable_ssl_verify: false
+  cors:
+    allowed_origins: []
+    allowed_methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+    allowed_headers: [authorization, content-type]
+    allow_credentials: true
+  api:
+    auth:
+      allow_no_auth: false
+      key_prefix: conduit
+
+db:
+  # Local-development credentials only. Production deployments must override
+  # CONDUIT_DB_DSN with a secret-managed PostgreSQL connection URL.
+  dialect: postgres
+  dsn: postgresql://conduit:conduit@127.0.0.1:5432/conduit
+  debug: false
+  max_open_conns: 20
+  max_idle_conns: 10
+  conn_max_lifetime: 30m
+  conn_max_idle_time: 10m
+  disable_auto_migration: false
+  connect_timeout: 30s
+  read_replica:
+    read_dsn: ""
+    read_max_open_conns: 0
+    read_max_idle_conns: 0
+    fallback_on_replica_failure: false
+
+log:
+  name: conduit
+  debug: false
+  skip_level: 1
+  level: info
+  level_key: level
+  time_key: time
+  caller_key: label
+  function_key: ""
+  name_key: logger
+  encoding: json
+  includes: []
+  excludes: []
+  output: stdio
+  file:
+    path: logs/conduit.log
+    max_size: 100
+    max_age: 30
+    max_backups: 10
+    local_time: true
+  # Rust-only extras (no Go log.Config counterpart):
+  format: json
+  directory: logs
+  stdout: true
+
+metrics:
+  enabled: true
+  host: 127.0.0.1
+  port: 9090
+  path: /metrics
+
+cache:
+  mode: memory
+  memory:
+    max_capacity: 10000
+    ttl: 5m
+  route_affinity:
+    enabled: true
+    prompt_cache_ttl: 1h
+    response_continuity_ttl: 7d
+    lookup_cache_ttl: 1m
+    negative_cache_ttl: 5s
+  redis:
+    url:
+    addr: 127.0.0.1:6379
+    addrs: []
+    username:
+    password:
+    db: 0
+    master_name:
+    sentinel: false
+    tls: false
+    cluster: false
+    connect_timeout: 5s
+
+gc:
+  enabled: true
+  stale_processing_enabled: true
+  stale_processing_interval: 1m
+  requests_cleanup_enabled: false
+  requests_retention: 3d
+  usage_logs_cleanup_enabled: false
+  usage_logs_retention: 30d
+
+provider_quota:
+  enabled: true
+  check_interval: 10m
+  warning_ratio: 0.8
+  providers: []
+
+oidc:
+  enabled: false
+  redirect_base_url:
+  state_ttl: 10m
+  providers: []
+
+api_auth:
+  enabled: true
+  api_key_header: Authorization
+  allow_no_auth_fallback: false
+  no_auth_sentinel: CONDUIT_API_KEY_NO_AUTH
+  admin_token:
+  jwt_secret:
+  session_ttl: 24h
+  bcrypt_cost: 12
+
+retry:
+  enabled: true
+  max_channel_retries: 3
+  max_single_channel_retries: 2
+  retry_delay: 1000ms
+  strategy: adaptive
+  upstream_error_passthrough: true
+  timeout: 600s

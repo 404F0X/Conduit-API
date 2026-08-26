@@ -1,0 +1,80 @@
+# Build artifacts
+/target/
+**/target/
+
+# Tooling caches / session-local state
+/.codebase-memory/
+/.memory/
+*.output
+
+# --- Secrets / credentials (NEVER commit) ---
+# The entire .codex/ dir holds session-local credentials, token-reading scripts,
+# smoke screenshots, and scratch files. None of it is source.
+/.codex/
+/.codex-runtime/
+/.codex-tmp/
+/.claude/
+/.run/
+*.token
+*.pem
+*.key
+# Runtime config carrying secrets (commit a *.example instead)
+/config.yml
+/smoke_config.yml
+# Environment files (keep the checked-in *.example templates)
+.env
+.env.*
+!.env.example
+
+# --- Local databases (runtime state, not source) ---
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/*.db*.pre-route-reset-*
+
+# --- Frontend build artifacts / deps (source is committed, these are not) ---
+/frontend/node_modules/
+**/node_modules/
+/frontend/dist/
+/frontend/package-lock.json
+/frontend/.env
+/frontend/.env.*
+!/frontend/.env.example
+frontend/playwright-report/
+frontend/test-results/
+
+# --- Local scratch / smoke-test artifacts ---
+/outputs/
+/dogfood-output/
+/.index/
+/docs/rust-migration/
+/scripts/contract/
+/scripts/audit/
+/scripts/index/
+/scripts/migration/
+/scripts/rust/shadow_compare.sh
+/probe_verification_report.md
+/PROJECT_STATUS.md
+/CLAUDE.md
+/fix_contains_key.sh
+/docs/feedback-driven-product-todo.md
+/docs/product-surface-distribution-audit.md
+/docs/simple-enterprise-mode-todo.md
+/tests/go_test_mapping.md
+/text.md
+/问题.md
+/*.png
+*.docx
+*.xlsx
+nul
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# OS cruft
+Thumbs.db
+.DS_Store

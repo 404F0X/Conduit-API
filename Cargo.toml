@@ -1,0 +1,97 @@
+[workspace]
+members = [
+    "crates/conduit-admin-graphql",
+    "crates/conduit-auth",
+    "crates/conduit-bin",
+    "crates/conduit-cache",
+    "crates/conduit-config",
+    "crates/conduit-core",
+    "crates/conduit-db",
+    "crates/conduit-http",
+    "crates/conduit-llm",
+    "crates/conduit-openapi-graphql",
+    "crates/conduit-orchestrator",
+    "crates/conduit-pipeline",
+    "crates/conduit-scheduler",
+    "crates/conduit-services",
+    "crates/conduit-storage",
+    "crates/conduit-testkit",
+    "crates/conduit-transformers",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+version = "0.1.0-alpha.1"
+repository = "https://github.com/404F0X/Conduit-API"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+unwrap_used = "deny"
+# `ConduitError` deliberately carries rich diagnostic context (provider_body,
+# provider_headers_subset, metadata, safe_message, code) so the per-inbound-
+# protocol error envelopes can be rendered faithfully. That makes it ~216 bytes,
+# which trips `result_large_err` on the ~500 `Result<T, ConduitError>` signatures
+# across the workspace. Boxing the Err variant everywhere would add an
+# allocation on error paths and churn 1200+ signatures for a lint that does not
+# affect correctness; the size is an intentional design trade-off. Allow it
+# explicitly so genuinely actionable clippy warnings stay visible.
+result_large_err = "allow"
+
+[workspace.dependencies]
+conduit-admin-graphql = { path = "crates/conduit-admin-graphql", version = "0.1.0-alpha.1" }
+conduit-auth = { path = "crates/conduit-auth", version = "0.1.0-alpha.1" }
+conduit-cache = { path = "crates/conduit-cache", version = "0.1.0-alpha.1" }
+conduit-config = { path = "crates/conduit-config", version = "0.1.0-alpha.1" }
+conduit-core = { path = "crates/conduit-core", version = "0.1.0-alpha.1" }
+conduit-db = { path = "crates/conduit-db", version = "0.1.0-alpha.1" }
+conduit-http = { path = "crates/conduit-http", version = "0.1.0-alpha.1" }
+conduit-llm = { path = "crates/conduit-llm", version = "0.1.0-alpha.1" }
+conduit-openapi-graphql = { path = "crates/conduit-openapi-graphql", version = "0.1.0-alpha.1" }
+conduit-orchestrator = { path = "crates/conduit-orchestrator", version = "0.1.0-alpha.1" }
+conduit-pipeline = { path = "crates/conduit-pipeline", version = "0.1.0-alpha.1" }
+conduit-scheduler = { path = "crates/conduit-scheduler", version = "0.1.0-alpha.1" }
+conduit-services = { path = "crates/conduit-services", version = "0.1.0-alpha.1" }
+conduit-storage = { path = "crates/conduit-storage", version = "0.1.0-alpha.1" }
+conduit-testkit = { path = "crates/conduit-testkit", version = "0.1.0-alpha.1" }
+conduit-transformers = { path = "crates/conduit-transformers", version = "0.1.0-alpha.1" }
+
+anyhow = "1"
+async-graphql = "7"
+async-graphql-axum = "7"
+async-trait = "0.1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono-tz = { version = "0.10", default-features = false }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-core = "0.3"
+hmac = "0.12"
+jsonwebtoken = "9"
+moka = { version = "0.12", features = ["future"] }
+opentelemetry = "0.27"
+redis = { version = "0.25", default-features = false, features = ["tokio-comp", "cluster-async"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+rust_decimal = { version = "1", features = ["serde"] }
+schemars = { version = "0.8", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "uuid", "json", "rust_decimal"] }
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }

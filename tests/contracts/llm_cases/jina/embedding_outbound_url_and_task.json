@@ -1,0 +1,49 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "embedding_outbound_url_and_task",
+  "api_format": "jina",
+  "stream": false,
+  "source": {
+    "go_outbound_request_test": "conduit/llm/transformer/jina/embedding_test.go::TestOutboundTransformer_TransformRequest_Embedding (subtest 'valid embedding request with /v1 suffix')",
+    "go_outbound_task_test": "conduit/llm/transformer/jina/embedding_test.go::TestOutboundTransformer_TransformRequest_Embedding (subtest 'embedding request with explicit task')",
+    "go_url_building_test": "conduit/llm/transformer/jina/embedding_test.go::TestOutboundTransformer_URLBuilding_Embedding",
+    "note": "Captures the Jina OutboundTransformer.TransformRequest embedding mapping and URL-building behavior. The Go test constructs NewOutboundTransformerWithConfig({BaseURL:'https://api.jina.ai/v1', APIKeyProvider:StaticKey('test-key')}) and feeds llm.Request{Model:'jina-embeddings-v3', RequestType:RequestTypeEmbedding, Embedding:{Input:{String:'Hello world'}}}. It asserts the resulting httpclient.Request has Method='POST', URL='https://api.jina.ai/v1/embeddings', Content-Type='application/json', Auth.Type='bearer', and the body unmarshals to EmbeddingRequest with Task=='text-matching' (default when not specified). The sibling 'explicit task' subtest asserts Task=='retrieval.query' when the llm.Request carries Embedding.Task='retrieval.query'. The URLBuilding subtest confirms '/v1' suffix is auto-appended when missing. selected_channel, upstream_http and client_http are null (outbound-only unit test)."
+  },
+  "inbound_http": null,
+  "unified_request": {
+    "_comment": "Exact llm.Request literal from the Go test 'valid embedding request with /v1 suffix' subtest (and reused by the URLBuilding subtest). Model='jina-embeddings-v3', RequestType=RequestTypeEmbedding, Embedding.Input.String='Hello world'. Embedding.Task is nil/empty here (defaults to 'text-matching' on the outbound side).",
+    "model": "jina-embeddings-v3",
+    "request_type": "embedding",
+    "embedding": {
+      "input": {"string": "Hello world"},
+      "task": null
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Asserted by the Go test: Method='POST', URL='https://api.jina.ai/v1/embeddings', Content-Type='application/json', Auth.Type='bearer'. The body unmarshals to EmbeddingRequest whose Task=='text-matching' (the default applied by the outbound transformer when Embedding.Task is empty/nil). The Go test explicitly asserts jinaReq.Task=='text-matching' for the default case and 'retrieval.query' for the explicit-task case.",
+    "base_url": "https://api.jina.ai/v1",
+    "api_key": "test-key",
+    "method": "POST",
+    "url": "https://api.jina.ai/v1/embeddings",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "bearer",
+      "api_key_note": "pending source snapshot: the Go test asserts Auth.Type=='bearer' but does not byte-assert the precise Authorization header format or Auth.APIKey value for this subtest."
+    },
+    "body_json": {
+      "_comment": "EmbeddingRequest body. The Go test asserts jinaReq.Task=='text-matching' (the default). Other fields (model, input) are passed through from the unified llm.Request and are not separately byte-asserted for this subtest but follow from the input literal.",
+      "model": "jina-embeddings-v3",
+      "input": ["Hello world"],
+      "task": "text-matching"
+    },
+    "url_building_variants": {
+      "_comment": "From TestOutboundTransformer_URLBuilding_Embedding. The '/v1' suffix is auto-appended when missing. Asserted expected URLs: 'https://api.jina.ai/v1' -> 'https://api.jina.ai/v1/embeddings'; 'https://api.jina.ai' -> 'https://api.jina.ai/v1/embeddings'; 'https://api.jina.ai/' -> 'https://api.jina.ai/v1/embeddings' (trailing slash + missing /v1 both normalized)."
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

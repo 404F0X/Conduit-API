@@ -1,0 +1,30 @@
+[package]
+name = "conduit-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+redis = []
+otel = []
+full = ["redis", "otel"]
+
+[dependencies]
+bcrypt = "0.15"
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = "0.8"
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Used by the jwt.rs `go_style_numeric_user_id_token_decodes` parity test to
+# build a Go-shaped JWT payload (`user_id` as a JSON number) independently of
+# the `Claims` Serialize impl.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

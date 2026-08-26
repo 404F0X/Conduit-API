@@ -1,0 +1,62 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "generation_upstream_response_usage",
+  "api_format": "openai_image",
+  "stream": false,
+  "source": {
+    "go_outbound_response_test": "conduit/llm/transformer/openai/image_outbound_test.go::TestTransformImageGenerationResponse_WithUsage (L456-491); shape/ID/object assertions from TestTransformImageGenerationResponse_BasicResponse (L426-454, same created value); model fallback from TestTransformImageGenerationResponse_WithoutModelInTransformerMetadata (L629-647); dispatch via TransformResponse from TestTransformResponse_ImageGeneration_Integration (L705-735)",
+    "note": "Response-only case: transformImageGenerationResponse mapping an OpenAI ImagesResponse (b64_json + usage) to unified llm.Response. The upstream body below is the verbatim body literal from TestTransformImageGenerationResponse_WithUsage. inbound_http, unified_request, selected_channel, outbound_http and client_http are null because the outbound response unit test does not exercise those stages. unified_response is an extension field recording the produced llm.Response."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "httpclient.Response{StatusCode:200, Body:<literal below>}. This fixture sets no Request/TransformerMetadata, so the transformer falls back to model 'image-generation'. (TestTransformResponse_ImageGeneration_Integration dispatches the same body through TransformResponse with Request.APIFormat=='openai/image_generation'.)",
+    "status_code": 200,
+    "body_json": {
+      "created": 1730000000,
+      "data": [
+        {
+          "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        }
+      ],
+      "usage": {
+        "input_tokens": 10,
+        "output_tokens": 256,
+        "total_tokens": 266,
+        "input_tokens_details": {
+          "image_tokens": 0,
+          "text_tokens": 10
+        }
+      }
+    }
+  },
+  "client_http": null,
+  "unified_response": {
+    "_comment": "Extension field recording the llm.Response produced by transformImageGenerationResponse (image_outbound.go). Byte-asserted by WithUsage: Usage.PromptTokens==10, CompletionTokens==256, TotalTokens==266, PromptTokensDetails.ImageTokens==0, PromptTokensDetails.TextTokens==10. Byte-asserted by BasicResponse for the same created value: ID=='img-1730000000', Object=='chat.completion', Created==1730000000, Choices empty, Image.Data len 1 with non-empty B64JSON. Model=='image-generation' fallback asserted by WithoutModelInTransformerMetadata. request_type 'image' set by the transformer source (not directly asserted). Zero-valued sibling detail fields of llm.Usage are omitted in this transcript for brevity.",
+    "id": "img-1730000000",
+    "object": "chat.completion",
+    "created": 1730000000,
+    "model": "image-generation",
+    "request_type": "image",
+    "image": {
+      "created": 1730000000,
+      "data": [
+        {
+          "b64_json": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        }
+      ]
+    },
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 256,
+      "total_tokens": 266,
+      "prompt_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 10,
+        "cached_tokens": 0
+      }
+    }
+  }
+}

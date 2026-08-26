@@ -1,0 +1,71 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "tool_filter_responses_custom_tool",
+  "api_format": "openai_chat",
+  "stream": false,
+  "source": {
+    "go_outbound_convert_test": "conduit/llm/transformer/openai/outbound_convert_test.go::TestRequestFromLLM_FiltersResponsesCustomTool",
+    "note": "Captures the OpenAI chat RequestFromLLM tool-filtering rule: a unified llm.Request carrying both a ToolTypeResponsesCustomTool and a ToolTypeFunction tool MUST yield an outbound OpenAI Request whose tools contain ONLY the function tool (length 1, type 'function', name 'get_weather'). This is a contract-level conversion case, not a full HTTP round-trip. inbound_http, selected_channel, upstream_http and client_http are null because the Go test does not exercise those stages — it only calls RequestFromLLM on a synthetic unified request."
+  },
+  "inbound_http": null,
+  "unified_request": {
+    "_comment": "Exact llm.Request literal passed to RequestFromLLM in the Go test (model 'gpt-4o', one user message 'hi', two tools).",
+    "model": "gpt-4o",
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "hi"
+        }
+      }
+    ],
+    "tools": [
+      {
+        "type": "responses_custom_tool",
+        "function": {
+          "name": ""
+        },
+        "response_custom_tool": {
+          "name": "apply_patch"
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "parameters": {
+            "type": "object"
+          }
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Expected OpenAI chat Request after RequestFromLLM filtering. Go test asserts req != nil, len(req.Tools)==1, req.Tools[0].Type==llm.ToolTypeFunction ('function'). The tool's function name 'get_weather' and parameters {\"type\":\"object\"} are copied from the input fixture (they survive the filter unchanged). Other request fields (model, messages) are passed through by RequestFromLLM and are copied verbatim from the Go input literal.",
+    "expected_openai_request": {
+      "model": "gpt-4o",
+      "messages": [
+        {
+          "role": "user",
+          "content": {
+            "content": "hi"
+          }
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

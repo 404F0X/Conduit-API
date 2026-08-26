@@ -1,0 +1,32 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "stream_message_stop",
+  "api_format": "anthropic",
+  "stream": true,
+  "source": {
+    "go_inbound_stream_test": "conduit/llm/transformer/anthropic/inbound_stream_test.go::TestInboundTransformer_StreamTransformation_WithTestData (case 'stream transformation with stop finish reason')",
+    "go_testdata_input_stream": "conduit/llm/transformer/anthropic/testdata/llm-stop.stream.jsonl",
+    "go_testdata_expected_stream": "conduit/llm/transformer/anthropic/testdata/anthropic-stop.stream.jsonl",
+    "go_aggregator_test": "conduit/llm/transformer/anthropic/aggregator_test.go (case referencing streamFile 'anthropic-stop.stream.jsonl')",
+    "go_outbound_stream_test": "conduit/llm/transformer/anthropic/outbound_stream_test.go (case referencing streamFile 'anthropic-stop.stream.jsonl')",
+    "note": "The events array below is the COMPLETE verbatim transcription of conduit/llm/transformer/anthropic/testdata/anthropic-stop.stream.jsonl (10 SSE events). The Go inbound-stream test (TestInboundTransformer_StreamTransformation_WithTestData case 'stream transformation with stop finish reason') loads llm-stop.stream.jsonl as the INPUT (OpenAI-shape upstream stream), transforms it through InboundTransformer.TransformStream, and asserts the produced Anthropic-shape stream equals anthropic-stop.stream.jsonl (expectedStreamFile) event-by-event. It also asserts aggregated Message has id 'msg_bdrk_01Fbg5HKuVfmtT6mAMxQoCSn', type 'message', model 'claude-3-7-sonnet-20250219', role 'assistant', one text content block with text '1 2 3 4 5\\n6 7 8 9 10\\n11 12 13 14 15\\n16 17 18 19 20', and input tokens = 21. The stable id 'msg_bdrk_01Fbg5HKuVfmtT6mAMxQoCSn' and model 'claude-3-7-sonnet-20250219' are pinned by the Go testdata and therefore NOT replaced with $ANY_* placeholders. selected_channel, upstream_http and client_http are null because the Go stream tests do not exercise those stages."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": null,
+  "client_http": null,
+  "events": [
+    {"event": "message_start", "data": {"type":"message_start","message":{"id":"msg_bdrk_01Fbg5HKuVfmtT6mAMxQoCSn","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":21,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}},
+    {"event": "content_block_start", "data": {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}},
+    {"event": "content_block_delta", "data": {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"1 2 3 4 "}}},
+    {"event": "content_block_delta", "data": {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"5\n6 7 8"}}},
+    {"event": "content_block_delta", "data": {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" 9 10\n11 12 "}}},
+    {"event": "content_block_delta", "data": {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"13 14 15\n16 "}}},
+    {"event": "content_block_delta", "data": {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"17 18 19 20"}}},
+    {"event": "content_block_stop", "data": {"type":"content_block_stop","index":0}},
+    {"event": "message_delta", "data": {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":43}}},
+    {"event": "message_stop", "data": {"type":"message_stop"}}
+  ]
+}

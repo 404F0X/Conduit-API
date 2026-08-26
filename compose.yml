@@ -1,0 +1,89 @@
+name: conduit-api
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_DB: conduit
+      POSTGRES_USER: conduit
+      POSTGRES_PASSWORD: ${CONDUIT_POSTGRES_PASSWORD:?Set CONDUIT_POSTGRES_PASSWORD in the deployment environment}
+    volumes:
+      - conduit-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 12
+
+  conduit-api:
+    image: ${CONDUIT_IMAGE:-conduit-api:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CONDUIT_VERSION: ${CONDUIT_VERSION:-}
+        CONDUIT_COMMIT: ${CONDUIT_COMMIT:-}
+        CONDUIT_BUILD_TIME: ${CONDUIT_BUILD_TIME:-}
+        CONDUIT_BRANCH: ${CONDUIT_BRANCH:-}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true
+    environment:
+      CONDUIT_DB_DIALECT: postgres
+      # Keep this password URI-unreserved (letters, digits, -._~), or override
+      # the complete DSN from a deployment-specific Compose override.
+      CONDUIT_DB_DSN: postgresql://conduit:${CONDUIT_POSTGRES_PASSWORD:?Set CONDUIT_POSTGRES_PASSWORD in the deployment environment}@postgres:5432/conduit
+      CONDUIT_DB_MAX_OPEN_CONNS: ${CONDUIT_DB_MAX_OPEN_CONNS:-20}
+      CONDUIT_DB_MAX_IDLE_CONNS: ${CONDUIT_DB_MAX_IDLE_CONNS:-5}
+      CONDUIT_DB_CONNECT_TIMEOUT: ${CONDUIT_DB_CONNECT_TIMEOUT:-30s}
+      CONDUIT_SERVER_HOST: 0.0.0.0
+      CONDUIT_SERVER_PORT: 8090
+      CONDUIT_SERVER_PUBLIC_URL: ${CONDUIT_PUBLIC_URL:-}
+      # Empty CORS config is permissive. Restrict the safe local default and
+      # require deployments behind TLS to provide their exact public origin.
+      CONDUIT_SERVER_CORS_ALLOWED_ORIGINS: '${CONDUIT_CORS_ALLOWED_ORIGINS:-["http://127.0.0.1:8090","http://localhost:8090"]}'
+      CONDUIT_OIDC_ENABLED: ${CONDUIT_OIDC_ENABLED:-false}
+      CONDUIT_OIDC_PROVIDERS: '${CONDUIT_OIDC_PROVIDERS:-[]}'
+      # Sensitive backups fail closed unless deployments provide this value.
+      CONDUIT_BACKUP_ENCRYPTION_KEY: ${CONDUIT_BACKUP_ENCRYPTION_KEY:-}
+      CONDUIT_LOG_STDOUT: "true"
+      CONDUIT_METRICS_ENABLED: "true"
+      CONDUIT_METRICS_HOST: 0.0.0.0
+      CONDUIT_METRICS_PORT: 9090
+      CONDUIT_CACHE_ROUTE_AFFINITY_ENABLED: ${CONDUIT_CACHE_ROUTE_AFFINITY_ENABLED:-true}
+      CONDUIT_CACHE_ROUTE_AFFINITY_PROMPT_CACHE_TTL: ${CONDUIT_CACHE_ROUTE_AFFINITY_PROMPT_CACHE_TTL:-1h}
+      CONDUIT_CACHE_ROUTE_AFFINITY_RESPONSE_CONTINUITY_TTL: ${CONDUIT_CACHE_ROUTE_AFFINITY_RESPONSE_CONTINUITY_TTL:-7d}
+      CONDUIT_CACHE_ROUTE_AFFINITY_LOOKUP_CACHE_TTL: ${CONDUIT_CACHE_ROUTE_AFFINITY_LOOKUP_CACHE_TTL:-1m}
+      CONDUIT_CACHE_ROUTE_AFFINITY_NEGATIVE_CACHE_TTL: ${CONDUIT_CACHE_ROUTE_AFFINITY_NEGATIVE_CACHE_TTL:-5s}
+    ports:
+      # Loopback by default: put TLS/reverse proxy in front, or explicitly set
+      # CONDUIT_HTTP_BIND=0.0.0.0 when direct exposure is intended.
+      - "${CONDUIT_HTTP_BIND:-127.0.0.1}:${CONDUIT_HTTP_PORT:-8090}:8090"
+    expose:
+      - "9090"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS http://127.0.0.1:8090/health >/dev/null &&
+          curl -fsS http://127.0.0.1:8090/admin/system/status >/dev/null
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  conduit-postgres-data:

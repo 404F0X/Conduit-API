@@ -1,0 +1,12 @@
+Conduit API
+Copyright 2026 404F0X and Conduit API contributors.
+
+This product includes software derived from AxonHub
+(https://github.com/looplj/axonhub), Copyright 2026 looplj and contributors.
+The upstream project is licensed under Apache License 2.0, except its `llm/`
+component, which is licensed under LGPL-3.0-only. Conduit API preserves those
+terms in the scopes described by the root LICENSE file.
+
+The web console includes code from shadcn-admin
+(https://github.com/satnaing/shadcn-admin), Copyright 2024 Sat Naing, licensed
+under the MIT License. See `frontend/NOTICE` for the full notice.

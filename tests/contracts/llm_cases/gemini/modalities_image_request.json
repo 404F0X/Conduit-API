@@ -1,0 +1,82 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "modalities_image_request",
+  "api_format": "gemini",
+  "stream": false,
+  "source": {
+    "go_integration_test": "conduit/llm/transformer/gemini/integraion_test.go::TestGeminiTransformers_Integration (case \"message with modalities\")",
+    "go_outbound_config": "NewOutboundTransformer('https://generativelanguage.googleapis.com', 'test-api-key')",
+    "note": "Captures Gemini multimodal generationConfig.responseModalities handling. The Go integration test feeds Path='/v1beta/models/gemini-2.5-flash-image-preview:generateContent' with body {contents:[{role:'user',parts:[{text:'Draw a green apple'}]}], generationConfig:{maxOutputTokens:1024, temperature:1, topP:1, responseModalities:['TEXT','IMAGE']}}. It asserts Model='gemini-2.5-flash-image-preview', MaxTokens=1024, and crucially chatReq.Modalities==['text','image'] (lowercased) and that the regenerated Gemini outbound body's GenerationConfig.ResponseModalities==['TEXT','IMAGE'] (UPPERCASE preserved). selected_channel and upstream_http/client_http are null (the test only verifies request + outbound-body stages for this case)."
+  },
+  "inbound_http": {
+    "_comment": "Verbatim inline JSON body from TestGeminiTransformers_Integration case 'message with modalities'. Path uses model 'gemini-2.5-flash-image-preview'.",
+    "method": "POST",
+    "path": "/v1beta/models/gemini-2.5-flash-image-preview:generateContent",
+    "query": {},
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {"text": "Draw a green apple"}
+          ]
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 1024,
+        "temperature": 1,
+        "topP": 1,
+        "responseModalities": ["TEXT", "IMAGE"]
+      }
+    }
+  },
+  "unified_request": {
+    "_comment": "Asserted by the Go test: Model='gemini-2.5-flash-image-preview' (from path), MaxTokens=1024 (from generationConfig.maxOutputTokens), one user message 'Draw a green apple', Modalities==['text','image'] (the Go transformer lowercases the Gemini responseModalities strings when populating llm.Request.Modalities).",
+    "model": "gemini-2.5-flash-image-preview",
+    "max_tokens": 1024,
+    "stream": false,
+    "modalities": ["text", "image"],
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Draw a green apple"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Asserted by the Go test step 2: method=POST, url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent', Content-Type='application/json'. Body unmarshals to GenerateContentRequest whose GenerationConfig.ResponseModalities==['TEXT','IMAGE'] (UPPERCASE is restored on the outbound path).",
+    "base_url": "https://generativelanguage.googleapis.com",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {"text": "Draw a green apple"}
+          ]
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 1024,
+        "temperature": 1,
+        "topP": 1,
+        "responseModalities": ["TEXT", "IMAGE"]
+      }
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

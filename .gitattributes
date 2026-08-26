@@ -1,0 +1,31 @@
+# Normalize line endings so the working tree, `git worktree` checkouts, and CI
+# all see identical bytes.
+#
+# Enforce LF in the index and working tree on every platform. Several migration
+# tests compare SQL fragments byte-for-byte, and shell scripts require LF.
+* text=auto eol=lf
+
+# Be explicit for the file types this repo asserts on byte-for-byte.
+*.rs   text eol=lf
+*.sql  text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.graphql text eol=lf
+
+# Shell scripts must stay LF or they break under sh.
+*.sh text eol=lf
+
+# Binary assets: never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zst binary
+*.db binary

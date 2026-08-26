@@ -1,0 +1,272 @@
+{
+  "sidebar": { "items": { "operations": "Operations ledger" } },
+  "operations": {
+    "eyebrow": "Financial operations",
+    "title": "Operations ledger",
+    "description": "Channel reliability, immutable recorded upstream cost and accounting coverage in one operating view.",
+    "refresh": "Refresh",
+    "updated": "Updated",
+    "never": "No activity",
+    "na": "N/A",
+    "attempts": "attempts",
+    "empty": "No upstream channels are configured.",
+    "tabs": { "overview": "Overview", "models": "Models", "flow": "Flow", "users": "Users" },
+    "analytics": {
+      "controls": "Analytics controls",
+      "metric": "Distribution metric",
+      "topN": "Number of ranked items",
+      "distribution": "Ranked distribution",
+      "empty": "No successful metered usage was attributed in this period.",
+      "error": "Could not load usage attribution",
+      "other": "Other",
+      "metrics": { "requests": "Requests", "tokens": "Tokens", "revenue": "Settled revenue" },
+      "fallback": {
+        "user": "Unattributed user",
+        "project": "Unattributed project",
+        "apiKey": "Unattributed API key",
+        "requestedModel": "Unknown public model",
+        "model": "Unknown public model",
+        "actualModel": "Unknown actual model",
+        "channel": "Unattributed channel"
+      },
+      "stages": {
+        "user": "User",
+        "project": "Project",
+        "apiKey": "API Key",
+        "requestedModel": "Public model",
+        "actualModel": "Actual model",
+        "channel": "Channel"
+      },
+      "models": {
+        "title": "Model analytics",
+        "description": "Usage and economics are grouped by the public model requested by customers, while every actual upstream supply remains channel-specific.",
+        "supplies": "{{count}} actual supplies",
+        "groupTotal": "Model total · {{count}} channel-specific supplies",
+        "modelTotal": "Model-level accounting total",
+        "supply": "Supply",
+        "financeAtModelLevel": "See model total above",
+        "publicModel": "Public model",
+        "actualModel": "Upstream actual model",
+        "channel": "Channel",
+        "success": "Success rate",
+        "attempts": "Attempts",
+        "health": "Performance health",
+        "noHealth": "No attributable supply health samples",
+        "chartMode": "Consumption chart type",
+        "distribution": "Usage distribution",
+        "bar": "Bar chart",
+        "area": "Area",
+        "analysis": "Model analysis",
+        "analysisMode": "Model analysis mode",
+        "proportion": "Call count distribution",
+        "top": "Call count ranking",
+        "ranking": "Call count ranking",
+        "trend": "Call trend",
+        "preferences": "Preferences",
+        "filter": "Filter",
+        "period": "Time range",
+        "days": "days",
+        "mainChart": "Main consumption chart",
+        "total": "Total",
+        "realBuckets": "Real usage time buckets grouped by the customer-facing public model.",
+        "scrollHint": "Positioned at the most recent bucket with usage; scroll left or right to view the full range.",
+        "scrollPending": "Positioning the latest buckets; scroll right for the latest data.",
+        "granularity": { "hour": "Hourly", "day": "Daily", "week": "Weekly" },
+        "noTrend": "Per-model time buckets are not recorded; this panel uses truthful distribution and ranking views.",
+        "detail": "Public model supply details",
+        "detailDescription": "Accounting totals belong to the public model; actual model and channel rows remain separate routing supplies.",
+        "kpi": {
+          "requests": "Requests",
+          "revenue": "Recognized revenue",
+          "tokens": "Total tokens",
+          "rpm": "Average RPM",
+          "tpm": "Average TPM"
+        }
+      },
+      "flow": {
+        "title": "Request flow",
+        "description": "Inspect successful metered traffic from customer identity through the public model to the actual upstream supply.",
+        "stages": "Visible request stages",
+        "minimumStages": "At least two stages remain visible.",
+        "pathTitle": "Attributed request paths",
+        "coverage": "{{returned}} metered requests returned · {{usage}} usage rows · {{settled}} settled rows",
+        "weight": "Flow weight: {{value}}",
+        "inspectPath": "Inspect complete path",
+        "overflow": "Overflow handling",
+        "merge": "Merge into Other",
+        "hide": "Hide overflow",
+        "userFilter": "Filter by user",
+        "allUsers": "All users",
+        "nodeFilter": "Filter any node or path",
+        "mask": "Mask identities",
+        "entitlementTitle": "Why model groups are not a stage:",
+        "entitlementNote": "groups authorize access and may overlap. Runtime usage does not yet record one winning grant, so assigning a group here would fabricate attribution."
+      },
+      "users": {
+        "title": "User consumption",
+        "description": "Successful metered usage only—not login activity and not subscription or Credit balances.",
+        "channelContribution": "User contribution by channel",
+        "channelContributionDescription": "A truthful second view of each user's selected metric split across actual upstream channels; no time series is inferred.",
+        "detail": "User accounting detail",
+        "detailDescription": "Project, API key, public-model and channel reach with recorded cost, settled revenue and latest activity.",
+        "columns": {
+          "user": "User",
+          "scope": "Reach",
+          "projects": "Projects",
+          "apiKeys": "API keys",
+          "models": "Public models",
+          "channels": "Channels",
+          "requests": "Requests",
+          "tokens": "Tokens",
+          "cost": "Cost",
+          "revenue": "Revenue",
+          "profit": "Gross profit",
+          "activity": "Last activity"
+        },
+        "scope": { "projects": "P", "apiKeys": "K", "models": "M", "channels": "C" }
+      }
+    },
+    "quality": { "exact": "Exact", "partial": "Partial", "unavailable": "Unavailable" },
+    "error": { "title": "Could not load the operations ledger", "description": "The reporting service returned no data." },
+    "coverage": {
+      "title": "Accounting confidence",
+      "cost": "Purchase cost coverage",
+      "billing": "Recognized billing coverage"
+    },
+    "summary": {
+      "revenue": "Recognized usage revenue",
+      "cost": "Recorded upstream cost",
+      "profit": "Usage gross profit"
+    },
+    "performance": {
+      "ttft": "Average time to first token",
+      "tps": "Average generation speed (token/s)",
+      "retries": "Retries",
+      "errors": "Structured error distribution",
+      "samples": "{{count}} valid samples",
+      "retryDefinition": "Second and later upstream attempts for one customer request"
+    },
+    "errorCategories": {
+      "auth": "Auth",
+      "rate_limit": "Rate limit",
+      "timeout": "Timeout",
+      "upstream_5xx": "Upstream 5xx",
+      "connection": "Connection",
+      "canceled": "Canceled",
+      "configuration": "Configuration",
+      "unknown": "Unknown"
+    },
+    "routeHealth": {
+      "title": "Route target health matrix",
+      "description": "Tracked separately by upstream channel, actual model and selected credential. Only a one-way fingerprint is shown; provider keys are never stored or returned.",
+      "target": "Channel / actual model",
+      "credential": "Credential fingerprint",
+      "status": "Health",
+      "unattributed": "Historical attempt without credential attribution",
+      "empty": "No attributable upstream attempts in this period.",
+      "statuses": { "healthy": "Healthy", "degraded": "Degraded", "unhealthy": "Unhealthy", "unknown": "Unknown" }
+    },
+    "trend": {
+      "title": "Traffic, cost and settled revenue",
+      "description": "Empty time-series points are drawn from zero and rise with data; summaries still distinguish a real zero from unavailable accounting. Revenue includes only settled usage.",
+      "failureRate": "Failure rate",
+      "requestFailureRate": "Customer request failure rate",
+      "upstreamFailureRate": "Upstream attempt failure rate",
+      "metricsLabel": "Choose trend metrics",
+      "metricsCount": "Metrics {{visible}}/{{total}}",
+      "groups": { "traffic": "Traffic", "finance": "Finance", "reliability": "Reliability" },
+      "showAll": "Show all",
+      "reset": "Reset",
+      "emptyTitle": "No trend metrics selected",
+      "emptyDescription": "Choose traffic, finance, or reliability signals from the metrics menu."
+    },
+    "reasons": {
+      "USAGE_GROSS_PROFIT_SCOPE": "Usage gross-profit only. Cash receipts, subscription sales, refunds, taxes and upstream invoice reconciliation are not recorded.",
+      "NO_METERED_USAGE": "No metered usage occurred in this period; historical coverage has no sample.",
+      "NO_RECORDED_COST": "No usage row has a recorded historical purchase cost; missing prices are not treated as free.",
+      "PARTIAL_RECORDED_COST": "Only usage rows with an immutable recorded purchase cost are included.",
+      "COMPLETE_RECORDED_COST": "All metered usage in this period has an immutable recorded cost.",
+      "NO_SETTLED_USAGE_REVENUE": "No usage was successfully settled in this period; unpriced, unfunded and non-user requests are excluded from revenue.",
+      "PARTIAL_SETTLED_USAGE_REVENUE": "Only usage successfully settled from subscription allowance or credit is included.",
+      "PROFIT_REQUIRES_REVENUE_AND_COST": "Usage gross profit requires both settled usage revenue and recorded historical purchase cost.",
+      "PARTIAL_GROSS_PROFIT": "Some usage lacks settlement revenue or purchase cost; gross profit covers only fully recorded rows."
+    },
+    "status": { "enabled": "Enabled", "disabled": "Disabled", "archived": "Archived" },
+    "freshness": { "fresh": "Fresh <24h", "stale": "Stale >24h", "unknown": "Snapshot unknown" },
+    "risks": { "title": "Needs attention", "critical": "critical", "other": "other", "empty": "No current operating risks" },
+    "riskCodes": {
+      "HISTORICAL_COST_INCOMPLETE": {
+        "title": "Historical cost coverage is incomplete",
+        "detail": "{{affected}} of {{total}} metered usage rows are missing immutable cost."
+      },
+      "PURCHASE_PRICE_NOT_CONFIGURED": {
+        "title": "Enabled channel has no purchase price",
+        "detail": "Future usage may be recorded without cost until a channel model purchase price is configured."
+      },
+      "HIGH_ERROR_RATE": {
+        "title": "Elevated upstream error rate",
+        "detail": "{{affected}} failed or canceled attempts out of {{total}} in this period."
+      },
+      "NO_TRAFFIC": {
+        "title": "Enabled channel has no traffic",
+        "detail": "No upstream attempts were recorded in the last {{days}} day(s)."
+      },
+      "STALE_HEALTH_PROBE": {
+        "title": "Health probe is stale",
+        "detail": "No channel health probe has been recorded in the last 24 hours."
+      },
+      "LOW_PROVIDER_QUOTA": {
+        "title": "Low upstream balance",
+        "detail": "Recorded remaining quota is at or below the configured warning threshold."
+      },
+      "STALE_QUOTA_SNAPSHOT": {
+        "title": "Upstream quota snapshot is stale",
+        "detail": "The recorded provider balance has not been verified in the last 24 hours."
+      },
+      "PENDING_CHARGE_ROWS": {
+        "title": "Charge rows are not settled",
+        "detail": "{{affected}} charge event(s) remain pending or unsettled."
+      },
+      "UPSTREAM_PRICE_STALE": {
+        "title": "Observed upstream pricing is stale",
+        "detail": "No upstream pricing observation succeeded in the last 6 hours."
+      },
+      "UPSTREAM_PRICE_CHANGED": {
+        "title": "Upstream pricing changed",
+        "detail": "The latest observation contains {{affected}} added, removed, or changed prices."
+      }
+    },
+    "kpi": {
+      "requests": "Customer requests",
+      "attempts": "upstream attempts",
+      "failed": "failed or canceled",
+      "success": "Attempt success rate",
+      "tokens": "Metered tokens",
+      "cached": "cached tokens"
+    },
+    "table": {
+      "title": "All-channel operating ledger",
+      "description": "Every configured upstream channel is shown, including disabled and zero-traffic channels.",
+      "channel": "Upstream channel",
+      "rail": "Health / coverage",
+      "attempts": "Attempts",
+      "retries": "Retries",
+      "requests": "Customer requests",
+      "success": "Success",
+      "tokens": "Tokens",
+      "latency": "Avg latency",
+      "cost": "Recorded cost",
+      "revenue": "Revenue",
+      "profit": "Gross profit",
+      "coverage": "Accounting coverage",
+      "quota": "Remaining quota",
+      "activity": "Last activity",
+      "costShort": "cost",
+      "billingShort": "billing",
+      "perAttempt": "per attempt",
+      "probe": "probe",
+      "observedPrice": "Observed price",
+      "changes": "changes"
+    }
+  }
+}

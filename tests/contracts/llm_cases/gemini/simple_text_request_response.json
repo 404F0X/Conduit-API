@@ -1,0 +1,150 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "simple_text_request_response",
+  "api_format": "gemini",
+  "stream": false,
+  "source": {
+    "go_integration_test": "conduit/llm/transformer/gemini/integraion_test.go::TestGeminiTransformers_Integration (case \"simple text message\")",
+    "go_outbound_config": "NewOutboundTransformer('https://generativelanguage.googleapis.com', 'test-api-key')",
+    "note": "Captures the full Gemini six-stage round-trip for the simplest case. The Go integration test feeds an httpclient.Request{Path:'/v1beta/models/gemini-2.5-flash:generateContent', Body:<JSON below>} to InboundTransformer.TransformRequest and asserts the resulting llm.Request has Model='gemini-2.5-flash', MaxTokens=1024, one user message 'Hello, Gemini!', Stream=false (path contains 'streamGenerateContent' is false). It then feeds the llm.Request to OutboundTransformer.TransformRequest and asserts outbound method=POST, Content-Type='application/json', url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', and that the body unmarshals to a GenerateContentRequest. The Go test then synthesizes an inline Gemini response (ResponseID='test-response-123', one candidate with role 'model', text 'This is a test response from Gemini.', FinishReason='STOP', UsageMetadata{prompt 15, candidates 25, total 40}), feeds it to OutboundTransformer.TransformResponse and asserts chatResp has id='test-response-123', object='chat.completion', model='gemini-2.5-flash', one choice with role 'assistant' and content 'This is a test response from Gemini.' and finish_reason 'stop'. Finally InboundTransformer.TransformResponse yields HTTP 200 + Content-Type 'application/json' with body unmarshaling to a GenerateContentResponse whose ResponseID='test-response-123', ModelVersion='gemini-2.5-flash', candidates[0].content.role='model'. selected_channel is null (no llm.Channel constructed by the test)."
+  },
+  "inbound_http": {
+    "_comment": "Verbatim from TestGeminiTransformers_Integration case 'simple text message'. Path is the literal request path; Query is empty. Body is the inline JSON string from the Go test.",
+    "method": "POST",
+    "path": "/v1beta/models/gemini-2.5-flash:generateContent",
+    "query": {},
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {"text": "Hello, Gemini!"}
+          ]
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 1024
+      }
+    }
+  },
+  "unified_request": {
+    "_comment": "llm.Request asserted by the Go integration test: Model='gemini-2.5-flash' (extracted from path), MaxTokens=1024 (from generationConfig.maxOutputTokens), one user message with content 'Hello, Gemini!'. Stream is asserted false for this path; outbound direction re-derives 'gemini-2.5-flash' from the model.",
+    "model": "gemini-2.5-flash",
+    "max_tokens": 1024,
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, Gemini!"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "From the same integration test step 2: outboundTransformer.TransformRequest(chatReq) yields method=POST, Content-Type='application/json', url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'. Auth uses StaticKeyProvider('test-api-key'); the Go test does not byte-assert the auth header, so the precise header format is 'pending source snapshot'. Body unmarshals to GenerateContentRequest; only the asserted fields are reproduced here (the round-trip preserves the user message and generationConfig).",
+    "base_url": "https://generativelanguage.googleapis.com",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "auth_note": "pending source snapshot: precise Authorization / x-goog-api-key header format is not byte-asserted by this Go test.",
+    "body_json": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {"text": "Hello, Gemini!"}
+          ]
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 1024
+      }
+    }
+  },
+  "upstream_http": {
+    "_comment": "Synthesized inline Gemini response from the Go integration test (step 3). ResponseID='test-response-123', ModelVersion='gemini-2.5-flash', one candidate with role 'model', text 'This is a test response from Gemini.', FinishReason='STOP', UsageMetadata{prompt 15, candidates 25, total 40}. Serialized with status 200.",
+    "status_code": 200,
+    "body_json": {
+      "responseId": "test-response-123",
+      "modelVersion": "gemini-2.5-flash",
+      "candidates": [
+        {
+          "index": 0,
+          "content": {
+            "role": "model",
+            "parts": [
+              {"text": "This is a test response from Gemini."}
+            ]
+          },
+          "finishReason": "STOP"
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 15,
+        "candidatesTokenCount": 25,
+        "totalTokenCount": 40
+      }
+    }
+  },
+  "client_http": {
+    "_comment": "Final inbound-transformed response. The Go test asserts finalHttpResp has StatusCode=200, Content-Type='application/json', body unmarshals to GenerateContentResponse with ResponseID='test-response-123', ModelVersion='gemini-2.5-flash', candidates[0].content.role='model'. The body shape mirrors the upstream Gemini response (the Gemini inbound path passes the Gemini response through).",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "unified_response": {
+      "id": "test-response-123",
+      "object": "chat.completion",
+      "model": "gemini-2.5-flash",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": {
+              "content": "This is a test response from Gemini."
+            }
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 25,
+        "total_tokens": 40
+      }
+    },
+    "body_json": {
+      "responseId": "test-response-123",
+      "modelVersion": "gemini-2.5-flash",
+      "candidates": [
+        {
+          "index": 0,
+          "content": {
+            "role": "model",
+            "parts": [
+              {"text": "This is a test response from Gemini."}
+            ]
+          },
+          "finishReason": "STOP"
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 15,
+        "candidatesTokenCount": 25,
+        "totalTokenCount": 40
+      }
+    }
+  }
+}

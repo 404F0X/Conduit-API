@@ -1,0 +1,117 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "basic_valid_request_response",
+  "api_format": "openai_chat",
+  "stream": false,
+  "source": {
+    "go_inbound_request_test": "conduit/llm/transformer/openai/inbound_test.go::TestInboundTransformer_TransformRequest (case \"valid request\")",
+    "go_outbound_request_test": "conduit/llm/transformer/openai/outbound_test.go::TestOutboundTransformer_TransformRequest (case \"valid request with default URL\")",
+    "go_outbound_response_test": "conduit/llm/transformer/openai/outbound_test.go::TestOutboundTransformer_TransformResponse (case \"valid response\")",
+    "go_inbound_response_test": "conduit/llm/transformer/openai/inbound_test.go::TestInboundTransformer_TransformResponse (case \"valid response\")",
+    "note": "All four Go fixtures are mutually coherent (model gpt-4, id chatcmpl-123, content 'Hello, world!' -> 'Hello! How can I help you today?'). The selected_channel segment is null because the Go unit tests do not construct an llm.Channel. The upstream_http segment is null because the Go tests do not perform a real upstream round-trip; upstream_http would need an integration test fixture."
+  },
+  "inbound_http": {
+    "_comment": "Copied verbatim (as JSON) from inbound_test.go 'valid request' fixture: an OpenAI chat completion HTTP request hitting /v1/chat/completions with JSON body. The Go test builds Body via mustMarshal(llm.Request{...}); the equivalent JSON is inlined under body_json. httpclient.Request serializes Body ([]byte) as base64, so the literal raw body is preserved here under body_json for parity; no base64 was synthesized.",
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "gpt-4",
+      "messages": [
+        {
+          "role": "user",
+          "content": {
+            "content": "Hello, world!"
+          }
+        }
+      ]
+    }
+  },
+  "unified_request": {
+    "_comment": "The expected llm.Request the inbound transformer must produce (the Go 'valid request' case asserts req.Model=='gpt-4', 1 message, content.Content==\"Hello, world!\"). Copied from the same Go fixture's llm.Request literal.",
+    "model": "gpt-4",
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, world!"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Copied verbatim from outbound_test.go 'valid request with default URL' fixture: the OutboundTransformer.TransformRequest output. Go test asserts method==POST, url=='https://api.openai.com/v1/chat/completions', Content-Type=='application/json', Auth.Type=='bearer', Auth.APIKey=='test-api-key'. The transformer also serializes the llm.Request to the outbound body; that body is the same shape as unified_request and is inlined under body_json. baseURL/apiKey come from the NewOutboundTransformer constructor args in the Go test.",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://api.openai.com/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "bearer",
+      "api_key": "test-api-key"
+    },
+    "body_json": {
+      "model": "gpt-4",
+      "messages": [
+        {
+          "role": "user",
+          "content": {
+            "content": "Hello, world!"
+          }
+        }
+      ]
+    }
+  },
+  "upstream_http": null,
+  "client_http": {
+    "_comment": "Assembled from two Go fixtures: (a) outbound_test.go 'valid response' provides the upstream httpclient.Response body (mustMarshal(llm.Response{...})); (b) inbound_test.go 'valid response' asserts the InboundTransformer.TransformResponse output has StatusCode==200, Content-Type=='application/json', body unmarshals to llm.Response with id=='chatcmpl-123' and model=='gpt-4'. The unified_response and resulting client body_json are identical here because the OpenAI inbound path passes the OpenAI-shaped llm.Response through. created=1677652288 is a fixed literal from the Go fixture (NOT a placeholder — it is asserted verbatim).",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "unified_response": {
+      "id": "chatcmpl-123",
+      "object": "chat.completion",
+      "created": 1677652288,
+      "model": "gpt-4",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": {
+              "content": "Hello! How can I help you today?"
+            }
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    },
+    "body_json": {
+      "id": "chatcmpl-123",
+      "object": "chat.completion",
+      "created": 1677652288,
+      "model": "gpt-4",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": {
+              "content": "Hello! How can I help you today?"
+            }
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  }
+}

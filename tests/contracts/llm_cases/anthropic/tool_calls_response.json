@@ -1,0 +1,74 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "tool_calls_response",
+  "api_format": "anthropic",
+  "stream": false,
+  "source": {
+    "go_inbound_response_test": "conduit/llm/transformer/anthropic/inbound_test.go::TestInboundTransformer_TransformResponse (case \"response with tool calls\")",
+    "note": "Captures the inbound response transform: a unified llm.Response carrying an assistant message with content 'I'll help you with that calculation.' plus one ToolCall{id:'call_123', type:'function', function:{name:'calculate', arguments:'{\"operation\": \"add\", \"a\": 5, \"b\": 3}'}} and finish_reason 'tool_calls' must produce an Anthropic-shaped Message response body with exactly two content blocks: [0]={type:'text', text:\"I'll help you with that calculation.\"} and [1]={type:'tool_use', id:'call_123', name:'calculate', input:{operation:'add', a:5, b:3}}, with stop_reason 'tool_use'. The Go test also asserts the wrapping HTTP response has StatusCode=200, Content-Type='application/json', id='msg_tool_123', type='message', role='assistant', model='claude-3-sonnet-20240229'. This is a response-only contract case: inbound_http, unified_request, selected_channel, outbound_http and upstream_http are null because the Go test does not exercise request stages."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": null,
+  "client_http": {
+    "_comment": "From inbound_test.go TestInboundTransformer_TransformResponse case 'response with tool calls'. Source llm.Response literal: ID='msg_tool_123', Object='chat.completion', Model='claude-3-sonnet-20240229', Created=1234567890, one choice with Index=0, Message.Role='assistant', Message.Content.Content=\"I'll help you with that calculation.\", Message.ToolCalls=[{ID:'call_123', Type:'function', Function:{Name:'calculate', Arguments:'{\"operation\": \"add\", \"a\": 5, \"b\": 3}'}}], FinishReason='tool_calls'. The validate callback asserts: resp.Content has len 2; [0].type='text', text=\"I'll help you with that calculation.\"; [1].type='tool_use', id='call_123', name='calculate', input JSON equals {operation:add, a:5, b:3}; stop_reason='tool_use'.",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "unified_response": {
+      "id": "msg_tool_123",
+      "object": "chat.completion",
+      "created": 1234567890,
+      "model": "claude-3-sonnet-20240229",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": {
+              "content": "I'll help you with that calculation."
+            },
+            "tool_calls": [
+              {
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                  "name": "calculate",
+                  "arguments": "{\"operation\": \"add\", \"a\": 5, \"b\": 3}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ]
+    },
+    "body_json": {
+      "id": "msg_tool_123",
+      "type": "message",
+      "role": "assistant",
+      "model": "claude-3-sonnet-20240229",
+      "content": [
+        {
+          "type": "text",
+          "text": "I'll help you with that calculation."
+        },
+        {
+          "type": "tool_use",
+          "id": "call_123",
+          "name": "calculate",
+          "input": {
+            "operation": "add",
+            "a": 5,
+            "b": 3
+          }
+        }
+      ],
+      "stop_reason": "tool_use"
+    }
+  }
+}

@@ -1,0 +1,385 @@
+import { useMemo, useState, useEffect } from 'react';
+import { format } from 'date-fns';
+import { useParams, useNavigate } from '@tanstack/react-router';
+import { zhCN, enUS } from 'date-fns/locale';
+import { ArrowLeft, FileText, Activity, RefreshCw, List, GitBranch, Waypoints, Maximize2, X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { DEFAULT_ACCOUNTING_CURRENCY_CODE } from '@/lib/accounting';
+import { cn, extractNumberID } from '@/lib/utils';
+import { usePaginationSearch } from '@/hooks/use-pagination-search';
+import useInterval from '@/hooks/useInterval';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Separator } from '@/components/ui/separator';
+import { Switch } from '@/components/ui/switch';
+import { Header } from '@/components/layout/header';
+import { Main } from '@/components/layout/main';
+import { useGeneralSettings } from '@/features/system/data/system';
+import { useTraceWithSegments } from '../data';
+import { Segment, Span, parseRawRootSegment } from '../data/schema';
+import { SpanSection } from './span-section';
+import { TraceFlatTimeline } from './trace-flat-timeline';
+import { TraceFlowTimeline } from './trace-flow-timeline';
+import { TraceTreeTimeline } from './trace-tree-view';
+
+export default function TraceDetailPage() {
+  const { t, i18n } = useTranslation();
+  const { traceId } = useParams({ from: '/_authenticated/project/traces/$traceId' });
+  const navigate = useNavigate();
+  const locale = i18n.language === 'zh' ? zhCN : enUS;
+  const [selectedTrace, setSelectedTrace] = useState<Segment | null>(null);
+  const [selectedSpan, setSelectedSpan] = useState<Span | null>(null);
+  const [selectedSpanType, setSelectedSpanType] = useState<'request' | 'response' | null>(null);
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [viewMode, setViewMode] = useState<'flat' | 'flow' | 'tree'>('flat');
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const { getSearchParams } = usePaginationSearch({ defaultPageSize: 20 });
+
+  const { data: trace, isLoading, refetch } = useTraceWithSegments(traceId);
+  const { data: settings } = useGeneralSettings();
+
+  // Parse rawRootSegment JSON once per trace
+  // 仅解析 rawRootSegment（完整 JSON）
+  const effectiveRootSegment = useMemo(() => {
+    if (!trace?.rawRootSegment) return null;
+    return parseRawRootSegment(trace.rawRootSegment);
+  }, [trace]);
+
+  // Auto-select first span when trace loads
+  useEffect(() => {
+    if (effectiveRootSegment && !selectedSpan) {
+      const firstSpan = effectiveRootSegment.requestSpans?.[0] || effectiveRootSegment.responseSpans?.[0];
+      if (firstSpan) {
+        const spanType = effectiveRootSegment.requestSpans?.[0] ? 'request' : 'response';
+        setSelectedTrace(effectiveRootSegment);
+        setSelectedSpan(firstSpan);
+        setSelectedSpanType(spanType);
+      }
+    }
+  }, [effectiveRootSegment, selectedSpan]);
+
+  useInterval(
+    () => {
+      refetch();
+    },
+    autoRefresh ? 30000 : null
+  );
+
+  const handleSpanSelect = (parentTrace: Segment, span: Span, type: 'request' | 'response') => {
+    setSelectedTrace(parentTrace);
+    setSelectedSpan(span);
+    setSelectedSpanType(type);
+  };
+
+  const handleBack = () => {
+    navigate({
+      to: '/project/traces',
+      search: getSearchParams(),
+    });
+  };
+
+  if (isLoading) {
+    return (
+      <div className='flex h-screen flex-col'>
+        <Header className='border-b'></Header>
+        <Main className='flex-1'>
+          <div className='flex h-full items-center justify-center'>
+            <div className='space-y-4 text-center'>
+              <div className='border-primary mx-auto h-12 w-12 animate-spin rounded-full border-b-2'></div>
+              <p className='text-muted-foreground text-lg'>{t('common.loading')}</p>
+            </div>
+          </div>
+        </Main>
+      </div>
+    );
+  }
+
+  if (!trace) {
+    return (
+      <div className='flex h-screen flex-col'>
+        <Header className='border-b'></Header>
+        <Main className='flex-1'>
+          <div className='flex h-full items-center justify-center'>
+            <div className='space-y-6 text-center'>
+              <div className='space-y-2'>
+                <Activity className='text-muted-foreground mx-auto h-16 w-16' />
+                <p className='text-muted-foreground text-xl font-medium'>{t('traces.detail.notFound')}</p>
+              </div>
+              <Button onClick={handleBack} size='lg'>
+                <ArrowLeft className='mr-2 h-4 w-4' />
+                {t('common.back')}
+              </Button>
+            </div>
+          </div>
+        </Main>
+      </div>
+    );
+  }
+
+  return (
+    <div className='flex h-screen flex-col'>
+      {/* Normal Header - hidden in fullscreen */}
+      {!isFullscreen && (
+        <Header className='bg-background/95 supports-[backdrop-filter]:bg-background/60 w-full border-b backdrop-blur'>
+          <div className='flex w-full items-center justify-between gap-2'>
+            <div className='flex min-w-0 flex-1 items-center gap-2 sm:gap-4'>
+              <Button variant='ghost' size='sm' onClick={handleBack} className='hover:bg-accent shrink-0'>
+                <ArrowLeft className='mr-1 h-4 w-4 sm:mr-2' />
+                <span className='hidden sm:inline'>{t('common.back')}</span>
+              </Button>
+              <Separator orientation='vertical' className='hidden h-6 shrink-0 sm:block' />
+              <div className='flex min-w-0 items-center gap-2 sm:gap-3'>
+                <div className='bg-primary/10 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg sm:h-8 sm:w-8'>
+                  <Activity className='text-primary h-3.5 w-3.5 sm:h-4 sm:w-4' />
+                </div>
+                <div className='min-w-0'>
+                  <h1 className='truncate text-sm leading-none font-semibold sm:text-lg'>
+                    {t('traces.detail.title')} #{extractNumberID(trace.id) || trace.traceID}
+                  </h1>
+                  <div className='mt-1 flex items-center gap-1 text-xs sm:gap-2 sm:text-sm'>
+                    <p className='text-muted-foreground max-w-[120px] truncate sm:max-w-none'>{trace.traceID}</p>
+                    <span className='text-muted-foreground hidden sm:inline'>•</span>
+                    <p className='text-muted-foreground hidden text-[10px] sm:inline sm:text-xs'>
+                      {format(new Date(trace.createdAt), 'yyyy-MM-dd HH:mm:ss', { locale })}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className='flex shrink-0 items-center gap-1 sm:gap-2'>
+              <div className='hidden items-center gap-2 sm:flex'>
+                <Switch checked={autoRefresh} onCheckedChange={setAutoRefresh} id='auto-refresh-switch' />
+                <label htmlFor='auto-refresh-switch' className='text-muted-foreground cursor-pointer text-sm'>
+                  {t('common.autoRefresh')}
+                </label>
+              </div>
+              <Button variant='outline' size='sm' onClick={() => refetch()} disabled={isLoading} className='px-2 sm:px-3'>
+                <RefreshCw className={`h-4 w-4 ${isLoading || autoRefresh ? 'animate-spin' : ''}`} />
+                <span className='ml-2 hidden sm:inline'>{t('common.refresh')}</span>
+              </Button>
+            </div>
+          </div>
+        </Header>
+      )}
+
+      <Main className={cn('flex flex-1 flex-col overflow-hidden p-0', isFullscreen && 'bg-background fixed inset-0 z-50')}>
+        {effectiveRootSegment ? (
+          <>
+            {/* Top: Usage Metadata */}
+            {!isFullscreen && (
+              <div className='bg-background border-b px-4 py-3 sm:px-6 sm:py-4'>
+                <div className='grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-4 lg:grid-cols-6'>
+                  <div className='bg-muted/30 rounded-lg px-3 py-2'>
+                    <p className='text-muted-foreground text-xs sm:text-sm'>{t('traces.detail.totalTokensLabel')}</p>
+                    <p className='text-base font-semibold sm:text-lg'>{(trace.usageMetadata?.totalTokens ?? 0).toLocaleString()}</p>
+                  </div>
+                  <div className='bg-muted/30 rounded-lg px-3 py-2'>
+                    <p className='text-muted-foreground text-xs sm:text-sm'>{t('traces.detail.inputTokensLabel')}</p>
+                    <p className='text-base font-semibold sm:text-lg'>{(trace.usageMetadata?.totalInputTokens ?? 0).toLocaleString()}</p>
+                  </div>
+                  <div className='bg-muted/30 rounded-lg px-3 py-2'>
+                    <p className='text-muted-foreground text-xs sm:text-sm'>{t('traces.detail.outputTokensLabel')}</p>
+                    <p className='text-base font-semibold sm:text-lg'>{(trace.usageMetadata?.totalOutputTokens ?? 0).toLocaleString()}</p>
+                  </div>
+                  <div className='bg-muted/30 rounded-lg px-3 py-2'>
+                    <p className='text-muted-foreground text-xs sm:text-sm'>{t('traces.detail.cachedTokensLabel')}</p>
+                    <p className='text-base font-semibold sm:text-lg'>{(trace.usageMetadata?.totalCachedTokens ?? 0).toLocaleString()}</p>
+                  </div>
+                  <div className='bg-muted/30 rounded-lg px-3 py-2'>
+                    <p className='text-muted-foreground text-xs sm:text-sm'>{t('traces.detail.cachedWriteTokensLabel')}</p>
+                    <p className='text-base font-semibold sm:text-lg'>
+                      {(trace.usageMetadata?.totalCachedWriteTokens ?? 0).toLocaleString()}
+                    </p>
+                  </div>
+                  <div className='bg-muted/30 rounded-lg px-3 py-2'>
+                    <p className='text-muted-foreground text-xs sm:text-sm'>{t('usageLogs.columns.totalCost')}</p>
+                    {trace.usageMetadata?.totalCost ? (
+                      <p className='text-base font-semibold sm:text-lg'>
+                        {t('currencies.format', {
+                          val: trace.usageMetadata.totalCost,
+                          currency: settings?.accountingCurrencyCode?.trim() || DEFAULT_ACCOUNTING_CURRENCY_CODE,
+                          locale: i18n.language === 'zh' ? 'zh-CN' : 'en-US',
+                          minimumFractionDigits: 6,
+                        })}
+                      </p>
+                    ) : (
+                      <p className='text-muted-foreground text-base font-semibold sm:text-lg'>-</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Fullscreen Header */}
+            {isFullscreen && (
+              <div className='bg-background flex shrink-0 items-center justify-between border-b px-4 py-3'>
+                <div className='flex items-center gap-3'>
+                  <Button variant='ghost' size='sm' onClick={() => setIsFullscreen(false)}>
+                    <ArrowLeft className='mr-2 h-4 w-4' />
+                    {t('common.back')}
+                  </Button>
+                  <Separator orientation='vertical' className='h-6' />
+                  <div className='flex items-center gap-2'>
+                    <Activity className='text-primary h-4 w-4' />
+                    <span className='font-semibold'>
+                      {t('traces.detail.title')} #{extractNumberID(trace.id) || trace.traceID}
+                    </span>
+                    <span className='text-muted-foreground text-sm'>{trace.traceID}</span>
+                  </div>
+                </div>
+                <div className='flex items-center gap-2'>
+                  <div className='bg-muted mr-2 inline-flex items-center rounded-md p-0.5'>
+                    <Button
+                      variant='ghost'
+                      size='sm'
+                      className={cn('h-7 gap-1.5 rounded-sm px-2.5 text-xs', viewMode === 'flat' && 'bg-background shadow-sm')}
+                      onClick={() => setViewMode('flat')}
+                    >
+                      <List className='h-3.5 w-3.5' />
+                      {t('traces.detail.viewMode.flat')}
+                    </Button>
+                    <Button
+                      variant='ghost'
+                      size='sm'
+                      className={cn('h-7 gap-1.5 rounded-sm px-2.5 text-xs', viewMode === 'flow' && 'bg-background shadow-sm')}
+                      onClick={() => setViewMode('flow')}
+                    >
+                      <GitBranch className='h-3.5 w-3.5' />
+                      {t('traces.detail.viewMode.flow')}
+                    </Button>
+                    <Button
+                      variant='ghost'
+                      size='sm'
+                      className={cn('h-7 gap-1.5 rounded-sm px-2.5 text-xs', viewMode === 'tree' && 'bg-background shadow-sm')}
+                      onClick={() => setViewMode('tree')}
+                    >
+                      <Waypoints className='h-3.5 w-3.5' />
+                      {t('traces.detail.viewMode.tree')}
+                    </Button>
+                  </div>
+                  <Button
+                    variant='ghost'
+                    size='sm'
+                    className='h-8 w-8 p-0'
+                    onClick={() => setIsFullscreen(false)}
+                    title={t('common.exitFullscreen')}
+                  >
+                    <X className='h-4 w-4' />
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className={cn('flex flex-1 flex-col overflow-hidden', isFullscreen ? '' : 'pt-2')}>
+              {/* View mode selector - always visible on mobile */}
+              <div className='mb-3 flex shrink-0 items-center justify-end px-4 sm:px-6'>
+                <div className='bg-muted inline-flex items-center rounded-md p-0.5'>
+                  <Button
+                    variant='ghost'
+                    size='sm'
+                    className={cn('h-7 gap-1.5 rounded-sm px-2.5 text-xs', viewMode === 'flat' && 'bg-background shadow-sm')}
+                    onClick={() => setViewMode('flat')}
+                  >
+                    <List className='h-3.5 w-3.5' />
+                    {t('traces.detail.viewMode.flat')}
+                  </Button>
+                  <Button
+                    variant='ghost'
+                    size='sm'
+                    className={cn('h-7 gap-1.5 rounded-sm px-2.5 text-xs', viewMode === 'flow' && 'bg-background shadow-sm')}
+                    onClick={() => setViewMode('flow')}
+                  >
+                    <GitBranch className='h-3.5 w-3.5' />
+                    {t('traces.detail.viewMode.flow')}
+                  </Button>
+                  <Button
+                    variant='ghost'
+                    size='sm'
+                    className={cn('h-7 gap-1.5 rounded-sm px-2.5 text-xs', viewMode === 'tree' && 'bg-background shadow-sm')}
+                    onClick={() => setViewMode('tree')}
+                  >
+                    <Waypoints className='h-3.5 w-3.5' />
+                    {t('traces.detail.viewMode.tree')}
+                  </Button>
+                </div>
+                <Button
+                  variant='ghost'
+                  size='sm'
+                  className='ml-2 h-7 w-7 p-0'
+                  onClick={() => setIsFullscreen(true)}
+                  title={t('common.fullscreen')}
+                >
+                  <Maximize2 className='h-4 w-4' />
+                </Button>
+              </div>
+
+              {/* Mobile: Stacked layout */}
+              <div className='flex flex-1 flex-col overflow-hidden sm:flex-row'>
+                {/* Left: Timeline */}
+                <div className={cn('flex flex-1 flex-col overflow-hidden', isFullscreen ? 'p-0' : 'overflow-auto p-4 sm:p-6')}>
+                  <div className={cn('flex-1 overflow-auto', isFullscreen && 'p-4')}>
+                    {viewMode === 'flat' ? (
+                      <TraceFlatTimeline
+                        trace={effectiveRootSegment}
+                        onSelectSpan={(selectedTrace, span, type) => handleSpanSelect(selectedTrace, span, type)}
+                        selectedSpanId={selectedSpan?.id}
+                      />
+                    ) : viewMode === 'flow' ? (
+                      <TraceFlowTimeline
+                        trace={effectiveRootSegment}
+                        onSelectSpan={(selectedTrace, span, type) => handleSpanSelect(selectedTrace, span, type)}
+                        selectedSpanId={selectedSpan?.id}
+                        isFullscreen={isFullscreen}
+                      />
+                    ) : (
+                      <TraceTreeTimeline
+                        trace={effectiveRootSegment}
+                        onSelectSpan={(selectedTrace, span, type) => handleSpanSelect(selectedTrace, span, type)}
+                        selectedSpanId={selectedSpan?.id}
+                      />
+                    )}
+                  </div>
+                </div>
+
+                {/* Right: Span Detail - collapsible on mobile */}
+                <div
+                  className={cn(
+                    'border-border bg-background overflow-y-auto border-t transition-all duration-300 sm:border-t-0 sm:border-l',
+                    isFullscreen ? 'w-full sm:w-[450px]' : 'w-full sm:w-[500px]',
+                    selectedSpan ? 'flex flex-col' : 'hidden sm:flex sm:flex-col'
+                  )}
+                >
+                  <div className='bg-background sticky top-0 z-10 flex items-center justify-between border-b px-4 py-3 sm:hidden'>
+                    <div className='flex items-center gap-2'>
+                      <Activity className='text-primary h-4 w-4' />
+                      <h3 className='text-sm font-medium'>{t('traces.detail.spanDetail')}</h3>
+                    </div>
+                    <Button variant='ghost' size='sm' className='h-8 w-8 p-0' onClick={() => setSelectedSpan(null)}>
+                      <X className='h-4 w-4' />
+                    </Button>
+                  </div>
+                  <div className='flex-1 overflow-y-auto'>
+                    <SpanSection selectedTrace={selectedTrace} selectedSpan={selectedSpan} selectedSpanType={selectedSpanType} />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className='flex h-full items-center justify-center p-6'>
+            <Card className='border-0 shadow-sm'>
+              <CardContent className='py-16'>
+                <div className='flex h-full items-center justify-center'>
+                  <div className='space-y-4 text-center'>
+                    <FileText className='text-muted-foreground mx-auto h-16 w-16' />
+                    <p className='text-muted-foreground text-lg'>{t('traces.detail.noTraceData')}</p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+      </Main>
+    </div>
+  );
+}

@@ -1,0 +1,59 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "metadata_user_id_request_id",
+  "api_format": "doubao",
+  "stream": false,
+  "source": {
+    "go_outbound_request_test": "conduit/llm/transformer/doubao/outbound_test.go::TestOutboundTransformer_TransformRequest (case 'request with metadata')",
+    "note": "Captures the Doubao OutboundTransformer.TransformRequest Metadata -> user_id/request_id promotion behavior. The Go test feeds llm.Request{Model:'ep-20241203072800-8f7f', Messages:[{user,'Hello, world!'}], Metadata:{'user_id':'user123','request_id':'req456'}} and asserts that the unmarshaled Doubao Request body has UserID='user123', RequestID='req456', and Metadata==nil (the llm.Request.Metadata map is consumed and popped from the outbound body). This is the canonical Doubao metadata-pass-through contract. selected_channel, upstream_http and client_http are null because the Go outbound unit test does not exercise those stages."
+  },
+  "inbound_http": null,
+  "unified_request": {
+    "_comment": "Exact llm.Request literal from the Go test 'request with metadata' fixture: same Model and one user message as chat_completion_basic, plus Metadata={'user_id':'user123','request_id':'req456'}.",
+    "model": "ep-20241203072800-8f7f",
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, world!"
+        }
+      }
+    ],
+    "metadata": {
+      "user_id": "user123",
+      "request_id": "req456"
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "From TestOutboundTransformer_TransformRequest case 'request with metadata'. The Go validate callback asserts: doubaoReq.UserID=='user123', doubaoReq.RequestID=='req456', doubaoReq.Metadata==nil. The URL/Auth/Method are the same as the basic chat case (the metadata case reuses the same transformer config). Other body fields (model, messages) survive unchanged.",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "bearer",
+      "api_key": "test-api-key"
+    },
+    "body_json": {
+      "_comment": "Doubao Request body after TransformRequest. The transformer promotes Metadata['user_id'] -> Request.UserID and Metadata['request_id'] -> Request.RequestID, then drops Metadata. Only the asserted fields are populated.",
+      "model": "ep-20241203072800-8f7f",
+      "messages": [
+        {
+          "role": "user",
+          "content": {
+            "content": "Hello, world!"
+          }
+        }
+      ],
+      "user_id": "user123",
+      "request_id": "req456"
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

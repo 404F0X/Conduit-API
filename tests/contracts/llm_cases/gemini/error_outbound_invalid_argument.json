@@ -1,0 +1,37 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "error_outbound_invalid_argument",
+  "api_format": "gemini",
+  "stream": false,
+  "source": {
+    "go_outbound_error_test": "conduit/llm/transformer/gemini/openai/outbound_test.go::TestOutboundTransformer_TransformError_ParsesGeminiOpenAIArray",
+    "note": "Captures the Gemini-OpenAI OutboundTransformer.TransformError mapping for Google's array-wrapped error envelope. The Go test constructs httpclient.Error{StatusCode: 400, Body: '[{\"error\":{\"code\":400,\"message\":\"Expected one of either `reasoning_effort` or custom `thinking_config`; found both.\",\"status\":\"INVALID_ARGUMENT\"}}]'} (note the outer JSON ARRAY) and feeds it to tr.TransformError. It asserts the resulting llm.ResponseError has StatusCode=400, Detail.Type='INVALID_ARGUMENT', Detail.Code='400' (string-coerced), and Detail.Message contains the substring 'found both'. This case is valuable because it exercises Gemini's non-standard array-wrapped error envelope and the string coercion of the numeric code field. inbound_http, unified_request, selected_channel, outbound_http and client_http are null because this test does not exercise request or inbound stages."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "Verbatim from TestOutboundTransformer_TransformError_ParsesGeminiOpenAIArray. The upstream body is a JSON ARRAY (Google's Gemini-OpenAI error envelope wraps the error object in an array). The Go test builds the body by string concatenation; the equivalent parsed JSON is shown below.",
+    "status_code": 400,
+    "body_json": [
+      {
+        "error": {
+          "code": 400,
+          "message": "Expected one of either `reasoning_effort` or custom `thinking_config`; found both.",
+          "status": "INVALID_ARGUMENT"
+        }
+      }
+    ]
+  },
+  "client_http": null,
+  "unified_error": {
+    "_comment": "Extension field (NOT one of the six required sections) recording the llm.ResponseError produced by OutboundTransformer.TransformError. The Go test asserts: StatusCode==400, Detail.Type=='INVALID_ARGUMENT', Detail.Code=='400' (numeric 400 from upstream is string-coerced to '400'), Detail.Message contains 'found both'. The full message string is preserved verbatim from the upstream fixture (the Go test only checks substring containment, but the message survives intact through the transform).",
+    "status_code": 400,
+    "detail": {
+      "message": "Expected one of either `reasoning_effort` or custom `thinking_config`; found both.",
+      "type": "INVALID_ARGUMENT",
+      "code": "400"
+    }
+  }
+}

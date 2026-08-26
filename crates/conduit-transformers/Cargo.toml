@@ -1,0 +1,41 @@
+[package]
+name = "conduit-transformers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-3.0-only"
+repository.workspace = true
+
+[features]
+default = []
+redis = []
+otel = []
+full = ["redis", "otel"]
+
+[dependencies]
+conduit-core = { workspace = true }
+conduit-llm = { workspace = true }
+# Used by claudecode OAuth credentials `expires_at` (mirrors Go `time.Time` in
+# `llm/oauth/credentials.go:15`).
+chrono = { workspace = true }
+# Used by claudecode `GenerateUserID` random device-id bytes (mirrors Go
+# `crypto/rand.Read` in `claudecode/userid.go:91`); same version as conduit-auth.
+rand = "0.8"
+regex = "1"
+# Used by nanogpt XML tool-call parser to generate deterministic tool-call IDs
+# (mirrors Go's `crypto/sha256` in `nanogpt/xml_parser.go:337-344`) and by
+# claudecode deterministic device ids (`claudecode/userid.go:86-87`).
+sha2 = "0.10"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Used by antigravity `replace_base_url` (mirrors Go `url.Parse` in
+# `llm/transformer/antigravity/executor.go:376-415`).
+url = { workspace = true }
+# claudecode user ids: v4 random session ids + v5 (`uuid.NewSHA1`) deterministic
+# account UUIDs (`claudecode/userid.go:88-97`). v5 is additive on top of the
+# workspace feature set (serde, v4, v7).
+uuid = { workspace = true, features = ["v5"] }
+
+[lints]
+workspace = true

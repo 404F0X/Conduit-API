@@ -1,0 +1,70 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "generation_json_request",
+  "api_format": "openai_image",
+  "stream": false,
+  "source": {
+    "go_inbound_request_test": "conduit/llm/transformer/openai/image_inbound_test.go::TestImageInboundTransformer_TransformRequest_Generation_JSON (L20-65)",
+    "go_outbound_request_test": "conduit/llm/transformer/openai/image_inbound_test.go::TestImageInboundTransformer_TransformRequest_Generation_JSON (outbound leg, L54-64); routing/metadata assertions from image_outbound_test.go::TestBuildImageGenerationAPIRequest_RoutesToGenerate (L321-338) and TestBuildImageGenerateRequest_BasicPrompt (L90-121, same builder path)",
+    "note": "Request-only case for POST /v1/images/generations (JSON body). A single Go test drives the full inbound->outbound request chain with one coherent fixture (dall-e-3, prompt 'a cat', n=2, response_format 'url', size '1024x1024', user 'u1'). selected_channel, upstream_http and client_http are null because the unit test does not exercise those stages."
+  },
+  "inbound_http": {
+    "_comment": "Verbatim reqBody literal from the Go test (L23-30), wrapped in httpclient.Request{Method POST, URL http://localhost/v1/images/generations, Content-Type application/json}.",
+    "method": "POST",
+    "url": "http://localhost/v1/images/generations",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "prompt": "a cat",
+      "model": "dall-e-3",
+      "n": 2,
+      "response_format": "url",
+      "size": "1024x1024",
+      "user": "u1"
+    }
+  },
+  "unified_request": {
+    "_comment": "Expected llm.Request from ImageInboundTransformer(generation).TransformRequest. Byte-asserted (L42-52): RequestType==image, APIFormat==openai/image_generation, Model=='dall-e-3', Modalities contains 'image', *Stream==false, Image.Prompt=='a cat', *Image.N==2, Image.ResponseFormat=='url', Image.Size=='1024x1024'. image.user=='u1' is copied by transformGenerationRequest (image_inbound.go L230-247) but not directly asserted.",
+    "model": "dall-e-3",
+    "modalities": ["image"],
+    "stream": false,
+    "request_type": "image",
+    "api_format": "openai/image_generation",
+    "image": {
+      "prompt": "a cat",
+      "n": 2,
+      "size": "1024x1024",
+      "response_format": "url",
+      "user": "u1"
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "OutboundTransformer.TransformRequest output. Byte-asserted in this test: URL=='https://api.openai.com/v1/images/generations', body contains '\"response_format\":\"url\"' and '\"n\":2'. Method POST, Content-Type/Accept headers and bearer auth come from buildImageGenerateRequest (image_outbound.go; Method/Content-Type also asserted by TestBuildImageGenerateRequest_BasicPrompt). request api_format and transformer_metadata.model asserted by TestBuildImageGenerationAPIRequest_RoutesToGenerate. PARITY GOTCHA: buildImageGenerateRequest builds the outbound body from an allowlist map and does NOT forward 'user' — the inbound 'user':'u1' is dropped from the outbound wire body.",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "test-key",
+    "method": "POST",
+    "url": "https://api.openai.com/v1/images/generations",
+    "api_format": "openai/image_generation",
+    "transformer_metadata": { "model": "dall-e-3" },
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Accept": ["application/json"]
+    },
+    "auth": {
+      "type": "bearer",
+      "api_key": "test-key"
+    },
+    "body_json": {
+      "prompt": "a cat",
+      "model": "dall-e-3",
+      "n": 2,
+      "size": "1024x1024",
+      "response_format": "url"
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

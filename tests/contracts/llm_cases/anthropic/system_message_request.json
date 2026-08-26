@@ -1,0 +1,73 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "system_message_request",
+  "api_format": "anthropic",
+  "stream": false,
+  "source": {
+    "go_inbound_request_test": "conduit/llm/transformer/anthropic/inbound_test.go::TestInboundTransformer_TransformRequest (case \"request with system message\")",
+    "go_outbound_request_test": "conduit/llm/transformer/anthropic/outbound_test.go::TestOutboundTransformer_TransformRequest (case \"request with system message\")",
+    "note": "Captures the Anthropic 'system' top-level field -> llm.Request.Messages[0] with Role='system' conversion. The Go inbound test feeds an inline JSON body with model 'claude-3-sonnet-20240229', max_tokens 1024, system 'You are a helpful assistant.', and one user message 'Hello!'. It asserts the resulting llm.Request has TWO messages: [0]={role:'system', content.Content:'You are a helpful assistant.'} and [1]={role:'user', content.Content:'Hello!'}. The outbound Go test feeds the equivalent llm.Request (system+user messages) through NewOutboundTransformer('https://api.anthropic.com','test-api-key') and asserts URL='https://api.anthropic.com/v1/messages', Content-Type='application/json', Anthropic-Version='2023-06-01', and that the marshaled body has Model and MaxTokens>0. selected_channel, upstream_http and client_http are null because the Go tests for this case do not exercise those stages."
+  },
+  "inbound_http": {
+    "_comment": "Inline JSON body from the Go inbound_test.go 'request with system message' fixture (verbatim transcription of the []byte(`{...}`) literal). The Go test sets only Headers on httpclient.Request (no URL), so url is omitted.",
+    "method": "POST",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "claude-3-sonnet-20240229",
+      "max_tokens": 1024,
+      "system": "You are a helpful assistant.",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello!"
+        }
+      ]
+    }
+  },
+  "unified_request": {
+    "_comment": "Expected llm.Request asserted by the Go inbound test 'request with system message': MaxTokens=1024, two messages (system then user) with the indicated string contents. Other fields (Model) copied from the same fixture.",
+    "model": "claude-3-sonnet-20240229",
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "role": "system",
+        "content": {
+          "content": "You are a helpful assistant."
+        }
+      },
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello!"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "From outbound_test.go TestOutboundTransformer_TransformRequest case 'request with system message'. The Go test asserts method=POST, url='https://api.anthropic.com/v1/messages', headers Content-Type and Anthropic-Version, body unmarshals to MessageRequest with Model='claude-3-sonnet-20240229' and MaxTokens>0. The system message is re-serialized into the Anthropic top-level 'system' field by the outbound converter; the exact wire shape of system is not byte-asserted in the Go outbound unit test for this case (pending source snapshot for the precise 'system' serialization).",
+    "base_url": "https://api.anthropic.com",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://api.anthropic.com/v1/messages",
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Anthropic-Version": ["2023-06-01"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "api_key",
+      "api_key": "test-api-key"
+    },
+    "body_json_asserted": {
+      "model": "claude-3-sonnet-20240229",
+      "max_tokens_gt": 0
+    },
+    "body_json_unasserted_note": "pending source snapshot: precise outbound 'system' field serialization for this case is not byte-asserted by the Go outbound unit test."
+  },
+  "upstream_http": null,
+  "client_http": null
+}

@@ -1,0 +1,152 @@
+{
+  "_source": "Faithfully transcribed from conduit/conf/conf.go (setDefaults) and conduit/internal/server/biz/system_default.go. Per RUST-P0-001 S07. No value is synthesized.",
+  "_env_prefix": "CONDUIT",
+  "_env_key_rule": "Each dotted file/env path maps to an CONDUIT_* env key by uppercasing and replacing '.' with '_'. Example: server.request_timeout -> CONDUIT_SERVER_REQUEST_TIMEOUT; cache.redis.master_name -> CONDUIT_CACHE_REDIS_MASTER_NAME; db.read_replica.read_dsn -> CONDUIT_DB_READ_REPLICA_READ_DSN. (Viper AutomaticEnv + '.'->'_' key replacer; matches Rust RUST-P1-003 S06.)",
+  "_verification": "Pending drift-audit verification against the Go source.",
+
+  "file_env_defaults": {
+    "server.host": "127.0.0.1",
+    "server.port": 8090,
+    "server.public_url": "",
+    "server.name": "Conduit API",
+    "server.base_path": "",
+    "server.request_timeout": "30s",
+    "server.llm_request_timeout": "600s",
+    "server.trace.thread_header": "Conduit-Thread-Id",
+    "server.trace.trace_header": "Conduit-Trace-Id",
+    "server.trace.extra_trace_headers": [],
+    "server.trace.extra_trace_body_fields": [],
+    "server.trace.claude_code_trace_enabled": false,
+    "server.trace.codex_trace_enabled": false,
+    "server.trace.opencode_trace_enabled": false,
+    "server.dashboard.all_time_token_stats_soft_ttl": "1h",
+    "server.dashboard.all_time_token_stats_hard_ttl": "24h",
+    "server.debug": false,
+    "server.disable_ssl_verify": false,
+    "server.cors.enabled": false,
+    "server.cors.debug": false,
+    "server.cors.allowed_origins": ["http://localhost:8090"],
+    "server.cors.allowed_methods": ["GET", "POST", "DELETE", "PATCH", "PUT", "OPTIONS", "HEAD"],
+    "server.cors.allowed_headers": ["Content-Type", "Authorization", "X-API-Key", "X-Goog-Api-Key", "X-Project-ID", "X-Thread-ID", "X-Trace-ID"],
+    "server.cors.exposed_headers": [],
+    "server.cors.allow_credentials": false,
+    "server.cors.max_age": "30m",
+    "server.api.auth.allow_no_auth": false,
+    "server.api.auth.key_prefix": "conduit",
+
+    "db.dialect": "sqlite3",
+    "db.dsn": "file:conduit.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)",
+    "db.disable_auto_migration": false,
+    "db.disable_sqlite_auto_wal": false,
+    "db.debug": false,
+    "db.max_open_conns": 20,
+    "db.max_idle_conns": 10,
+    "db.conn_max_lifetime": "30m",
+    "db.conn_max_idle_time": "10m",
+    "db.read_replica.read_dsn": "",
+    "db.read_replica.read_max_open_conns": 0,
+    "db.read_replica.read_max_idle_conns": 0,
+
+    "log.name": "conduit",
+    "log.debug": false,
+    "log.skip_level": 1,
+    "log.level": "info",
+    "log.level_key": "level",
+    "log.time_key": "time",
+    "log.caller_key": "label",
+    "log.function_key": "",
+    "log.name_key": "logger",
+    "log.encoding": "json",
+    "log.includes": [],
+    "log.excludes": [],
+    "log.output": "stdio",
+    "log.file.path": "logs/conduit.log",
+    "log.file.max_size": 100,
+    "log.file.max_age": 30,
+    "log.file.max_backups": 10,
+    "log.file.local_time": true,
+
+    "metrics.enabled": false,
+
+    "gc.cron": "0 2 * * *",
+    "gc.vacuum_enabled": true,
+    "gc.vacuum_full": false,
+
+    "provider_quota.check_interval": "5m",
+    "provider_quota.warning_check_interval_ratio": 4,
+
+    "cache.mode": "memory",
+    "cache.default_expiration": "5m",
+    "cache.cleanup_interval": "10m",
+    "cache.redis.addr": "",
+    "cache.redis.addrs": [],
+    "cache.redis.url": "",
+    "cache.redis.username": "",
+    "cache.redis.password": "",
+    "cache.redis.master_name": "",
+    "cache.redis.sentinel_username": "",
+    "cache.redis.sentinel_password": "",
+    "_cache.redis.db_note": "No default — intentionally unset so an explicit 0 override is distinguishable.",
+    "cache.redis.tls": false,
+    "cache.redis.tls_insecure_skip_verify": false,
+
+    "oidc.providers": []
+  },
+
+  "system_defaults": {
+    "_source": "conduit/internal/server/biz/system_default.go. Stored as system settings (not env-driven); relevant to RUST-P5-002.",
+    "storage_policy": {
+      "store_chunks": false,
+      "live_preview": false,
+      "store_request_body": true,
+      "store_response_body": true,
+      "cleanup_options": [
+        {"resource_type": "requests", "enabled": false, "cleanup_days": 3},
+        {"resource_type": "usage_logs", "enabled": false, "cleanup_days": 30}
+      ]
+    },
+    "retry_policy": {
+      "max_channel_retries": 3,
+      "max_single_channel_retries": 2,
+      "retry_delay_ms": 1000,
+      "load_balancer_strategy": "adaptive",
+      "enabled": true,
+      "upstream_error_policy": {"mode": "UpstreamErrorModePassthrough (const)"}
+    },
+    "model_settings": {
+      "fallback_to_channels_on_model_not_found": true,
+      "query_all_channel_models": true,
+      "default_model_api_include_all": false,
+      "auto_reasoning_effort": false,
+      "model_blacklist_regex": "",
+      "developer_settings": []
+    },
+    "channel_setting": {
+      "probe": {"enabled": true, "frequency": "ProbeFrequency5Min (const — resolve exact string)"},
+      "auto_sync": {"frequency": "AutoSyncFrequencyOneHour (const — resolve exact string)"}
+    },
+    "general": {"currency_code": "USD", "timezone": "UTC"},
+    "auto_backup": {
+      "enabled": false,
+      "frequency": "BackupFrequencyDaily (const — resolve exact string)",
+      "include_channels": true,
+      "include_models": true,
+      "include_api_keys": false,
+      "include_model_prices": true,
+      "include_usage_stats": false,
+      "include_request_logs": false,
+      "retention_days": 30
+    },
+    "video_storage": {
+      "enabled": false,
+      "data_storage_id": 0,
+      "scan_interval_minutes": 1,
+      "scan_limit": 50
+    },
+    "quota_enforcement": {
+      "enabled": false,
+      "mode": "QuotaEnforcementModeExhaustedOnly (const — resolve exact string)"
+    },
+    "security": {"blocked_ips": [], "show_request_log_ip_ban_icon": true}
+  }
+}

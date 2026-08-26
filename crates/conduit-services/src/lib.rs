@@ -1,0 +1,53 @@
+#![forbid(unsafe_code)]
+
+pub mod apikey_service;
+pub mod auth_service;
+pub mod backup_archive_crypto;
+pub mod backup_service;
+pub mod billing;
+pub mod channel_service;
+pub mod file_service;
+pub mod gc_service;
+pub mod model_price_service;
+pub mod model_service;
+pub mod oidc_service;
+pub mod project_commercialization;
+pub mod project_service;
+pub mod prompt_protection_service;
+pub mod prompt_service;
+pub mod provider_quota_service;
+pub mod quota_service;
+pub mod request_service;
+pub mod role_service;
+pub mod route_health;
+pub mod system_service;
+pub mod thread_service;
+pub mod trace_service;
+pub mod usage_service;
+pub mod user_project_service;
+pub mod user_service;
+pub mod video_service;
+
+pub use auth_service::*;
+pub use backup_service::*;
+pub use channel_service::*;
+pub use file_service::*;
+pub use gc_service::*;
+pub use model_price_service::*;
+pub use model_service::*;
+pub use oidc_service::*;
+pub use project_commercialization::*;
+pub use prompt_protection_service::*;
+pub use prompt_service::*;
+pub use provider_quota_service::*;
+pub use quota_service::*;
+pub use request_service::*;
+pub use route_health::*;
+pub use system_service::*;
+pub use thread_service::*;
+pub use trace_service::*;
+pub use usage_service::*;
+pub use user_project_service::*;
+pub use video_service::*;
+
+pub const CRATE_NAME: &str = "conduit-services";

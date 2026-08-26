@@ -1,0 +1,31 @@
+[package]
+name = "conduit-admin-graphql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+redis = []
+otel = []
+full = ["redis", "otel"]
+
+[dependencies]
+async-graphql = { workspace = true }
+async-trait = { workspace = true }
+conduit-auth = { workspace = true }
+conduit-core = { workspace = true }
+chrono = { workspace = true }
+regex = "1"
+rust_decimal = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

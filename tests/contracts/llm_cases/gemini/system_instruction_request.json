@@ -1,0 +1,86 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "system_instruction_request",
+  "api_format": "gemini",
+  "stream": false,
+  "source": {
+    "go_integration_test": "conduit/llm/transformer/gemini/integraion_test.go::TestGeminiTransformers_Integration (case \"message with system instruction\")",
+    "go_outbound_config": "NewOutboundTransformer('https://generativelanguage.googleapis.com', 'test-api-key')",
+    "note": "Captures Gemini 'systemInstruction' handling and generationConfig.temperature. The Go integration test feeds Path='/v1beta/models/gemini-2.5-flash:generateContent' with the inline JSON body containing systemInstruction.parts=[{text:'You are a helpful assistant.'}], contents=[{role:'user', parts:[{text:'What is the capital of France?'}]}], generationConfig.maxOutputTokens=2048, temperature=0.7. It asserts Model='gemini-2.5-flash', MaxTokens=2048, one user message, Stream=false, and the outbound URL 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent'. The response-side asserts mirror the simple case (synthesized ResponseID='test-response-123', text 'This is a test response from Gemini.', etc.). selected_channel is null."
+  },
+  "inbound_http": {
+    "_comment": "Verbatim from the Go integration test case 'message with system instruction'. The body is the inline JSON literal.",
+    "method": "POST",
+    "path": "/v1beta/models/gemini-2.5-flash:generateContent",
+    "query": {},
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "systemInstruction": {
+        "parts": [
+          {"text": "You are a helpful assistant."}
+        ]
+      },
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {"text": "What is the capital of France?"}
+          ]
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 2048,
+        "temperature": 0.7
+      }
+    }
+  },
+  "unified_request": {
+    "_comment": "llm.Request asserted by the Go test: Model='gemini-2.5-flash', MaxTokens=2048, one user message with content 'What is the capital of France?'. Stream=false (path does not contain 'streamGenerateContent'). The Go integration test does not directly assert the converted system-message shape in the llm.Request for this case, so the precise system-message representation is 'pending source snapshot'.",
+    "model": "gemini-2.5-flash",
+    "max_tokens": 2048,
+    "stream": false,
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "What is the capital of France?"
+        }
+      }
+    ],
+    "system_message_note": "pending source snapshot: the Go integration test does not directly assert the unified llm.Request system-message representation for this case; only the outbound round-trip URL + body unmarshal are checked."
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Asserted by the Go integration test step 2: method=POST, url='https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', Content-Type='application/json'. Body unmarshals to GenerateContentRequest; the test does not byte-assert body fields beyond successful unmarshal for this case.",
+    "base_url": "https://generativelanguage.googleapis.com",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "contents": [
+        {
+          "role": "user",
+          "parts": [
+            {"text": "What is the capital of France?"}
+          ]
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 2048,
+        "temperature": 0.7
+      }
+    },
+    "body_asserted_fields": {
+      "_comment": "Only maxOutputTokens and temperature are explicitly checked via unmarshal; the systemInstruction round-trip serialization is not byte-asserted for this case."
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

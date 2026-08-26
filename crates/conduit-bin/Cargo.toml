@@ -1,0 +1,62 @@
+[package]
+name = "conduit-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "conduit-api"
+path = "src/main.rs"
+
+[features]
+default = []
+redis = ["conduit-cache/redis"]
+otel = []
+full = ["redis", "otel"]
+
+[dependencies]
+conduit-admin-graphql = { workspace = true }
+conduit-auth = { workspace = true }
+conduit-cache = { workspace = true }
+conduit-config = { workspace = true }
+conduit-core = { workspace = true }
+conduit-db = { workspace = true }
+conduit-http = { workspace = true }
+conduit-llm = { workspace = true }
+conduit-orchestrator = { workspace = true }
+conduit-openapi-graphql = { workspace = true }
+conduit-pipeline = { workspace = true }
+conduit-services = { workspace = true }
+conduit-scheduler = { workspace = true }
+conduit-storage = { workspace = true }
+conduit-transformers = { workspace = true }
+async-graphql = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = "0.22"
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+clap = { workspace = true }
+jsonwebtoken = { workspace = true }
+regex = "1"
+reqwest = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

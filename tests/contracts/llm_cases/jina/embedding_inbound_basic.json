@@ -1,0 +1,78 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "embedding_inbound_basic",
+  "api_format": "jina",
+  "stream": false,
+  "source": {
+    "go_inbound_request_test": "conduit/llm/transformer/jina/embedding_test.go::TestEmbeddingInboundTransformer_TransformRequest (subtest 'valid string input with task')",
+    "go_inbound_response_test": "conduit/llm/transformer/jina/embedding_test.go::TestEmbeddingInboundTransformer_TransformResponse (subtest 'valid response')",
+    "note": "Captures the Jina InboundTransformer.TransformRequest/TransformResponse round-trip for a basic string embedding with an explicit task. The Go inbound request test feeds an httpclient.Request whose Body is json.Marshal({model:'jina-embeddings-v3', input:'The quick brown fox', task:'retrieval.query'}) and asserts the resulting llm.Request has Model='jina-embeddings-v3', APIFormat=APIFormatJinaEmbedding, Stream==nil, and Embedding.Task=='retrieval.query'. The Go inbound response test feeds an llm.Response{Object:'list', Model:'jina-embeddings-v3', Embedding:{Object:'list', Data:[{Object:'embedding', Embedding:[0.1,0.2,0.3], Index:0}]}, Usage:{PromptTokens:5, TotalTokens:5}} and asserts the resulting httpclient.Response has StatusCode=200, Content-Type='application/json', and the body unmarshals to EmbeddingResponse with Object='list', Model='jina-embeddings-v3', len(Data)==1. selected_channel, outbound_http and upstream_http are null because the inbound-only unit test does not exercise those stages."
+  },
+  "inbound_http": {
+    "_comment": "Body is the JSON-marshal of the Go test's reqBody map literal ({model,input,task}). The Go test sets only Headers (Content-Type: application/json); no URL is asserted, so url is omitted.",
+    "method": "POST",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "jina-embeddings-v3",
+      "input": "The quick brown fox",
+      "task": "retrieval.query"
+    }
+  },
+  "unified_request": {
+    "_comment": "Asserted llm.Request from the Go test 'valid string input with task': Model='jina-embeddings-v3', APIFormat=APIFormatJinaEmbedding, Stream=nil (not set), Embedding.Task='retrieval.query'. The Embedding.Input.String is 'The quick brown fox' (copied from the inbound body; the Go test does not explicitly assert Input.String for this subtest but it is the obvious mapped value).",
+    "model": "jina-embeddings-v3",
+    "api_format": "jina_embedding",
+    "stream": null,
+    "embedding": {
+      "input": {"string": "The quick brown fox"},
+      "task": "retrieval.query"
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": null,
+  "client_http": {
+    "_comment": "From TestEmbeddingInboundTransformer_TransformResponse subtest 'valid response'. Source llm.Response literal: Object='list', Model='jina-embeddings-v3', Embedding.Data=[{Object:'embedding', Embedding:[0.1,0.2,0.3], Index:0}], Usage={PromptTokens:5, TotalTokens:5}. The Go test asserts StatusCode=200, Content-Type='application/json', body unmarshals to EmbeddingResponse with Object='list', Model='jina-embeddings-v3', len(Data)==1. The body_json below mirrors the unified_response because the Jina inbound path passes the Jina-shape response through.",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "unified_response": {
+      "object": "list",
+      "model": "jina-embeddings-v3",
+      "embedding": {
+        "object": "list",
+        "data": [
+          {
+            "object": "embedding",
+            "embedding": [0.1, 0.2, 0.3],
+            "index": 0
+          }
+        ]
+      },
+      "usage": {
+        "prompt_tokens": 5,
+        "total_tokens": 5
+      }
+    },
+    "body_json": {
+      "object": "list",
+      "model": "jina-embeddings-v3",
+      "data": [
+        {
+          "object": "embedding",
+          "index": 0,
+          "embedding": [0.1, 0.2, 0.3]
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "total_tokens": 5
+      }
+    }
+  }
+}

@@ -1,0 +1,175 @@
+name: Release gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: conduit_test
+          POSTGRES_USER: conduit
+          POSTGRES_PASSWORD: conduit-ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U conduit -d conduit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CONDUIT_POSTGRES_PASSWORD: conduit-ci-only-password
+      CONDUIT_DB_DIALECT: postgres
+      CONDUIT_DB_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
+      CONDUIT_TEST_POSTGRES_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.23.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit frontend production dependencies
+        working-directory: frontend
+        run: pnpm audit --prod --audit-level high
+
+      - name: Check frontend formatting
+        working-directory: frontend
+        run: pnpm format:check
+
+      - name: Lint frontend
+        working-directory: frontend
+        run: pnpm lint
+
+      - name: Test frontend
+        working-directory: frontend
+        run: pnpm test:unit
+
+      - name: Build frontend
+        working-directory: frontend
+        run: pnpm build
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check configuration schema drift
+        run: bash scripts/generate_config_schema.sh --check
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --all-targets
+
+      - name: Check PostgreSQL production binary
+        run: cargo check -p conduit-bin
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets
+
+      - name: Install Rust dependency auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Validate Compose model
+        run: docker compose -f compose.yml config --quiet
+
+  container-smoke:
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    timeout-minutes: 30
+    env:
+      COMPOSE_PROJECT_NAME: conduit-ci
+      CONDUIT_HTTP_PORT: "18090"
+      CONDUIT_COMMIT: ${{ github.sha }}
+      CONDUIT_BRANCH: ${{ github.ref_name }}
+      CONDUIT_POSTGRES_PASSWORD: conduit-ci-only-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start release image
+        run: docker compose -f compose.yml up --build --detach
+
+      - name: Wait for healthy service
+        shell: bash
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:18090/health >/dev/null &&
+               curl --fail --silent --show-error http://127.0.0.1:18090/admin/system/status >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f compose.yml ps
+          docker compose -f compose.yml logs conduit-api
+          exit 1
+
+      - name: Verify PostgreSQL schema persistence
+        shell: bash
+        run: |
+          migration_count="$(docker compose -f compose.yml exec --no-TTY postgres \
+            psql --username conduit --dbname conduit --tuples-only --no-align \
+            --command 'SELECT COUNT(*) FROM schema_migrations')"
+          test "${migration_count}" -gt 0
+
+      - name: Verify image build identity
+        shell: bash
+        run: |
+          build_info="$(docker compose -f compose.yml exec --no-TTY conduit-api /app/conduit-api build-info)"
+          printf '%s\n' "$build_info"
+          grep --fixed-strings "commit: $CONDUIT_COMMIT" <<<"$build_info"
+          grep --fixed-strings "branch: $CONDUIT_BRANCH" <<<"$build_info"
+
+      - name: Verify restart health
+        shell: bash
+        run: |
+          docker compose -f compose.yml restart conduit-api
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:18090/health >/dev/null &&
+               curl --fail --silent --show-error http://127.0.0.1:18090/admin/system/status >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f compose.yml logs conduit-api
+          exit 1
+
+      - name: Verify PostgreSQL data survived restart
+        shell: bash
+        run: |
+          migration_count="$(docker compose -f compose.yml exec --no-TTY postgres \
+            psql --username conduit --dbname conduit --tuples-only --no-align \
+            --command 'SELECT COUNT(*) FROM schema_migrations')"
+          test "${migration_count}" -gt 0
+
+      - name: Show container logs
+        if: always()
+        run: docker compose -f compose.yml logs conduit-api
+
+      - name: Remove isolated CI deployment
+        if: always()
+        run: docker compose -f compose.yml down --volumes --remove-orphans

@@ -1,0 +1,394 @@
+import { z } from 'zod';
+import { pageInfoSchema } from '@/gql/pagination';
+import { userSchema } from '@/features/users/data/schema';
+
+// API Key Type
+export const apiKeyTypeSchema = z.enum(['user', 'service_account', 'noauth']);
+export type ApiKeyType = z.infer<typeof apiKeyTypeSchema>;
+
+// API Key Status
+export const apiKeyStatusSchema = z.enum(['enabled', 'disabled', 'archived']);
+export type ApiKeyStatus = z.infer<typeof apiKeyStatusSchema>;
+
+export const channelTagsMatchModeSchema = z.enum(['any', 'all', 'none']);
+export type ChannelTagsMatchMode = z.infer<typeof channelTagsMatchModeSchema>;
+
+const channelTagsMatchModeFieldSchema = channelTagsMatchModeSchema.optional().nullable();
+
+// GraphQL keeps this legacy field nullable, while the profile editor always
+// works with an array. Normalize old/empty profiles at the API boundary.
+export const modelMappingSchema = z.object({
+  from: z.string(),
+  to: z.string(),
+});
+export type ModelMapping = z.infer<typeof modelMappingSchema>;
+
+const modelMappingsFieldSchema = z.preprocess((value) => value ?? [], z.array(modelMappingSchema));
+
+// API Key schema based on GraphQL schema
+export const apiKeySchema = z.object({
+  id: z.string(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  user: userSchema.partial().optional().nullable(),
+  key: z.string(),
+  name: z.string(),
+  type: apiKeyTypeSchema,
+  status: apiKeyStatusSchema,
+  scopes: z.array(z.string()).optional().nullable(),
+  // Optional profiles for detailed view (may be omitted in list queries)
+  profiles: z
+    .object({
+      activeProfile: z.string(),
+      profiles: z
+        .array(
+          z.object({
+            name: z.string(),
+            modelMappings: modelMappingsFieldSchema,
+            channelIDs: z.array(z.number()).optional().nullable(),
+            channelTags: z.array(z.string()).optional().nullable(),
+            channelTagsMatchMode: channelTagsMatchModeFieldSchema,
+            modelIDs: z.array(z.string()).optional().nullable(),
+            validFrom: z.string().optional().nullable(),
+            validUntil: z.string().optional().nullable(),
+            loadBalanceStrategy: z.string().optional().nullable(),
+            maxConcurrentRequests: z.number().int().min(0).optional().nullable(),
+            quota: z
+              .object({
+                requests: z.number().optional().nullable(),
+                totalTokens: z.number().optional().nullable(),
+                cost: z.number().optional().nullable(),
+                period: z.object({
+                  type: z.enum(['all_time', 'past_duration', 'calendar_duration']),
+                  pastDuration: z
+                    .object({
+                      value: z.number(),
+                      unit: z.enum(['minute', 'hour', 'day']),
+                    })
+                    .optional()
+                    .nullable(),
+                  calendarDuration: z
+                    .object({
+                      unit: z.enum(['day', 'month']),
+                    })
+                    .optional()
+                    .nullable(),
+                }),
+              })
+              .optional()
+              .nullable(),
+          })
+        )
+        .nullable(),
+    })
+    .optional()
+    .nullable(),
+});
+export type ApiKey = z.infer<typeof apiKeySchema>;
+
+// API Key Connection schema for GraphQL pagination
+export const apiKeyEdgeSchema = z.object({
+  node: apiKeySchema,
+  cursor: z.string(),
+});
+
+export const apiKeyConnectionSchema = z.object({
+  edges: z.array(apiKeyEdgeSchema),
+  pageInfo: pageInfoSchema,
+  totalCount: z.number(),
+});
+export type ApiKeyConnection = z.infer<typeof apiKeyConnectionSchema>;
+
+// Create API Key Input - factory function for i18n support
+export const createApiKeyInputSchemaFactory = (t: (key: string) => string) =>
+  z.object({
+    name: z.string().min(1, t('apikeys.validation.nameRequired')),
+    type: apiKeyTypeSchema.optional(),
+    scopes: z.array(z.string()).optional(),
+    projectID: z.number().optional(),
+    profiles: z.any().optional(),
+  });
+
+// Default schema for backward compatibility
+export const createApiKeyInputSchema = z.object({
+  name: z.string().min(1, 'Name is required'),
+  type: apiKeyTypeSchema.optional(),
+  scopes: z.array(z.string()).optional(),
+  projectID: z.number().optional(),
+  profiles: z.any().optional(),
+});
+export type CreateApiKeyInput = z.infer<typeof createApiKeyInputSchema>;
+
+// Update API Key Input - factory function for i18n support
+export const updateApiKeyInputSchemaFactory = (t: (key: string) => string) =>
+  z.object({
+    name: z.string().min(1, t('apikeys.validation.nameRequired')).optional(),
+    scopes: z.array(z.string()).optional(),
+  });
+
+// Default schema for backward compatibility
+export const updateApiKeyInputSchema = z.object({
+  name: z.string().min(1, 'Name is required').optional(),
+  scopes: z.array(z.string()).optional(),
+});
+export type UpdateApiKeyInput = z.infer<typeof updateApiKeyInputSchema>;
+
+// API Key Profile schema
+export const apiKeyProfileSchema = z.object({
+  name: z.string(),
+  modelMappings: modelMappingsFieldSchema,
+  channelIDs: z.array(z.number()).optional().nullable(),
+  channelTags: z.array(z.string()).optional().nullable(),
+  channelTagsMatchMode: channelTagsMatchModeFieldSchema,
+  modelIDs: z.array(z.string()).optional().nullable(),
+  validFrom: z.union([z.string(), z.date()]).optional().nullable(),
+  validUntil: z.union([z.string(), z.date()]).optional().nullable(),
+  loadBalanceStrategy: z.string().optional().nullable(),
+  maxConcurrentRequests: z.number().int().min(0).optional().nullable(),
+  quota: z
+    .object({
+      requests: z.number().optional().nullable(),
+      totalTokens: z.number().optional().nullable(),
+      cost: z.number().optional().nullable(),
+      period: z.object({
+        type: z.enum(['all_time', 'past_duration', 'calendar_duration']),
+        pastDuration: z
+          .object({
+            value: z.number().int().positive(),
+            unit: z.enum(['minute', 'hour', 'day']),
+          })
+          .optional()
+          .nullable(),
+        calendarDuration: z
+          .object({
+            unit: z.enum(['day', 'month']),
+          })
+          .optional()
+          .nullable(),
+      }),
+    })
+    .optional()
+    .nullable(),
+});
+export type ApiKeyProfile = z.infer<typeof apiKeyProfileSchema>;
+
+// API Key Profiles schema
+export const apiKeyProfilesSchema = z.object({
+  activeProfile: z.string(),
+  profiles: z.array(apiKeyProfileSchema),
+});
+export type ApiKeyProfiles = z.infer<typeof apiKeyProfilesSchema>;
+
+// API Key Profile Template schema
+export const apiKeyProfileTemplateSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().default(''),
+  profile: apiKeyProfileSchema,
+  projectID: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type ApiKeyProfileTemplate = z.infer<typeof apiKeyProfileTemplateSchema>;
+
+// Create API Key Profile Template Input schema
+export const createApiKeyProfileTemplateInputSchema = z.object({
+  name: z.string().min(1, 'Name is required'),
+  description: z.string().optional(),
+  projectID: z.string(),
+  profile: apiKeyProfileSchema,
+});
+export type CreateApiKeyProfileTemplateInput = z.infer<typeof createApiKeyProfileTemplateInputSchema>;
+
+// Update API Key Profile Template Input schema
+export const updateApiKeyProfileTemplateInputSchema = z.object({
+  name: z.string().min(1, 'Name is required').optional(),
+  description: z.string().optional(),
+  profile: apiKeyProfileSchema.optional(),
+});
+export type UpdateApiKeyProfileTemplateInput = z.infer<typeof updateApiKeyProfileTemplateInputSchema>;
+
+// Update API Key Profiles Input schema - factory function for i18n support
+export const updateApiKeyProfilesInputSchemaFactory = (t: (key: string) => string) =>
+  z
+    .object({
+      activeProfile: z.string().min(1, t('apikeys.validation.activeProfileRequired')),
+      profiles: z
+        .array(
+          z.object({
+            name: z.string().min(1, t('apikeys.validation.profileNameRequired')),
+            modelMappings: z.array(
+              z.object({
+                from: z.string().min(1, t('apikeys.validation.sourceModelRequired')),
+                to: z.string().min(1, t('apikeys.validation.targetModelRequired')),
+              })
+            ),
+            channelIDs: z.array(z.number()).optional().nullable(),
+            channelTags: z.array(z.string()).optional().nullable(),
+            channelTagsMatchMode: channelTagsMatchModeFieldSchema,
+            modelIDs: z.array(z.string()).optional().nullable(),
+            validFrom: z.union([z.string(), z.date()]).optional().nullable(),
+            validUntil: z.union([z.string(), z.date()]).optional().nullable(),
+            loadBalanceStrategy: z.string().optional().nullable(),
+            maxConcurrentRequests: z.number().int().min(0).optional().nullable(),
+            quota: z
+              .object({
+                requests: z.number().int().positive().optional().nullable(),
+                totalTokens: z.number().int().positive().optional().nullable(),
+                cost: z.number().optional().nullable(),
+                period: z.object({
+                  type: z.enum(['all_time', 'past_duration', 'calendar_duration']),
+                  pastDuration: z
+                    .object({
+                      value: z.number().int().positive(),
+                      unit: z.enum(['minute', 'hour', 'day']),
+                    })
+                    .optional()
+                    .nullable(),
+                  calendarDuration: z
+                    .object({
+                      unit: z.enum(['day', 'month']),
+                    })
+                    .optional()
+                    .nullable(),
+                }),
+              })
+              .optional()
+              .nullable(),
+          })
+        )
+        .min(1, t('apikeys.validation.atLeastOneProfile')),
+    })
+    .refine((data) => data.profiles.some((profile) => profile.name === data.activeProfile), {
+      message: t('apikeys.validation.activeProfileMustExist'),
+      path: ['activeProfile'],
+    })
+    .refine(
+      (data) => {
+        const names = data.profiles.map((p) => p.name.trim().toLowerCase());
+        return names.length === new Set(names).size;
+      },
+      {
+        message: t('apikeys.validation.duplicateProfileName'),
+        path: ['profiles'],
+      }
+    )
+    .superRefine((data, ctx) => {
+      data.profiles.forEach((profile, index) => {
+        const quota = profile.quota;
+        if (!quota) {
+          return;
+        }
+
+        const requests = quota.requests ?? undefined;
+        const totalTokens = quota.totalTokens ?? undefined;
+        const cost = quota.cost ?? undefined;
+
+        if (requests == null && totalTokens == null && cost == null) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: t('apikeys.validation.quotaAtLeastOneLimit'),
+            path: ['profiles', index, 'quota'],
+          });
+        }
+
+        if (quota.period.type === 'past_duration') {
+          if (!quota.period.pastDuration) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: t('apikeys.validation.quotaPastDurationRequired'),
+              path: ['profiles', index, 'quota', 'period', 'pastDuration'],
+            });
+          }
+        }
+
+        if (quota.period.type === 'calendar_duration') {
+          if (!quota.period.calendarDuration) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: t('apikeys.validation.quotaCalendarDurationRequired'),
+              path: ['profiles', index, 'quota', 'period', 'calendarDuration'],
+            });
+          }
+        }
+      });
+    });
+
+// Default schema for backward compatibility
+export const updateApiKeyProfilesInputSchema = z.object({
+  activeProfile: z.string(),
+  profiles: z.array(
+    z.object({
+      name: z.string().min(1, 'Profile name is required'),
+      modelMappings: z.array(
+        z.object({
+          from: z.string().min(1, 'Source model is required'),
+          to: z.string().min(1, 'Target model is required'),
+        })
+      ),
+      channelIDs: z.array(z.number()).optional().nullable(),
+      channelTags: z.array(z.string()).optional().nullable(),
+      channelTagsMatchMode: channelTagsMatchModeFieldSchema,
+      modelIDs: z.array(z.string()).optional().nullable(),
+      validFrom: z.union([z.string(), z.date()]).optional().nullable(),
+      validUntil: z.union([z.string(), z.date()]).optional().nullable(),
+      loadBalanceStrategy: z.string().optional().nullable(),
+      maxConcurrentRequests: z.number().int().min(0).optional().nullable(),
+      quota: z
+        .object({
+          requests: z.number().int().positive().optional().nullable(),
+          totalTokens: z.number().optional().nullable(),
+          cost: z.number().optional().nullable(),
+          period: z.object({
+            type: z.enum(['all_time', 'past_duration', 'calendar_duration']),
+            pastDuration: z
+              .object({
+                value: z.number(),
+                unit: z.enum(['minute', 'hour', 'day']),
+              })
+              .optional()
+              .nullable(),
+            calendarDuration: z
+              .object({
+                unit: z.enum(['day', 'month']),
+              })
+              .optional()
+              .nullable(),
+          }),
+        })
+        .optional()
+        .nullable(),
+    })
+  ),
+});
+export type UpdateApiKeyProfilesInput = z.infer<typeof updateApiKeyProfilesInputSchema>;
+
+export const apiKeyQuotaWindowSchema = z.object({
+  start: z.coerce.date().optional().nullable(),
+  end: z.coerce.date().optional().nullable(),
+});
+export type ApiKeyQuotaWindow = z.infer<typeof apiKeyQuotaWindowSchema>;
+
+export const apiKeyQuotaUsageSchema = z.object({
+  requestCount: z.number(),
+  totalTokens: z.number(),
+  totalCost: z.coerce.number(),
+});
+export type ApiKeyQuotaUsage = z.infer<typeof apiKeyQuotaUsageSchema>;
+
+export const apiKeyProfileQuotaUsageSchema = z.object({
+  profileName: z.string(),
+  quota: apiKeyProfileSchema.shape.quota,
+  window: apiKeyQuotaWindowSchema,
+  usage: apiKeyQuotaUsageSchema,
+});
+export type ApiKeyProfileQuotaUsage = z.infer<typeof apiKeyProfileQuotaUsageSchema>;
+
+export const apiKeyTokenUsageStatsSchema = z.object({
+  apiKeyId: z.number(),
+  apiKeyName: z.string(),
+  totalInputTokens: z.number().default(0),
+  totalOutputTokens: z.number().default(0),
+  totalCachedTokens: z.number().default(0),
+});
+export type ApiKeyTokenUsageStats = z.infer<typeof apiKeyTokenUsageStatsSchema>;

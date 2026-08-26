@@ -1,0 +1,54 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "embedding_outbound_response",
+  "api_format": "jina",
+  "stream": false,
+  "source": {
+    "go_outbound_response_test": "conduit/llm/transformer/jina/embedding_test.go::TestOutboundTransformer_TransformResponse_Embedding (subtest 'valid embedding response')",
+    "note": "Captures the Jina OutboundTransformer.TransformResponse mapping for a valid embedding response. The Go test constructs an EmbeddingResponse{Object:'list', Model:'jina-embeddings-v3', Data:[{Object:'embedding', Index:0, Embedding:{Embedding:[0.1,0.2,0.3]}}], Usage:{PromptTokens:5, TotalTokens:5}}, marshals it, and wraps it in httpclient.Response{StatusCode:200, Body:<marshaled>, Request:{APIFormat:'jina_embedding'}}. It then asserts the resulting llm.Response has Embedding.Object=='list', Model=='jina-embeddings-v3', Usage.PromptTokens==5, Usage.TotalTokens==5. This is a response-only contract case: inbound_http, unified_request, selected_channel, outbound_http and client_http are null because the Go outbound response unit test does not exercise request or inbound stages."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "Source upstream httpclient.Response constructed by the Go test. The body is json.Marshal(EmbeddingResponse{...}). The Go test sets Request.APIFormat='jina_embedding' on the response (used by the transformer to dispatch). StatusCode=200 = http.StatusOK.",
+    "status_code": 200,
+    "request_api_format": "jina_embedding",
+    "body_json": {
+      "object": "list",
+      "model": "jina-embeddings-v3",
+      "data": [
+        {
+          "object": "embedding",
+          "index": 0,
+          "embedding": [0.1, 0.2, 0.3]
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 5,
+        "total_tokens": 5
+      }
+    }
+  },
+  "client_http": null,
+  "unified_response": {
+    "_comment": "Extension field (NOT one of the six required sections) recording the llm.Response produced by OutboundTransformer.TransformResponse. The Go test asserts llmResp.Embedding.Object=='list', llmResp.Model=='jina-embeddings-v3', llmResp.Usage.PromptTokens==5, llmResp.Usage.TotalTokens==5. The Embedding.Data[0] survives the transform intact (the Go test does not separately byte-assert Data[0] fields beyond successful transformation).",
+    "object": "list",
+    "model": "jina-embeddings-v3",
+    "embedding": {
+      "object": "list",
+      "data": [
+        {
+          "object": "embedding",
+          "index": 0,
+          "embedding": [0.1, 0.2, 0.3]
+        }
+      ]
+    },
+    "usage": {
+      "prompt_tokens": 5,
+      "total_tokens": 5
+    }
+  }
+}

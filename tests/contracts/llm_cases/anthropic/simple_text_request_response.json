@@ -1,0 +1,135 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "simple_text_request_response",
+  "api_format": "anthropic",
+  "stream": false,
+  "source": {
+    "go_inbound_request_test": "conduit/llm/transformer/anthropic/inbound_test.go::TestInboundTransformer_TransformRequest (case \"valid simple text request\")",
+    "go_inbound_request_fixture": "conduit/llm/transformer/anthropic/testdata/anthropic-simple-inbound.request.json",
+    "go_outbound_request_test": "conduit/llm/transformer/anthropic/outbound_test.go::TestOutboundTransformer_TransformRequest (case \"valid simple request\")",
+    "go_outbound_response_test": "conduit/llm/transformer/anthropic/outbound_test.go::TestOutboundTransformer_TransformResponse (case \"valid response\")",
+    "go_inbound_response_test": "conduit/llm/transformer/anthropic/inbound_test.go::TestInboundTransformer_TransformResponse (case \"valid response\")",
+    "note": "Inbound HTTP body is copied verbatim from the Go testdata file anthropic-simple-inbound.request.json (the same fixture used by TestInboundTransformer_TransformRequest_WithTestData case 'simple text request transformation'). The Go inbound unit test asserts the resulting llm.Request has Model='claude-3-sonnet-20240229', MaxTokens=1024, Temperature=0.7, Stop.MultipleStop=['Human:','Assistant:'], one user message with content 'Hello, Claude! How are you today?'. The outbound Go test (NewOutboundTransformer('https://api.anthropic.com','test-api-key')) asserts URL='https://api.anthropic.com/v1/messages', Content-Type='application/json', Anthropic-Version='2023-06-01', Auth.Type='api_key'. The outbound response fixture is the inline JSON body in TestOutboundTransformer_TransformResponse case 'valid response' (id 'msg_123', text 'Hello! How can I help you?', stop_reason 'end_turn', usage input 10 / output 20). The inbound response test then asserts the inbound-transformed body has id 'msg_123', type 'message', role 'assistant', model 'claude-3-sonnet-20240229', one text content block, stop_reason 'end_turn'. selected_channel is null (no llm.Channel in unit tests); upstream_http is null (no real upstream round-trip in unit tests)."
+  },
+  "inbound_http": {
+    "_comment": "Verbatim copy of conduit/llm/transformer/anthropic/testdata/anthropic-simple-inbound.request.json (used by the inbound integration test 'simple text request transformation'). Model claude-3-sonnet-20240229, max_tokens 1024, temperature 0.7, stop_sequences ['Human:','Assistant:'], one user message with text 'Hello, Claude! How are you today?'. The Anthropic inbound test does not set a URL on httpclient.Request (only Headers+Body), so url is omitted.",
+    "method": "POST",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "claude-3-sonnet-20240229",
+      "max_tokens": 1024,
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Hello, Claude! How are you today?"
+            }
+          ]
+        }
+      ],
+      "temperature": 0.7,
+      "stop_sequences": ["Human:", "Assistant:"]
+    }
+  },
+  "unified_request": {
+    "_comment": "Expected llm.Request asserted by the Go inbound test (case 'valid simple text request') plus the integration test 'simple text request transformation': Model, MaxTokens=1024, Temperature=0.7, Stop.MultipleStop=['Human:','Assistant:'], one user message whose Content.Content points to 'Hello, Claude! How are you today?'.",
+    "model": "claude-3-sonnet-20240229",
+    "max_tokens": 1024,
+    "temperature": 0.7,
+    "stop": {
+      "multiple_stop": ["Human:", "Assistant:"]
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, Claude! How are you today?"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "From outbound_test.go TestOutboundTransformer_TransformRequest case 'valid simple request' with NewOutboundTransformer('https://api.anthropic.com', 'test-api-key'). Go asserts method=POST, url='https://api.anthropic.com/v1/messages', Content-Type='application/json', Anthropic-Version='2023-06-01', Auth.Type='api_key', Auth.APIKey='test-api-key'. The body is the Anthropic-shaped MessageRequest produced by marshaling the converted request; its asserted fields (Model, MaxTokens>0) match the unified_request values above. Body_json fields not directly asserted in the Go test are marked 'pending source snapshot'.",
+    "base_url": "https://api.anthropic.com",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://api.anthropic.com/v1/messages",
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Anthropic-Version": ["2023-06-01"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "api_key",
+      "api_key": "test-api-key"
+    },
+    "body_json": {
+      "_comment": "Only fields explicitly asserted by the Go outbound test are populated here. Other MessageRequest fields (system, tools, tool_choice, etc.) are not asserted for this case and are omitted rather than synthesized.",
+      "model": "claude-3-sonnet-20240229",
+      "max_tokens": 1024,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello, Claude! How are you today?"
+        }
+      ],
+      "temperature": 0.7,
+      "stop_sequences": ["Human:", "Assistant:"]
+    }
+  },
+  "upstream_http": null,
+  "client_http": {
+    "_comment": "Assembled from two Go fixtures. (a) outbound_test.go TestOutboundTransformer_TransformResponse case 'valid response' provides the upstream httpclient.Response body (id 'msg_123', type 'message', role 'assistant', one text content 'Hello! How can I help you?', model 'claude-3-sonnet-20240229', stop_reason 'end_turn', usage input 10 / output 20). (b) inbound_test.go TestInboundTransformer_TransformResponse case 'valid response' asserts the inbound transformer produces StatusCode=200, Content-Type='application/json', body unmarshals to Message with id 'msg_123', type 'message', role 'assistant', model 'claude-3-sonnet-20240229', exactly one text content block whose text is 'Hello! How can I help you?', and stop_reason 'end_turn'. created=1234567890 is the literal value from the Go inbound-test fixture (the outbound 'valid response' fixture has no created field).",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "unified_response": {
+      "id": "msg_123",
+      "object": "chat.completion",
+      "created": 1234567890,
+      "model": "claude-3-sonnet-20240229",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": {
+              "content": "Hello! How can I help you?"
+            }
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 20,
+        "total_tokens": 30
+      }
+    },
+    "body_json": {
+      "id": "msg_123",
+      "type": "message",
+      "role": "assistant",
+      "model": "claude-3-sonnet-20240229",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello! How can I help you?"
+        }
+      ],
+      "stop_reason": "end_turn",
+      "usage": {
+        "input_tokens": 10,
+        "output_tokens": 20
+      }
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "transcription_upstream_json_response",
+  "api_format": "openai_audio",
+  "stream": false,
+  "source": {
+    "go_outbound_response_test": "conduit/llm/transformer/openai/audio_outbound_test.go::TestOutbound_TransformTranscriptionResponse (subtest 'json' L176-191)",
+    "go_inbound_response_test": "conduit/llm/transformer/openai/audio_inbound_test.go::TestAudioInboundTransformer_Transcription (subtest 'response raw verbose_json passthrough keeps extra fields' L268-276, asserting raw-body passthrough when Transcription.Raw is set)",
+    "note": "Response path for POST /v1/audio/transcriptions with response_format json. The upstream body {\"text\":\"hello world\"} is the verbatim Go literal. The outbound test asserts the unified llm.Response preserves both the parsed Text and the raw body (Raw==body, RawContentType=='application/json') for lossless passthrough. The client_http section is COMPOSED from two Go assertions with different fixtures: the outbound 'json' subtest pins Raw for this body, and the inbound passthrough subtest pins that a set Raw is returned verbatim as the client body — no single Go test chains this exact fixture end-to-end. llm.TranscriptionResponse.Raw/RawContentType are json:\"-\" fields, so they do not appear in the serialized unified_response; they are documented in the comment instead. inbound_http, unified_request, selected_channel and outbound_http are null (request stages not exercised by these tests; the transcription request wire body is multipart/form-data with a generated boundary and is not representable as a byte-stable golden body)."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "httpclient.Response from the outbound 'json' subtest: StatusCode 200, Content-Type application/json, Request.APIFormat 'openai/audio_transcriptions' (dispatch key), Body = verbatim literal below.",
+    "status_code": 200,
+    "request_api_format": "openai/audio_transcriptions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "text": "hello world"
+    }
+  },
+  "unified_response": {
+    "_comment": "Extension field recording the llm.Response produced by the outbound transformer. Byte-asserted: Transcription.Text=='hello world', Transcription.Raw==<upstream body bytes>, Transcription.RawContentType=='application/json'. Raw/RawContentType are json:\"-\" (not serialized); only the modeled fields appear below.",
+    "transcription": {
+      "text": "hello world"
+    }
+  },
+  "client_http": {
+    "_comment": "Expected client HTTP response when the inbound transcription transformer serves a unified response whose Raw is set: audio_inbound.go TransformResponse (L259-273) returns StatusCode 200 with Body==Raw and Content-Type==RawContentType. The passthrough behavior is byte-asserted by the inbound subtest 'response raw verbose_json passthrough keeps extra fields' (with its own fixture); applying it to THIS fixture's Raw deterministically yields the body below.",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "text": "hello world"
+    }
+  }
+}

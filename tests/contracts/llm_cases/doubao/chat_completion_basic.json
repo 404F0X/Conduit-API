@@ -1,0 +1,53 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "chat_completion_basic",
+  "api_format": "doubao",
+  "stream": false,
+  "source": {
+    "go_outbound_request_test": "conduit/llm/transformer/doubao/outbound_test.go::TestOutboundTransformer_TransformRequest (case 'valid chat completion request')",
+    "note": "Captures the Doubao (Volcengine Ark) OutboundTransformer.TransformRequest mapping for a basic chat completion. The Go test constructs NewOutboundTransformer('https://ark.cn-beijing.volces.com/api/v3', 'test-api-key') and feeds an llm.Request{Model:'ep-20241203072800-8f7f', Messages:[{Role:'user', Content.Content:'Hello, world!'}]}. It asserts the resulting httpclient.Request has Method='POST', URL='https://ark.cn-beijing.volces.com/api/v3/chat/completions', Content-Type='application/json', Auth.Type='bearer', Auth.APIKey='test-api-key', and that the body unmarshals to a Doubao Request whose Model, Messages[0].Role, *Messages[0].Content.Content, and Metadata==nil match the indicated values (Metadata is stripped by the transformer). Doubao uses Ark endpoint IDs (ep-...) as the model field — 'ep-20241203072800-8f7f' is a real pinned fixture literal from the Go test. selected_channel is null (no llm.Channel constructed); upstream_http and client_http are null because the Go outbound unit test does not exercise those stages."
+  },
+  "inbound_http": null,
+  "unified_request": {
+    "_comment": "Exact llm.Request literal the Go test feeds to TransformRequest: Model='ep-20241203072800-8f7f' (Doubao Ark endpoint ID), one user message with Content.Content='Hello, world!'.",
+    "model": "ep-20241203072800-8f7f",
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, world!"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Asserted by TestOutboundTransformer_TransformRequest case 'valid chat completion request'. The Go validate callback checks Method, URL, Content-Type, Auth.Type='bearer', Auth.APIKey='test-api-key', and the unmarshaled Doubao Request body's Model/Messages[0]/Metadata==nil fields. The Doubao Request type embeds user_id and request_id fields (populated from llm.Request.Metadata) — both nil/empty here because Metadata is nil.",
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "bearer",
+      "api_key": "test-api-key"
+    },
+    "body_json": {
+      "_comment": "Doubao-shaped Request body after TransformRequest. Only fields explicitly asserted by the Go test are populated; other Doubao-specific fields (e.g. stream, max_tokens) are not set by this minimal fixture and are omitted rather than synthesized.",
+      "model": "ep-20241203072800-8f7f",
+      "messages": [
+        {
+          "role": "user",
+          "content": {
+            "content": "Hello, world!"
+          }
+        }
+      ]
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

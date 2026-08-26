@@ -1,0 +1,374 @@
+import { useChannels } from '../context/channels-context';
+import { ChannelOperationsWorkspace } from './channel-operations-workspace';
+import { ChannelsActionDialog } from './channels-action-dialog';
+import { ChannelsArchiveDialog } from './channels-archive-dialog';
+import { ChannelsAutomationDialog } from './channels-automation-dialog';
+import { ChannelsBulkApplyTemplateDialog } from './channels-bulk-apply-template-dialog';
+import { ChannelsBulkArchiveDialog } from './channels-bulk-archive-dialog';
+import { ChannelsBulkClearTemplateDialog } from './channels-bulk-clear-template-dialog';
+import { ChannelsBulkDeleteDialog } from './channels-bulk-delete-dialog';
+import { ChannelsBulkDisableDialog } from './channels-bulk-disable-dialog';
+import { ChannelsBulkEnableDialog } from './channels-bulk-enable-dialog';
+import { ChannelsBulkImportDialog } from './channels-bulk-import-dialog';
+import { ChannelsBulkOrderingDialog } from './channels-bulk-ordering-dialog';
+import { ChannelsBulkTestDialog } from './channels-bulk-test-dialog';
+import { ChannelsDeleteDialog } from './channels-delete-dialog';
+import { ChannelsDisabledAPIKeysDialog } from './channels-disabled-api-keys-dialog';
+import { ChannelsEndpointsDialog } from './channels-endpoints-dialog';
+import { ChannelsErrorResolvedDialog } from './channels-error-resolved-dialog';
+import { ChannelsModelMappingDialog } from './channels-model-mapping-dialog';
+import { ChannelsModelPriceDialog } from './channels-model-price-dialog';
+import { ChannelsOverrideDialog } from './channels-override-dialog';
+import { ChannelsProxyDialog } from './channels-proxy-dialog';
+import { ChannelsQuotaProbeDialog } from './channels-quota-probe-dialog';
+import { ChannelsRateLimitDialog } from './channels-rate-limit-dialog';
+import { ChannelsStatusDialog } from './channels-status-dialog';
+import { ChannelsSystemSettingsDialog } from './channels-system-settings-dialog';
+import { ChannelsTestAPIKeysDialog } from './channels-test-api-keys-dialog';
+import { ChannelsTestDialog } from './channels-test-dialog';
+import { ChannelsTestHistoryDrawer } from './channels-test-history-drawer';
+import { ChannelsTransformOptionsDialog } from './channels-transform-options-dialog';
+
+export function ChannelsDialogs() {
+  const { open, setOpen, currentRow, setCurrentRow, selectedChannels } = useChannels();
+  return (
+    <>
+      <ChannelsSystemSettingsDialog />
+
+      <ChannelsActionDialog key='channel-add' open={open === 'add'} onOpenChange={(isOpen) => setOpen(isOpen ? 'add' : null)} />
+
+      <ChannelsBulkArchiveDialog />
+
+      <ChannelsBulkDisableDialog />
+
+      <ChannelsBulkEnableDialog />
+
+      <ChannelsBulkTestDialog />
+
+      <ChannelsBulkDeleteDialog />
+
+      <ChannelsBulkApplyTemplateDialog
+        open={open === 'bulkApplyTemplate'}
+        onOpenChange={(isOpen) => setOpen(isOpen ? 'bulkApplyTemplate' : null)}
+        selectedChannels={selectedChannels}
+      />
+
+      <ChannelsBulkClearTemplateDialog />
+
+      <ChannelsBulkImportDialog isOpen={open === 'bulkImport'} onClose={() => setOpen(null)} />
+
+      <ChannelsBulkOrderingDialog open={open === 'bulkOrdering'} onOpenChange={(isOpen) => setOpen(isOpen ? 'bulkOrdering' : null)} />
+
+      {currentRow && (
+        <>
+          <ChannelOperationsWorkspace
+            key={`channel-operations-${currentRow.id}`}
+            open={open === 'operations'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('operations');
+              } else {
+                setOpen(null);
+                setTimeout(() => setCurrentRow(null), 500);
+              }
+            }}
+            channel={currentRow}
+          />
+          <ChannelsActionDialog
+            key={`channel-edit-${currentRow.id}`}
+            open={open === 'edit'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('edit');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsActionDialog
+            key={`channel-duplicate-${currentRow.id}`}
+            open={open === 'duplicate'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('duplicate');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            duplicateFromRow={currentRow}
+          />
+
+          <ChannelsActionDialog
+            key={`channel-view-models-${currentRow.id}`}
+            open={open === 'viewModels'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('viewModels');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+            showModelsPanel={true}
+          />
+
+          <ChannelsDeleteDialog
+            key={`channel-delete-${currentRow.id}`}
+            open={open === 'delete'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          {/* <ChannelsSettingsDialog
+            key={`channel-settings-${currentRow.id}`}
+            open={open === 'settings'}
+            onOpenChange={() => {
+              setOpen('settings')
+              setTimeout(() => {
+                setCurrentRow(null)
+              }, 500)
+            }}
+            currentRow={currentRow}
+          /> */}
+
+          <ChannelsModelMappingDialog
+            key={`channel-model-mapping-${currentRow.id}`}
+            open={open === 'modelMapping'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('modelMapping');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsModelPriceDialog />
+
+          <ChannelsOverrideDialog
+            key={`channel-overrides-${currentRow.id}`}
+            open={open === 'overrides'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsProxyDialog
+            key={`channel-proxy-${currentRow.id}`}
+            open={open === 'proxy'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsStatusDialog
+            key={`channel-status-${currentRow.id}`}
+            open={open === 'status'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('status');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsArchiveDialog
+            key={`channel-archive-${currentRow.id}`}
+            open={open === 'archive'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('archive');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsTestDialog
+            key={`channel-test-${currentRow.id}`}
+            open={open === 'test'}
+            onOpenChange={(isOpen: boolean) => {
+              if (isOpen) {
+                setOpen('test');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            channel={currentRow}
+          />
+
+          <ChannelsTestHistoryDrawer
+            key={`channel-test-history-${currentRow.id}`}
+            open={open === 'testHistory'}
+            onOpenChange={(isOpen) => {
+              if (isOpen) {
+                setOpen('testHistory');
+              } else {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            channel={currentRow}
+          />
+
+          <ChannelsErrorResolvedDialog
+            key={`channel-error-resolved-${currentRow.id}`}
+            open={open === 'errorResolved'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+          />
+
+          <ChannelsTransformOptionsDialog
+            key={`channel-transform-options-${currentRow.id}`}
+            open={open === 'transformOptions'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsRateLimitDialog
+            key={`channel-rate-limit-${currentRow.id}`}
+            open={open === 'rateLimit'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsAutomationDialog
+            key={`channel-automation-${currentRow.id}`}
+            open={open === 'automation'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            currentRow={currentRow}
+          />
+
+          <ChannelsEndpointsDialog
+            key={`channel-endpoints-${currentRow.id}`}
+            open={open === 'endpoints'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            channel={currentRow}
+          />
+
+          <ChannelsDisabledAPIKeysDialog
+            key={`channel-disabled-api-keys-${currentRow.id}`}
+            open={open === 'disabledAPIKeys'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+          />
+
+          <ChannelsTestAPIKeysDialog
+            key={`channel-test-api-keys-${currentRow.id}`}
+            open={open === 'testAPIKeys'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+          />
+
+          <ChannelsQuotaProbeDialog
+            key={`channel-quota-probe-${currentRow.id}`}
+            open={open === 'quotaProbe'}
+            onOpenChange={(isOpen) => {
+              if (!isOpen) {
+                setOpen(null);
+                setTimeout(() => {
+                  setCurrentRow(null);
+                }, 500);
+              }
+            }}
+            channel={currentRow}
+          />
+        </>
+      )}
+    </>
+  );
+}

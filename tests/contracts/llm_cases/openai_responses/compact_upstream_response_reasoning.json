@@ -1,0 +1,81 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "compact_upstream_response_reasoning",
+  "api_format": "openai_responses",
+  "stream": false,
+  "source": {
+    "go_outbound_response_test": "conduit/llm/transformer/openai/responses/compact_outbound_test.go::TestOutboundTransformer_TransformCompactResponse (subtest 'valid compact response' L146-204)",
+    "note": "Response-only case: OutboundTransformer.TransformResponse for a compact upstream reply containing a reasoning item with encrypted_content plus a message item. The upstream body below is the verbatim respBody string literal from the Go test (L147-164). inbound_http, unified_request, selected_channel, outbound_http and client_http are null because the outbound response unit test does not exercise those stages. unified_response is an extension field (not one of the six required sections) recording the llm.Response the transformer must produce."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "httpclient.Response constructed by the Go test: StatusCode=200, Body=respBody, Request.RequestType='compact' (used by the transformer to dispatch to transformCompactResponse). body_json is the verbatim respBody literal.",
+    "status_code": 200,
+    "request_request_type": "compact",
+    "body_json": {
+      "id": "resp_001",
+      "object": "response.compaction",
+      "created_at": 1764967971,
+      "model": "gpt-4o",
+      "instructions": "Be concise",
+      "output": [
+        {
+          "id": "rs_001",
+          "type": "reasoning",
+          "status": "completed",
+          "summary": [{ "type": "summary_text", "text": "Reasoning summary" }],
+          "encrypted_content": "gAAAAAB..."
+        },
+        {
+          "id": "msg_000",
+          "type": "message",
+          "status": "completed",
+          "content": [{ "type": "output_text", "text": "Hello" }],
+          "role": "assistant"
+        }
+      ],
+      "usage": {
+        "input_tokens": 139,
+        "input_tokens_details": { "cached_tokens": 0 },
+        "output_tokens": 438,
+        "output_tokens_details": { "reasoning_tokens": 64 },
+        "total_tokens": 577
+      }
+    }
+  },
+  "client_http": null,
+  "unified_response": {
+    "_comment": "Extension field recording the llm.Response produced by transformCompactResponse. Byte-asserted by the Go test: RequestType==compact, APIFormat==openai/responses_compact, Model=='gpt-4o', Choices empty, Compact.ID=='resp_001', Compact.CreatedAt==1764967971, Compact.Object=='response.compaction', Compact.Instructions=='Be concise', len(Compact.Output)==1 (reasoning item is folded into the message), Output[0].ID=='msg_000', Role=='assistant', *Content.Content=='Hello', *ReasoningContent=='Reasoning summary', *ReasoningSignature=='gAAAAAB...', Usage 139/438/577, CompletionTokensDetails.ReasoningTokens==64. Top-level id/created/object mirror Compact per compact_outbound.go transformCompactResponse L104-118. usage.ToUsage() (usage.go) always populates prompt_tokens_details.cached_tokens (0 here); zero-valued sibling detail fields of llm.Usage are omitted in this transcript for brevity.",
+    "id": "resp_001",
+    "object": "response.compaction",
+    "created": 1764967971,
+    "model": "gpt-4o",
+    "request_type": "compact",
+    "api_format": "openai/responses_compact",
+    "compact": {
+      "id": "resp_001",
+      "created_at": 1764967971,
+      "object": "response.compaction",
+      "instructions": "Be concise",
+      "output": [
+        {
+          "id": "msg_000",
+          "role": "assistant",
+          "content": { "content": "Hello" },
+          "reasoning_content": "Reasoning summary",
+          "reasoning_signature": "gAAAAAB..."
+        }
+      ]
+    },
+    "usage": {
+      "prompt_tokens": 139,
+      "completion_tokens": 438,
+      "total_tokens": 577,
+      "prompt_tokens_details": { "cached_tokens": 0 },
+      "completion_tokens_details": { "reasoning_tokens": 64 }
+    }
+  }
+}

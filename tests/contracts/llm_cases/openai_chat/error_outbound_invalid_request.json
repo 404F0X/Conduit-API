@@ -1,0 +1,35 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "error_outbound_invalid_request",
+  "api_format": "openai_chat",
+  "stream": false,
+  "source": {
+    "go_outbound_error_test": "conduit/llm/transformer/openai/outbound_test.go::TestOutboundTransformer_TransformError (case 'http error with json body')",
+    "note": "Captures the OpenAI chat OutboundTransformer.TransformError mapping: an upstream httpclient.Error with StatusCode=400 and JSON body {\"error\":{\"message\":\"Invalid request\",\"type\":\"invalid_request_error\",\"code\":\"invalid_request\"}} must produce an llm.ResponseError with StatusCode=400, Detail.Message='Invalid request', Detail.Type='invalid_request_error'. The Go test also asserts Detail.Message and Detail.Type exactly. The 'code' field ('invalid_request') is present in the upstream body but is NOT asserted by the Go test (only message+type are checked) — it is preserved here verbatim from the source fixture but flagged in _comment. The 'nvidia error with numeric code' sibling case in the same Go test demonstrates numeric code coercion (400 instead of string) but is not included as a separate case to keep this file focused. inbound_http, unified_request, selected_channel and outbound_http are null because OutboundTransformer.TransformError does not exercise request stages. client_http is null because this is the OUTBOUND error path (upstream -> unified); the inbound error path (unified -> client) is covered by anthropic/error_inbound_internal.json."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "Verbatim from TestOutboundTransformer_TransformError case 'http error with json body'. The Go test constructs httpclient.Error{StatusCode: 400, Body: []byte(`{\"error\":{\"message\":\"Invalid request\",\"type\":\"invalid_request_error\",\"code\":\"invalid_request\"}}`)} and feeds it to transformer.TransformError. Status 400 = http.StatusBadRequest.",
+    "status_code": 400,
+    "body_json": {
+      "error": {
+        "message": "Invalid request",
+        "type": "invalid_request_error",
+        "code": "invalid_request"
+      }
+    }
+  },
+  "client_http": null,
+  "unified_error": {
+    "_comment": "Extension field (NOT one of the six required sections) recording the llm.ResponseError produced by OutboundTransformer.TransformError. The Go test asserts llmErr.StatusCode==400, llmErr.Detail.Message=='Invalid request', llmErr.Detail.Type=='invalid_request_error'. Detail.Code ('invalid_request') is present in the upstream body but is NOT asserted by the Go test for this case (pending source snapshot for whether OutboundTransformer copies code verbatim).",
+    "status_code": 400,
+    "detail": {
+      "message": "Invalid request",
+      "type": "invalid_request_error",
+      "code": "pending source snapshot"
+    }
+  }
+}

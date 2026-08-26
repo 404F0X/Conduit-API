@@ -1,0 +1,7 @@
+[advisories]
+# Cargo records optional dependencies from registry package manifests even when
+# their features are disabled. Keep these exceptions scoped to dependencies
+# that have no active path in `cargo tree --target all`:
+# - RUSTSEC-2023-0071: SQLx's optional MySQL/RSA dependency; only PostgreSQL is enabled.
+# - RUSTSEC-2026-0235: rust_decimal's optional rkyv 0.7 dependency; rkyv is not enabled.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0235"]

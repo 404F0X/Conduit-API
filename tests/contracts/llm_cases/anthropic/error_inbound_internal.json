@@ -1,0 +1,37 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "error_inbound_internal",
+  "api_format": "anthropic",
+  "stream": false,
+  "source": {
+    "go_inbound_error_test": "conduit/llm/transformer/anthropic/inbound_test.go::TestInboundTransformer_TransformError (case 'generic error')",
+    "note": "Captures the Anthropic InboundTransformer.TransformError mapping: a unified llm.ResponseError with StatusCode=500 and Detail{Message:'some error', Type:'test_error', RequestID:'123456'} must produce an httpclient.Error with StatusCode=500, Status='Internal Server Error', and a JSON body shaped as Anthropic's error envelope: {\"type\":\"test_error\",\"error\":{\"message\":\"some error\",\"type\":\"test_error\"},\"request_id\":\"123456\"}. The Go test asserts the result via require.JSONEq on the Body bytes and a direct StatusCode comparison. The 'nil error' sibling case asserts a fallback body {\"type\":\"error\",\"error\":{\"message\":\"internal server error\",\"type\":\"\"},\"request_id\":\"\"} and is not duplicated here. RequestID '123456' is a fixed literal in the Go fixture (NOT a placeholder — it is asserted byte-for-byte via JSONEq). inbound_http, unified_request, selected_channel, outbound_http and upstream_http are null because InboundTransformer.TransformError does not exercise request or upstream stages."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": null,
+  "client_http": {
+    "_comment": "Expected httpclient.Error asserted by TestInboundTransformer_TransformError case 'generic error'. The Go test compares StatusCode directly and uses require.JSONEq on the Body bytes, so the body_json below is byte-equivalent to the Go fixture (key order is not significant under JSONEq). request_id '123456' is a pinned literal from the Go fixture.",
+    "status_code": 500,
+    "status": "Internal Server Error",
+    "body_json": {
+      "type": "test_error",
+      "error": {
+        "message": "some error",
+        "type": "test_error"
+      },
+      "request_id": "123456"
+    }
+  },
+  "unified_error_input": {
+    "_comment": "Extension field (NOT one of the six required sections) recording the llm.ResponseError fed INTO InboundTransformer.TransformError. Verbatim from the Go test fixture: StatusCode=500, Detail.Message='some error', Detail.Type='test_error', Detail.RequestID='123456'.",
+    "status_code": 500,
+    "detail": {
+      "message": "some error",
+      "type": "test_error",
+      "request_id": "123456"
+    }
+  }
+}

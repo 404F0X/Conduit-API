@@ -1,0 +1,34 @@
+[package]
+name = "conduit-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-3.0-only"
+repository.workspace = true
+
+[features]
+default = []
+redis = []
+otel = []
+full = ["redis", "otel"]
+
+[dependencies]
+async-trait = { workspace = true }
+conduit-core = { workspace = true }
+conduit-llm = { workspace = true }
+conduit-transformers = { workspace = true }
+# Retryable error-pattern matching (Go `regexp.MatchString` in
+# `internal/server/orchestrator/retry.go`). Same direct pin as
+# conduit-orchestrator / conduit-services / conduit-transformers.
+regex = "1"
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` so retry-delay /
+# response-timeout tests run on a fake (auto-advancing) clock (RUST-P8-002 S15).
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

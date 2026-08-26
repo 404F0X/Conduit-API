@@ -1,0 +1,78 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "speech_stream_sse",
+  "api_format": "openai_audio",
+  "stream": true,
+  "source": {
+    "go_stream_test": "conduit/llm/transformer/openai/audio_outbound_test.go::TestAudioStreaming_Speech (L308-377)",
+    "note": "End-to-end SSE streaming TTS round trip. The events array below is the UPSTREAM provider SSE stream, transcribed verbatim from the Go test's events literal (L335-340); the final frame is the '[DONE]' sentinel. Client-side expectations asserted by the Go test: outbound request carries Accept 'text/event-stream' and passes stream_format 'sse' through the wire body; the client stream forwards exactly 3 events (delta, delta, done) with the '[DONE]' sentinel swallowed by the inbound transformer; the terminal event carries SSE Type 'speech.audio.done'; collected[0] contains '\"speech.audio.delta\"' and collected[2] contains '\"speech.audio.done\"'. The exact byte payload of each forwarded client frame is not byte-asserted by the Go test (contains-only) — the client-side per-frame stream is pending source snapshot. Aggregation: inbound.AggregateStreamChunks over the same 4 upstream events must yield a body containing '\"audio_bytes\":8' (base64 'YWJjZA=='+'ZWZnaA==' decode to 4+4 bytes), meta.Completed==true, meta.Usage.TotalTokens==12; the full aggregate body shape {object:'audio.speech.stream', audio_bytes:8, chunks:4} follows aggregateSpeechStreamChunks (audio_inbound.go L426-441) with llm.SpeechStreamResponseID=='audio.speech.stream' (llm/audio.go L7), of which only audio_bytes is byte-asserted.",
+    "aggregate_body_json": {
+      "object": "audio.speech.stream",
+      "audio_bytes": 8,
+      "chunks": 4
+    },
+    "aggregate_meta": {
+      "id": "audio.speech.stream",
+      "completed": true,
+      "usage_total_tokens": 12
+    }
+  },
+  "inbound_http": {
+    "_comment": "clientBody = json.Marshal(map{model:'gpt-4o-mini-tts', input:'Hi', voice:'alloy', stream_format:'sse'}) with Content-Type application/json (L313-321).",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "gpt-4o-mini-tts",
+      "input": "Hi",
+      "voice": "alloy",
+      "stream_format": "sse"
+    }
+  },
+  "unified_request": {
+    "_comment": "Asserted: *llmReq.Stream==true (L323; also 'sse stream_format enables streaming' subtest in audio_inbound_test.go L97-110 asserts req.Speech.StreamFormat=='sse'). Remaining fields mirror the inbound body per transformSpeechRequest (audio_inbound.go).",
+    "model": "gpt-4o-mini-tts",
+    "stream": true,
+    "request_type": "speech",
+    "api_format": "openai/audio_speech",
+    "speech": {
+      "input": "Hi",
+      "voice": "alloy",
+      "stream_format": "sse"
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Asserted: Accept=='text/event-stream' (L327), providerBody['stream_format']=='sse' (L330-332). URL/method/auth/body remainder from buildSpeechRequest with the same newAudioOutbound config (exact URL asserted by TestOutbound_BuildSpeechRequest). Note there is still NO OpenAI-chat-style 'stream' key in the speech wire body.",
+    "base_url": "https://api.openai.com",
+    "api_key": "sk-test",
+    "method": "POST",
+    "url": "https://api.openai.com/v1/audio/speech",
+    "request_type": "speech",
+    "api_format": "openai/audio_speech",
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Accept": ["text/event-stream"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "bearer",
+      "api_key": "sk-test"
+    },
+    "body_json": {
+      "model": "gpt-4o-mini-tts",
+      "input": "Hi",
+      "voice": "alloy",
+      "stream_format": "sse"
+    }
+  },
+  "upstream_http": null,
+  "client_http": null,
+  "events": [
+    { "data": { "type": "speech.audio.delta", "audio": "YWJjZA==" } },
+    { "data": { "type": "speech.audio.delta", "audio": "ZWZnaA==" } },
+    { "data": { "type": "speech.audio.done", "usage": { "total_tokens": 12 } } },
+    { "data": "[DONE]" }
+  ]
+}

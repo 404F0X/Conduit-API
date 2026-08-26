@@ -1,0 +1,1171 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "ApiAuthConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "admin_token": {
+          "default": null,
+          "description": "NOT WIRED (P-53): parsed but no auth middleware consumes it. Admin access is gated by the JWT resolver (P-01/P-33), not a static token, so setting this has no effect.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "allow_no_auth_fallback": {
+          "default": false,
+          "description": "NOT WIRED (P-53): parsed but no auth middleware consumes it; the no-auth sentinel is always rejected (see `no_auth_sentinel`).",
+          "type": "boolean"
+        },
+        "api_key_header": {
+          "default": "Authorization",
+          "description": "NOT WIRED (P-53): parsed but the API-key extractor uses a fixed header set (Authorization / X-Goog-Api-Key / query param), not this config.",
+          "type": "string"
+        },
+        "bcrypt_cost": {
+          "default": 12,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "jwt_secret": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "no_auth_sentinel": {
+          "default": "CONDUIT_API_KEY_NO_AUTH",
+          "description": "NOT WIRED (P-53): parsed but the sentinel check uses the hardcoded `NO_AUTH_SENTINEL` constant (`conduit-auth`), not this config value.",
+          "type": "string"
+        },
+        "session_ttl": {
+          "default": "1d",
+          "description": "NOT WIRED (P-53): parsed but no session store honors it. JWT expiry is driven by the token `exp` claim at sign time, not this config value.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "CacheConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "memory": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/MemoryCacheConfig"
+            }
+          ],
+          "default": {
+            "max_capacity": 10000,
+            "ttl": "5m"
+          }
+        },
+        "mode": {
+          "default": "memory",
+          "type": "string"
+        },
+        "redis": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RedisConfig"
+            }
+          ],
+          "default": {
+            "addr": "127.0.0.1:6379",
+            "addrs": [],
+            "cluster": false,
+            "connect_timeout": "5s",
+            "db": 0,
+            "master_name": null,
+            "password": null,
+            "sentinel": false,
+            "tls": false,
+            "url": null,
+            "username": null
+          }
+        },
+        "route_affinity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RouteAffinityConfig"
+            }
+          ],
+          "default": {
+            "enabled": true,
+            "lookup_cache_ttl": "1m",
+            "negative_cache_ttl": "5s",
+            "prompt_cache_ttl": "1h",
+            "response_continuity_ttl": "7d"
+          }
+        }
+      },
+      "type": "object"
+    },
+    "CorsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_credentials": {
+          "default": true,
+          "type": "boolean"
+        },
+        "allowed_headers": {
+          "default": [
+            "authorization",
+            "content-type"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allowed_methods": {
+          "default": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allowed_origins": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DashboardConfig": {
+      "additionalProperties": false,
+      "description": "Mirrors Go `server.Dashboard` (`conduit/internal/server/config.go`). Stale-while-revalidate TTLs for cached all-time token stats.",
+      "properties": {
+        "all_time_token_stats_hard_ttl": {
+          "default": "1d",
+          "description": "Go `Dashboard.AllTimeTokenStatsHardTTL` (`all_time_token_stats_hard_ttl`). Go default: 24h.",
+          "type": "string"
+        },
+        "all_time_token_stats_soft_ttl": {
+          "default": "1h",
+          "description": "Go `Dashboard.AllTimeTokenStatsSoftTTL` (`all_time_token_stats_soft_ttl`). Go default: 1h.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "DatabaseConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "conn_max_idle_time": {
+          "default": "10m",
+          "description": "Maps to Go `db.conn_max_idle_time` (`SetConnMaxIdleTime`). Go default \"10m\".",
+          "type": "string"
+        },
+        "conn_max_lifetime": {
+          "default": "30m",
+          "description": "Maps to Go `db.conn_max_lifetime` (`SetConnMaxLifetime`). Go default \"30m\".",
+          "type": "string"
+        },
+        "connect_timeout": {
+          "default": "30s",
+          "description": "Acquire timeout for a connection from the pool (sqlx-side; no direct Go `db.Config` equivalent). Kept for runtime use. Default 30s.",
+          "type": "string"
+        },
+        "debug": {
+          "default": false,
+          "type": "boolean"
+        },
+        "dialect": {
+          "default": "postgres",
+          "type": "string"
+        },
+        "disable_auto_migration": {
+          "default": false,
+          "type": "boolean"
+        },
+        "dsn": {
+          "default": "postgresql://conduit:conduit@127.0.0.1:5432/conduit",
+          "type": "string"
+        },
+        "max_idle_conns": {
+          "default": 10,
+          "description": "Maps to Go `db.max_idle_conns` (`SetMaxIdleConns`). Go default 10.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_open_conns": {
+          "default": 20,
+          "description": "Maps to Go `db.max_open_conns` (`SetMaxOpenConns`). Go default 20.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "read_replica": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DbReadReplicaConfig"
+            }
+          ],
+          "default": {
+            "fallback_on_replica_failure": false,
+            "read_dsn": "",
+            "read_max_idle_conns": 0,
+            "read_max_open_conns": 0
+          }
+        }
+      },
+      "type": "object"
+    },
+    "DbReadReplicaConfig": {
+      "additionalProperties": false,
+      "description": "Mirrors Go `db.ReadReplicaConfig` (`conduit/internal/server/db/config.go`) plus the Rust-only `fallback_on_replica_failure` switch (RUST-P3-001 S11). Defaults: empty DSN, 0 conns (=> use pool defaults / disabled), `fallback_on_replica_failure = false`.\n\nGo semantics (verified against `conduit/internal/server/db/router.go`): when a replica is configured, the Ent read path calls `replica.Query` *directly* with **no try/catch and no runtime fallback** — a replica failure propagates to the caller. To stay byte-compatible with that behavior the Rust default is therefore `false` (do not fall back to master when the replica fails at runtime). Writes (`Exec`) and transactions always run on master regardless of this flag, so replica outages never break the write path — this is what \"default compatible with Go\" guarantees.",
+      "properties": {
+        "fallback_on_replica_failure": {
+          "default": false,
+          "description": "When `true`, a runtime failure on the replica (connection error, pool exhaustion, etc.) falls back to executing the read on master. When `false` (default, Go-compatible) the error is propagated as-is. Has no effect when no replica is configured (reads always use master) and never affects writes or transactions.",
+          "type": "boolean"
+        },
+        "read_dsn": {
+          "default": "",
+          "type": "string"
+        },
+        "read_max_idle_conns": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "read_max_open_conns": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "GcConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "requests_cleanup_enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "requests_retention": {
+          "default": "3d",
+          "type": "string"
+        },
+        "stale_processing_enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "stale_processing_interval": {
+          "default": "1m",
+          "type": "string"
+        },
+        "usage_logs_cleanup_enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "usage_logs_retention": {
+          "default": "30d",
+          "type": "string"
+        },
+        "vacuum_enabled": {
+          "default": false,
+          "description": "Whether the policy-driven GC runs `VACUUM` after cleanup (Go `gc.Config.VacuumEnabled`, `gc.go:198`). P-47.",
+          "type": "boolean"
+        },
+        "vacuum_full": {
+          "default": false,
+          "description": "Whether PostgreSQL VACUUM uses the locking `FULL` variant (Go `gc.Config.VacuumFull`). P-47.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "LogConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "caller_key": {
+          "default": "label",
+          "description": "Go `log.Config.CallerKey` (`caller_key`). Go default: \"label\".",
+          "type": "string"
+        },
+        "debug": {
+          "default": false,
+          "description": "Go `log.Config.Debug` (`debug`). Go default: false.",
+          "type": "boolean"
+        },
+        "directory": {
+          "default": "logs",
+          "description": "Rust-only. Log directory (Go uses `file.path` dirname). Default: \"logs\".",
+          "type": "string"
+        },
+        "encoding": {
+          "default": "json",
+          "description": "Go `log.Config.Encoding` (`encoding`). Go default: \"json\".",
+          "type": "string"
+        },
+        "excludes": {
+          "default": [],
+          "description": "Go `log.Config.Excludes` (`excludes`). Go default: [].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "file": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LogFileConfig"
+            }
+          ],
+          "default": {
+            "local_time": true,
+            "max_age": 30,
+            "max_backups": 10,
+            "max_size": 100,
+            "path": "logs/conduit.log"
+          },
+          "description": "Go `log.Config.File` (`file`) — mirrors `log.FileConfig`."
+        },
+        "format": {
+          "default": "json",
+          "description": "Rust-only. Semantic alias for Go `encoding`. Default: \"json\".",
+          "type": "string"
+        },
+        "function_key": {
+          "default": "",
+          "description": "Go `log.Config.FunctionKey` (`function_key`). Go default: \"\".",
+          "type": "string"
+        },
+        "includes": {
+          "default": [],
+          "description": "Go `log.Config.Includes` (`includes`). Go default: [].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "level": {
+          "default": "info",
+          "description": "Go `log.Config.Level` (`level`). Go accepts a string (\"info\", \"debug\", ...) and parses it to a zapcore.Level. Stored as a string here. Go default: \"info\".",
+          "type": "string"
+        },
+        "level_key": {
+          "default": "level",
+          "description": "Go `log.Config.LevelKey` (`level_key`). Go default: \"level\".",
+          "type": "string"
+        },
+        "name": {
+          "default": "conduit",
+          "description": "Go `log.Config.Name` (`name`). Go default: \"conduit\".",
+          "type": "string"
+        },
+        "name_key": {
+          "default": "logger",
+          "description": "Go `log.Config.NameKey` (`name_key`). Go default: \"logger\".",
+          "type": "string"
+        },
+        "output": {
+          "default": "stdio",
+          "description": "Go `log.Config.Output` (`output`). \"stdio\" or \"file\". Go default: \"stdio\".",
+          "type": "string"
+        },
+        "skip_level": {
+          "default": 1,
+          "description": "Go `log.Config.SkipLevel` (`skip_level`). Go default: 1.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "stdout": {
+          "default": true,
+          "description": "Rust-only. Mirror of Go `output == \"stdio\"`. Default: true.",
+          "type": "boolean"
+        },
+        "time_key": {
+          "default": "time",
+          "description": "Go `log.Config.TimeKey` (`time_key`). Go default: \"time\".",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "LogFileConfig": {
+      "additionalProperties": false,
+      "description": "Mirrors Go `log.FileConfig` (`conduit/internal/log/logger.go`) — lumberjack v2 file-rotation options.",
+      "properties": {
+        "local_time": {
+          "default": true,
+          "description": "Go `FileConfig.LocalTime` (`local_time`). Go default: true.",
+          "type": "boolean"
+        },
+        "max_age": {
+          "default": 30,
+          "description": "Go `FileConfig.MaxAge` (`max_age`) in days. Go default: 30.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "max_backups": {
+          "default": 10,
+          "description": "Go `FileConfig.MaxBackups` (`max_backups`) in files. Go default: 10.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "max_size": {
+          "default": 100,
+          "description": "Go `FileConfig.MaxSize` (`max_size`) in megabytes. Go default: 100.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "path": {
+          "default": "logs/conduit.log",
+          "description": "Go `FileConfig.Path` (`path`). Go default: \"logs/conduit.log\".",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "MemoryCacheConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_capacity": {
+          "default": 10000,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "ttl": {
+          "default": "5m",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "MetricsConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "type": "string"
+        },
+        "path": {
+          "default": "/metrics",
+          "type": "string"
+        },
+        "port": {
+          "default": 9090,
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "OidcConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "providers": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/OidcProviderConfig"
+          },
+          "type": "array"
+        },
+        "redirect_base_url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state_ttl": {
+          "default": "10m",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "OidcProviderConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_signup": {
+          "default": true,
+          "type": "boolean"
+        },
+        "client_id": {
+          "default": "",
+          "type": "string"
+        },
+        "client_secret": {
+          "default": "",
+          "type": "string"
+        },
+        "issuer_url": {
+          "default": "",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "scopes": {
+          "default": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ProviderQuotaConfig": {
+      "additionalProperties": false,
+      "description": "Provider quota polling configuration.\n\n`enabled` and `check_interval` drive the production quota worker. The provider-specific `providers` allowlist is retained for compatibility but is not consumed; all supported checkers are registered. `warning_ratio` currently remains fixed to Go's canonical 0.8 threshold.",
+      "properties": {
+        "check_interval": {
+          "default": "10m",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "providers": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "warning_ratio": {
+          "default": 0.8,
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
+    "RedisConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "addr": {
+          "default": "127.0.0.1:6379",
+          "type": "string"
+        },
+        "addrs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cluster": {
+          "default": false,
+          "type": "boolean"
+        },
+        "connect_timeout": {
+          "default": "5s",
+          "type": "string"
+        },
+        "db": {
+          "default": 0,
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "master_name": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "password": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sentinel": {
+          "default": false,
+          "type": "boolean"
+        },
+        "tls": {
+          "default": false,
+          "type": "boolean"
+        },
+        "url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "username": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RetryConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "max_channel_retries": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_single_channel_retries": {
+          "default": 2,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "retry_delay": {
+          "default": "1s",
+          "type": "string"
+        },
+        "strategy": {
+          "default": "adaptive",
+          "type": "string"
+        },
+        "timeout": {
+          "default": "10m",
+          "type": "string"
+        },
+        "upstream_error_passthrough": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RouteAffinityConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "lookup_cache_ttl": {
+          "default": "1m",
+          "type": "string"
+        },
+        "negative_cache_ttl": {
+          "default": "5s",
+          "type": "string"
+        },
+        "prompt_cache_ttl": {
+          "default": "1h",
+          "type": "string"
+        },
+        "response_continuity_ttl": {
+          "default": "7d",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ServerApiAuthConfig": {
+      "additionalProperties": false,
+      "description": "Mirrors Go `server.APIAuth` (`conduit/internal/server/config.go`).",
+      "properties": {
+        "allow_no_auth": {
+          "default": false,
+          "description": "Go `APIAuth.AllowNoAuth` (`allow_no_auth`). Go default: false.",
+          "type": "boolean"
+        },
+        "key_prefix": {
+          "default": "conduit",
+          "description": "Go `APIAuth.KeyPrefix` (`key_prefix`). Go default: \"conduit\".",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ServerApiConfig": {
+      "additionalProperties": false,
+      "description": "Mirrors Go `server.API` (`conduit/internal/server/config.go`) — a thin wrapper whose only field is `auth: APIAuth`.",
+      "properties": {
+        "auth": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServerApiAuthConfig"
+            }
+          ],
+          "default": {
+            "allow_no_auth": false,
+            "key_prefix": "conduit"
+          },
+          "description": "Go `API.Auth` (`auth`) — mirrors `server.APIAuth`."
+        }
+      },
+      "type": "object"
+    },
+    "ServerConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "api": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ServerApiConfig"
+            }
+          ],
+          "default": {
+            "auth": {
+              "allow_no_auth": false,
+              "key_prefix": "conduit"
+            }
+          },
+          "description": "Go `server.Config.API` (`api`) — wraps `APIAuth`."
+        },
+        "base_path": {
+          "default": "",
+          "type": "string"
+        },
+        "cors": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CorsConfig"
+            }
+          ],
+          "default": {
+            "allow_credentials": true,
+            "allowed_headers": [
+              "authorization",
+              "content-type"
+            ],
+            "allowed_methods": [
+              "GET",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE",
+              "OPTIONS"
+            ],
+            "allowed_origins": []
+          }
+        },
+        "dashboard": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DashboardConfig"
+            }
+          ],
+          "default": {
+            "all_time_token_stats_hard_ttl": "1d",
+            "all_time_token_stats_soft_ttl": "1h"
+          },
+          "description": "Go `server.Config.Dashboard` (`dashboard`) — mirrors `server.Dashboard` (`conduit/internal/server/config.go`). Cache TTLs for dashboard stats."
+        },
+        "debug": {
+          "default": false,
+          "type": "boolean"
+        },
+        "disable_ssl_verify": {
+          "default": false,
+          "description": "Go `server.Config.DisableSSLVerify` (`disable_ssl_verify`). Go default: false.\n\nNOT WIRED (P-53): parsed but no HTTP client honors it. The upstream `reqwest::Client` instances are built with default TLS verification and never read this flag, so setting `true` does not relax cert checks (e.g. for a self-signed upstream). Wiring requires threading the flag into every `reqwest::Client::builder()` call site (`danger_accept_invalid_certs`).",
+          "type": "boolean"
+        },
+        "graceful_shutdown_timeout": {
+          "default": "10s",
+          "description": "Rust-only maximum drain window after an interrupt/terminate signal. The binary passes it to the bounded axum graceful-shutdown path.",
+          "type": "string"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "type": "string"
+        },
+        "llm_request_timeout": {
+          "default": "10m",
+          "description": "Go `server.Config.LLMRequestTimeout` (`llm_request_timeout`). Go default: 600s.",
+          "type": "string"
+        },
+        "name": {
+          "default": "conduit",
+          "type": "string"
+        },
+        "port": {
+          "default": 8090,
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "public_url": {
+          "default": "",
+          "description": "Go `server.Config.PublicURL` (`public_url`). Go default: \"\".",
+          "type": "string"
+        },
+        "read_timeout": {
+          "default": "30s",
+          "type": "string"
+        },
+        "request_timeout": {
+          "default": "30s",
+          "description": "Go `server.Config.RequestTimeout` (`request_timeout`). Go default: 30s.",
+          "type": "string"
+        },
+        "trace": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TraceConfig"
+            }
+          ],
+          "default": {
+            "claude_code_trace_enabled": false,
+            "codex_trace_enabled": false,
+            "extra_trace_body_fields": [],
+            "extra_trace_headers": [],
+            "opencode_trace_enabled": false,
+            "request_header": "",
+            "thread_header": "Conduit-Thread-Id",
+            "trace_header": "Conduit-Trace-Id"
+          },
+          "description": "Go `server.Config.Trace` (`trace`) — mirrors `tracing.Config` (`conduit/internal/tracing/tracing.go`)."
+        },
+        "write_timeout": {
+          "default": "30s",
+          "description": "NOT WIRED (P-53): Rust-only field, parsed but no HTTP server honors it (axum/hyper have no per-write deadline knob consumed here).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "TraceConfig": {
+      "additionalProperties": false,
+      "description": "Mirrors Go `tracing.Config` (`conduit/internal/tracing/tracing.go`). All fields are non-pointer in Go (zero value = Go default), so all are `#[serde(default)]`-filled here with the Go `conf.go` setDefaults values.",
+      "properties": {
+        "claude_code_trace_enabled": {
+          "default": false,
+          "description": "Go `tracing.Config.ClaudeCodeTraceEnabled`. Go default: false.",
+          "type": "boolean"
+        },
+        "codex_trace_enabled": {
+          "default": false,
+          "description": "Go `tracing.Config.CodexTraceEnabled`. Go default: false.",
+          "type": "boolean"
+        },
+        "extra_trace_body_fields": {
+          "default": [],
+          "description": "Go `tracing.Config.ExtraTraceBodyFields`. Go default: [].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "extra_trace_headers": {
+          "default": [],
+          "description": "Go `tracing.Config.ExtraTraceHeaders`. Go default: [].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "opencode_trace_enabled": {
+          "default": false,
+          "description": "Go `tracing.Config.OpenCodeTraceEnabled`. Go default: false.",
+          "type": "boolean"
+        },
+        "request_header": {
+          "default": "",
+          "description": "Go `tracing.Config.RequestHeader`. Go has no setDefault for this; the Go zero value is \"\". (Code that reads it falls back to \"Conduit-Request-Id\".)",
+          "type": "string"
+        },
+        "thread_header": {
+          "default": "Conduit-Thread-Id",
+          "description": "Go `tracing.Config.ThreadHeader`. Go default: \"Conduit-Thread-Id\".",
+          "type": "string"
+        },
+        "trace_header": {
+          "default": "Conduit-Trace-Id",
+          "description": "Go `tracing.Config.TraceHeader`. Go default: \"Conduit-Trace-Id\".",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "properties": {
+    "api_auth": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ApiAuthConfig"
+        }
+      ],
+      "default": {
+        "admin_token": null,
+        "allow_no_auth_fallback": false,
+        "api_key_header": "Authorization",
+        "bcrypt_cost": 12,
+        "enabled": true,
+        "jwt_secret": null,
+        "no_auth_sentinel": "CONDUIT_API_KEY_NO_AUTH",
+        "session_ttl": "1d"
+      }
+    },
+    "cache": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CacheConfig"
+        }
+      ],
+      "default": {
+        "memory": {
+          "max_capacity": 10000,
+          "ttl": "5m"
+        },
+        "mode": "memory",
+        "redis": {
+          "addr": "127.0.0.1:6379",
+          "addrs": [],
+          "cluster": false,
+          "connect_timeout": "5s",
+          "db": 0,
+          "master_name": null,
+          "password": null,
+          "sentinel": false,
+          "tls": false,
+          "url": null,
+          "username": null
+        },
+        "route_affinity": {
+          "enabled": true,
+          "lookup_cache_ttl": "1m",
+          "negative_cache_ttl": "5s",
+          "prompt_cache_ttl": "1h",
+          "response_continuity_ttl": "7d"
+        }
+      }
+    },
+    "db": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/DatabaseConfig"
+        }
+      ],
+      "default": {
+        "conn_max_idle_time": "10m",
+        "conn_max_lifetime": "30m",
+        "connect_timeout": "30s",
+        "debug": false,
+        "dialect": "postgres",
+        "disable_auto_migration": false,
+        "dsn": "postgresql://conduit:conduit@127.0.0.1:5432/conduit",
+        "max_idle_conns": 10,
+        "max_open_conns": 20,
+        "read_replica": {
+          "fallback_on_replica_failure": false,
+          "read_dsn": "",
+          "read_max_idle_conns": 0,
+          "read_max_open_conns": 0
+        }
+      }
+    },
+    "gc": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/GcConfig"
+        }
+      ],
+      "default": {
+        "enabled": true,
+        "requests_cleanup_enabled": false,
+        "requests_retention": "3d",
+        "stale_processing_enabled": true,
+        "stale_processing_interval": "1m",
+        "usage_logs_cleanup_enabled": false,
+        "usage_logs_retention": "30d",
+        "vacuum_enabled": false,
+        "vacuum_full": false
+      }
+    },
+    "log": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LogConfig"
+        }
+      ],
+      "default": {
+        "caller_key": "label",
+        "debug": false,
+        "directory": "logs",
+        "encoding": "json",
+        "excludes": [],
+        "file": {
+          "local_time": true,
+          "max_age": 30,
+          "max_backups": 10,
+          "max_size": 100,
+          "path": "logs/conduit.log"
+        },
+        "format": "json",
+        "function_key": "",
+        "includes": [],
+        "level": "info",
+        "level_key": "level",
+        "name": "conduit",
+        "name_key": "logger",
+        "output": "stdio",
+        "skip_level": 1,
+        "stdout": true,
+        "time_key": "time"
+      }
+    },
+    "metrics": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/MetricsConfig"
+        }
+      ],
+      "default": {
+        "enabled": false,
+        "host": "127.0.0.1",
+        "path": "/metrics",
+        "port": 9090
+      }
+    },
+    "oidc": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/OidcConfig"
+        }
+      ],
+      "default": {
+        "enabled": false,
+        "providers": [],
+        "redirect_base_url": null,
+        "state_ttl": "10m"
+      }
+    },
+    "provider_quota": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProviderQuotaConfig"
+        }
+      ],
+      "default": {
+        "check_interval": "10m",
+        "enabled": true,
+        "providers": [],
+        "warning_ratio": 0.8
+      }
+    },
+    "retry": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RetryConfig"
+        }
+      ],
+      "default": {
+        "enabled": true,
+        "max_channel_retries": 3,
+        "max_single_channel_retries": 2,
+        "retry_delay": "1s",
+        "strategy": "adaptive",
+        "timeout": "10m",
+        "upstream_error_passthrough": true
+      }
+    },
+    "server": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ServerConfig"
+        }
+      ],
+      "default": {
+        "api": {
+          "auth": {
+            "allow_no_auth": false,
+            "key_prefix": "conduit"
+          }
+        },
+        "base_path": "",
+        "cors": {
+          "allow_credentials": true,
+          "allowed_headers": [
+            "authorization",
+            "content-type"
+          ],
+          "allowed_methods": [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+          ],
+          "allowed_origins": []
+        },
+        "dashboard": {
+          "all_time_token_stats_hard_ttl": "1d",
+          "all_time_token_stats_soft_ttl": "1h"
+        },
+        "debug": false,
+        "disable_ssl_verify": false,
+        "graceful_shutdown_timeout": "10s",
+        "host": "127.0.0.1",
+        "llm_request_timeout": "10m",
+        "name": "conduit",
+        "port": 8090,
+        "public_url": "",
+        "read_timeout": "30s",
+        "request_timeout": "30s",
+        "trace": {
+          "claude_code_trace_enabled": false,
+          "codex_trace_enabled": false,
+          "extra_trace_body_fields": [],
+          "extra_trace_headers": [],
+          "opencode_trace_enabled": false,
+          "request_header": "",
+          "thread_header": "Conduit-Thread-Id",
+          "trace_header": "Conduit-Trace-Id"
+        },
+        "write_timeout": "30s"
+      }
+    }
+  },
+  "title": "AppConfig",
+  "type": "object"
+}

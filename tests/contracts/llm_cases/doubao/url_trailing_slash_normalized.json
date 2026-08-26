@@ -1,0 +1,35 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "url_trailing_slash_normalized",
+  "api_format": "doubao",
+  "stream": false,
+  "source": {
+    "go_outbound_request_test": "conduit/llm/transformer/doubao/outbound_test.go::TestOutboundTransformer_TransformRequest (case 'base URL with trailing slash')",
+    "go_constructor_test": "conduit/llm/transformer/doubao/outbound_test.go::TestNewOutboundTransformer (case 'base URL with trailing slash') + TestNewOutboundTransformerWithConfig (case 'valid config with trailing slash')",
+    "note": "Captures Doubao's trailing-slash normalization. The Go constructor test feeds baseURL 'https://ark.cn-beijing.volces.com/api/v3/' (trailing slash) and asserts the transformer's BaseURL is normalized to 'https://ark.cn-beijing.volces.com/api/v3' (slash stripped). The TransformRequest case 'base URL with trailing slash' then feeds a minimal chat request through that transformer and asserts req.URL=='https://ark.cn-beijing.volces.com/api/v3/chat/completions' (no double slash). selected_channel, upstream_http and client_http are null (outbound-only unit test)."
+  },
+  "inbound_http": null,
+  "unified_request": {
+    "_comment": "Exact llm.Request literal from the Go test 'base URL with trailing slash' fixture (same minimal chat request).",
+    "model": "ep-20241203072800-8f7f",
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, world!"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "Asserted by the Go test 'base URL with trailing slash': the transformer is constructed with baseURL 'https://ark.cn-beijing.volces.com/api/v3/' (trailing slash) and TransformRequest produces req.URL=='https://ark.cn-beijing.volces.com/api/v3/chat/completions' (slash normalized away). Only the URL assertion is made by this case (the validate callback is URL-only); Auth/Method/Content-Type are the same as chat_completion_basic since the same transformer logic applies.",
+    "base_url_input": "https://ark.cn-beijing.volces.com/api/v3/",
+    "base_url_normalized": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "test-api-key",
+    "method": "POST",
+    "expected_url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+  },
+  "upstream_http": null,
+  "client_http": null
+}

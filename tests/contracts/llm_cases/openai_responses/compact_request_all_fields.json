@@ -1,0 +1,81 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "compact_request_all_fields",
+  "api_format": "openai_responses",
+  "stream": false,
+  "source": {
+    "go_inbound_request_test": "conduit/llm/transformer/openai/responses/compact_inbound_test.go::TestCompactInboundTransformer_TransformRequest (subtests 'valid request with all fields' L66-87, 'valid request with input' L21-44)",
+    "go_outbound_request_test": "conduit/llm/transformer/openai/responses/compact_outbound_test.go::TestOutboundTransformer_TransformCompactRequest (subtests 'compact request with all fields' L78-105, 'valid compact request with input' L24-55), TestOutboundTransformer_BuildCompactURL (subtest 'standard URL' L235-241)",
+    "note": "Request-only case for POST /responses/compact. Inbound and outbound Go fixtures are mutually coherent (model gpt-4o, input 'Hello', instructions 'Be concise', prompt_cache_key 'cache_key_1'). The inbound test builds Body via json.Marshal(CompactAPIRequest{Model, Input{Text}, Instructions, PromptCacheKey}); responses.Input.MarshalJSON emits a bare JSON string when Text is set, so the wire body has \"input\":\"Hello\". selected_channel, upstream_http and client_http are null because the request-path unit tests do not exercise those stages."
+  },
+  "inbound_http": {
+    "_comment": "From compact_inbound_test.go 'valid request with all fields'. The Go test sets only Body and Headers on httpclient.Request (no Method/URL are set or asserted).",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "gpt-4o",
+      "input": "Hello",
+      "instructions": "Be concise",
+      "prompt_cache_key": "cache_key_1"
+    }
+  },
+  "unified_request": {
+    "_comment": "Expected llm.Request from CompactInboundTransformer.TransformRequest. Byte-asserted by the Go subtests: Model=='gpt-4o', RequestType==compact, APIFormat==openai/responses_compact, Compact.Input[0].Role=='user', *Compact.Input[0].Content.Content=='Hello', Compact.Instructions=='Be concise', Compact.PromptCacheKey=='cache_key_1'. messages==[] and stream==false are set unconditionally by compact_inbound.go TransformRequest (L63-74) but are not directly asserted by the unit test.",
+    "model": "gpt-4o",
+    "messages": [],
+    "stream": false,
+    "request_type": "compact",
+    "api_format": "openai/responses_compact",
+    "compact": {
+      "input": [
+        {
+          "role": "user",
+          "content": {
+            "content": "Hello"
+          }
+        }
+      ],
+      "instructions": "Be concise",
+      "prompt_cache_key": "cache_key_1"
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "From compact_outbound_test.go. Asserted: Method==POST, URL contains '/responses/compact' (exact URL 'https://api.openai.com/v1/responses/compact' asserted by TestOutboundTransformer_BuildCompactURL with the same base URL), RequestType=='compact', APIFormat=='openai/responses_compact', payload Model=='gpt-4o', len(Input.Items)==1, Items[0].Type=='message', Items[0].Role=='user', Instructions=='Be concise', PromptCacheKey=='cache_key_1'. The content array shape ([{type:'input_text',text:'Hello'}]) is produced by convertUserMessage (outbound_convert.go) and is not separately byte-asserted here. Headers Content-Type+Accept and bearer auth come from transformCompactRequest (compact_outbound.go L41-57); api key 'test-key' is the NewOutboundTransformer constructor arg.",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "test-key",
+    "method": "POST",
+    "url": "https://api.openai.com/v1/responses/compact",
+    "request_type": "compact",
+    "api_format": "openai/responses_compact",
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Accept": ["application/json"]
+    },
+    "auth": {
+      "type": "bearer",
+      "api_key": "test-key"
+    },
+    "body_json": {
+      "model": "gpt-4o",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Hello"
+            }
+          ]
+        }
+      ],
+      "instructions": "Be concise",
+      "prompt_cache_key": "cache_key_1"
+    }
+  },
+  "upstream_http": null,
+  "client_http": null
+}

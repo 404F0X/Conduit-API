@@ -1,0 +1,94 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "stream_gemini_thought",
+  "api_format": "gemini",
+  "stream": false,
+  "source": {
+    "go_testdata_request": "conduit/llm/transformer/gemini/testdata/gemini-simple.request.json",
+    "go_testdata_response": "conduit/llm/transformer/gemini/testdata/gemini-simple.response.json",
+    "note": "Not a streaming case in the SSE sense (Gemini default streaming is a JSON array stream; see README). This file captures a non-streaming Gemini round-trip from the canonical 'simple' request/response testdata pair used by gemini outbound integration tests. The request (gemini-simple.request.json) is a thinking-budget request: one user part 'Output 1-20, 5 each line', generationConfig.maxOutputTokens=4096, thinkingConfig.includeThoughts=true, thinkingConfig.thinkingBudget=1024. The response (gemini-simple.response.json) has responseId 'G34qaY30KYSk0-kPkIX5UA', modelVersion 'gemini-2.5-flash', one candidate with role 'model', two parts: [0]={text: <long reasoning>, thought:true}, [1]={text: '1 2 3 4 5\\n6 7 8 9 10\\n11 12 13 14 15\\n16 17 18 19 20'}, finishReason 'STOP', and usageMetadata{prompt 12, candidates 51, total 201, thoughts 138}. This case is included to exercise Gemini thinking-config + thought-tagged parts. selected_channel/upstream_http/client_http are null because the Go outbound-only tests do not construct those segments."
+  },
+  "inbound_http": {
+    "_comment": "Verbatim copy of conduit/llm/transformer/gemini/testdata/gemini-simple.request.json. This file is consumed by TestTransformRequest_Integration (case 'simple request') and by outbound_convert tests.",
+    "method": "POST",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "contents": [
+        {
+          "parts": [
+            {"text": "Output 1-20, 5 each line"}
+          ],
+          "role": "user"
+        }
+      ],
+      "generationConfig": {
+        "maxOutputTokens": 4096,
+        "thinkingConfig": {
+          "includeThoughts": true,
+          "thinkingBudget": 1024
+        }
+      }
+    }
+  },
+  "unified_request": {
+    "_comment": "llm.Request representation asserted by the Go outbound tests for this fixture: model and max_tokens are taken from the testdata file (the test asserts Model==outbound-derived and MaxTokens>0). The thinkingConfig fields are mapped to llm.Request.ReasoningEffort/ReasoningBudget (includeThoughts=true and thinkingBudget=1024). The precise unified llm.Request shape for thinkingConfig is 'pending source snapshot' (the Go outbound test only byte-asserts the round-trip body, not the intermediate llm.Request struct fields for thinking).",
+    "model": "pending source snapshot",
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Output 1-20, 5 each line"
+        }
+      }
+    ],
+    "reasoning_budget": 1024,
+    "reasoning_budget_note": "pending source snapshot: precise mapping of thinkingConfig.thinkingBudget into llm.Request is not directly asserted by the Go outbound test for this fixture."
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "The Go outbound tests for this fixture assert that OutboundTransformer.TransformRequest yields method=POST, Content-Type='application/json', body unmarshals to GenerateContentRequest. The exact URL (which model is embedded in the path) depends on the channel config and is 'pending source snapshot'. Body shape mirrors the inbound body (the outbound round-trip preserves contents and generationConfig)."
+  },
+  "upstream_http": {
+    "_comment": "Verbatim copy of conduit/llm/transformer/gemini/testdata/gemini-simple.response.json. This is the upstream Gemini response body the Go tests feed to OutboundTransformer.TransformResponse.",
+    "status_code": 200,
+    "body_json": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "**Organizing Numbers: A Straightforward Approach**\n\nOkay, I've got a simple task: I need to output the numbers from 1 to 20, but with a specific formatting requirement.  Let's see, it's pretty clear. I need to arrange them in rows of five numbers each.  So my thought process is literally:\n\n*   First line: 1, 2, 3, 4, 5\n*   Second line: 6, 7, 8, 9, 10\n*   Third line: 11, 12, 13, 14, 15\n*   Final line: 16, 17, 18, 19, 20\n\nI could just use spaces between them to keep it clean and readable. That should be an efficient and clear way to deliver the result.\n",
+                "thought": true
+              },
+              {
+                "text": "1 2 3 4 5\n6 7 8 9 10\n11 12 13 14 15\n16 17 18 19 20"
+              }
+            ],
+            "role": "model"
+          },
+          "finishReason": "STOP",
+          "index": 0
+        }
+      ],
+      "usageMetadata": {
+        "promptTokenCount": 12,
+        "candidatesTokenCount": 51,
+        "totalTokenCount": 201,
+        "promptTokensDetails": [
+          {
+            "modality": "TEXT",
+            "tokenCount": 12
+          }
+        ],
+        "thoughtsTokenCount": 138
+      },
+      "modelVersion": "gemini-2.5-flash",
+      "responseId": "G34qaY30KYSk0-kPkIX5UA"
+    }
+  },
+  "client_http": null
+}

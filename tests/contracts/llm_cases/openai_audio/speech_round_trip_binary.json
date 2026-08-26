@@ -1,0 +1,78 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "speech_round_trip_binary",
+  "api_format": "openai_audio",
+  "stream": false,
+  "source": {
+    "go_round_trip_test": "conduit/llm/transformer/openai/audio_outbound_test.go::TestAudioRoundTrip_Speech (L271-305)",
+    "go_outbound_request_test": "conduit/llm/transformer/openai/audio_outbound_test.go::TestOutbound_BuildSpeechRequest (L34-71, same newAudioOutbound config; asserts exact URL and absence of a 'stream' key)",
+    "go_outbound_response_test": "conduit/llm/transformer/openai/audio_outbound_test.go::TestOutbound_TransformSpeechResponse (L155-171, binary audio -> llm.Response.Speech)",
+    "go_inbound_response_test": "conduit/llm/transformer/openai/audio_inbound_test.go::TestAudioInboundTransformer_Speech (subtest 'response binary passthrough' L73-82)",
+    "note": "End-to-end TTS round trip driven by one coherent Go test: client JSON {model tts-1, input Hi, voice alloy} -> unified speech request -> outbound POST .../v1/audio/speech -> provider returns binary audio/mpeg -> unified Speech{Audio,ContentType} -> client receives the identical bytes. Binary bodies cannot be body_json; they are recorded as body_bytes_hex (lowercase hex of the exact Go byte literal). llm.SpeechResponse.Audio and .ContentType are json:\"-\" fields (carried out-of-band), so unified_response.speech serializes as an empty object; the byte content is asserted via the hex transcript. selected_channel is null (no llm.Channel constructed)."
+  },
+  "inbound_http": {
+    "_comment": "clientBody = json.Marshal(map{model:'tts-1', input:'Hi', voice:'alloy'}) with Content-Type application/json (L275-282). No Method/URL set by the Go test.",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "tts-1",
+      "input": "Hi",
+      "voice": "alloy"
+    }
+  },
+  "unified_request": {
+    "_comment": "llm.Request from SpeechInboundTransformer.TransformRequest. Asserted in TestAudioInboundTransformer_Speech 'valid request' (richer fixture) and by this round trip via the outbound leg; stream==false because stream_format is absent (subtest 'missing stream_format stays non-streaming' L127-139). request_type/api_format constants asserted at audio_inbound_test.go L39-40.",
+    "model": "tts-1",
+    "stream": false,
+    "request_type": "speech",
+    "api_format": "openai/audio_speech",
+    "speech": {
+      "input": "Hi",
+      "voice": "alloy"
+    }
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "_comment": "buildSpeechRequest output. Round trip asserts URL HasSuffix '/audio/speech'; TestOutbound_BuildSpeechRequest with the identical config (BaseURL 'https://api.openai.com', key 'sk-test') asserts the exact URL, Method POST, RequestType 'speech', APIFormat 'openai/audio_speech', and that the wire body has NO 'stream' key. Accept '*/*' for non-SSE speech and bearer auth come from audio_outbound.go buildSpeechRequest L60-84. Body fields with omitempty (response_format/speed/instructions/stream_format) are absent for this fixture.",
+    "base_url": "https://api.openai.com",
+    "api_key": "sk-test",
+    "method": "POST",
+    "url": "https://api.openai.com/v1/audio/speech",
+    "request_type": "speech",
+    "api_format": "openai/audio_speech",
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Accept": ["*/*"]
+    },
+    "content_type": "application/json",
+    "auth": {
+      "type": "bearer",
+      "api_key": "sk-test"
+    },
+    "body_json": {
+      "model": "tts-1",
+      "input": "Hi",
+      "voice": "alloy"
+    }
+  },
+  "upstream_http": {
+    "_comment": "Simulated provider reply from the round-trip test (L290-296): StatusCode 200, Content-Type audio/mpeg, Body = []byte{0xDE, 0xAD, 0xBE, 0xEF} (binary, transcribed as lowercase hex).",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["audio/mpeg"]
+    },
+    "content_type": "audio/mpeg",
+    "body_bytes_hex": "deadbeef"
+  },
+  "client_http": {
+    "_comment": "Final client response. Round trip asserts clientResp.Body == the provider audio bytes and Content-Type 'audio/mpeg'; StatusCode 200 asserted by the inbound 'response binary passthrough' subtest. The intermediate unified llm.Response carries Speech{Audio: 0xDEADBEEF, ContentType: 'audio/mpeg'} (asserted by TestOutbound_TransformSpeechResponse for the same shape).",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["audio/mpeg"]
+    },
+    "content_type": "audio/mpeg",
+    "body_bytes_hex": "deadbeef"
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "stream_reasoning_then_text_aggregated",
+  "api_format": "aisdk",
+  "stream": true,
+  "source": {
+    "go_stream_test": "conduit/llm/transformer/aisdk/convert_stream_data_test.go::TestDataStreamTransformer_StreamTransformation_WithTestData (case 'stream transformation with thinking content and parallel tool calls')",
+    "go_testdata_input_stream": "conduit/llm/transformer/aisdk/testdata/llm-think.stream.jsonl",
+    "note": "Captures the AI SDK DataStreamTransformer aggregation behavior for a stream containing reasoning_content + text + parallel tool calls. The Go test loads llm-think.stream.jsonl (18 frames carrying id 'msg_bdrk_01DDaPSX8bJqM5dRkdv32TkC', model 'claude-sonnet-4-20250514', reasoning deltas followed by text deltas and tool_call deltas) and feeds it to NewDataStreamTransformer(). The Go test does NOT set an expectedStreamFile for this case (expectedStreamFile:'') so only the AGGREGATED UIMessage is asserted, not the per-frame output stream. The aggregated assertions: result.ID=='msg_bdrk_01DDaPSX8bJqM5dRkdv32TkC', result.Role=='assistant', and concatenating the 'reasoning'-type parts' Text yields the indicated multi-paragraph thinking string, while the 'text'-type parts' Text yields the indicated user-facing reply. Because the Go test does not pin the per-frame DataStream output for this case, the events array below is left EMPTY (rather than synthesized) and the aggregated shape is recorded in the unified_response/client_http extension fields. This case documents a real aggregated contract; per-frame DataStream sequence for this input is 'pending source snapshot' (would require Leader to add an expectedStreamFile to the Go test). selected_channel, outbound_http and upstream_http are null because the Go test does not exercise those stages."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "_comment": "The upstream llm-shape input stream is llm-think.stream.jsonl (18 frames, NOT transcribed here for brevity). It carries id 'msg_bdrk_01DDaPSX8bJqM5dRkdv32TkC', model 'claude-sonnet-4-20250514', and interleaves reasoning_content + content + tool_call deltas. The full source file is at conduit/llm/transformer/aisdk/testdata/llm-think.stream.jsonl. Per-frame DataStream output for this input is 'pending source snapshot'."
+  },
+  "client_http": null,
+  "aggregated_ui_message": {
+    "_comment": "Extension field (NOT one of the six required sections) recording the UIMessage aggregated by DataStreamTransformer from the llm-think.stream.jsonl input. All values below are transcribed verbatim from the Go test's expectedAggregated callback assertions.",
+    "id": "msg_bdrk_01DDaPSX8bJqM5dRkdv32TkC",
+    "role": "assistant",
+    "reasoning_text": "The user is asking for the weather in San Francisco, CA. To get the weather, I need to:\n\n1. First get the coordinates (latitude and longitude) of San Francisco, CA using the get_coordinates function\n2. Then get the temperature unit for the US using get_temperature_unit function \n3. Finally use the get_weather function with the coordinates and appropriate unit\n\nLet me start with getting the coordinates and temperature unit.",
+    "text": "I'll help you get the weather for San Francisco, CA. Let me first get the coordinates and determine the appropriate temperature unit for the US."
+  },
+  "events": []
+}

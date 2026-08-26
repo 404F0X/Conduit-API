@@ -1,0 +1,52 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "generation_client_response_data_url",
+  "api_format": "openai_image",
+  "stream": false,
+  "source": {
+    "go_inbound_response_test": "conduit/llm/transformer/openai/image_inbound_test.go::TestImageInboundTransformer_TransformResponse_ToImagesResponse (L266-296)",
+    "note": "Response-only case: ImageInboundTransformer(generation).TransformResponse turning a unified llm.Response (one b64+data-URL image, one https URL image) into the OpenAI ImagesResponse client wire shape. inbound_http, unified_request, selected_channel, outbound_http and upstream_http are null because the inbound response unit test does not exercise those stages. unified_response is an extension field recording the INPUT llm.Response fixture."
+  },
+  "inbound_http": null,
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": null,
+  "unified_response": {
+    "_comment": "Verbatim transcription of the llm.Response literal the Go test feeds to TransformResponse (L269-283): Created 123, Image{Created 123, Data:[{B64JSON 'AAA', URL 'data:image/png;base64,AAA'}, {URL 'https://example.com/a.png'}]}.",
+    "created": 123,
+    "image": {
+      "created": 123,
+      "data": [
+        {
+          "b64_json": "AAA",
+          "url": "data:image/png;base64,AAA"
+        },
+        {
+          "url": "https://example.com/a.png"
+        }
+      ]
+    }
+  },
+  "client_http": {
+    "_comment": "Expected client HTTP response. Byte-asserted by the Go test: StatusCode==200, body unmarshals to ImagesResponse with Created==123, len(Data)==2, Data[0].B64JSON=='AAA', Data[1].URL=='https://example.com/a.png'. Derived from image_inbound.go TransformResponse (not separately byte-asserted): Data[0].url passthrough of the data URL; Content-Type/Cache-Control headers (L176-183).",
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Cache-Control": ["no-cache"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "created": 123,
+      "data": [
+        {
+          "b64_json": "AAA",
+          "url": "data:image/png;base64,AAA"
+        },
+        {
+          "url": "https://example.com/a.png"
+        }
+      ]
+    }
+  }
+}

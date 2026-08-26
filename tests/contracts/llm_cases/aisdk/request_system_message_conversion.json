@@ -1,0 +1,40 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "request_system_message_conversion",
+  "api_format": "aisdk",
+  "stream": false,
+  "source": {
+    "go_request_test": "conduit/llm/transformer/aisdk/convert_request_test.go::TestConvertToLLMRequestComprehensive_SystemMessage (subtest 'simple system message')",
+    "note": "Captures the AI SDK inbound request conversion: an aisdk Request{Model:'gpt-4', Messages:[{Role:'system', Parts:[{Type:'text', Text:'System message'}]}]} fed to convertToLLMRequest must yield an llm.Request with one Message{Role:'system', Content.Content:'System message'}. The Go test asserts result.Messages[0] equals the expected llm.Message via assert.Equal. This is a request-conversion contract case: inbound_http carries the raw aisdk Request body (the test builds the struct directly, not an HTTP body — body_json below is the equivalent JSON serialization), unified_request carries the converted llm.Request. selected_channel, outbound_http, upstream_http and client_http are null because convertToLLMRequest does not exercise those stages."
+  },
+  "inbound_http": {
+    "_comment": "Equivalent JSON serialization of the aisdk.Request struct the Go test constructs inline. The Go test calls convertToLLMRequest(req) directly (no HTTP layer), so method/url/headers are not asserted; body_json shows the equivalent wire-shape of the input struct.",
+    "body_json": {
+      "model": "gpt-4",
+      "messages": [
+        {
+          "role": "system",
+          "parts": [
+            {"type": "text", "text": "System message"}
+          ]
+        }
+      ]
+    }
+  },
+  "unified_request": {
+    "_comment": "Asserted by TestConvertToLLMRequestComprehensive_SystemMessage subtest 'simple system message'. The Go test uses assert.Equal(t, expected, result.Messages[0]) where expected is llm.Message{Role:'system', Content:{Content: lo.ToPtr('System message')}}. Model is preserved from the input ('gpt-4').",
+    "model": "gpt-4",
+    "messages": [
+      {
+        "role": "system",
+        "content": {
+          "content": "System message"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": null,
+  "client_http": null
+}

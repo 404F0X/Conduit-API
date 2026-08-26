@@ -1,0 +1,62 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "outbound_url_trailing_slash",
+  "api_format": "openai_chat",
+  "stream": false,
+  "source": {
+    "go_outbound_request_test": "conduit/llm/transformer/openai/outbound_test.go::TestOutboundTransformer_TransformRequest (cases \"URL with trailing slash\" and \"URL with /v1/ \")",
+    "go_inbound_request_fixture": "conduit/llm/transformer/openai/inbound_test.go::TestInboundTransformer_TransformRequest (case \"valid request\") — reused because the outbound test feeds the SAME minimal llm.Request{Model:\"gpt-4\", Messages:[{user, \"Hello, world!\"}]} literal.",
+    "note": "This case isolates the OutboundTransformer URL-joining behavior (baseURL normalization, trailing-slash and /v1/openai suffix). It captures TWO sub-variants under outbound_http[*]; the unified_request is the same minimal request the Go test feeds in. selected_channel, upstream_http and client_http are null because the Go outbound-only unit test does not exercise those stages."
+  },
+  "inbound_http": {
+    "_comment": "Same minimal OpenAI chat request the Go outbound_test.go feeds to TransformRequest (the Go test uses &llm.Request{Model:\"gpt-4\", Messages:[{user, \"Hello, world!\"}]} as the unified input). Inlined here as the inbound_http body for context; the Go outbound test does not assert inbound parsing.",
+    "method": "POST",
+    "url": "/v1/chat/completions",
+    "headers": {
+      "Content-Type": ["application/json"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "model": "gpt-4",
+      "messages": [
+        {
+          "role": "user",
+          "content": {
+            "content": "Hello, world!"
+          }
+        }
+      ]
+    }
+  },
+  "unified_request": {
+    "_comment": "Exact llm.Request literal the Go outbound_test.go cases 'URL with trailing slash' and 'URL with /v1/ ' pass to TransformRequest.",
+    "model": "gpt-4",
+    "messages": [
+      {
+        "role": "user",
+        "content": {
+          "content": "Hello, world!"
+        }
+      }
+    ]
+  },
+  "selected_channel": null,
+  "outbound_http": [
+    {
+      "_comment": "Go case 'URL with trailing slash': baseURL 'https://api.openai.com/v1/' + path 'chat/completions' -> 'https://api.openai.com/v1/chat/completions' (trailing slash normalized away). Asserted verbatim in Go test.",
+      "base_url": "https://api.openai.com/v1/",
+      "api_key": "test-key",
+      "expected_url": "https://api.openai.com/v1/chat/completions",
+      "method": "POST"
+    },
+    {
+      "_comment": "Go case 'URL with /v1/ ': baseURL 'https://api.deepinfra.com/v1/openai' + path 'chat/completions' -> 'https://api.deepinfra.com/v1/openai/chat/completions'. Asserted verbatim in Go test.",
+      "base_url": "https://api.deepinfra.com/v1/openai",
+      "api_key": "test-key",
+      "expected_url": "https://api.deepinfra.com/v1/openai/chat/completions",
+      "method": "POST"
+    }
+  ],
+  "upstream_http": null,
+  "client_http": null
+}
