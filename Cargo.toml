@@ -73,7 +73,7 @@ chrono-tz = { version = "0.10", default-features = false }
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-core = "0.3"
 hmac = "0.12"
-jsonwebtoken = "11"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 moka = { version = "0.12", features = ["future"] }
 opentelemetry = "0.27"
 redis = { version = "0.25", default-features = false, features = ["tokio-comp", "cluster-async"] }
