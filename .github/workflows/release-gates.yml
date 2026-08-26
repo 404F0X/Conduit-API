@@ -48,7 +48,7 @@ jobs:
       CONDUIT_DB_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
       CONDUIT_TEST_POSTGRES_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -132,7 +132,7 @@ jobs:
       CONDUIT_BRANCH: ${{ github.ref_name }}
       CONDUIT_POSTGRES_PASSWORD: conduit-ci-only-password
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
