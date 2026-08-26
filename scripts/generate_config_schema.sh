@@ -36,7 +36,7 @@ TMP_OUT="$(mktemp -t config.schema.XXXXXX.json)"
 trap 'rm -f "${TMP_OUT}"' EXIT
 
 echo "[generate_config_schema] compiling conduit-config schema generator …"
-(cd "${REPO_ROOT}" && cargo run --quiet --release -p conduit-config --example generate_schema -- "${TMP_OUT}") >&2
+(cd "${REPO_ROOT}" && cargo run --locked --quiet --release -p conduit-config --example generate_schema -- "${TMP_OUT}") >&2
 
 # Re-parse to guarantee the output is valid JSON before touching the real file.
 if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "${TMP_OUT}" 2>/dev/null \

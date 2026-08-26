@@ -1,27 +1,17 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-bookworm-slim AS frontend-build
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS frontend-build
 WORKDIR /workspace
 
-COPY . .
+COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/
+RUN corepack enable \
+    && cd frontend \
+    && HUSKY=0 pnpm install --frozen-lockfile
 
-RUN if [ -f frontend/package.json ]; then \
-        cd frontend; \
-        corepack enable; \
-        if [ -f pnpm-lock.yaml ]; then \
-            pnpm install --frozen-lockfile && pnpm run build; \
-        elif [ -f yarn.lock ]; then \
-            yarn install --frozen-lockfile && yarn build; \
-        elif [ -f package-lock.json ]; then \
-            npm ci && npm run build; \
-        else \
-            npm install && npm run build; \
-        fi; \
-    else \
-        mkdir -p frontend/dist; \
-    fi
+COPY frontend ./frontend
+RUN cd frontend && pnpm run build
 
-FROM rust:1.96.0-bookworm AS rust-build
+FROM rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS rust-build
 WORKDIR /workspace
 
 # PostgreSQL support is compiled into the workspace; there is no selectable
@@ -42,14 +32,14 @@ ENV CONDUIT_VERSION=${CONDUIT_VERSION} \
     CONDUIT_BRANCH=${CONDUIT_BRANCH}
 
 COPY Cargo.toml Cargo.lock ./
+COPY config.example.yml ./
 COPY crates ./crates
 # conduit-db embeds the PostgreSQL migrations with include_str! at compile time.
 COPY migrations ./migrations
-COPY --from=frontend-build /workspace/frontend/dist ./frontend/dist
 
-RUN cargo build --release -p conduit-bin --bin conduit-api --features redis
+RUN cargo build --locked --release -p conduit-bin --bin conduit-api --features redis
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 WORKDIR /app
 
 RUN apt-get update \
@@ -65,6 +55,8 @@ RUN apt-get update \
 
 COPY --from=rust-build --chown=conduit:conduit /workspace/target/release/conduit-api /app/conduit-api
 COPY --from=frontend-build --chown=conduit:conduit /workspace/frontend/dist /app/frontend/dist
+COPY --chown=conduit:conduit LICENSE NOTICE /app/licenses/
+COPY --chown=conduit:conduit LICENSES /app/licenses/third-party/
 
 USER conduit
 

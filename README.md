@@ -1,5 +1,8 @@
 # Conduit API
 
+[![Release gates](https://github.com/404F0X/Conduit-API/actions/workflows/release-gates.yml/badge.svg)](https://github.com/404F0X/Conduit-API/actions/workflows/release-gates.yml)
+[![CodeQL](https://github.com/404F0X/Conduit-API/actions/workflows/codeql.yml/badge.svg)](https://github.com/404F0X/Conduit-API/actions/workflows/codeql.yml)
+
 Conduit API is a self-hosted AI gateway for managing upstream providers,
 model routing, prompt-cache affinity, usage accounting, and customer billing.
 The project is under active development and its first public releases are
@@ -33,6 +36,14 @@ curl -fsS http://127.0.0.1:8090/health
 Open `http://127.0.0.1:8090` and create the first owner account. See
 [Production Deployment](docs/production-deployment.md) before exposing an
 instance outside the local machine.
+
+## Releases
+
+A tag that exactly matches the workspace version, such as
+`v0.1.0-alpha.1`, runs the complete release gates before publishing signed
+`linux/amd64` and `linux/arm64` images to
+`ghcr.io/404f0x/conduit-api`. Each release records the immutable image digest;
+the registry image carries an SBOM and build provenance attestation.
 
 ## Build From Source
 

@@ -14,10 +14,10 @@ security, licensing, or data-integrity checks.
 
 ## Rust
 
-- [ ] `cargo metadata --no-deps --format-version 1`
+- [ ] `cargo metadata --locked --no-deps --format-version 1`
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo test --workspace --all-targets`
-- [ ] `cargo clippy --workspace --all-targets`
+- [ ] `cargo test --locked --workspace --all-targets`
+- [ ] `cargo clippy --locked --workspace --all-targets`
 - [ ] `bash scripts/generate_config_schema.sh --check`
 
 ## Frontend
@@ -45,6 +45,16 @@ security, licensing, or data-integrity checks.
 - [ ] `pnpm --dir frontend audit --prod` has no critical or high finding.
 - [ ] Container runs as a non-root user with loopback-safe source defaults.
 - [ ] Release artifacts include checksums, build provenance, and an SBOM.
+
+## Automated publication
+
+`.github/workflows/publish-release.yml` accepts only a `v*` tag whose value
+exactly matches `workspace.package.version` and whose commit is contained in
+`main`. It reuses the complete release-gates workflow before publishing. The
+result is a multi-architecture GHCR image, keyless Cosign signature, GitHub
+build-provenance attestation, registry SBOM/provenance attestations, immutable
+image-digest manifest, checksum, and GitHub Release. Third-party Actions are
+pinned to immutable commits and updated through Dependabot.
 
 Record the command output and commit SHA with each release. Do not check an item
 based on an older dirty-worktree run.

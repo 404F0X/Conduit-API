@@ -23,6 +23,32 @@ container, and a TLS reverse proxy in front of the loopback-bound HTTP port.
 The repository pins Rust 1.96.0 in both `rust-toolchain.toml` and the Docker
 builder stage so local, CI, and image builds use the same compiler.
 
+Tagged releases publish signed `linux/amd64` and `linux/arm64` images. The tag
+must exactly match the workspace version, and publication occurs only after the
+full CI and container smoke gates pass:
+
+```sh
+export TAG='v0.1.0-alpha.1'
+export IMAGE='ghcr.io/404f0x/conduit-api:0.1.0-alpha.1'
+docker pull "$IMAGE"
+cosign verify \
+  --certificate-identity "https://github.com/404F0X/Conduit-API/.github/workflows/publish-release.yml@refs/tags/$TAG" \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  "$IMAGE"
+```
+
+The corresponding GitHub Release contains the immutable manifest digest and
+its checksum. SBOM and provenance attestations are attached to the image in
+GHCR. Prefer deploying the recorded digest instead of a mutable tag. To use a
+published image with the supported Compose model, set `CONDUIT_IMAGE` and
+disable local building:
+
+```sh
+export CONDUIT_IMAGE='ghcr.io/404f0x/conduit-api@sha256:replace-with-release-digest'
+docker compose pull conduit-api
+docker compose up -d --no-build
+```
+
 ```sh
 export CONDUIT_POSTGRES_PASSWORD='replace-with-a-long-random-value'
 docker compose config --quiet

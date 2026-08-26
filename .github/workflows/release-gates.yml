@@ -1,20 +1,36 @@
 name: Release gates
 
 on:
+  workflow_call:
   pull_request:
+    branches: [main]
   push:
     branches: [main]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+
   test-and-build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
       postgres:
-        image: postgres:17-bookworm
+        image: postgres:17-bookworm@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0
         env:
           POSTGRES_DB: conduit_test
           POSTGRES_USER: conduit
@@ -32,19 +48,23 @@ jobs:
       CONDUIT_DB_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
       CONDUIT_TEST_POSTGRES_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          cache-on-failure: true
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
         with:
           version: 10.23.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -77,17 +97,20 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Rust workspace metadata
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
       - name: Check configuration schema drift
         run: bash scripts/generate_config_schema.sh --check
 
       - name: Test Rust workspace
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
 
       - name: Check PostgreSQL production binary
-        run: cargo check -p conduit-bin
+        run: cargo check --locked -p conduit-bin
 
       - name: Lint Rust workspace
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets
 
       - name: Install Rust dependency auditor
         run: cargo install cargo-audit --version 0.22.2 --locked
@@ -109,7 +132,9 @@ jobs:
       CONDUIT_BRANCH: ${{ github.ref_name }}
       CONDUIT_POSTGRES_PASSWORD: conduit-ci-only-password
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Build and start release image
         run: docker compose -f compose.yml up --build --detach
@@ -143,6 +168,14 @@ jobs:
           printf '%s\n' "$build_info"
           grep --fixed-strings "commit: $CONDUIT_COMMIT" <<<"$build_info"
           grep --fixed-strings "branch: $CONDUIT_BRANCH" <<<"$build_info"
+
+      - name: Verify runtime identity and legal notices
+        shell: bash
+        run: |
+          test "$(docker compose -f compose.yml exec --no-TTY conduit-api id -u)" = "10001"
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSE
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/NOTICE
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/third-party/LGPL-3.0-only.txt
 
       - name: Verify restart health
         shell: bash
