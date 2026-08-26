@@ -985,10 +985,9 @@ mod tests {
         format!("{CLAUDE_AUTHORIZE_URL}?{}", encode_query(pairs))
     }
 
-    /// Antigravity authorize URL constants — verbatim from
-    /// `llm/transformer/antigravity/constants.go:8,13,15,34,54`.
-    const ANTIGRAVITY_CLIENT_ID: &str =
-        "REMOVED_GOOGLE_OAUTH_CLIENT_ID";
+    /// Antigravity authorize URL fixtures. The client ID is deliberately
+    /// synthetic; endpoint, redirect, scopes, and project ID mirror Go.
+    const ANTIGRAVITY_CLIENT_ID: &str = "test-antigravity-client-id";
     const ANTIGRAVITY_REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
     const ANTIGRAVITY_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
     const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
@@ -2005,9 +2004,7 @@ mod tests {
         assert!(auth_url.contains("access_type=offline"), "{auth_url}");
         assert!(auth_url.contains("prompt=consent"), "{auth_url}");
         assert!(
-            auth_url.contains(
-                "client_id=REMOVED_GOOGLE_OAUTH_CLIENT_ID"
-            ),
+            auth_url.contains("client_id=test-antigravity-client-id"),
             "{auth_url}"
         );
         // Sorted query: access_type precedes client_id.

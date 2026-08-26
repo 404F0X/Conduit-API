@@ -119,6 +119,18 @@ provider, or `/oauth/oidc/callback/{name}` when multiple providers are
 configured. Supply the client secret through the deployment secret manager;
 do not commit it to Compose or `.env`.
 
+The channel-side Antigravity OAuth flow is disabled until both of its Google
+OAuth credentials are injected. Configure them only when that provider flow is
+needed:
+
+```sh
+CONDUIT_ANTIGRAVITY_CLIENT_ID='replace-from-secret-store'
+CONDUIT_ANTIGRAVITY_CLIENT_SECRET='replace-from-secret-store'
+```
+
+An incomplete pair is rejected before an OAuth session is created. Keep both
+values in the deployment secret manager; they are not compiled into Conduit.
+
 Backups containing channels, API keys, or request logs are encrypted before
 download or upload. Configure a dedicated random 32-byte key as base64 and
 keep it outside the database and image:

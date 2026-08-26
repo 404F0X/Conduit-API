@@ -102,6 +102,9 @@ const DEVICE_FLOW_CACHE_EXPIRATION_SECS: i64 = 15 * 60;
 /// claudecode.go:108, antigravity.go:119).
 const PKCE_STATE_TTL_SECS: i64 = 10 * 60;
 
+const ANTIGRAVITY_CLIENT_ID_ENV: &str = "CONDUIT_ANTIGRAVITY_CLIENT_ID";
+const ANTIGRAVITY_CLIENT_SECRET_ENV: &str = "CONDUIT_ANTIGRAVITY_CLIENT_SECRET";
+
 /// Go `getGithubCopilotClientID` (copilot.go:49-54): env override first,
 /// then the VS Code default. Read at call time, like Go.
 fn github_copilot_client_id() -> String {
@@ -357,11 +360,11 @@ fn claude_authorize_url(state: &str, challenge: &str) -> String {
 
 /// Antigravity (Google) authorize URL (antigravity.go:124-135) — adds
 /// `access_type=offline` + `prompt=consent`.
-fn antigravity_authorize_url(state: &str, challenge: &str) -> String {
+fn antigravity_authorize_url(client_id: &str, state: &str, challenge: &str) -> String {
     let scopes = anti_tf::scopes_string();
     let pairs: &[(&str, &str)] = &[
         ("response_type", "code"),
-        ("client_id", anti_tf::CLIENT_ID),
+        ("client_id", client_id),
         ("redirect_uri", anti_tf::REDIRECT_URI),
         ("scope", scopes.as_str()),
         ("code_challenge", challenge),
@@ -587,20 +590,54 @@ fn parse_access_token_response(
 pub struct OAuthAdminAdapter {
     http: Arc<dyn OAuthTokenHttp>,
     store: StateStore,
+    antigravity_client_id: String,
+    antigravity_client_secret: String,
 }
 
 impl OAuthAdminAdapter {
     /// Production constructor (reqwest-backed token HTTP).
     pub fn new() -> Self {
-        Self::with_http(Arc::new(ReqwestTokenHttp::new()))
+        Self::with_http_and_antigravity_credentials(
+            Arc::new(ReqwestTokenHttp::new()),
+            std::env::var(ANTIGRAVITY_CLIENT_ID_ENV).unwrap_or_default(),
+            std::env::var(ANTIGRAVITY_CLIENT_SECRET_ENV).unwrap_or_default(),
+        )
     }
 
     /// Constructor with an injectable token-HTTP executor (tests).
+    #[cfg(test)]
     pub fn with_http(http: Arc<dyn OAuthTokenHttp>) -> Self {
+        Self::with_http_and_antigravity_credentials(
+            http,
+            "test-antigravity-client-id".to_string(),
+            "test-antigravity-client-secret".to_string(),
+        )
+    }
+
+    fn with_http_and_antigravity_credentials(
+        http: Arc<dyn OAuthTokenHttp>,
+        antigravity_client_id: String,
+        antigravity_client_secret: String,
+    ) -> Self {
         Self {
             http,
             store: StateStore::default(),
+            antigravity_client_id,
+            antigravity_client_secret,
         }
+    }
+
+    fn antigravity_credentials(&self) -> Result<(&str, &str), OAuthServerError> {
+        if self.antigravity_client_id.is_empty() || self.antigravity_client_secret.is_empty() {
+            return Err(OAuthServerError::Internal(format!(
+                "Antigravity OAuth is not configured; set {ANTIGRAVITY_CLIENT_ID_ENV} and \
+                 {ANTIGRAVITY_CLIENT_SECRET_ENV}"
+            )));
+        }
+        Ok((
+            self.antigravity_client_id.as_str(),
+            self.antigravity_client_secret.as_str(),
+        ))
     }
 
     /// Generate the PKCE trio. State: Go generates 32 random bytes
@@ -792,6 +829,7 @@ impl OAuthAdminService for OAuthAdminAdapter {
         &self,
         project_id: String,
     ) -> Result<StartAntigravityOAuthResponse, OAuthServerError> {
+        let (client_id, _) = self.antigravity_credentials()?;
         let (state, code_verifier, challenge) = Self::generate_pkce();
         // antigravity.go:114-122 — cache Set failure → 500 "failed to save
         // oauth state".
@@ -805,7 +843,7 @@ impl OAuthAdminService for OAuthAdminAdapter {
         )?;
 
         Ok(StartAntigravityOAuthResponse {
-            auth_url: antigravity_authorize_url(&state, &challenge),
+            auth_url: antigravity_authorize_url(client_id, &state, &challenge),
             session_id: state,
         })
     }
@@ -819,6 +857,7 @@ impl OAuthAdminService for OAuthAdminAdapter {
         &self,
         request: ExchangeOAuthRequest,
     ) -> Result<String, OAuthServerError> {
+        let (client_id, client_secret) = self.antigravity_credentials()?;
         let key = format!("antigravity:oauth:{}", request.session_id);
         // antigravity.go:189-193 — cache miss → 400 (non-consuming Get).
         let Some(PendingState::AntigravityPkce {
@@ -846,10 +885,10 @@ impl OAuthAdminService for OAuthAdminAdapter {
         self.store.remove(&key)?;
 
         // antigravity.go:217-229 — form-encoded exchange against Google's
-        // token endpoint (includes the public client_secret,
-        // token_provider.go:40-63).
+        // token endpoint (includes the runtime-configured client secret).
         let http_request = anti_tf::build_exchange_request(
-            anti_tf::CLIENT_ID,
+            client_id,
+            client_secret,
             &code,
             anti_tf::REDIRECT_URI,
             &code_verifier,
@@ -858,7 +897,7 @@ impl OAuthAdminService for OAuthAdminAdapter {
         .map_err(|err| OAuthServerError::BadGateway(wrap_token_exchange_message(&err.message)))?;
 
         let creds = self
-            .execute_token_exchange(http_request, request.proxy.as_ref(), anti_tf::CLIENT_ID)
+            .execute_token_exchange(http_request, request.proxy.as_ref(), client_id)
             .await?;
 
         // antigravity.go:232-241 — cached project_id wins; otherwise Go runs
@@ -1268,6 +1307,33 @@ mod tests {
             }
             other => return Err(format!("unexpected state: {other:?}").into()),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn antigravity_start_oauth_requires_complete_runtime_credentials() -> TestResult {
+        let adapter = OAuthAdminAdapter::with_http_and_antigravity_credentials(
+            Arc::new(MockTokenHttp::default()),
+            String::new(),
+            String::new(),
+        );
+
+        match adapter
+            .start_antigravity_oauth("proj-123".to_string())
+            .await
+        {
+            Err(OAuthServerError::Internal(message)) => {
+                assert!(message.contains(ANTIGRAVITY_CLIENT_ID_ENV), "{message}");
+                assert!(message.contains(ANTIGRAVITY_CLIENT_SECRET_ENV), "{message}");
+            }
+            other => return Err(format!("expected configuration error, got {other:?}").into()),
+        }
+        let guard = adapter
+            .store
+            .entries
+            .lock()
+            .map_err(|_| "store poisoned".to_string())?;
+        assert!(guard.is_empty());
         Ok(())
     }
 

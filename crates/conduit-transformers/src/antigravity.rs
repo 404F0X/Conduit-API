@@ -42,15 +42,8 @@ use crate::TransformerResult;
 // constants.go
 // ===========================================================================
 
-/// Go `ClientID` (constants.go:8) — public OAuth client ID for the
-/// Antigravity installed-app flow.
-pub const CLIENT_ID: &str =
-    "REMOVED_GOOGLE_OAUTH_CLIENT_ID";
-
-/// Go `ClientSecret` (constants.go:11) — public client secret paired with
-/// [`CLIENT_ID`]. Antigravity uses Google's "installed app" OAuth flow which
-/// requires the secret in the token exchange.
-pub const CLIENT_SECRET: &str = "REMOVED_GOOGLE_OAUTH_CLIENT_SECRET";
+// OAuth client credentials are supplied by the host at runtime. They must not
+// be compiled into this library or committed to the repository.
 
 /// Go `RedirectURI` (constants.go:13) — local CLI callback server.
 pub const REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
@@ -311,6 +304,7 @@ pub fn default_token_urls() -> (String, String) {
 /// build the same key order deterministically via [`form_encode_pairs`].
 pub fn build_exchange_form_body(
     client_id: &str,
+    client_secret: &str,
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
@@ -318,7 +312,7 @@ pub fn build_exchange_form_body(
     form_encode_pairs(&[
         ("grant_type", "authorization_code"),
         ("client_id", client_id),
-        ("client_secret", CLIENT_SECRET),
+        ("client_secret", client_secret),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("code_verifier", code_verifier),
@@ -330,14 +324,18 @@ pub fn build_exchange_form_body(
 /// `AntigravityExchangeStrategy.BuildRefreshRequest` (token_provider.go:
 /// 66-95). Returns `Err` when `refresh_token` is empty to mirror the Go
 /// guard at token_provider.go:71-73.
-pub fn build_refresh_form_body(client_id: &str, refresh_token: &str) -> TransformerResult<String> {
+pub fn build_refresh_form_body(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> TransformerResult<String> {
     if refresh_token.is_empty() {
         return Err(ConduitError::invalid_request("refresh_token is empty"));
     }
     Ok(form_encode_pairs(&[
         ("grant_type", "refresh_token"),
         ("client_id", client_id),
-        ("client_secret", CLIENT_SECRET),
+        ("client_secret", client_secret),
         ("refresh_token", refresh_token),
     ]))
 }
@@ -390,12 +388,14 @@ fn percent_encode_form(input: &str, out: &mut String) {
 /// defaulting (token_provider.go:14-16).
 pub fn build_exchange_request(
     client_id: &str,
+    client_secret: &str,
     code: &str,
     redirect_uri: &str,
     code_verifier: &str,
     user_agent: Option<&str>,
 ) -> TransformerResult<HttpRequest> {
-    let body = build_exchange_form_body(client_id, code, redirect_uri, code_verifier);
+    let body =
+        build_exchange_form_body(client_id, client_secret, code, redirect_uri, code_verifier);
     Ok(HttpRequest {
         method: "POST".to_string(),
         url: Some(TOKEN_URL.to_string()),
@@ -409,10 +409,11 @@ pub fn build_exchange_request(
 /// (token_provider.go:66-95).
 pub fn build_refresh_request(
     client_id: &str,
+    client_secret: &str,
     refresh_token: &str,
     user_agent: Option<&str>,
 ) -> TransformerResult<HttpRequest> {
-    let body = build_refresh_form_body(client_id, refresh_token)?;
+    let body = build_refresh_form_body(client_id, client_secret, refresh_token)?;
     Ok(HttpRequest {
         method: "POST".to_string(),
         url: Some(TOKEN_URL.to_string()),
@@ -1688,6 +1689,8 @@ mod tests {
     use serde_json::json;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    const TEST_CLIENT_ID: &str = "test-antigravity-client-id";
+    const TEST_CLIENT_SECRET: &str = "test-antigravity-client-secret";
 
     // -----------------------------------------------------------------------
     // constants.go sanity
@@ -2567,7 +2570,13 @@ mod tests {
 
     #[test]
     fn build_exchange_form_body_is_alphabetical_and_urlencoded() -> TestResult {
-        let body = build_exchange_form_body(CLIENT_ID, "my-code", REDIRECT_URI, "my-verifier");
+        let body = build_exchange_form_body(
+            TEST_CLIENT_ID,
+            TEST_CLIENT_SECRET,
+            "my-code",
+            REDIRECT_URI,
+            "my-verifier",
+        );
         // Go's url.Values.Encode() sorts keys alphabetically and
         // percent-encodes `:` and `/` in the redirect URI per RFC 3986.
         // Expected order:
@@ -2577,8 +2586,8 @@ mod tests {
             body,
             format!(
                 "client_id={cid}&client_secret={csec}&code=my-code&code_verifier=my-verifier&grant_type=authorization_code&redirect_uri={ru}",
-                cid = CLIENT_ID,
-                csec = CLIENT_SECRET,
+                cid = TEST_CLIENT_ID,
+                csec = TEST_CLIENT_SECRET,
                 ru = expected_redirect,
             )
         );
@@ -2588,7 +2597,8 @@ mod tests {
     #[test]
     fn build_exchange_form_body_percent_encodes_special_chars() -> TestResult {
         let body = build_exchange_form_body(
-            CLIENT_ID,
+            TEST_CLIENT_ID,
+            TEST_CLIENT_SECRET,
             "code with spaces+plus/slash",
             REDIRECT_URI,
             "verifier",
@@ -2605,7 +2615,7 @@ mod tests {
     fn build_refresh_form_body_rejects_empty_refresh_token() {
         // Use `match` instead of `.unwrap_err()` — the workspace lints deny
         // `clippy::unwrap_used` (which also fires for `.unwrap_err()`).
-        match build_refresh_form_body(CLIENT_ID, "") {
+        match build_refresh_form_body(TEST_CLIENT_ID, TEST_CLIENT_SECRET, "") {
             Ok(body) => panic!("expected error, got body: {body}"),
             Err(err) => assert!(
                 format!("{err}").contains("refresh_token is empty"),
@@ -2616,13 +2626,13 @@ mod tests {
 
     #[test]
     fn build_refresh_form_body_is_alphabetical() -> TestResult {
-        let body = build_refresh_form_body(CLIENT_ID, "rtoken")?;
+        let body = build_refresh_form_body(TEST_CLIENT_ID, TEST_CLIENT_SECRET, "rtoken")?;
         assert_eq!(
             body,
             format!(
                 "client_id={cid}&client_secret={csec}&grant_type=refresh_token&refresh_token=rtoken",
-                cid = CLIENT_ID,
-                csec = CLIENT_SECRET,
+                cid = TEST_CLIENT_ID,
+                csec = TEST_CLIENT_SECRET,
             )
         );
         Ok(())
@@ -2631,7 +2641,8 @@ mod tests {
     #[test]
     fn build_exchange_request_assembles_http_request() -> TestResult {
         let req = build_exchange_request(
-            CLIENT_ID,
+            TEST_CLIENT_ID,
+            TEST_CLIENT_SECRET,
             "code",
             REDIRECT_URI,
             "verifier",
@@ -2657,7 +2668,14 @@ mod tests {
 
     #[test]
     fn build_exchange_request_defaults_user_agent_when_empty() -> TestResult {
-        let req = build_exchange_request(CLIENT_ID, "code", REDIRECT_URI, "verifier", Some(""))?;
+        let req = build_exchange_request(
+            TEST_CLIENT_ID,
+            TEST_CLIENT_SECRET,
+            "code",
+            REDIRECT_URI,
+            "verifier",
+            Some(""),
+        )?;
         // Empty UA falls back to `get_user_agent()` (token_provider.go:14-16).
         assert_eq!(
             req.headers.get("User-Agent").map(String::as_str),
@@ -2668,7 +2686,7 @@ mod tests {
 
     #[test]
     fn build_refresh_request_assembles_http_request() -> TestResult {
-        let req = build_refresh_request(CLIENT_ID, "rtoken", None)?;
+        let req = build_refresh_request(TEST_CLIENT_ID, TEST_CLIENT_SECRET, "rtoken", None)?;
         assert_eq!(req.method, "POST");
         assert_eq!(req.url.as_deref(), Some(TOKEN_URL));
         assert!(req.body.as_deref().is_some_and(|b| !b.is_empty()));
