@@ -13,7 +13,7 @@ otel = []
 full = ["redis", "otel"]
 
 [dependencies]
-bcrypt = "0.15"
+bcrypt = "0.19"
 chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 rand = "0.8"
