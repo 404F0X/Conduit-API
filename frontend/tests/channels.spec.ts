@@ -1,6 +1,11 @@
 import { test, expect } from '@playwright/test'
 import { gotoAndEnsureAuth, waitForGraphQLOperation } from './auth.utils'
 
+const mockUpstreamURL = process.env.CONDUIT_E2E_MOCK_UPSTREAM_URL
+if (!mockUpstreamURL) {
+  throw new Error('CONDUIT_E2E_MOCK_UPSTREAM_URL is required; run tests through test:e2e')
+}
+
 test.describe('Admin Channels Management', () => {
   test.beforeEach(async ({ page }) => {
     // Increase timeout for authentication
@@ -18,7 +23,7 @@ test.describe('Admin Channels Management', () => {
   test('can create, edit, and archive a channel', async ({ page }) => {
     const uniqueSuffix = Date.now().toString().slice(-6)
     const name = `pw-test-Channel ${uniqueSuffix}`
-    const baseURL = `https://api.test-${uniqueSuffix}.example.com`
+    const baseURL = mockUpstreamURL
 
     // Step 1: Create a new channel
     // Wait for the add button to appear (requires write_channels permission)
@@ -32,6 +37,8 @@ test.describe('Admin Channels Management', () => {
 
     // Fill in channel details
     await createDialog.getByTestId('channel-name-input').fill(name)
+    await createDialog.locator('#channel-billing-currency').fill('CNY')
+    await createDialog.locator('#channel-recharge-multiplier').fill('1')
 
     // Select provider (OpenAI) - use data-testid for reliable selection
     const openaiProviderRadio = createDialog.getByTestId('provider-openai')
@@ -232,12 +239,14 @@ test.describe('Admin Channels Management', () => {
 
     const createDialog = page.getByRole('dialog')
     await createDialog.getByTestId('channel-name-input').fill(searchTerm)
+    await createDialog.locator('#channel-billing-currency').fill('CNY')
+    await createDialog.locator('#channel-recharge-multiplier').fill('1')
 
     // Select provider - use data-testid for reliable selection
     const openaiProviderRadio = createDialog.getByTestId('provider-openai')
     await openaiProviderRadio.click()
 
-    await createDialog.getByTestId('channel-base-url-input').fill('https://api.openai.com/v1')
+    await createDialog.getByTestId('channel-base-url-input').fill(mockUpstreamURL)
     await createDialog.getByTestId('channel-api-key-input').fill('sk-test-key-' + uniqueSuffix)
 
     // Add at least one supported model (required to enable Create button)
@@ -502,11 +511,9 @@ test.describe('Admin Channels Management', () => {
     }
 
     await expect(firstRow).toBeVisible()
-    const channelName = await firstRow.locator('td').nth(2).getByRole('link').innerText()
-    const targetRow = channelsTable.locator('tbody tr').filter({ hasText: channelName }).first()
 
     // Click actions menu
-    const actionsTrigger = targetRow.locator('[data-testid="row-actions"]')
+    const actionsTrigger = firstRow.locator('[data-testid="row-actions"]')
 
     // Check if actions button exists (user may not have permission)
     const actionsCount = await actionsTrigger.count()
@@ -668,8 +675,7 @@ test.describe('Admin Channels Management', () => {
     }
 
     await expect(firstRow).toBeVisible()
-    const channelName = await firstRow.locator('td').nth(2).getByRole('link').innerText()
-    const targetRow = channelsTable.locator('tbody tr').filter({ hasText: channelName }).first()
+    const targetRow = firstRow
 
     // Click actions menu
     const actionsTrigger = targetRow.locator('[data-testid="row-actions"]')
@@ -793,12 +799,14 @@ test.describe('Admin Channels Management', () => {
 
     const createDialog = page.getByRole('dialog')
     await createDialog.getByTestId('channel-name-input').fill(`Channel-${tagName}`)
+    await createDialog.locator('#channel-billing-currency').fill('CNY')
+    await createDialog.locator('#channel-recharge-multiplier').fill('1')
 
     // Select provider - use data-testid for reliable selection
     const openaiProviderRadio = createDialog.getByTestId('provider-openai')
     await openaiProviderRadio.click()
 
-    await createDialog.getByTestId('channel-base-url-input').fill('https://api.openai.com/v1')
+    await createDialog.getByTestId('channel-base-url-input').fill(mockUpstreamURL)
     await createDialog.getByTestId('channel-api-key-input').fill('sk-test-' + uniqueSuffix)
 
     // Add model - wait for badge to be visible then click
@@ -910,7 +918,7 @@ test.describe('Admin Channels mobile actions', () => {
     const footer = dialog.getByTestId('model-price-dialog-footer')
     await expect(footer).toBeVisible()
     await expect(footer.getByRole('button', { name: /取消|Cancel/i })).toBeVisible()
-    await expect(footer.getByRole('button', { name: /保存|Save/i })).toBeVisible()
+    await expect(footer.getByRole('button', { name: /保存|Save|创建草稿|Create Draft/i })).toBeVisible()
 
     const footerBounds = await footer.boundingBox()
     expect(footerBounds).not.toBeNull()

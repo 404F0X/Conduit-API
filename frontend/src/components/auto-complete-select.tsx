@@ -23,6 +23,10 @@ type Props<T extends string> = {
   disabled?: boolean;
   /** Associates the combobox input with an external label. */
   inputId?: string;
+  /** Exposes validation state and supporting text to assistive technology. */
+  ariaInvalid?: boolean;
+  ariaDescribedBy?: string;
+  ariaLabelledBy?: string;
 };
 
 // AutoCompleteSelect: strictly selects from provided items. No free-form values are allowed.
@@ -37,6 +41,9 @@ export function AutoCompleteSelect<T extends string>({
   inputClassName,
   disabled = false,
   inputId,
+  ariaInvalid,
+  ariaDescribedBy,
+  ariaLabelledBy,
 }: Props<T>) {
   const [open, setOpen] = useState(false);
   const [searchValue, setSearchValue] = useState('');
@@ -110,7 +117,15 @@ export function AutoCompleteSelect<T extends string>({
               }}
               onBlur={onInputBlur}
             >
-              <Input id={inputId} disabled={disabled} placeholder={placeholder} className={cn('w-full', inputClassName)} />
+              <Input
+                id={inputId}
+                disabled={disabled}
+                placeholder={placeholder}
+                aria-invalid={ariaInvalid}
+                aria-describedby={ariaDescribedBy}
+                aria-labelledby={ariaLabelledBy}
+                className={cn('w-full', inputClassName)}
+              />
             </CommandPrimitive.Input>
           </PopoverAnchor>
           {!open && <CommandList aria-hidden='true' className='hidden' />}

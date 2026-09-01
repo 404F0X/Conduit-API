@@ -10,9 +10,11 @@ import {
   IconRefresh,
   IconShieldLock,
   IconStack2,
+  IconTicket,
   IconWallet,
 } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
+import { useSelectedProjectId } from '@/stores/projectStore';
 import { DEFAULT_CREDIT_DISPLAY_NAME } from '@/lib/accounting';
 import { cn } from '@/lib/utils';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -33,6 +35,7 @@ import {
 import { FundingOrderStrip } from '@/features/billing/funding-order-strip';
 import { bucketTotalsByClass, spendableAllowanceBuckets } from '@/features/billing/quota-buckets';
 import { useGeneralSettings } from '@/features/system/data/system';
+import { RedeemCodeDialog } from './components/redeem-code-dialog';
 
 function amount(creditDisplayName: string, value?: string) {
   if (!value) return '—';
@@ -101,8 +104,10 @@ function projectWalletStatus(value: string, t: ReturnType<typeof useTranslation>
 
 export default function WalletPage() {
   const { t, i18n } = useTranslation();
+  const selectedProjectID = useSelectedProjectId();
   const generalSettingsQuery = useGeneralSettings();
   const creditDisplayName = generalSettingsQuery.data?.creditDisplayName?.trim() || DEFAULT_CREDIT_DISPLAY_NAME;
+  const [redeemOpen, setRedeemOpen] = useState(false);
   const [expandedBuckets, setExpandedBuckets] = useState<Set<string>>(() => new Set());
   const balanceQuery = useMyProjectBalance();
   const subscriptionsQuery = useMySubscriptions();
@@ -121,12 +126,23 @@ export default function WalletPage() {
   return (
     <>
       <Header fixed>
-        <div className='min-w-0'>
-          <h2 className='flex items-center gap-2 text-xl font-bold tracking-tight'>
-            <IconWallet className='text-emerald-600' size={22} />
-            {t('wallet.title')}
-          </h2>
-          <p className='text-muted-foreground truncate text-sm'>{t('wallet.description')}</p>
+        <div className='flex min-w-0 flex-1 items-center justify-between gap-4'>
+          <div className='min-w-0'>
+            <h2 className='flex items-center gap-2 text-xl font-bold tracking-tight'>
+              <IconWallet className='text-emerald-600' size={22} />
+              {t('wallet.title')}
+            </h2>
+            <p className='text-muted-foreground truncate text-sm'>{t('wallet.description')}</p>
+          </div>
+          <Button
+            className='shrink-0'
+            aria-label={t('wallet.redeem.action')}
+            onClick={() => setRedeemOpen(true)}
+            disabled={!selectedProjectID}
+          >
+            <IconTicket />
+            <span className='hidden sm:inline'>{t('wallet.redeem.action')}</span>
+          </Button>
         </div>
       </Header>
       <Main className='space-y-5 pb-10'>
@@ -424,6 +440,7 @@ export default function WalletPage() {
           </Card>
         </div>
       </Main>
+      <RedeemCodeDialog open={redeemOpen} onOpenChange={setRedeemOpen} creditDisplayName={creditDisplayName} />
     </>
   );
 }

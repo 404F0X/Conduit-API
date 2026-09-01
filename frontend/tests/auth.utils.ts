@@ -15,6 +15,56 @@ const defaultCredentials: AdminCredentials = {
   password: process.env.CONDUIT_ADMIN_PASSWORD || 'pwd123456',
 }
 
+const ACCESS_TOKEN_KEY = 'conduit_access_token'
+
+function signInEmailField(page: Page) {
+  return page
+    .getByTestId('sign-in-email')
+    .or(page.locator('input[type="email"], input[name="email"]'))
+    .first()
+}
+
+function signInPasswordField(page: Page) {
+  return page
+    .getByTestId('sign-in-password')
+    .or(page.locator('input[type="password"], input[name="password"]'))
+    .first()
+}
+
+function isSignInUrl(url: URL) {
+  return url.pathname === '/sign-in' || url.pathname.endsWith('/sign-in')
+}
+
+function isRequestedUrl(url: URL, path: string) {
+  const expected = new URL(path, 'http://127.0.0.1/')
+  const pathnameMatches = url.pathname === expected.pathname || url.pathname.endsWith(expected.pathname)
+  return pathnameMatches && url.search === expected.search
+}
+
+async function hasStoredAccessToken(page: Page) {
+  try {
+    return await page.evaluate(
+      (key) => {
+        const token = localStorage.getItem(key)
+        return typeof token === 'string' && token.trim().length > 0
+      },
+      ACCESS_TOKEN_KEY
+    )
+  } catch {
+    // A document navigation can briefly replace the execution context.
+    return false
+  }
+}
+
+async function waitForStoredAccessToken(page: Page) {
+  await expect
+    .poll(() => hasStoredAccessToken(page), {
+      message: 'expected sign-in to persist a non-empty access token',
+      timeout: 15000,
+    })
+    .toBe(true)
+}
+
 export async function signInAsAdmin(page: Page, credentials: AdminCredentials = defaultCredentials) {
   // Listen for console errors
   page.on('console', (msg) => {
@@ -54,18 +104,12 @@ export async function signInAsAdmin(page: Page, credentials: AdminCredentials = 
 
   // Wait for the login form to be visible using reliable test IDs
   // Fallback to multiple selectors for backward compatibility
-  const emailField = page
-    .getByTestId('sign-in-email')
-    .or(page.locator('input[type="email"], input[name="email"]'))
-    .first()
+  const emailField = signInEmailField(page)
 
   await emailField.waitFor({ state: 'visible', timeout: 20000 })
 
   // Fill in credentials with test IDs and fallback selectors
-  const passwordField = page
-    .getByTestId('sign-in-password')
-    .or(page.locator('input[type="password"], input[name="password"]'))
-    .first()
+  const passwordField = signInPasswordField(page)
 
   await emailField.fill(credentials.email)
   await passwordField.fill(credentials.password)
@@ -76,14 +120,15 @@ export async function signInAsAdmin(page: Page, credentials: AdminCredentials = 
 
   // Wait for the sign-in API response before checking navigation
   const responsePromise = page.waitForResponse(
-    (response) => response.url().includes('/admin/auth/signin') && response.status() === 200,
+    (response) => response.url().includes('/admin/auth/signin') && response.request().method() === 'POST',
     { timeout: 15000 }
   )
 
   await loginButton.click()
 
   try {
-    await responsePromise
+    const response = await responsePromise
+    expect(response.status(), 'expected the sign-in API to accept the credentials').toBe(200)
   } catch (error) {
     console.log(`Sign-in API error: ${error}`)
     // Take a screenshot for debugging
@@ -93,11 +138,17 @@ export async function signInAsAdmin(page: Page, credentials: AdminCredentials = 
     throw error
   }
 
-  // Wait for navigation away from sign-in page
-  await page.waitForURL((url) => !url.toString().includes('/sign-in'), { timeout: 10000 })
+  // The response event fires before React has necessarily consumed the body
+  // and run the mutation success callback. Prove that callback completed
+  // before a caller is allowed to start another document navigation.
+  await waitForStoredAccessToken(page)
+  await expect(emailField).toBeHidden({ timeout: 15000 })
+  await page.waitForURL((url) => !isSignInUrl(url), { timeout: 15000 })
+  await expect(page.locator('#content')).toBeVisible({ timeout: 20000 })
 
-  // Verify we're no longer on the sign-in page
-  await expect(page.url()).not.toContain('/sign-in')
+  // Verify the authenticated shell did not clear a rejected token while it
+  // loaded the current user.
+  await waitForStoredAccessToken(page)
 }
 
 export async function ensureSignedIn(page: Page) {
@@ -106,10 +157,7 @@ export async function ensureSignedIn(page: Page) {
   }
 
   // Verify we have a valid token
-  const hasToken = await page.evaluate(() => {
-    const token = localStorage.getItem('conduit_access_token')
-    return !!token && token.length > 0
-  })
+  const hasToken = await hasStoredAccessToken(page)
 
   if (!hasToken) {
     console.warn('Warning: No valid auth token found, attempting to sign in')
@@ -121,70 +169,27 @@ export async function gotoAndEnsureAuth(page: Page, path: string) {
   // Navigate to the target path - let the app handle auth redirects naturally
   await page.goto(path, { waitUntil: 'domcontentloaded', timeout: 30000 })
 
-  // Wait for potential redirects and React to mount
-  await page.waitForTimeout(2000)
+  const emailField = signInEmailField(page)
+  const authenticatedShell = page.locator('#content')
 
-  // Wait for React app to mount
-  // try {
-  //   await page.waitForFunction(
-  //     () => {
-  //       const root = document.getElementById('root')
-  //       return root && root.innerHTML.length > 50
-  //     },
-  //     { timeout: 10000 }
-  //   )
-  // } catch (error) {
-  //   console.log('Warning: React app may not have mounted properly')
-  //   const rootState = await page.evaluate(() => {
-  //     const root = document.getElementById('root')
-  //     return { exists: !!root, innerHTML: root?.innerHTML.substring(0, 200) }
-  //   })
-  //   console.log('Root state:', rootState)
-  // }
+  // A protected route can briefly retain its URL while the auth guard renders
+  // and redirects. Wait for a real UI state instead of guessing with a sleep.
+  await expect(authenticatedShell.or(emailField)).toBeVisible({ timeout: 20000 })
 
-  // If we got redirected to sign-in OR the login form is rendered within the current route, perform login and navigate back
-  let needsLogin = page.url().includes('/sign-in')
-  try {
-    // Use test IDs with fallback for more reliable detection
-    const emailField = page
-      .getByTestId('sign-in-email')
-      .or(page.locator('input[type="email"], input[name="email"]'))
-      .first()
-    const passwordField = page
-      .getByTestId('sign-in-password')
-      .or(page.locator('input[type="password"], input[name="password"]'))
-      .first()
-
-    const emailVisible = await emailField.isVisible({ timeout: 2000 })
-    const passwordVisible = await passwordField.isVisible({ timeout: 2000 })
-    if (emailVisible && passwordVisible) needsLogin = true
-  } catch {}
-
-  if (needsLogin) {
+  if (await emailField.isVisible()) {
     await signInAsAdmin(page)
-    // After successful login, navigate to the target path
-    await page.goto(path, { waitUntil: 'domcontentloaded' })
-    // Wait for page to load after navigation
-    await page.waitForTimeout(1000)
   }
 
-  // Verify we have a valid token after login
-  const hasToken = await page.evaluate(() => {
-    const token = localStorage.getItem('conduit_access_token')
-    return !!token && token.length > 0
-  })
-
-  if (!hasToken) {
-    console.warn('Warning: No valid auth token found after login')
+  // Login redirects to the product landing page. Only navigate again after
+  // signInAsAdmin has proven token persistence and authenticated-shell load.
+  if (!isRequestedUrl(new URL(page.url()), path)) {
+    await page.goto(path, { waitUntil: 'domcontentloaded', timeout: 30000 })
   }
 
-  // Final wait for page to stabilize
-  try {
-    await page.waitForLoadState('networkidle', { timeout: 5000 })
-  } catch (error) {
-    // Ignore load state timeouts to avoid masking downstream assertions.
-    console.log('Network idle timeout (expected in some cases)')
-  }
+  await page.waitForURL((url) => isRequestedUrl(url, path), { timeout: 15000 })
+  await waitForStoredAccessToken(page)
+  await expect(authenticatedShell).toBeVisible({ timeout: 20000 })
+  await expect(emailField).toBeHidden()
 }
 
 export async function waitForGraphQLOperation(page: Page, operationName: string) {

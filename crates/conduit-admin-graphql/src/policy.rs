@@ -415,6 +415,93 @@ pub fn request_context<'a>(ctx: &'a Context<'_>) -> Option<&'a RequestContext> {
     ctx.data_opt::<RequestContext>()
 }
 
+/// Authorization boundary carried from a GraphQL request into admin services.
+/// A selected project is deliberately restrictive: services must not treat a
+/// project-authorized request as permission to operate on global rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AdminAccessScope {
+    #[default]
+    Global,
+    Project(String),
+}
+
+impl AdminAccessScope {
+    /// Derive the service visibility for the exact scope required by the
+    /// current resolver.
+    ///
+    /// A selected project is only restrictive when the caller needs its
+    /// project membership/role grant to satisfy `required_scope`. Global
+    /// authority for that same scope (owner, direct user scope, system role,
+    /// or a trusted system/test principal) remains global even when the UI
+    /// sends its default `X-Project-ID` header.
+    #[allow(clippy::result_large_err)]
+    pub fn from_graphql_context(
+        ctx: &Context<'_>,
+        required_scope: &str,
+    ) -> Result<Self, ConduitError> {
+        let request = request_context(ctx).ok_or_else(|| {
+            ConduitError::unauthorized("authz: request carries no authenticated principal")
+        })?;
+        Self::from_request_context(request, required_scope)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn from_request_context(
+        request: &RequestContext,
+        required_scope: &str,
+    ) -> Result<Self, ConduitError> {
+        let Some(principal) = request.principal.as_ref() else {
+            return Err(ConduitError::unauthorized(
+                "authz: request carries no authenticated principal",
+            ));
+        };
+
+        // Evaluate the exact resolver scope without the selected project
+        // first. This deliberately does not ask whether the principal has
+        // *some* global scope: only a global grant for `required_scope` may
+        // widen the downstream service boundary.
+        let global = rbac::has_scope(request, required_scope);
+        if matches!(
+            global.source(),
+            Some(
+                rbac::PermissionSource::System
+                    | rbac::PermissionSource::Test
+                    | rbac::PermissionSource::Owner
+                    | rbac::PermissionSource::DirectScope
+                    | rbac::PermissionSource::SystemRoleScope
+            )
+        ) {
+            return Ok(Self::Global);
+        }
+
+        let Some(project_id) = request.project_id.as_deref() else {
+            return authorize_resolver(principal, required_scope).map(|()| Self::Global);
+        };
+        authorize_project_resolver(principal, project_id, required_scope)
+            .map(|()| Self::Project(project_id.to_owned()))
+    }
+
+    pub fn project_id(&self) -> Option<&str> {
+        match self {
+            Self::Global => None,
+            Self::Project(project_id) => Some(project_id),
+        }
+    }
+
+    pub fn allows_project(&self, project_id: &str) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Project(authorized) => canonical_id(authorized) == canonical_id(project_id),
+        }
+    }
+}
+
+fn canonical_id(raw: &str) -> String {
+    crate::node::parse_guid(raw)
+        .map(|guid| guid.id.to_string())
+        .unwrap_or_else(|_| raw.to_owned())
+}
+
 /// Authorize the current resolver against `scope`, using the real per-request
 /// principal.
 ///
@@ -432,12 +519,23 @@ pub fn authorize_current(ctx: &Context<'_>, scope: &str) -> Result<(), ConduitEr
             "authz: request carries no authenticated principal",
         ));
     };
+    authorize_request_context_scope(request_ctx, scope)
+}
+
+#[allow(clippy::result_large_err)]
+fn authorize_request_context_scope(
+    request_ctx: &RequestContext,
+    scope: &str,
+) -> Result<(), ConduitError> {
     let Some(principal) = request_ctx.principal.as_ref() else {
         return Err(ConduitError::unauthorized(
             "authz: request carries no authenticated principal",
         ));
     };
-    authorize_resolver(principal, scope)
+    match request_ctx.project_id.as_deref() {
+        Some(project_id) => authorize_project_resolver(principal, project_id, scope),
+        None => authorize_resolver(principal, scope),
+    }
 }
 
 /// P-31: prevent privilege escalation through user/role scope grants.
@@ -460,21 +558,38 @@ pub fn guard_scope_grant<'a>(
     set_owner: Option<bool>,
     granted_scopes: impl IntoIterator<Item = &'a String>,
 ) -> Result<(), ConduitError> {
-    let Some(principal) = request_context(ctx).and_then(|rc| rc.principal.as_ref()) else {
+    let Some(request_ctx) = request_context(ctx) else {
         return Ok(());
     };
+    let Some(principal) = request_ctx.principal.as_ref() else {
+        return Ok(());
+    };
+    let is_selected_project_owner = request_ctx.project_id.is_some()
+        && matches!(
+            rbac::has_project_scope(request_ctx, conduit_auth::scopes::slug::WILDCARD).source(),
+            Some(rbac::PermissionSource::ProjectMembershipScope)
+        );
+    // Promoting a project member is reserved to a global owner or the owner
+    // membership of that same selected project. A role carrying write_users
+    // (or even a role wildcard) is not itself ownership.
+    if set_owner == Some(true) && !principal.is_owner && !is_selected_project_owner {
+        return Err(ConduitError::forbidden(
+            "authz: only an owner may grant owner (is_owner) in this scope",
+        ));
+    }
     if principal.is_owner {
         return Ok(());
     }
-    // Non-owner: `is_owner` is an owner-only grant.
-    if set_owner == Some(true) {
-        return Err(ConduitError::forbidden(
-            "authz: only an owner may grant owner (is_owner)",
-        ));
-    }
-    // Non-owner: may only grant scopes it already possesses.
+    // Non-owner: may only grant scopes it already possesses. Project-derived
+    // scopes are encoded with their project id, so an exact lookup against the
+    // bare slug would incorrectly reject legitimate same-project grants.
     for scope in granted_scopes {
-        if !principal.scopes.contains(scope) {
+        let allowed = if request_ctx.project_id.is_some() {
+            rbac::has_project_scope(request_ctx, scope).is_allowed()
+        } else {
+            rbac::has_scope(request_ctx, scope).is_allowed()
+        };
+        if !allowed {
             return Err(ConduitError::forbidden(format!(
                 "authz: cannot grant scope `{scope}` you do not hold"
             )));
@@ -744,6 +859,104 @@ mod tests {
                 role: GraphqlPrincipalRole::Member,
                 project_id: "project-1".to_owned(),
             }]
+        );
+    }
+
+    #[test]
+    fn admin_access_scope_canonicalizes_raw_and_global_project_ids() {
+        let raw = super::AdminAccessScope::Project("41".to_owned());
+        let global = super::AdminAccessScope::Project("gid://conduit/Project/41".to_owned());
+
+        assert!(raw.allows_project("gid://conduit/Project/41"));
+        assert!(global.allows_project("41"));
+        assert!(!raw.allows_project("gid://conduit/Project/42"));
+    }
+
+    #[test]
+    fn admin_access_scope_keeps_owner_global_with_selected_project() {
+        let mut context = conduit_auth::RequestContext::new();
+        context
+            .set_principal(conduit_auth::Principal::user("owner").with_owner(true))
+            .expect("principal");
+        context.set_project_id("41").expect("project");
+
+        let access = super::AdminAccessScope::from_request_context(
+            &context,
+            conduit_auth::scopes::slug::READ_PROJECTS,
+        )
+        .expect("owner access");
+
+        assert_eq!(access, super::AdminAccessScope::Global);
+    }
+
+    #[test]
+    fn admin_access_scope_keeps_matching_system_role_global() {
+        let mut context = conduit_auth::RequestContext::new();
+        context
+            .set_principal(conduit_auth::Principal::user("operator").with_scope(
+                conduit_auth::scopes::Scope::system_role(conduit_auth::scopes::slug::READ_USERS),
+            ))
+            .expect("principal");
+        context.set_project_id("41").expect("project");
+
+        let access = super::AdminAccessScope::from_request_context(
+            &context,
+            conduit_auth::scopes::slug::READ_USERS,
+        )
+        .expect("system-role access");
+
+        assert_eq!(access, super::AdminAccessScope::Global);
+    }
+
+    #[test]
+    fn admin_access_scope_is_project_when_required_scope_is_project_only() {
+        let mut context = conduit_auth::RequestContext::new();
+        context
+            .set_principal(
+                conduit_auth::Principal::user("project-user")
+                    // An unrelated global scope must not widen READ_USERS.
+                    .with_scope(conduit_auth::scopes::slug::READ_CHANNELS)
+                    .with_scope(conduit_auth::scopes::Scope::project_role(
+                        "41",
+                        conduit_auth::scopes::slug::READ_USERS,
+                    )),
+            )
+            .expect("principal");
+        context.set_project_id("41").expect("project");
+
+        let access = super::AdminAccessScope::from_request_context(
+            &context,
+            conduit_auth::scopes::slug::READ_USERS,
+        )
+        .expect("project-role access");
+
+        assert_eq!(access, super::AdminAccessScope::Project("41".to_owned()));
+    }
+
+    #[test]
+    fn current_scope_authorization_uses_selected_project() {
+        let mut context = conduit_auth::RequestContext::new();
+        context
+            .set_principal(conduit_auth::Principal::user("project-user").with_scope(
+                conduit_auth::scopes::Scope::project("41", conduit_auth::scopes::slug::READ_USERS),
+            ))
+            .expect("principal");
+        context.set_project_id("41").expect("project");
+
+        assert!(
+            super::authorize_request_context_scope(
+                &context,
+                conduit_auth::scopes::slug::READ_USERS,
+            )
+            .is_ok()
+        );
+        context.project_id = Some("42".to_owned());
+        assert!(
+            super::authorize_request_context_scope(
+                &context,
+                conduit_auth::scopes::slug::READ_USERS,
+            )
+            .is_err()
         );
     }
 }

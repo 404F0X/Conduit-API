@@ -59,19 +59,39 @@ test.describe('System Setup', () => {
       await page.getByRole('textbox', { name: /Owner First Name/i }).fill('Admin')
       await page.getByRole('textbox', { name: /Owner Last Name/i }).fill('User')
       await page.getByRole('textbox', { name: /Owner Email/i }).fill(ownerEmail)
-      await page.getByLabel(/Owner Password/i).fill(ownerPassword)
+      await page.getByLabel(/^Owner Password$/i).fill(ownerPassword)
+      const confirmPasswordField = page.getByLabel(/Confirm Owner Password/i)
+      await confirmPasswordField.fill(`${ownerPassword}-typo`)
       await page.getByRole('textbox', { name: /Brand Name/i }).fill('Conduit API')
 
       // Submit initialization form
-      const submitButton = page.getByRole('button', { name: /Initialize System|初始化系统/i })
+      const submitButton = page.getByRole('button', { name: /Continue to financial setup|继续配置财务信息/i })
       await expect(submitButton).toBeVisible()
+      await expect(submitButton).toBeDisabled()
+      await confirmPasswordField.fill(ownerPassword)
+      await expect(submitButton).toBeEnabled()
 
-      // After initialization, system redirects to sign-in page
+      await submitButton.click()
+
+      const financialDialog = page.getByRole('dialog', { name: /Set currency and internal credits|设置实际货币与站内积分/i })
+      await expect(financialDialog).toBeVisible()
+      const currencyField = page.getByLabel(/Real accounting currency|实际记账货币/i)
+      await currencyField.click()
+      await currencyField.fill('CNY')
+      await page.getByRole('option', { name: 'CNY', exact: true }).click()
+      await page.getByLabel(/Internal credit display name|站内积分显示名称/i).fill('Credits')
+      await page.getByLabel(/Credits per 1 accounting currency unit|每 1 单位记账货币对应积分数/i).fill('10000')
+      const confirmInitializationButton = page.getByRole('button', {
+        name: /Confirm and initialize|确认并初始化/i,
+      })
+      await expect(confirmInitializationButton).toBeEnabled()
+
+      // After final confirmation, system redirects to sign-in page
       await Promise.all([
         page.waitForURL((url) => url.toString().includes('/sign-in'), {
           timeout: 15000,
         }),
-        submitButton.click(),
+        confirmInitializationButton.click(),
       ])
 
       console.log('System initialized successfully, now on sign-in page')

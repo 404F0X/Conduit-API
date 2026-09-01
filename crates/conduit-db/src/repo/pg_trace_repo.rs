@@ -31,6 +31,19 @@ impl PgTraceRepo {
             .map_err(|error| database_error("list all", error))
     }
 
+    pub async fn list_by_project(&self, project_id: &str) -> RepoResult<Vec<TraceRow>> {
+        sqlx::query_as::<_, TraceRow>(&format!(
+            "SELECT {COLUMNS} FROM traces WHERE project_id = $1 ORDER BY id ASC"
+        ))
+        .bind(parse_id(
+            project_id,
+            "trace project id not a valid integer",
+        )?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| database_error("list by project", error))
+    }
+
     /// Primary-key lookup used by the Relay `node(id:)` resolver.
     pub async fn find_by_row_id(&self, id: i64) -> RepoResult<Option<TraceRow>> {
         sqlx::query_as::<_, TraceRow>(&format!("SELECT {COLUMNS} FROM traces WHERE id = $1"))

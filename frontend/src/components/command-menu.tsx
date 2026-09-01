@@ -2,6 +2,7 @@ import React from 'react';
 import { useNavigate, useRouter } from '@tanstack/react-router';
 import { IconArrowRightDashed, IconChevronRight, IconDeviceLaptop, IconMoon, IconSun } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
+import { withoutBasePath } from '@/lib/base-path';
 import { useSearch } from '@/context/search-context';
 import { useTheme } from '@/context/theme-context';
 import {
@@ -103,7 +104,7 @@ export function CommandMenu() {
   }
 
   // Don't render on auth pages (sign-in, sign-up, initialization, etc.)
-  const currentPath = window.location.pathname;
+  const currentPath = withoutBasePath(window.location.pathname);
   if (
     currentPath.startsWith('/sign-in') ||
     currentPath.startsWith('/sign-up') ||

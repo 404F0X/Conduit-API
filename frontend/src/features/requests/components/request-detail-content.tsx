@@ -6,6 +6,7 @@ import { Copy, Clock, Key, Database, FileText, Layers, Download, Terminal } from
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { getTokenFromStorage } from '@/stores/authStore';
+import { withBasePath } from '@/lib/base-path';
 import { extractNumberID } from '@/lib/utils';
 import { useAdminPriceDisplay } from '@/hooks/use-admin-price-display';
 import { Badge } from '@/components/ui/badge';
@@ -143,7 +144,7 @@ export function RequestDetailContent({ requestId, projectId, previewRequest, isP
       return null;
     }
 
-    const url = `/admin/requests/${encodeURIComponent(requestIdNumber)}/content`;
+    const url = withBasePath(`/admin/requests/${encodeURIComponent(requestIdNumber)}/content`);
     const resp = await fetch(url, {
       headers: {
         Authorization: `Bearer ${token}`,

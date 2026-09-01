@@ -25,7 +25,6 @@ impl CliOverrides {
     }
 }
 
-#[derive(Debug)]
 pub enum ConfigError {
     Io {
         path: PathBuf,
@@ -37,7 +36,6 @@ pub enum ConfigError {
     },
     Env {
         key: &'static str,
-        value: String,
         message: String,
     },
     Validation(ValidationError),
@@ -54,13 +52,18 @@ impl Display for ConfigError {
                     path.display()
                 )
             }
-            Self::Env {
-                key,
-                value,
-                message,
-            } => write!(f, "invalid env {key}={value:?}: {message}"),
+            Self::Env { key, message } => write!(f, "invalid env {key}: {message}"),
             Self::Validation(err) => write!(f, "{err}"),
         }
+    }
+}
+
+// Configuration errors are routinely logged with both Display and Debug.
+// Environment values can contain database passwords, JWT keys, or OIDC client
+// secrets, so ConfigError deliberately never retains or renders them.
+impl std::fmt::Debug for ConfigError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
     }
 }
 
@@ -175,7 +178,17 @@ fn apply_env_overrides(
         "CONDUIT_SERVER_BASE_PATH",
         &mut config.server.base_path,
     )?;
+    set_string_vec(
+        env_lookup,
+        "CONDUIT_SERVER_TRUSTED_PROXIES",
+        &mut config.server.trusted_proxies,
+    )?;
     set_bool(env_lookup, "CONDUIT_SERVER_DEBUG", &mut config.server.debug)?;
+    set_bool(
+        env_lookup,
+        "CONDUIT_SERVER_DISABLE_SSL_VERIFY",
+        &mut config.server.disable_ssl_verify,
+    )?;
     set_string_vec(
         env_lookup,
         "CONDUIT_SERVER_CORS_ALLOWED_ORIGINS",
@@ -185,11 +198,6 @@ fn apply_env_overrides(
         env_lookup,
         "CONDUIT_SERVER_READ_TIMEOUT",
         &mut config.server.read_timeout,
-    )?;
-    set_duration(
-        env_lookup,
-        "CONDUIT_SERVER_WRITE_TIMEOUT",
-        &mut config.server.write_timeout,
     )?;
 
     set_string(env_lookup, "CONDUIT_DB_DIALECT", &mut config.db.dialect)?;
@@ -422,26 +430,6 @@ fn apply_env_overrides(
         &mut config.oidc.providers,
     )?;
 
-    set_bool(
-        env_lookup,
-        "CONDUIT_API_AUTH_ENABLED",
-        &mut config.api_auth.enabled,
-    )?;
-    set_string(
-        env_lookup,
-        "CONDUIT_API_AUTH_API_KEY_HEADER",
-        &mut config.api_auth.api_key_header,
-    )?;
-    set_bool(
-        env_lookup,
-        "CONDUIT_API_AUTH_ALLOW_NO_AUTH_FALLBACK",
-        &mut config.api_auth.allow_no_auth_fallback,
-    )?;
-    set_optional_string(
-        env_lookup,
-        "CONDUIT_API_AUTH_ADMIN_TOKEN",
-        &mut config.api_auth.admin_token,
-    )?;
     set_optional_string(
         env_lookup,
         "CONDUIT_API_AUTH_JWT_SECRET",
@@ -601,10 +589,9 @@ fn set_duration(
     target: &mut Duration,
 ) -> Result<(), ConfigError> {
     if let Some(value) = env_value(env_lookup, key) {
-        *target = duration_format::parse_duration(&value).map_err(|message| ConfigError::Env {
+        *target = duration_format::parse_duration(&value).map_err(|_| ConfigError::Env {
             key,
-            value,
-            message,
+            message: "expected a duration such as 500ms, 30s, or 5m".to_string(),
         })?;
     }
     Ok(())
@@ -638,18 +625,17 @@ where
 {
     match serde_json::from_str::<Vec<T>>(value) {
         Ok(parsed) => Ok(parsed),
-        Err(json_error) => {
+        Err(_) => {
             let csv_value = value
                 .split(',')
                 .map(str::trim)
                 .filter(|part| !part.is_empty())
                 .map(|part| serde_json::Value::String(part.to_string()))
                 .collect::<Vec<_>>();
-            serde_json::from_value(serde_json::Value::Array(csv_value)).map_err(|csv_error| {
+            serde_json::from_value(serde_json::Value::Array(csv_value)).map_err(|_| {
                 ConfigError::Env {
                     key,
-                    value: value.to_string(),
-                    message: format!("expected JSON array/object env value or comma list; JSON error: {json_error}; CSV error: {csv_error}"),
+                    message: "expected a JSON array or compatible comma-separated list".to_string(),
                 }
             })
         }
@@ -662,7 +648,6 @@ fn parse_bool(key: &'static str, value: &str) -> Result<bool, ConfigError> {
         "0" | "false" | "no" | "n" | "off" => Ok(false),
         _ => Err(ConfigError::Env {
             key,
-            value: value.to_string(),
             message: "expected boolean value".to_string(),
         }),
     }
@@ -675,7 +660,6 @@ where
 {
     value.trim().parse::<T>().map_err(|err| ConfigError::Env {
         key,
-        value: value.to_string(),
         message: err.to_string(),
     })
 }
@@ -747,6 +731,15 @@ server:
     }
 
     #[test]
+    fn env_disable_ssl_verify_overrides_default() -> Result<(), Box<dyn std::error::Error>> {
+        let env =
+            |key: &str| (key == "CONDUIT_SERVER_DISABLE_SSL_VERIFY").then(|| "true".to_string());
+        let config = load_from_optional_path_with_env(None, &CliOverrides::default(), &env)?;
+        assert!(config.server.disable_ssl_verify);
+        Ok(())
+    }
+
+    #[test]
     fn env_json_like_arrays_parse_json_then_csv() -> Result<(), Box<dyn std::error::Error>> {
         let env = |key: &str| {
             (key == "CONDUIT_PROVIDER_QUOTA_PROVIDERS")
@@ -761,5 +754,49 @@ server:
         let config = load_from_optional_path_with_env(None, &CliOverrides::default(), &env)?;
         assert_eq!(config.provider_quota.providers, vec!["OpenAI", "Anthropic"]);
         Ok(())
+    }
+
+    #[test]
+    fn env_trusted_proxies_accepts_json_array() -> Result<(), Box<dyn std::error::Error>> {
+        let env = |key: &str| {
+            (key == "CONDUIT_SERVER_TRUSTED_PROXIES")
+                .then(|| r#"["127.0.0.1","10.0.0.0/8"]"#.to_string())
+        };
+        let config = load_from_optional_path_with_env(None, &CliOverrides::default(), &env)?;
+        assert_eq!(
+            config.server.trusted_proxies,
+            vec!["127.0.0.1", "10.0.0.0/8"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn env_parse_errors_redact_the_rejected_value() {
+        const SECRET_VALUE: &str = "not-a-duration-with-secret-token";
+        let env =
+            |key: &str| (key == "CONDUIT_API_AUTH_SESSION_TTL").then(|| SECRET_VALUE.to_string());
+        let error = match load_from_optional_path_with_env(None, &CliOverrides::default(), &env) {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid duration to fail"),
+        };
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(rendered.contains("CONDUIT_API_AUTH_SESSION_TTL"));
+            assert!(!rendered.contains(SECRET_VALUE), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn structured_env_parse_errors_do_not_render_secret_input() {
+        const SECRET_VALUE: &str = "oidc-client-secret-review-marker";
+        let rejected = format!(r#"{{"client_secret":"{SECRET_VALUE}"}}"#);
+        let error = parse_json_or_csv::<OidcProviderConfig>("CONDUIT_OIDC_PROVIDERS", &rejected)
+            .expect_err("a JSON object is not a provider array");
+
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(rendered.contains("CONDUIT_OIDC_PROVIDERS"));
+            assert!(!rendered.contains(SECRET_VALUE), "{rendered}");
+            assert!(!rendered.contains("client_secret"), "{rendered}");
+        }
     }
 }

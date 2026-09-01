@@ -2,8 +2,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub const NO_AUTH_SENTINEL: &str = "CONDUIT_API_KEY_NO_AUTH";
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
@@ -23,10 +21,9 @@ pub struct AppConfig {
 // Mirrors Go `server.Config` (`conduit/internal/server/config.go`) field
 // set, yaml/json tags, and defaults (sourced from `conduit/conf/conf.go`
 // `setDefaults`). Divergences are documented inline:
-//   * `write_timeout` and `graceful_shutdown_timeout` have NO Go counterpart
-//     at this struct (Go's HTTP server sets these via the `http.Server` ctor,
-//     not via config). They are kept because the Rust `axum`/hyper runtime
-//     consumes them directly from this struct (see `conduit-http`).
+//   * `graceful_shutdown_timeout` has NO Go counterpart at this struct (Go's
+//     HTTP server sets it via the `http.Server` ctor). Rust consumes it from
+//     this struct in the bounded graceful-shutdown path.
 //   * `CorsConfig` is a Rust-authored shape that predates this parity pass;
 //     Go `server.CORS` additionally has `enabled`, `debug`, `exposed_headers`,
 //     `max_age` (and the default allowed_origins/methods/headers differ).
@@ -45,6 +42,9 @@ pub struct ServerConfig {
     pub public_url: String,
     pub port: u16,
     pub base_path: String,
+    /// Exact IP addresses or CIDR ranges whose forwarding headers may be
+    /// trusted. Empty by default: direct clients cannot spoof their source IP.
+    pub trusted_proxies: Vec<String>,
     /// Go `server.Config.RequestTimeout` (`request_timeout`). Go default: 30s.
     #[serde(with = "duration_format")]
     #[schemars(with = "String")]
@@ -56,11 +56,6 @@ pub struct ServerConfig {
     #[serde(with = "duration_format")]
     #[schemars(with = "String")]
     pub read_timeout: Duration,
-    /// NOT WIRED (P-53): Rust-only field, parsed but no HTTP server honors it
-    /// (axum/hyper have no per-write deadline knob consumed here).
-    #[serde(with = "duration_format")]
-    #[schemars(with = "String")]
-    pub write_timeout: Duration,
     /// Rust-only maximum drain window after an interrupt/terminate signal.
     /// The binary passes it to the bounded axum graceful-shutdown path.
     #[serde(with = "duration_format")]
@@ -75,11 +70,9 @@ pub struct ServerConfig {
     pub debug: bool,
     /// Go `server.Config.DisableSSLVerify` (`disable_ssl_verify`). Go default: false.
     ///
-    /// NOT WIRED (P-53): parsed but no HTTP client honors it. The upstream
-    /// `reqwest::Client` instances are built with default TLS verification and
-    /// never read this flag, so setting `true` does not relax cert checks (e.g.
-    /// for a self-signed upstream). Wiring requires threading the flag into
-    /// every `reqwest::Client::builder()` call site (`danger_accept_invalid_certs`).
+    /// Applied to the provider-facing upstream client, including clients
+    /// rebuilt for per-channel proxy configuration. Keep disabled in
+    /// production unless a self-signed upstream is explicitly trusted.
     pub disable_ssl_verify: bool,
     pub cors: CorsConfig,
     /// Go `server.Config.API` (`api`) — wraps `APIAuth`.
@@ -95,13 +88,12 @@ impl Default for ServerConfig {
             public_url: String::new(),
             port: 8090,
             base_path: String::new(),
+            trusted_proxies: Vec::new(),
             // Go conf.go setDefault: `server.request_timeout` -> "30s".
             request_timeout: Duration::from_secs(30),
             // Go conf.go setDefault: `server.llm_request_timeout` -> "600s".
             llm_request_timeout: Duration::from_secs(600),
             read_timeout: Duration::from_secs(30),
-            // Rust-only (no Go counterpart at this struct).
-            write_timeout: Duration::from_secs(30),
             // Rust-only (no Go counterpart at this struct).
             graceful_shutdown_timeout: Duration::from_secs(10),
             trace: TraceConfig::default(),
@@ -715,23 +707,8 @@ impl Default for OidcProviderConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiAuthConfig {
-    pub enabled: bool,
-    /// NOT WIRED (P-53): parsed but the API-key extractor uses a fixed header
-    /// set (Authorization / X-Goog-Api-Key / query param), not this config.
-    pub api_key_header: String,
-    /// NOT WIRED (P-53): parsed but no auth middleware consumes it; the no-auth
-    /// sentinel is always rejected (see `no_auth_sentinel`).
-    pub allow_no_auth_fallback: bool,
-    /// NOT WIRED (P-53): parsed but the sentinel check uses the hardcoded
-    /// `NO_AUTH_SENTINEL` constant (`conduit-auth`), not this config value.
-    pub no_auth_sentinel: String,
-    /// NOT WIRED (P-53): parsed but no auth middleware consumes it. Admin
-    /// access is gated by the JWT resolver (P-01/P-33), not a static token, so
-    /// setting this has no effect.
-    pub admin_token: Option<String>,
     pub jwt_secret: Option<String>,
-    /// NOT WIRED (P-53): parsed but no session store honors it. JWT expiry is
-    /// driven by the token `exp` claim at sign time, not this config value.
+    /// Lifetime applied to password and OIDC login JWTs at sign time.
     #[serde(with = "duration_format")]
     #[schemars(with = "String")]
     pub session_ttl: Duration,
@@ -741,11 +718,6 @@ pub struct ApiAuthConfig {
 impl Default for ApiAuthConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            api_key_header: "Authorization".to_string(),
-            allow_no_auth_fallback: false,
-            no_auth_sentinel: NO_AUTH_SENTINEL.to_string(),
-            admin_token: None,
             jwt_secret: None,
             session_ttl: Duration::from_secs(24 * 60 * 60),
             bcrypt_cost: 12,
@@ -1019,11 +991,6 @@ read_replica:
         assert_eq!(config.oidc.state_ttl, Duration::from_secs(10 * 60));
         assert!(config.oidc.providers.is_empty());
 
-        assert!(config.api_auth.enabled);
-        assert_eq!(config.api_auth.api_key_header, "Authorization");
-        assert!(!config.api_auth.allow_no_auth_fallback);
-        assert_eq!(config.api_auth.no_auth_sentinel, NO_AUTH_SENTINEL);
-        assert_eq!(config.api_auth.admin_token, None);
         assert_eq!(config.api_auth.jwt_secret, None);
         assert_eq!(
             config.api_auth.session_ttl,
@@ -1074,7 +1041,10 @@ log:
         let yaml = include_str!("../../../config.example.yml");
         let config: AppConfig = serde_yaml::from_str(yaml)?;
         assert_eq!(config.server.port, 8090);
-        assert_eq!(config.api_auth.no_auth_sentinel, NO_AUTH_SENTINEL);
+        assert_eq!(
+            config.api_auth.session_ttl,
+            Duration::from_secs(24 * 60 * 60)
+        );
         Ok(())
     }
 

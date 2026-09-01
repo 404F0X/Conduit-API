@@ -354,10 +354,15 @@ fn is_calendar_duration_unit(unit: &str) -> bool {
 }
 
 /// Run every profile validator in the order Go's `UpdateAPIKeyProfiles` uses:
-/// names, active-profile, filters, quota. Returns the first failure.
+/// names, active-profile, filters, quota. An explicitly empty active profile
+/// is the canonical representation of "no profile" (including the default
+/// empty object), so only a non-empty selection must resolve to an entry.
+/// Returns the first failure.
 pub fn validate_all_profiles(profiles: &APIKeyProfiles) -> Result<(), ProfileError> {
     validate_profile_names(&profiles.profiles)?;
-    validate_active_profile(&profiles.active_profile, &profiles.profiles)?;
+    if !profiles.active_profile.is_empty() {
+        validate_active_profile(&profiles.active_profile, &profiles.profiles)?;
+    }
     validate_profile_filters(&profiles.profiles)?;
     validate_profile_quota(&profiles.profiles)?;
     Ok(())
@@ -1332,6 +1337,21 @@ mod tests {
         assert_eq!(
             validate_all_profiles(&profiles),
             Err(ProfileError::QuotaNoLimit("production".to_string()))
+        );
+    }
+
+    #[test]
+    fn validate_all_profiles_allows_explicit_no_profile_but_not_missing_selection() {
+        let no_profile = APIKeyProfiles::default();
+        assert_eq!(validate_all_profiles(&no_profile), Ok(()));
+
+        let missing = APIKeyProfiles {
+            active_profile: "ghost".to_string(),
+            profiles: vec![named("production")],
+        };
+        assert_eq!(
+            validate_all_profiles(&missing),
+            Err(ProfileError::ActiveMissing("ghost".to_string()))
         );
     }
 

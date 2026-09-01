@@ -187,7 +187,10 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         "updatePublicChannelHealthSettings" => Scope(slug::WRITE_SETTINGS),
 
         // ── billing + subscriptions ────────────────────────────────────────
-        "userBalance" | "projectBalance" | "projectWalletComparison" => {
+        "userBalance"
+        | "projectBalance"
+        | "projectWalletComparison"
+        | "creditRedemptionCodes" => {
             Scope(slug::READ_BILLING)
         }
         "userSubscriptions" | "subscriptionProjects" | "subscriptionPlans" => {
@@ -195,7 +198,11 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         }
         "myBalance" | "mySubscriptions" | "myProjectBalance"
         | "myProjectWalletComparison" | "myPrimaryProject" => Authenticated,
-        "grantUserCredit" | "grantProjectCredit" => Scope(slug::GRANT_CREDIT),
+        "grantUserCredit"
+        | "grantProjectCredit"
+        | "createCreditRedemptionCodes"
+        | "revokeCreditRedemptionCode" => Scope(slug::GRANT_CREDIT),
+        "redeemCreditCode" => Authenticated,
         "createSubscriptionPlan" | "updateSubscriptionPlan" | "assignUserSubscription"
         | "refreshSubscriptionAllowance" | "pauseUserSubscription"
         | "resumeUserSubscription" | "cancelUserSubscription" | "renewUserSubscription"
@@ -412,6 +419,7 @@ mod tests {
         // Go WithSystemBypass reads / self-service.
         assert_eq!(field_authz("me"), FieldAuthz::Authenticated);
         assert_eq!(field_authz("myBalance"), FieldAuthz::Authenticated);
+        assert_eq!(field_authz("redeemCreditCode"), FieldAuthz::Authenticated);
         assert_eq!(field_authz("myPrimaryProject"), FieldAuthz::Authenticated);
         assert_eq!(field_authz("myProjectBalance"), FieldAuthz::Authenticated);
         assert_eq!(
@@ -452,7 +460,19 @@ mod tests {
             FieldAuthz::Scope(slug::READ_BILLING)
         );
         assert_eq!(
+            field_authz("creditRedemptionCodes"),
+            FieldAuthz::Scope(slug::READ_BILLING)
+        );
+        assert_eq!(
             field_authz("grantProjectCredit"),
+            FieldAuthz::Scope(slug::GRANT_CREDIT)
+        );
+        assert_eq!(
+            field_authz("createCreditRedemptionCodes"),
+            FieldAuthz::Scope(slug::GRANT_CREDIT)
+        );
+        assert_eq!(
+            field_authz("revokeCreditRedemptionCode"),
             FieldAuthz::Scope(slug::GRANT_CREDIT)
         );
         assert_eq!(
@@ -518,6 +538,18 @@ mod tests {
             ),
             ("projectBalance", FieldAuthz::Scope(slug::READ_BILLING)),
             ("grantProjectCredit", FieldAuthz::Scope(slug::GRANT_CREDIT)),
+            (
+                "creditRedemptionCodes",
+                FieldAuthz::Scope(slug::READ_BILLING),
+            ),
+            (
+                "createCreditRedemptionCodes",
+                FieldAuthz::Scope(slug::GRANT_CREDIT),
+            ),
+            (
+                "revokeCreditRedemptionCode",
+                FieldAuthz::Scope(slug::GRANT_CREDIT),
+            ),
             ("apiKeys", FieldAuthz::Scope(slug::READ_API_KEYS)),
             (
                 "updateAPIKeyProfiles",

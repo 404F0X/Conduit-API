@@ -11,6 +11,22 @@ services:
       POSTGRES_PASSWORD: ${CONDUIT_POSTGRES_PASSWORD:?Set CONDUIT_POSTGRES_PASSWORD in the deployment environment}
     volumes:
       - conduit-postgres-data:/var/lib/postgresql/data
+    read_only: true
+    tmpfs:
+      - /run/postgresql:size=16m,mode=0775
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # The official entrypoint starts as root only to prepare the mounted data
+    # directory and then drops to postgres; retain only those setup capabilities.
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     healthcheck:
       test:
         - CMD-SHELL
@@ -48,6 +64,10 @@ services:
       CONDUIT_SERVER_HOST: 0.0.0.0
       CONDUIT_SERVER_PORT: 8090
       CONDUIT_SERVER_PUBLIC_URL: ${CONDUIT_PUBLIC_URL:-}
+      CONDUIT_SERVER_BASE_PATH: ${CONDUIT_BASE_PATH:-}
+      # Forwarding headers are ignored unless the immediate TCP peer matches
+      # one of these operator-controlled addresses or CIDR ranges.
+      CONDUIT_SERVER_TRUSTED_PROXIES: '${CONDUIT_TRUSTED_PROXIES:-[]}'
       # Empty CORS config is permissive. Restrict the safe local default and
       # require deployments behind TLS to provide their exact public origin.
       CONDUIT_SERVER_CORS_ALLOWED_ORIGINS: '${CONDUIT_CORS_ALLOWED_ORIGINS:-["http://127.0.0.1:8090","http://localhost:8090"]}'
@@ -71,6 +91,9 @@ services:
       # Loopback by default: put TLS/reverse proxy in front, or explicitly set
       # CONDUIT_HTTP_BIND=0.0.0.0 when direct exposure is intended.
       - "${CONDUIT_HTTP_BIND:-127.0.0.1}:${CONDUIT_HTTP_PORT:-8090}:8090"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
     expose:
       - "9090"
     security_opt:
@@ -81,8 +104,8 @@ services:
       test:
         - CMD-SHELL
         - >-
-          curl -fsS http://127.0.0.1:8090/health >/dev/null &&
-          curl -fsS http://127.0.0.1:8090/admin/system/status >/dev/null
+          curl -fsS "http://127.0.0.1:8090$${CONDUIT_SERVER_BASE_PATH}/health" >/dev/null &&
+          curl -fsS "http://127.0.0.1:8090$${CONDUIT_SERVER_BASE_PATH}/admin/system/status" >/dev/null
       interval: 30s
       timeout: 5s
       start_period: 10s

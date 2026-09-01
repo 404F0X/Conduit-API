@@ -20,7 +20,10 @@ use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use conduit_core::objects::money::AccountingSettings;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 use crate::admin_handlers::{build_system_status_response, check_initialize_precondition};
 use crate::api_error::{is_valid_email, json_error, min_chars};
@@ -40,6 +43,7 @@ pub struct InitializeSystemParams {
     pub owner_last_name: String,
     pub brand_name: String,
     pub prefer_language: String,
+    pub accounting_settings: AccountingSettings,
 }
 
 /// Minimal system-service trait consumed by the two handlers. Stands in for
@@ -124,6 +128,12 @@ pub struct InitializeSystemRequest {
     pub brand_name: String,
     #[serde(default)]
     pub prefer_language: String,
+    #[serde(default)]
+    pub accounting_currency_code: String,
+    #[serde(default)]
+    pub credit_display_name: String,
+    #[serde(default)]
+    pub credits_per_accounting_unit: String,
 }
 
 impl InitializeSystemRequest {
@@ -138,6 +148,20 @@ impl InitializeSystemRequest {
             && !self.owner_first_name.is_empty()
             && !self.owner_last_name.is_empty()
             && !self.brand_name.is_empty()
+            && self.normalized_accounting_settings().is_some()
+    }
+
+    fn normalized_accounting_settings(&self) -> Option<AccountingSettings> {
+        let settings = AccountingSettings {
+            accounting_currency: self.accounting_currency_code.trim().to_ascii_uppercase(),
+            credit_display_name: self.credit_display_name.trim().to_string(),
+            credits_per_accounting_unit: Decimal::from_str(self.credits_per_accounting_unit.trim())
+                .ok()?,
+            exchange_rates: Vec::new(),
+            version: 1,
+        };
+        settings.validate().ok()?;
+        Some(settings)
     }
 }
 
@@ -213,6 +237,9 @@ pub async fn initialize_system(
             return initialize_response(StatusCode::BAD_REQUEST, false, "Invalid request format");
         }
     };
+    let Some(accounting_settings) = request.normalized_accounting_settings() else {
+        return initialize_response(StatusCode::BAD_REQUEST, false, "Invalid request format");
+    };
 
     let Some(service) = state.services().system_service() else {
         // Unwired service degrades to the IsInitialized error branch below.
@@ -249,6 +276,7 @@ pub async fn initialize_system(
             owner_last_name: request.owner_last_name,
             brand_name: request.brand_name,
             prefer_language: request.prefer_language,
+            accounting_settings,
         })
         .await;
 
@@ -526,15 +554,21 @@ mod tests {
         Ok((status, serde_json::from_slice(&bytes)?))
     }
 
-    fn valid_initialize_body() -> String {
+    fn valid_initialize_value() -> Value {
         json!({
             "ownerEmail": "owner@example.com",
             "ownerPassword": "secret123",
             "ownerFirstName": "Ada",
             "ownerLastName": "Lovelace",
             "brandName": "Conduit API",
+            "accountingCurrencyCode": " usd ",
+            "creditDisplayName": " API credits ",
+            "creditsPerAccountingUnit": " 2500.50 ",
         })
-        .to_string()
+    }
+
+    fn valid_initialize_body() -> String {
+        valid_initialize_value().to_string()
     }
 
     // ---- GET /admin/system/status ---------------------------------------
@@ -624,6 +658,13 @@ mod tests {
                 owner_last_name: "Lovelace".to_string(),
                 brand_name: "Conduit API".to_string(),
                 prefer_language: String::new(),
+                accounting_settings: AccountingSettings {
+                    accounting_currency: "USD".to_string(),
+                    credit_display_name: "API credits".to_string(),
+                    credits_per_accounting_unit: Decimal::from_str("2500.50")?,
+                    exchange_rates: Vec::new(),
+                    version: 1,
+                },
             })
         );
         Ok(())
@@ -641,6 +682,9 @@ mod tests {
             "ownerLastName": "Lovelace",
             "brandName": "Conduit API",
             "preferLanguage": "zh",
+            "accountingCurrencyCode": "CNY",
+            "creditDisplayName": "Credits",
+            "creditsPerAccountingUnit": "10000",
         })
         .to_string();
         let (status, _) = call(
@@ -668,7 +712,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_bind_failures_return_invalid_request_format()
     -> Result<(), Box<dyn StdError>> {
-        let cases: Vec<String> = vec![
+        let mut cases: Vec<String> = vec![
             "{".to_string(), // malformed JSON
             json!({"ownerPassword": "secret123", "ownerFirstName": "A", "ownerLastName": "L", "brandName": "B"}).to_string(), // missing ownerEmail (required)
             json!({"ownerEmail": "not-an-email", "ownerPassword": "secret123", "ownerFirstName": "A", "ownerLastName": "L", "brandName": "B"}).to_string(), // email tag
@@ -676,6 +720,26 @@ mod tests {
             json!({"ownerEmail": "owner@example.com", "ownerPassword": "secret123", "ownerFirstName": "", "ownerLastName": "L", "brandName": "B"}).to_string(), // required first name
             json!({"ownerEmail": "owner@example.com", "ownerPassword": "secret123", "ownerFirstName": "A", "ownerLastName": "L"}).to_string(), // missing brandName
         ];
+        let mut missing_currency = valid_initialize_value();
+        missing_currency
+            .as_object_mut()
+            .expect("valid payload is an object")
+            .remove("accountingCurrencyCode");
+        cases.push(missing_currency.to_string());
+        for (field, invalid) in [
+            ("accountingCurrencyCode", json!("US1")),
+            ("creditDisplayName", json!("   ")),
+            ("creditsPerAccountingUnit", json!("0")),
+            ("creditsPerAccountingUnit", json!("-1")),
+            ("creditsPerAccountingUnit", json!("not-a-number")),
+        ] {
+            let mut payload = valid_initialize_value();
+            payload
+                .as_object_mut()
+                .expect("valid payload is an object")
+                .insert(field.to_string(), invalid);
+            cases.push(payload.to_string());
+        }
 
         for payload in cases {
             let mut app = app_with(Arc::new(FakeSystemService::default()));

@@ -473,14 +473,13 @@ fn merge_settings(existing: &WireSettings, input: &WireSettings) -> WireSettings
 // Row → GraphQL conversion.
 // ---------------------------------------------------------------------------
 
-/// Wire settings → the GraphQL output object. Sensitive fields are dropped
-/// where the snapshot output type omits them (S3 `accessKey`/`secretKey`,
-/// GCS `credential` — input-only fields). WebDAV values are surfaced
-/// verbatim, mirroring Go gqlgen which resolves the plain-string model
-/// fields directly (empty string, not null, for unset values).
+/// Wire settings → the GraphQL output object. Credentials are write-only:
+/// the persisted database DSN and WebDAV password must never be serialized
+/// back to an administrative client. Non-sensitive locator/configuration
+/// fields remain readable so an existing storage can still be edited.
 fn wire_settings_to_gql(settings: WireSettings) -> GqlDataStorageSettings {
     GqlDataStorageSettings {
-        dsn: settings.dsn,
+        dsn: None,
         directory: settings.directory,
         s3: settings.s3.map(|s3| GqlS3 {
             bucket_name: s3.bucket_name,
@@ -494,7 +493,7 @@ fn wire_settings_to_gql(settings: WireSettings) -> GqlDataStorageSettings {
         webdav: settings.webdav.map(|w| GqlWebDav {
             url: w.url,
             username: Some(w.username),
-            password: Some(w.password),
+            password: None,
             insecure_skip_tls: Some(w.insecure_skip_tls),
             path: Some(w.path),
         }),
@@ -1079,4 +1078,30 @@ fn str_family(
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphql_storage_settings_never_expose_credentials() {
+        let output = wire_settings_to_gql(WireSettings {
+            dsn: Some("postgresql://user:password@db/storage".to_string()),
+            webdav: Some(WireWebDav {
+                url: "https://storage.example.invalid/dav".to_string(),
+                username: "backup-user".to_string(),
+                password: "webdav-password".to_string(),
+                insecure_skip_tls: false,
+                path: "/backups".to_string(),
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(output.dsn, None);
+        let webdav = output.webdav.expect("WebDAV locator remains readable");
+        assert_eq!(webdav.password, None);
+        assert_eq!(webdav.username.as_deref(), Some("backup-user"));
+        assert_eq!(webdav.path.as_deref(), Some("/backups"));
+    }
 }

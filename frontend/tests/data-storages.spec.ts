@@ -1,6 +1,11 @@
 import { test, expect, type Page } from '@playwright/test'
 import { gotoAndEnsureAuth, waitForGraphQLOperation } from './auth.utils'
 
+const mockStorageEndpoint = process.env.CONDUIT_E2E_MOCK_ORIGIN
+if (!mockStorageEndpoint) {
+  throw new Error('CONDUIT_E2E_MOCK_ORIGIN is required; run tests through test:e2e')
+}
+
 async function createFilesystemDataStorage(page: Page) {
   const uniqueSuffix = Date.now().toString().slice(-6)
   const name = `pw-test-storage-${uniqueSuffix}`
@@ -205,7 +210,7 @@ test.describe('Admin Data Storage Management', () => {
 
     const endpointInput = dialog.locator('input[name="s3Endpoint"]').first()
     if ((await endpointInput.count()) > 0) {
-      await endpointInput.fill('https://s3.amazonaws.com')
+      await endpointInput.fill(mockStorageEndpoint)
     }
 
     const regionInput = dialog.locator('input[name="s3Region"]').first()

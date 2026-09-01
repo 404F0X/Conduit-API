@@ -567,7 +567,11 @@ async fn build_postgres_core_services(
         AuthService::new(auth_user_repo.clone(), auth_key_repo, jwt_secret)
             .with_allow_no_auth(config.server.api.auth.allow_no_auth),
     );
-    let signin = Arc::new(DbSigninService::new(auth.clone(), system_repo));
+    let signin = Arc::new(DbSigninService::new(
+        auth.clone(),
+        system_repo,
+        config.api_auth.session_ttl,
+    ));
     let signup = Arc::new(crate::wiring_postgres_auth::PgSignupService::new(
         pool.clone(),
         config.api_auth.bcrypt_cost,
@@ -874,6 +878,7 @@ async fn build_postgres_core_services(
         registry.clone(),
         cache.clone(),
         &config.cache.route_affinity,
+        config.server.disable_ssl_verify,
     )
     .await?;
     let openapi_schema = conduit_openapi_graphql::build_openapi_schema(
@@ -886,10 +891,14 @@ async fn build_postgres_core_services(
         Arc::new(crate::wiring_oidc::OidcAdapter::new_postgres(
             config.oidc.clone(),
             config.api_auth.jwt_secret.clone(),
+            config.api_auth.session_ttl,
             pool.clone(),
         ));
     let services = AppServices::new()
-        .with_system_service(Arc::new(DbSystemService { system }))
+        .with_system_service(Arc::new(DbSystemService {
+            system,
+            pool: pool.clone(),
+        }))
         .with_signin_service(signin)
         .with_signup_service(signup)
         .with_oidc_service(oidc)
@@ -914,6 +923,7 @@ async fn build_postgres_proxy_service(
     live_registry: Arc<conduit_orchestrator::live_streaming::LiveStreamRegistry>,
     cache: Arc<dyn Cache>,
     route_affinity_config: &conduit_config::model::RouteAffinityConfig,
+    insecure_skip_verify: bool,
 ) -> Result<Arc<dyn OpenAiOrchestratorService>, String> {
     let model_repo: Arc<dyn ModelRepo> = Arc::new(conduit_db::PgModelRepo::new(pool.clone()));
     let channel_repo: Arc<dyn ChannelRepo> = Arc::new(conduit_db::PgChannelRepo::new(pool.clone()));
@@ -995,10 +1005,13 @@ async fn build_postgres_proxy_service(
     let outbound: Arc<dyn conduit_transformers::OutboundTransformer> =
         Arc::new(OpenAiCompatOutbound);
     let client = HttpClientBuilder::new()
+        .insecure_skip_verify(insecure_skip_verify)
         .build()
         .map_err(|e| format!("failed to build PostgreSQL runtime upstream client: {e}"))?;
-    let executor: Arc<dyn conduit_pipeline::Executor> =
-        Arc::new(conduit_orchestrator::upstream_executor::UpstreamExecutor::new(client));
+    let executor: Arc<dyn conduit_pipeline::Executor> = Arc::new(
+        conduit_orchestrator::upstream_executor::UpstreamExecutor::new(client)
+            .with_insecure_skip_verify(insecure_skip_verify),
+    );
     let runtime_retry_policy = resolve_runtime_retry_policy(&system).await;
     let retry_policy_source: Arc<dyn RuntimeRetryPolicySource> =
         Arc::new(SystemRuntimeRetryPolicySource::new(system.clone()));
@@ -1329,6 +1342,7 @@ impl RoutingModelSettingsSource for SystemRoutingModelSettingsSource {
 /// bridge so `conduit-http` stays decoupled from `conduit-services`/`conduit-db`.
 struct DbSystemService {
     system: Arc<DomainSystemService>,
+    pool: PgPool,
 }
 
 /// GraphQL-facing [`SystemStatusServices`] adapter backed by the same domain
@@ -4372,7 +4386,6 @@ impl SystemService for DbSystemService {
     }
 
     async fn initialize(&self, params: InitializeSystemParams) -> Result<(), String> {
-        let ctx = boot_request_context();
         let domain_params = InitializeParams {
             owner_email: params.owner_email,
             owner_password: params.owner_password,
@@ -4380,16 +4393,32 @@ impl SystemService for DbSystemService {
             owner_last_name: non_empty_option(params.owner_last_name),
             brand_name: params.brand_name,
             prefer_language: non_empty_option(params.prefer_language),
+            accounting_settings: params.accounting_settings,
             // Go records build.Version; the binary's package version stands in
             // until the build script stamps CONDUIT_BUILD_VERSION. Empty would
             // skip the write, but recording it is more faithful.
             version: env!("CARGO_PKG_VERSION").to_string(),
             now: chrono::Utc::now().to_rfc3339(),
         };
-        self.system
-            .initialize(&ctx, &domain_params)
-            .await
-            .map_err(|err| err.to_string())?;
+        crate::wiring_postgres_system_initialize::initialize_system(&self.pool, &domain_params)
+            .await?;
+
+        // The transaction bypasses the repository objects so all potentially
+        // cached bootstrap values must be evicted after the commit. Cache
+        // invalidation is best-effort: returning an error after a successful
+        // commit would make a safe retry look like a failed initialization.
+        for key in [
+            system_key::JWT_SECRET_KEY,
+            system_key::BRAND_NAME,
+            system_key::DEFAULT_DATA_STORAGE_ID,
+            system_key::GENERAL_SETTINGS,
+            system_key::VERSION,
+            system_key::INITIALIZED,
+        ] {
+            if let Err(error) = self.system.invalidate_system_value_cache(key).await {
+                tracing::warn!(key, %error, "failed to invalidate committed bootstrap setting");
+            }
+        }
         Ok(())
     }
 
@@ -4503,6 +4532,7 @@ struct DbSigninService {
     /// System repo for fetching the JWT secret at token-generation time.
     /// The secret is persisted by `initialize` under `system_jwt_secret_key`.
     system_repo: Arc<dyn conduit_db::repo::SystemRepo>,
+    session_ttl: std::time::Duration,
 }
 
 /// Simple hex decoder (lowercase hex, matching Go's `hex.EncodeToString` output).
@@ -4536,8 +4566,16 @@ fn decode_nibble(byte: u8, index: usize) -> Result<u8, SigninError> {
 }
 
 impl DbSigninService {
-    fn new(auth: Arc<AuthService>, system_repo: Arc<dyn conduit_db::repo::SystemRepo>) -> Self {
-        Self { auth, system_repo }
+    fn new(
+        auth: Arc<AuthService>,
+        system_repo: Arc<dyn conduit_db::repo::SystemRepo>,
+        session_ttl: std::time::Duration,
+    ) -> Self {
+        Self {
+            auth,
+            system_repo,
+            session_ttl,
+        }
     }
 }
 
@@ -4621,7 +4659,10 @@ impl SigninService for DbSigninService {
         // Build JWT claims with the user's numeric id (Go's `user_id` claim is i64).
         // The session scope is a minimal default; a full implementation would
         // include project-specific scopes.
-        let claims = Claims::new(user.id, "session:project:default");
+        let ttl = chrono::Duration::from_std(self.session_ttl).map_err(|_| {
+            SigninError::Internal("configured JWT session TTL is too large".to_string())
+        })?;
+        let claims = Claims::with_ttl(user.id, "session:project:default", ttl);
 
         encode_hs256(&claims, secret_bytes).map_err(|e| SigninError::Internal(e.to_string()))
     }
@@ -5639,6 +5680,34 @@ impl OpenAiOrchestratorService for BridgeOrchestratorService {
                 Ok(OpenAiHandlerOutput::LiveStream(
                     conduit_http::openai_handlers::LiveEventStream(rx),
                 ))
+            }
+            BridgeOutput::LiveBinary {
+                stream: live,
+                content_type,
+            } => {
+                // Headers are already committed once Axum starts a binary
+                // body, so a terminal provider failure can only abort that
+                // body. Still apply the configured policy before forwarding
+                // the typed error to avoid leaking upstream details through
+                // any downstream observer.
+                let policy = resolve_upstream_error_policy(&self.system).await;
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                let mut upstream = live.0;
+                tokio::spawn(async move {
+                    while let Some(item) = upstream.recv().await {
+                        let stop = item.is_err();
+                        let item = item.map_err(|error| {
+                            conduit_pipeline::apply_upstream_error_policy(&policy, error)
+                        });
+                        if tx.send(item).await.is_err() || stop {
+                            break;
+                        }
+                    }
+                });
+                Ok(OpenAiHandlerOutput::LiveBinary {
+                    stream: conduit_http::openai_handlers::LiveEventStream(rx),
+                    content_type,
+                })
             }
         }
     }

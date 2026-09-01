@@ -5,6 +5,7 @@ import { ArrowLeft, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { getTokenFromStorage } from '@/stores/authStore';
 import { useSelectedProjectId } from '@/stores/projectStore';
+import { withBasePath } from '@/lib/base-path';
 import { extractNumberID } from '@/lib/utils';
 import { usePermissions } from '@/hooks/usePermissions';
 import { Button } from '@/components/ui/button';
@@ -234,7 +235,7 @@ export default function RequestDetailPage() {
 
     async function connectPreview() {
       try {
-        const response = await fetch(`/admin/requests/${encodeURIComponent(requestIdNumber)}/preview`, {
+        const response = await fetch(withBasePath(`/admin/requests/${encodeURIComponent(requestIdNumber)}/preview`), {
           headers: {
             Authorization: `Bearer ${token}`,
             'X-Project-ID': selectedProjectId,

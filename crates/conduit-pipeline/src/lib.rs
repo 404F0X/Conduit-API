@@ -19,12 +19,13 @@ pub use middleware::{
 pub use pipeline::{
     AttemptError, AttemptObservation, AttemptObservationOutcome, AttemptObserver, AttemptOutcome,
     AttemptRecord, AttemptStage, CanRetryFn, CustomizeExecutorFn, ExecutionMode, Executor,
-    FailoverError, HasMoreChannelsFn, IsTimeoutErrorFn, MAX_RETRY_RESPONSE_TIMEOUT_SECONDS,
-    NON_STREAM_RESPONSE_TIMEOUT_CODE, Pipeline, PipelineCandidate, RetryContext, RetryDecision,
-    RetryHooks, RetryPolicy, RetryState, STREAM_FIRST_EVENT_TIMEOUT_CODE, StreamMode,
-    clamp_response_timeout_seconds, decide_retry, decide_stream_mode,
-    is_non_stream_response_timeout, is_response_timeout_error, is_stream_first_event_timeout,
-    non_stream_response_timeout_error, stream_first_event_timeout_error,
+    FailoverError, HasMoreChannelsFn, IsTimeoutErrorFn, LiveUpstreamResponse,
+    MAX_RETRY_RESPONSE_TIMEOUT_SECONDS, NON_STREAM_RESPONSE_TIMEOUT_CODE, Pipeline,
+    PipelineCandidate, RetryContext, RetryDecision, RetryHooks, RetryPolicy, RetryState,
+    STREAM_FIRST_EVENT_TIMEOUT_CODE, StreamMode, clamp_response_timeout_seconds, decide_retry,
+    decide_stream_mode, is_non_stream_response_timeout, is_response_timeout_error,
+    is_stream_first_event_timeout, non_stream_response_timeout_error,
+    stream_first_event_timeout_error,
 };
 
 pub const CRATE_NAME: &str = "conduit-pipeline";

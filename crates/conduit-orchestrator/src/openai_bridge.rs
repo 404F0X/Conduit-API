@@ -132,6 +132,12 @@ pub enum OpenAiHandlerOutput {
     /// layer forwards each event to the client as an SSE frame as it arrives,
     /// instead of collecting the whole stream first.
     LiveStream(LiveEventStream),
+    /// Live raw-audio response. Chunks use `StreamEvent::binary`; the provider
+    /// content type is captured before body polling begins.
+    LiveBinary {
+        stream: LiveEventStream,
+        content_type: Option<String>,
+    },
 }
 
 /// Wrapper carrying the live client-facing event receiver so
@@ -268,7 +274,8 @@ impl OpenAiOrchestratorBridge {
         // layer flushes as SSE frames as they arrive — instead of collecting
         // the whole stream first. Mirrors Go `orchestrator.go:331-335`
         // (`if result.Stream { return …ChatCompletionStream: result.EventStream }`).
-        if candidate_request.stream {
+        if should_use_live_stream(candidate_request.stream) {
+            let binary_speech = is_binary_speech_stream(route, &raw_inbound);
             let handle = self
                 .orchestrator
                 .process_command_stream_with_resolved_candidates(
@@ -285,6 +292,12 @@ impl OpenAiOrchestratorBridge {
                 )
                 .await
                 .map_err(|err| err.source)?;
+            if binary_speech {
+                return Ok(OpenAiHandlerOutput::LiveBinary {
+                    stream: LiveEventStream(handle.client_rx),
+                    content_type: handle.content_type,
+                });
+            }
             return Ok(OpenAiHandlerOutput::LiveStream(LiveEventStream(
                 handle.client_rx,
             )));
@@ -322,6 +335,19 @@ impl OpenAiOrchestratorBridge {
         // ---- 6. Map HttpResponse → OpenAiHandlerOutput ----
         Ok(map_http_response_to_output(http_response))
     }
+}
+
+const fn should_use_live_stream(requested_stream: bool) -> bool {
+    requested_stream
+}
+
+fn is_binary_speech_stream(route: OpenAiRoute, request: &HttpRequest) -> bool {
+    route == OpenAiRoute::AudioSpeech
+        && request
+            .metadata
+            .get("audio_stream_mode")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("binary"))
 }
 
 /// Return the caller-supplied request id, or mint one before candidate
@@ -395,7 +421,14 @@ pub fn map_http_response_to_output(response: HttpResponse) -> OpenAiHandlerOutpu
 
     // Extract content-type from headers (if present).
     // HeaderMap is BTreeMap<String, String>, so get returns Option<&String>.
-    let content_type = response.headers.get("content-type").cloned();
+    let content_type = response.headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type")
+            .then(|| value.clone())
+    });
+
+    if content_type.as_deref().is_some_and(is_binary_content_type) {
+        return OpenAiHandlerOutput::Binary { body, content_type };
+    }
 
     if response.stream.is_empty() {
         // Non-stream response — Go `result.ChatCompletion` branch.
@@ -419,6 +452,16 @@ pub fn map_http_response_to_output(response: HttpResponse) -> OpenAiHandlerOutpu
 
         OpenAiHandlerOutput::Stream(stream_events)
     }
+}
+
+fn is_binary_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    media_type.starts_with("audio/") || media_type == "application/octet-stream"
 }
 
 // ===========================================================================
@@ -462,6 +505,25 @@ mod tests {
 
         assert_eq!(ensure_routing_request_id(&mut request), "caller-request-42");
         assert_eq!(request.request_id.as_deref(), Some("caller-request-42"));
+    }
+
+    #[test]
+    fn binary_speech_uses_live_branch_with_distinct_wire_mode() {
+        let mut request = HttpRequest::default();
+        request.metadata.insert(
+            "audio_stream_mode".to_string(),
+            serde_json::Value::String("binary".to_string()),
+        );
+        assert!(should_use_live_stream(true));
+        assert!(is_binary_speech_stream(OpenAiRoute::AudioSpeech, &request));
+
+        request.metadata.insert(
+            "audio_stream_mode".to_string(),
+            serde_json::Value::String("sse".to_string()),
+        );
+        assert!(should_use_live_stream(true));
+        assert!(!is_binary_speech_stream(OpenAiRoute::AudioSpeech, &request));
+        assert!(!should_use_live_stream(false));
     }
 
     #[test]
@@ -616,6 +678,27 @@ mod tests {
                 assert_eq!(resp.content_type.as_deref(), Some("application/json"));
             }
             _ => panic!("Expected NonStream variant"),
+        }
+    }
+
+    #[test]
+    fn binary_audio_response_maps_to_binary_output() {
+        let mut response = HttpResponse {
+            status: 200,
+            body: Some(vec![0x49, 0x44, 0x33, 0x04]),
+            ..HttpResponse::default()
+        };
+        response.headers.insert(
+            "Content-Type".to_string(),
+            "audio/mpeg; charset=binary".to_string(),
+        );
+
+        match map_http_response_to_output(response) {
+            OpenAiHandlerOutput::Binary { body, content_type } => {
+                assert_eq!(body, vec![0x49, 0x44, 0x33, 0x04]);
+                assert_eq!(content_type.as_deref(), Some("audio/mpeg; charset=binary"));
+            }
+            other => panic!("expected binary output, got {other:?}"),
         }
     }
 

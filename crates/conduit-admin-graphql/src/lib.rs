@@ -362,6 +362,22 @@ impl QueryRoot {
             .map_err(|error| error.to_string())
     }
 
+    /// Administrative redemption-code inventory. Plaintext codes are never
+    /// returned by this query.
+    async fn credit_redemption_codes(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 50)] limit: i32,
+        #[graphql(default = 0)] offset: i32,
+    ) -> Result<billing::CreditRedemptionCodePage, String> {
+        billing::validate_credit_redemption_pagination(limit, offset)
+            .map_err(|error| error.to_string())?;
+        billing::billing_services(ctx)?
+            .credit_redemption_codes(limit, offset)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn subscription_plans(
         &self,
         ctx: &Context<'_>,
@@ -806,6 +822,11 @@ impl QueryRoot {
         >,
     ) -> Result<profile_template::APIKeyProfileTemplateConnection, String> {
         let services = profile_template::profile_template_query_services(ctx)?;
+        let access = policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_API_KEYS,
+        )
+        .map_err(|error| error.to_string())?;
         let args = profile_template::APIKeyProfileTemplateConnectionArgs {
             after: after.map(|cursor| cursor.0),
             first,
@@ -815,7 +836,7 @@ impl QueryRoot {
             where_filter,
         };
         services
-            .api_key_profile_templates(args)
+            .api_key_profile_templates_with_access(&access, args)
             .await
             .map_err(|err| err.to_string())
     }
@@ -852,7 +873,15 @@ impl QueryRoot {
             order_by: project::resolve_project_order(order_by),
             where_filter,
         };
-        services.projects(args).await.map_err(|err| err.to_string())
+        let access = policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
+        services
+            .projects_with_access(&access, args)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// `Query.prompts` — ent connection query over prompts. Mirrors the Go
@@ -885,7 +914,15 @@ impl QueryRoot {
             order_by: prompt::resolve_prompt_order(order_by),
             where_filter,
         };
-        services.prompts(args).await.map_err(|err| err.to_string())
+        let access = policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
+        services
+            .prompts_with_access(&access, args)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// `Query.promptProtectionRules` — ent connection query over prompt
@@ -958,7 +995,15 @@ impl QueryRoot {
             order_by: role::resolve_role_order(order_by),
             where_filter,
         };
-        services.roles(args).await.map_err(|err| err.to_string())
+        let access = policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_ROLES,
+        )
+        .map_err(|error| error.to_string())?;
+        services
+            .roles_with_access(&access, args)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// `Query.users` — ent connection query over users. Mirrors the Go
@@ -992,7 +1037,15 @@ impl QueryRoot {
             order_by: user::resolve_user_order(order_by),
             where_filter,
         };
-        services.users(args).await.map_err(|err| err.to_string())
+        let access = policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_USERS,
+        )
+        .map_err(|error| error.to_string())?;
+        services
+            .users_with_access(&access, args)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     // -----------------------------------------------------------------
@@ -1067,6 +1120,7 @@ impl QueryRoot {
     ) -> Result<request_usage::RequestConnection, String> {
         let services = request_usage::request_query_services(ctx)?;
         let args = request_usage::RequestConnectionArgs {
+            access: request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -1100,6 +1154,7 @@ impl QueryRoot {
     ) -> Result<request_usage::UsageLogConnection, String> {
         let services = request_usage::usage_log_query_services(ctx)?;
         let args = request_usage::UsageLogConnectionArgs {
+            access: request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -1395,6 +1450,7 @@ impl QueryRoot {
     ) -> Result<threads_ext::ThreadConnection, String> {
         let services = threads_ext::thread_query_services(ctx)?;
         let args = threads_ext::ThreadConnectionArgs {
+            access: request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -1425,6 +1481,7 @@ impl QueryRoot {
     ) -> Result<threads_ext::TraceConnection, String> {
         let services = threads_ext::trace_query_services(ctx)?;
         let args = threads_ext::TraceConnectionArgs {
+            access: request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -1897,6 +1954,41 @@ mod tests {
             !sdl.contains("modelsData"),
             "modelsData is a frontend variable, not a GraphQL root field"
         );
+    }
+
+    #[test]
+    fn credit_redemption_contract_exposes_secrets_only_on_create_payload() {
+        let sdl = build_admin_schema().sdl();
+        for expected in [
+            "creditRedemptionCodes(limit: Int! = 50, offset: Int! = 0): CreditRedemptionCodePage!",
+            "createCreditRedemptionCodes(input: CreateCreditRedemptionCodesInput!): CreateCreditRedemptionCodesPayload!",
+            "revokeCreditRedemptionCode(id: ID!): CreditRedemptionCode!",
+            "redeemCreditCode(code: String!): CreditRedemptionReceipt!",
+            "input CreateCreditRedemptionCodesInput",
+            "type CreditRedemptionCode",
+            "type CreditRedemptionCodePage",
+            "type CreditRedemptionReceipt",
+            "type GeneratedCreditRedemptionCode",
+            "description: String",
+            "maxRedemptions: Int! = 1",
+            "redemptionCount: Int!",
+            "remainingRedemptions: Int!",
+        ] {
+            assert!(sdl.contains(expected), "admin SDL is missing {expected}");
+        }
+
+        let inventory = sdl
+            .split("type CreditRedemptionCode {")
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("CreditRedemptionCode SDL block");
+        assert!(!inventory.contains("code: String"));
+        let generated = sdl
+            .split("type GeneratedCreditRedemptionCode {")
+            .nth(1)
+            .and_then(|tail| tail.split('}').next())
+            .expect("GeneratedCreditRedemptionCode SDL block");
+        assert!(generated.contains("code: String!"));
     }
 
     #[test]

@@ -5,33 +5,11 @@
     "ApiAuthConfig": {
       "additionalProperties": false,
       "properties": {
-        "admin_token": {
-          "default": null,
-          "description": "NOT WIRED (P-53): parsed but no auth middleware consumes it. Admin access is gated by the JWT resolver (P-01/P-33), not a static token, so setting this has no effect.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "allow_no_auth_fallback": {
-          "default": false,
-          "description": "NOT WIRED (P-53): parsed but no auth middleware consumes it; the no-auth sentinel is always rejected (see `no_auth_sentinel`).",
-          "type": "boolean"
-        },
-        "api_key_header": {
-          "default": "Authorization",
-          "description": "NOT WIRED (P-53): parsed but the API-key extractor uses a fixed header set (Authorization / X-Goog-Api-Key / query param), not this config.",
-          "type": "string"
-        },
         "bcrypt_cost": {
           "default": 12,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
-        },
-        "enabled": {
-          "default": true,
-          "type": "boolean"
         },
         "jwt_secret": {
           "default": null,
@@ -40,14 +18,9 @@
             "null"
           ]
         },
-        "no_auth_sentinel": {
-          "default": "CONDUIT_API_KEY_NO_AUTH",
-          "description": "NOT WIRED (P-53): parsed but the sentinel check uses the hardcoded `NO_AUTH_SENTINEL` constant (`conduit-auth`), not this config value.",
-          "type": "string"
-        },
         "session_ttl": {
           "default": "1d",
-          "description": "NOT WIRED (P-53): parsed but no session store honors it. JWT expiry is driven by the token `exp` claim at sign time, not this config value.",
+          "description": "Lifetime applied to password and OIDC login JWTs at sign time.",
           "type": "string"
         }
       },
@@ -806,7 +779,7 @@
         },
         "disable_ssl_verify": {
           "default": false,
-          "description": "Go `server.Config.DisableSSLVerify` (`disable_ssl_verify`). Go default: false.\n\nNOT WIRED (P-53): parsed but no HTTP client honors it. The upstream `reqwest::Client` instances are built with default TLS verification and never read this flag, so setting `true` does not relax cert checks (e.g. for a self-signed upstream). Wiring requires threading the flag into every `reqwest::Client::builder()` call site (`danger_accept_invalid_certs`).",
+          "description": "Go `server.Config.DisableSSLVerify` (`disable_ssl_verify`). Go default: false.\n\nApplied to the provider-facing upstream client, including clients rebuilt for per-channel proxy configuration. Keep disabled in production unless a self-signed upstream is explicitly trusted.",
           "type": "boolean"
         },
         "graceful_shutdown_timeout": {
@@ -865,10 +838,13 @@
           },
           "description": "Go `server.Config.Trace` (`trace`) — mirrors `tracing.Config` (`conduit/internal/tracing/tracing.go`)."
         },
-        "write_timeout": {
-          "default": "30s",
-          "description": "NOT WIRED (P-53): Rust-only field, parsed but no HTTP server honors it (axum/hyper have no per-write deadline knob consumed here).",
-          "type": "string"
+        "trusted_proxies": {
+          "default": [],
+          "description": "Exact IP addresses or CIDR ranges whose forwarding headers may be trusted. Empty by default: direct clients cannot spoof their source IP.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -935,13 +911,8 @@
         }
       ],
       "default": {
-        "admin_token": null,
-        "allow_no_auth_fallback": false,
-        "api_key_header": "Authorization",
         "bcrypt_cost": 12,
-        "enabled": true,
         "jwt_secret": null,
-        "no_auth_sentinel": "CONDUIT_API_KEY_NO_AUTH",
         "session_ttl": "1d"
       }
     },
@@ -1162,7 +1133,7 @@
           "thread_header": "Conduit-Thread-Id",
           "trace_header": "Conduit-Trace-Id"
         },
-        "write_timeout": "30s"
+        "trusted_proxies": []
       }
     }
   },

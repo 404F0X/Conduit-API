@@ -243,6 +243,25 @@ mod tests {
         let (key_two_id, key_two_guid, _) =
             create_key(&schema, &principal_two, &format!("OpenAPI Key P2 {suffix}")).await?;
 
+        let invalid_update = execute(
+            &schema,
+            &principal_one,
+            UPDATE_PROFILES,
+            json!({
+                "id": key_one_guid,
+                "input": {
+                    "activeProfile": "Missing",
+                    "profiles": [{"name": "Scoped", "modelIDs": [model_id]}]
+                }
+            }),
+        )
+        .await;
+        let invalid_error = response_error(invalid_update)?;
+        assert!(
+            invalid_error.contains("active profile 'Missing' does not exist"),
+            "unexpected profile validation error: {invalid_error}"
+        );
+
         let scoped_profile = json!({
             "activeProfile": "Scoped",
             "profiles": [{

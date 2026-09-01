@@ -1,0 +1,78 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "chat_cross_protocol_client_response",
+  "api_format": "openai_responses",
+  "stream": false,
+  "source": {
+    "note": "Regression contract for COR-004. A Chat Completions-shaped unified response must be rendered as an OpenAI Responses response when the client called /v1/responses and the selected upstream used another protocol."
+  },
+  "inbound_http": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "content_type": "application/json",
+    "body_json": {
+      "model": "gpt-test",
+      "input": "hello"
+    }
+  },
+  "unified_request": null,
+  "selected_channel": null,
+  "outbound_http": null,
+  "upstream_http": {
+    "status_code": 200,
+    "content_type": "application/json",
+    "body_json": {
+      "id": "resp_cross_protocol",
+      "object": "chat.completion",
+      "created": 1700000000,
+      "model": "gpt-test",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "hello"
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  },
+  "client_http": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": ["application/json"],
+      "Cache-Control": ["no-cache"]
+    },
+    "content_type": "application/json",
+    "body_json": {
+      "id": "resp_cross_protocol",
+      "object": "response",
+      "created_at": 1700000000,
+      "status": "completed",
+      "model": "gpt-test",
+      "output": [
+        {
+          "id": "msg_cross_protocol",
+          "type": "message",
+          "status": "completed",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "text": "hello"
+            }
+          ]
+        }
+      ],
+      "usage": {
+        "input_tokens": 3,
+        "input_tokens_details": {"cached_tokens": 1},
+        "output_tokens": 2,
+        "output_tokens_details": {"reasoning_tokens": 1},
+        "total_tokens": 5
+      }
+    }
+  }
+}

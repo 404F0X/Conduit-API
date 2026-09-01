@@ -77,6 +77,17 @@ pub fn serve_from_asset_source(
     request_path: &str,
     source: &dyn crate::asset_source::AssetSource,
 ) -> Response<Body> {
+    serve_from_asset_source_with_base_path(request_path, "", source)
+}
+
+/// Serve static content mounted beneath `base_path`. SPA index responses are
+/// annotated with a document base and a runtime base-path meta value so both
+/// Vite chunks, client-side navigation, and API calls resolve consistently.
+pub fn serve_from_asset_source_with_base_path(
+    request_path: &str,
+    base_path: &str,
+    source: &dyn crate::asset_source::AssetSource,
+) -> Response<Body> {
     use axum::http::header::{EXPIRES, PRAGMA};
 
     let cleaned = request_path
@@ -98,7 +109,7 @@ pub fn serve_from_asset_source(
                     (PRAGMA, SPA_INDEX_PRAGMA),
                     (EXPIRES, SPA_INDEX_EXPIRES),
                 ],
-                bytes.into_owned(),
+                inject_frontend_base_path(bytes.as_ref(), base_path),
             )
                 .into_response(),
             None => static_index_missing_response(),
@@ -106,7 +117,7 @@ pub fn serve_from_asset_source(
     }
 
     // Asset path (has an extension): try the source, else JSON 404.
-    match source.read(request_path) {
+    match source.read(cleaned) {
         Some(bytes) => {
             let content_path = Path::new(cleaned);
             (
@@ -120,6 +131,34 @@ pub fn serve_from_asset_source(
                 .into_response()
         }
         None => static_asset_not_found_response(Path::new(cleaned)),
+    }
+}
+
+fn inject_frontend_base_path(index: &[u8], base_path: &str) -> Vec<u8> {
+    let base_path = base_path.trim_end_matches('/');
+    let href = if base_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("{base_path}/")
+    };
+    let runtime =
+        format!("<base href=\"{href}\"><meta name=\"conduit-base-path\" content=\"{base_path}\">");
+    let html = String::from_utf8_lossy(index);
+    // The HTML parser resolves relative resource URLs as it encounters them.
+    // Injecting <base> at the end of <head> is therefore too late for Vite's
+    // preceding ./assets/* tags on a nested SPA route such as /project/wallet.
+    // Keep it as the first head child so every relative URL uses the mount root.
+    let head_content_start = html
+        .find("<head")
+        .and_then(|head_start| html[head_start..].find('>').map(|end| head_start + end + 1));
+    if let Some(head_content_start) = head_content_start {
+        let mut output = String::with_capacity(html.len() + runtime.len());
+        output.push_str(&html[..head_content_start]);
+        output.push_str(&runtime);
+        output.push_str(&html[head_content_start..]);
+        output.into_bytes()
+    } else {
+        format!("{runtime}{html}").into_bytes()
     }
 }
 
@@ -172,7 +211,7 @@ fn matches_api_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
-fn api_not_found_response() -> Response<Body> {
+pub(crate) fn api_not_found_response() -> Response<Body> {
     let body = json!({
         "error": {
             "code": "not_found",
@@ -488,6 +527,37 @@ mod tests {
                 .map(|v| v.to_str().unwrap_or("")),
             Some(SPA_INDEX_EXPIRES)
         );
+    }
+
+    #[test]
+    fn spa_index_injection_carries_runtime_base_path() {
+        let output = inject_frontend_base_path(
+            b"<html><head><title>Conduit</title></head><body></body></html>",
+            "/gateway",
+        );
+        let html = String::from_utf8(output).expect("injected index remains UTF-8");
+
+        assert!(html.contains("<base href=\"/gateway/\">"));
+        assert!(html.contains("name=\"conduit-base-path\" content=\"/gateway\""));
+    }
+
+    #[test]
+    fn spa_index_injection_precedes_relative_assets() {
+        let output = inject_frontend_base_path(
+            br#"<html><head data-app="conduit"><script src="./assets/app.js"></script><link href="./assets/app.css"></head><body></body></html>"#,
+            "",
+        );
+        let html = String::from_utf8(output).expect("injected index remains UTF-8");
+
+        let base = html.find("<base href=\"/\">").expect("base is injected");
+        let script = html
+            .find("./assets/app.js")
+            .expect("script remains present");
+        let stylesheet = html
+            .find("./assets/app.css")
+            .expect("stylesheet remains present");
+        assert!(base < script, "base must precede the first relative script");
+        assert!(base < stylesheet, "base must precede relative stylesheets");
     }
 
     #[test]

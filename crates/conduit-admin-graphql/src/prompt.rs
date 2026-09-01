@@ -847,6 +847,8 @@ pub enum PromptServiceError {
     InvalidRuleSettings(String),
     #[error("prompt not found or not in project")]
     PromptNotFound,
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("failed to query prompt protection rule: {0}")]
     RuleQuery(String),
     #[error("failed to create prompt: {0}")]
@@ -896,6 +898,21 @@ pub trait PromptQueryServices: Send + Sync {
         &self,
         args: PromptConnectionArgs,
     ) -> Result<PromptConnection, PromptServiceError>;
+
+    async fn prompts_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        args: PromptConnectionArgs,
+    ) -> Result<PromptConnection, PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.prompts(args).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped prompt listing requires a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
 }
 
 /// Backs `Query.promptProtectionRules` (Go ent.resolvers.go:425).
@@ -913,6 +930,21 @@ pub trait PromptMutationServices: Send + Sync {
     /// Mirrors `PromptService.CreatePrompt` (biz/prompt.go:126).
     async fn create_prompt(&self, input: CreatePromptInput) -> Result<Prompt, PromptServiceError>;
 
+    async fn create_prompt_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        input: CreatePromptInput,
+    ) -> Result<Prompt, PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.create_prompt(input).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped prompt creation requires a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `PromptService.UpdatePrompt` (biz/prompt.go:171).
     async fn update_prompt(
         &self,
@@ -920,8 +952,39 @@ pub trait PromptMutationServices: Send + Sync {
         input: UpdatePromptInput,
     ) -> Result<Prompt, PromptServiceError>;
 
+    async fn update_prompt_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+        input: UpdatePromptInput,
+    ) -> Result<Prompt, PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.update_prompt(id, input).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped prompt updates require a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `PromptService.DeletePrompt` (biz/prompt.go:241).
     async fn delete_prompt(&self, id: &str) -> Result<(), PromptServiceError>;
+
+    async fn delete_prompt_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+    ) -> Result<(), PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.delete_prompt(id).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped prompt deletion requires a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
 
     /// Mirrors `PromptService.UpdatePromptStatus` (biz/prompt.go:266).
     async fn update_prompt_status(
@@ -930,14 +993,82 @@ pub trait PromptMutationServices: Send + Sync {
         status: PromptStatus,
     ) -> Result<Prompt, PromptServiceError>;
 
+    async fn update_prompt_status_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+        status: PromptStatus,
+    ) -> Result<Prompt, PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.update_prompt_status(id, status).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped prompt status updates require a scoped service boundary"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `PromptService.BulkDeletePrompts` (biz/prompt.go:302).
     async fn bulk_delete_prompts(&self, ids: Vec<String>) -> Result<(), PromptServiceError>;
+
+    async fn bulk_delete_prompts_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.bulk_delete_prompts(ids).await,
+            crate::policy::AdminAccessScope::Project(_) if ids.is_empty() => Ok(()),
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped bulk prompt deletion requires a scoped service boundary"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
 
     /// Mirrors `PromptService.BulkEnablePrompts` (biz/prompt.go:323).
     async fn bulk_enable_prompts(&self, ids: Vec<String>) -> Result<(), PromptServiceError>;
 
+    async fn bulk_enable_prompts_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.bulk_enable_prompts(ids).await,
+            crate::policy::AdminAccessScope::Project(_) if ids.is_empty() => Ok(()),
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped bulk prompt updates require a scoped service boundary"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `PromptService.BulkDisablePrompts` (biz/prompt.go:345).
     async fn bulk_disable_prompts(&self, ids: Vec<String>) -> Result<(), PromptServiceError>;
+
+    async fn bulk_disable_prompts_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), PromptServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.bulk_disable_prompts(ids).await,
+            crate::policy::AdminAccessScope::Project(_) if ids.is_empty() => Ok(()),
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(PromptServiceError::PermissionDenied(
+                    "project-scoped bulk prompt updates require a scoped service boundary"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
 }
 
 /// Backs the eight PromptProtectionRule mutations (Go
@@ -1550,11 +1681,18 @@ mod tests {
             .data(pm)
             .data(rq)
             .data(rm)
+            .data(system_context())
             .finish()
     }
 
     fn bare_schema() -> AdminSchema {
-        crate::build_admin_schema()
+        admin_schema_builder().data(system_context()).finish()
+    }
+
+    fn system_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(conduit_auth::Principal::system());
+        context
     }
 
     // -----------------------------------------------------------------

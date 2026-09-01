@@ -1,6 +1,7 @@
 use crate::model::AppConfig;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::net::IpAddr;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +60,25 @@ pub fn validate(config: &AppConfig) -> Result<(), ValidationError> {
     }
 
     validate_base_path(&config.server.base_path, &mut errors);
+    validate_trusted_proxies(&config.server.trusted_proxies, &mut errors);
     validate_cors_origins(&config.server.cors.allowed_origins, &mut errors);
+    validate_public_base_url("server.public_url", &config.server.public_url, &mut errors);
+    if let Some(redirect_base_url) = config.oidc.redirect_base_url.as_deref() {
+        validate_public_base_url("oidc.redirect_base_url", redirect_base_url, &mut errors);
+    }
+    if config.oidc.enabled
+        && config
+            .oidc
+            .redirect_base_url
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && config.server.public_url.trim().is_empty()
+    {
+        errors.push(
+            "OIDC requires oidc.redirect_base_url or server.public_url; request Host headers are not a trusted canonical URL"
+                .to_string(),
+        );
+    }
 
     if config.retry.timeout > Duration::from_secs(600) {
         errors.push("retry.timeout must not exceed 600s".to_string());
@@ -142,6 +161,37 @@ fn validate_base_path(base_path: &str, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_trusted_proxies(entries: &[String], errors: &mut Vec<String>) {
+    for entry in entries {
+        let value = entry.trim();
+        if value.is_empty() {
+            errors.push("server.trusted_proxies entries must not be empty".to_string());
+            continue;
+        }
+        let valid = if let Some((address, prefix)) = value.split_once('/') {
+            if prefix.contains('/') {
+                false
+            } else {
+                match (
+                    address.trim().parse::<IpAddr>(),
+                    prefix.trim().parse::<u8>(),
+                ) {
+                    (Ok(IpAddr::V4(_)), Ok(prefix)) => prefix <= 32,
+                    (Ok(IpAddr::V6(_)), Ok(prefix)) => prefix <= 128,
+                    _ => false,
+                }
+            }
+        } else {
+            value.parse::<IpAddr>().is_ok()
+        };
+        if !valid {
+            errors.push(format!(
+                "server.trusted_proxies entry {entry:?} must be an IP address or CIDR range"
+            ));
+        }
+    }
+}
+
 /// Pure, standalone `server.base_path` validator.
 ///
 /// Mirrors the Go semantics encoded in the accumulation helper above and the
@@ -191,6 +241,31 @@ fn validate_cors_origins(origins: &[String], errors: &mut Vec<String>) {
                 "server.cors.allowed_origins entry {origin:?} must be '*' or an http(s) origin"
             ));
         }
+    }
+}
+
+fn validate_public_base_url(name: &str, value: &str, errors: &mut Vec<String>) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    let parsed = match url::Url::parse(value) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            errors.push(format!("{name} must be an absolute HTTP(S) URL"));
+            return;
+        }
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        errors.push(format!(
+            "{name} must be an absolute HTTP(S) URL without credentials, query, or fragment"
+        ));
     }
 }
 
@@ -419,5 +494,55 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn oidc_requires_a_configured_canonical_url() {
+        let mut config = AppConfig::default();
+        config.oidc.enabled = true;
+        let error = match validate(&config) {
+            Err(error) => error,
+            Ok(()) => panic!("expected OIDC without a canonical URL to be rejected"),
+        };
+        assert!(error.to_string().contains("request Host headers"));
+
+        config.oidc.redirect_base_url = Some("https://login.example.test/conduit".to_string());
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn canonical_urls_reject_credentials_and_non_http_schemes() {
+        for value in [
+            "ftp://example.test",
+            "https://user:secret@example.test",
+            "https://example.test/path?token=secret",
+        ] {
+            let mut config = AppConfig::default();
+            config.server.public_url = value.to_string();
+            let error = match validate(&config) {
+                Err(error) => error,
+                Ok(()) => panic!("expected invalid canonical URL to be rejected"),
+            };
+            let rendered = error.to_string();
+            assert!(rendered.contains("server.public_url"), "{rendered}");
+            assert!(!rendered.contains("secret"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_entries_accept_ip_and_cidr_but_reject_invalid_ranges() {
+        let mut config = AppConfig::default();
+        config.server.trusted_proxies = vec![
+            "127.0.0.1".to_string(),
+            "10.0.0.0/8".to_string(),
+            "2001:db8::/32".to_string(),
+        ];
+        assert!(validate(&config).is_ok());
+
+        for invalid in ["", "proxy.internal", "10.0.0.0/33", "2001:db8::/129"] {
+            config.server.trusted_proxies = vec![invalid.to_string()];
+            let error = validate(&config).expect_err("invalid trusted proxy must fail");
+            assert!(error.to_string().contains("server.trusted_proxies"));
+        }
     }
 }

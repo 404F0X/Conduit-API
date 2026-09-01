@@ -1,8 +1,8 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -10,8 +10,8 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::middleware::{
-    TracingHeaderConfig, extract_client_ip_candidates, insert_request_context, is_blocked_ip,
-    operation_name_for_logging, request_context_for_route, resolve_logging_trace_id,
+    TracingHeaderConfig, insert_request_context, is_blocked_ip, operation_name_for_logging,
+    request_context_for_route, resolve_logging_trace_id,
 };
 use crate::router::{RouteGroupKind, route_group_for_path, strip_base_path_for_mount};
 
@@ -35,9 +35,13 @@ pub async fn production_request_middleware(
 
     let route_path = strip_base_path_for_mount(&path, state.base_path()).unwrap_or(&path);
     let group = route_group_for_path(route_path);
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip());
 
     if should_apply_ip_blocklist(route_path, group.kind)
-        && request_ip_is_blocked(&state, request.headers()).await
+        && request_ip_is_blocked(&state, peer_ip, request.headers()).await
     {
         return (
             StatusCode::FORBIDDEN,
@@ -55,7 +59,11 @@ pub async fn production_request_middleware(
         return response;
     }
 
-    let client_ip = client_ip(request.headers());
+    let client_ip = resolve_client_ip(
+        peer_ip,
+        request.headers(),
+        &state.config().server.trusted_proxies,
+    );
     let context = request_context_for_route(
         matches!(group.kind, crate::router::RouteGroupKind::Playground),
         None,
@@ -118,7 +126,11 @@ fn should_apply_ip_blocklist(path: &str, kind: RouteGroupKind) -> bool {
     kind == RouteGroupKind::LlmApi || path == "/openapi" || path.starts_with("/openapi/")
 }
 
-async fn request_ip_is_blocked(state: &AppState, headers: &HeaderMap) -> bool {
+async fn request_ip_is_blocked(
+    state: &AppState,
+    peer_ip: Option<IpAddr>,
+    headers: &HeaderMap,
+) -> bool {
     let Some(system) = state.services().system_service() else {
         return false;
     };
@@ -133,17 +145,12 @@ async fn request_ip_is_blocked(state: &AppState, headers: &HeaderMap) -> bool {
         return false;
     }
 
-    let forwarded_headers = ["x-forwarded-for", "x-real-ip"]
-        .into_iter()
-        .filter_map(|name| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect::<Vec<_>>();
-    let candidates = extract_client_ip_candidates(None, &forwarded_headers);
-    is_blocked_ip(&candidates, &blocked_ips)
+    let Some(client_ip) =
+        resolve_client_ip(peer_ip, headers, &state.config().server.trusted_proxies)
+    else {
+        return false;
+    };
+    is_blocked_ip(&[client_ip.to_string()], &blocked_ips)
 }
 
 fn validate_cors(
@@ -216,18 +223,52 @@ fn apply_cors_headers(state: &AppState, headers: &mut HeaderMap, origin: Option<
     }
 }
 
-fn client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+fn resolve_client_ip(
+    peer_ip: Option<IpAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[String],
+) -> Option<IpAddr> {
+    let peer_ip = peer_ip?;
+    if !ip_matches_ranges(peer_ip, trusted_proxies) {
+        return Some(peer_ip);
+    }
+
+    let mut forwarded = Vec::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        forwarded.extend(
+            value
+                .split(',')
+                .filter_map(|candidate| candidate.trim().parse::<IpAddr>().ok()),
+        );
+    }
+
+    if !forwarded.is_empty() {
+        // A compliant proxy appends its observed client to the right. Walk
+        // toward the origin, discard every explicitly trusted hop, and use
+        // the first untrusted address. This prevents a caller-controlled
+        // leftmost value from overriding the actual client address.
+        if let Some(client) = forwarded
+            .iter()
+            .rev()
+            .find(|candidate| !ip_matches_ranges(**candidate, trusted_proxies))
+        {
+            return Some(*client);
+        }
+        return forwarded.first().copied();
+    }
+
     headers
-        .get("x-forwarded-for")
+        .get("x-real-ip")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|value| value.to_str().ok())
-        })
-        .map(str::trim)
-        .and_then(|value| value.parse().ok())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .or(Some(peer_ip))
+}
+
+fn ip_matches_ranges(ip: IpAddr, ranges: &[String]) -> bool {
+    is_blocked_ip(&[ip.to_string()], ranges)
 }
 
 fn tracing_config(state: &AppState) -> TracingHeaderConfig {
@@ -351,6 +392,12 @@ mod tests {
         }))
     }
 
+    fn with_peer(mut request: Request<Body>, peer_ip: &str) -> Request<Body> {
+        let address = SocketAddr::new(peer_ip.parse().expect("test peer IP is valid"), 43123);
+        request.extensions_mut().insert(ConnectInfo(address));
+        request
+    }
+
     #[tokio::test]
     async fn preflight_bypasses_routes_and_emits_cors_headers()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -390,7 +437,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_ip_rejects_llm_and_openapi_routes_before_cors()
+    async fn blocked_peer_cannot_bypass_blocklist_with_forged_forwarding_headers()
     -> Result<(), Box<dyn std::error::Error>> {
         let app = wrapped_router_with_services(
             conduit_config::AppConfig::default(),
@@ -400,13 +447,15 @@ mod tests {
         for path in ["/v1/models", "/openapi/v1/graphql"] {
             let response = app
                 .clone()
-                .oneshot(
+                .oneshot(with_peer(
                     Request::builder()
                         .uri(path)
-                        .header("x-forwarded-for", "203.0.113.9, 10.0.0.1")
+                        .header("x-forwarded-for", "198.51.100.44")
+                        .header("x-real-ip", "198.51.100.45")
                         .header(header::ORIGIN, "https://ui.example")
                         .body(Body::empty())?,
-                )
+                    "203.0.113.9",
+                ))
                 .await?;
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "path {path}");
             assert!(
@@ -447,12 +496,13 @@ mod tests {
         let mut config = conduit_config::AppConfig::default();
         config.server.base_path = "/gateway".to_string();
         let response = wrapped_router_with_services(config, blocklist_services(&["2001:db8::/32"]))
-            .oneshot(
+            .oneshot(with_peer(
                 Request::builder()
                     .uri("/gateway/v1/models")
-                    .header("x-real-ip", "2001:db8::8")
+                    .header("x-real-ip", "198.51.100.1")
                     .body(Body::empty())?,
-            )
+                "2001:db8::8",
+            ))
             .await?;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -466,15 +516,79 @@ mod tests {
             read_fails: true,
         }));
         let response = wrapped_router_with_services(conduit_config::AppConfig::default(), services)
-            .oneshot(
+            .oneshot(with_peer(
                 Request::builder()
                     .uri("/v1/models")
                     .header("x-real-ip", "203.0.113.9")
                     .body(Body::empty())?,
-            )
+                "203.0.113.9",
+            ))
             .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_client_ip_is_used_only_for_explicitly_trusted_proxy_peers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.77, 203.0.113.9, 10.0.0.3"),
+        );
+        let trusted = vec!["10.0.0.0/8".to_string()];
+
+        assert_eq!(
+            resolve_client_ip(Some("192.0.2.20".parse().unwrap()), &headers, &trusted),
+            Some("192.0.2.20".parse().unwrap())
+        );
+        assert_eq!(
+            resolve_client_ip(Some("10.0.0.2".parse().unwrap()), &headers, &trusted),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert_eq!(resolve_client_ip(None, &headers, &trusted), None);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_chain_preserves_blocked_actual_client()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = conduit_config::AppConfig::default();
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let response =
+            wrapped_router_with_services(config, blocklist_services(&["203.0.113.0/24"]))
+                .oneshot(with_peer(
+                    Request::builder()
+                        .uri("/v1/models")
+                        .header("x-forwarded-for", "198.51.100.77, 203.0.113.9, 10.0.0.3")
+                        .body(Body::empty())?,
+                    "10.0.0.2",
+                ))
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipv4_mapped_proxy_chain_matches_ipv4_trust_and_blocklist_cidrs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = conduit_config::AppConfig::default();
+        config.server.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let response =
+            wrapped_router_with_services(config, blocklist_services(&["203.0.113.0/24"]))
+                .oneshot(with_peer(
+                    Request::builder()
+                        .uri("/v1/models")
+                        .header(
+                            "x-forwarded-for",
+                            "::ffff:198.51.100.77, ::ffff:203.0.113.9, ::ffff:10.0.0.3",
+                        )
+                        .body(Body::empty())?,
+                    "::ffff:10.0.0.2",
+                ))
+                .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         Ok(())
     }
 }

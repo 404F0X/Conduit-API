@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { useAuthStore } from '@/stores/authStore';
 import { useSelectedProjectId } from '@/stores/projectStore';
+import { withBasePath } from '@/lib/base-path';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -97,7 +98,7 @@ export default function Playground() {
 
   const { messages, sendMessage, status, setMessages, regenerate, stop } = useChat({
     transport: new DefaultChatTransport({
-      api: '/admin/playground/chat',
+      api: withBasePath('/admin/playground/chat'),
       credentials: 'include',
       headers: () => {
         const headers: Record<string, string> = {
@@ -304,21 +305,6 @@ export default function Playground() {
 
   return (
     <TooltipProvider>
-      {/* {process.env.NODE_ENV === 'development' && (
-        <AIDevtools
-          config={{
-            enabled: true,
-            position: 'bottom',
-            theme: 'dark',
-            streamCapture: {
-              enabled: true,
-              endpoint: '/admin/playground/chat',
-              autoConnect: true,
-            },
-          }}
-          enabled={true}
-        />
-      )} */}
       <div className='bg-background flex h-screen w-full flex-col md:flex-row'>
         {/* Settings Sidebar */}
 

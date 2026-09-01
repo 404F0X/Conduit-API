@@ -80,6 +80,62 @@ impl RequestExecutionRepo for PgRequestExecutionRepo {
         .await
         .map_err(|e| err("list all", e))
     }
+
+    async fn list_request_executions_by_channel_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        authorized_project_id: Option<&str>,
+        channel_id: &str,
+    ) -> RepoResult<Vec<RequestExecutionRow>> {
+        let channel_id = id(channel_id)?;
+        match authorized_project_id {
+            Some(project_id) => sqlx::query_as::<_, RequestExecutionRow>(&format!(
+                "SELECT {C} FROM request_executions \
+                 WHERE project_id=$1 AND channel_id=$2 ORDER BY created_at,id"
+            ))
+            .bind(id(project_id)?)
+            .bind(channel_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| err("list by channel and project", e)),
+            None => sqlx::query_as::<_, RequestExecutionRow>(&format!(
+                "SELECT {C} FROM request_executions \
+                 WHERE channel_id=$1 ORDER BY created_at,id"
+            ))
+            .bind(channel_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| err("list by channel", e)),
+        }
+    }
+
+    async fn list_request_executions_by_data_storage_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        authorized_project_id: Option<&str>,
+        data_storage_id: &str,
+    ) -> RepoResult<Vec<RequestExecutionRow>> {
+        let data_storage_id = id(data_storage_id)?;
+        match authorized_project_id {
+            Some(project_id) => sqlx::query_as::<_, RequestExecutionRow>(&format!(
+                "SELECT {C} FROM request_executions \
+                 WHERE project_id=$1 AND data_storage_id=$2 ORDER BY created_at,id"
+            ))
+            .bind(id(project_id)?)
+            .bind(data_storage_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| err("list by data storage and project", e)),
+            None => sqlx::query_as::<_, RequestExecutionRow>(&format!(
+                "SELECT {C} FROM request_executions \
+                 WHERE data_storage_id=$1 ORDER BY created_at,id"
+            ))
+            .bind(data_storage_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| err("list by data storage", e)),
+        }
+    }
     async fn update_request_execution_unchecked(
         &self,
         ctx: &RequestContext,

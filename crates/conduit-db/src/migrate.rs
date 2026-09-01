@@ -144,7 +144,9 @@ pub const ROUTE_AFFINITIES_SCHEMA_VERSION: &str = "000029";
 pub const PROVIDER_PRICE_ACCOUNTING_SCHEMA_VERSION: &str = "000030";
 pub const PRICING_CHANGE_AUDITS_SCHEMA_VERSION: &str = "000031";
 pub const CHANGE_SETS_SCHEMA_VERSION: &str = "000032";
-pub const LATEST_SCHEMA_VERSION: &str = CHANGE_SETS_SCHEMA_VERSION;
+pub const CREDIT_REDEMPTIONS_SCHEMA_VERSION: &str = "000033";
+pub const CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION: &str = "000034";
+pub const LATEST_SCHEMA_VERSION: &str = CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION;
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +300,14 @@ const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
     EmbeddedMigration {
         version: CHANGE_SETS_SCHEMA_VERSION,
         sql: include_str!("../../../migrations/postgres/000032_change_sets.sql"),
+    },
+    EmbeddedMigration {
+        version: CREDIT_REDEMPTIONS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000033_credit_redemptions.sql"),
+    },
+    EmbeddedMigration {
+        version: CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000034_credit_redemption_limits.sql"),
     },
 ];
 
@@ -619,13 +629,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_latest_pricing_review_migrations() -> Result<(), &'static str> {
+    fn catalog_includes_latest_pricing_and_credit_redemption_migrations() -> Result<(), &'static str>
+    {
         let migrations = migrations_for_dialect(Dialect::Postgres);
         assert_eq!(
             migrations.last().map(|migration| migration.version),
             Some(LATEST_SCHEMA_VERSION)
         );
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 31);
         assert!(
             migrations
                 .iter()
@@ -656,6 +667,31 @@ mod tests {
         assert!(change_sets.contains("change_set_events_append_only"));
         assert!(change_sets.contains("change_sets_activity"));
         assert!(change_sets.contains("status, updated_at DESC, id DESC"));
+
+        let redemptions = migration_sql(&migrations, CREDIT_REDEMPTIONS_SCHEMA_VERSION)?;
+        assert!(redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_batches"));
+        assert!(redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_codes"));
+        assert!(redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_receipts"));
+        assert!(
+            redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_transaction_audits")
+        );
+        assert!(redemptions.contains("code_digest ~ '^sha256:[0-9a-f]{64}$'"));
+        assert!(redemptions.contains("quantity BETWEEN 1 AND 1000"));
+        assert!(redemptions.contains("credit_redemption_batches_append_only"));
+        assert!(redemptions.contains("credit_redemption_codes_state_machine"));
+        assert!(redemptions.contains("credit_redemption_receipts_append_only"));
+        assert!(redemptions.contains("credit_redemption_transaction_audits_append_only"));
+
+        let redemption_limits =
+            migration_sql(&migrations, CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION)?;
+        assert!(
+            redemption_limits.contains("ADD COLUMN max_redemptions INTEGER NOT NULL DEFAULT 1")
+        );
+        assert!(redemption_limits.contains("max_redemptions BETWEEN 1 AND 100000"));
+        assert!(
+            redemption_limits.contains("DROP CONSTRAINT credit_redemption_receipts_code_id_key")
+        );
+        assert!(redemption_limits.contains("UNIQUE (code_id, user_id)"));
         assert!(accounting.contains("customer_charge_events_station_credit_currency"));
         assert!(accounting.contains("project_commercial_profiles_station_credit_currency"));
         assert!(accounting.contains("channel_model_prices_currency_code_iso"));

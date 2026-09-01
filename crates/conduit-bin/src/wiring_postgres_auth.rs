@@ -15,6 +15,7 @@ use conduit_http::auth_handlers::{
 use conduit_http::middleware::api_key_auth::{
     ApiKeyValidationError, ApiKeyValidationService, ValidatedApiKeyMetadata,
 };
+use conduit_services::apikey_service::validate_all_profiles;
 use conduit_services::{
     AuthApiKey, AuthApiKeyRepo, AuthApiKeyStatus, AuthApiKeyType, AuthProjectStatus,
     AuthServiceError, AuthUser, AuthUserRepo, AuthUserStatus,
@@ -97,6 +98,25 @@ impl PgApiKeyValidationService {
     }
 }
 
+fn parse_validated_profiles(
+    api_key_id: &str,
+    value: &serde_json::Value,
+) -> Result<APIKeyProfiles, ApiKeyValidationError> {
+    let profiles: APIKeyProfiles = serde_json::from_value(value.clone()).map_err(|_| {
+        tracing::warn!(api_key_id, "rejecting API key with malformed profile state");
+        ApiKeyValidationError::Invalid
+    })?;
+    if let Err(error) = validate_all_profiles(&profiles) {
+        tracing::warn!(
+            api_key_id,
+            reason = %error,
+            "rejecting API key with invalid profile state"
+        );
+        return Err(ApiKeyValidationError::Invalid);
+    }
+    Ok(profiles)
+}
+
 #[async_trait]
 impl ApiKeyValidationService for PgApiKeyValidationService {
     async fn validate(
@@ -123,12 +143,21 @@ impl ApiKeyValidationService for PgApiKeyValidationService {
             .await
             .map_err(|_| ApiKeyValidationError::Internal)?
             .ok_or(ApiKeyValidationError::Invalid)?;
-        let profiles: APIKeyProfiles = serde_json::from_value(row.profiles.clone())
-            .map_err(|_| ApiKeyValidationError::Internal)?;
-        let active = profiles
-            .profiles
-            .iter()
-            .find(|p| p.name == profiles.active_profile);
+        let profiles = parse_validated_profiles(&row.id, &row.profiles)?;
+        let active = if profiles.active_profile.is_empty() {
+            None
+        } else {
+            // The domain validator above guarantees that every non-empty
+            // selection resolves. Keep the explicit fail-closed branch here
+            // so future validator changes cannot reintroduce a bypass.
+            Some(
+                profiles
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.name == profiles.active_profile)
+                    .ok_or(ApiKeyValidationError::Invalid)?,
+            )
+        };
         let now = chrono::Utc::now();
         if active.is_some_and(|p| {
             p.valid_from.is_some_and(|v| now < v) || p.valid_until.is_some_and(|v| now >= v)
@@ -549,6 +578,24 @@ impl SignupService for PgSignupService {
 mod tests {
     use super::*;
     use conduit_db::policy::{PolicyContext, Principal};
+    use serde_json::json;
+
+    #[test]
+    fn persisted_profiles_fail_closed_when_active_selection_is_missing() {
+        let invalid = json!({
+            "activeProfile": "ghost",
+            "profiles": [{ "name": "production", "modelIDs": ["restricted-model"] }]
+        });
+
+        assert_eq!(
+            parse_validated_profiles("test-key", &invalid),
+            Err(ApiKeyValidationError::Invalid)
+        );
+        assert_eq!(
+            parse_validated_profiles("test-key", &json!({})),
+            Ok(APIKeyProfiles::default())
+        );
+    }
 
     #[tokio::test]
     async fn postgres_auth_expands_membership_and_role_scopes_when_dsn_is_provided()

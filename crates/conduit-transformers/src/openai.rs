@@ -2,7 +2,7 @@ use conduit_core::{ConduitError, ErrorKind};
 use conduit_llm::{
     ApiFormat, AudioRequest, ChatRequest, CompletionRequest, ContentPart, EmbeddingRequest,
     HttpRequest, HttpResponse, ImageRequest, LlmMessage, LlmRequest, LlmRequestPayload,
-    MessageContent, RequestType, ResponsesRequest, StreamEvent, ToolCall, UnifiedTool,
+    LlmResponse, MessageContent, RequestType, ResponsesRequest, StreamEvent, ToolCall, UnifiedTool,
     VideoRequest,
 };
 use serde::de::{DeserializeOwned, Error as _};
@@ -965,6 +965,59 @@ where
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OpenAiChatInbound;
 
+struct OpenAiChatClientStream {
+    inner: Box<dyn Iterator<Item = LlmResponse> + Send>,
+    saw_terminal_chunk: bool,
+    emitted_done: bool,
+}
+
+impl OpenAiChatClientStream {
+    fn new(inner: Box<dyn Iterator<Item = LlmResponse> + Send>) -> Self {
+        Self {
+            inner,
+            saw_terminal_chunk: false,
+            emitted_done: false,
+        }
+    }
+}
+
+impl Iterator for OpenAiChatClientStream {
+    type Item = StreamEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(response) = self.inner.next() {
+            if response.object == "[DONE]" {
+                self.emitted_done = true;
+                return Some(StreamEvent {
+                    data: Some("[DONE]".to_string()),
+                    done: true,
+                    ..StreamEvent::default()
+                });
+            }
+            self.saw_terminal_chunk |= response.error.is_some()
+                || response
+                    .choices
+                    .iter()
+                    .any(|choice| choice.finish_reason.is_some());
+            let data = serde_json::to_string(&response).ok()?;
+            return Some(StreamEvent {
+                data: Some(data),
+                ..StreamEvent::default()
+            });
+        }
+
+        if self.saw_terminal_chunk && !self.emitted_done {
+            self.emitted_done = true;
+            return Some(StreamEvent {
+                data: Some("[DONE]".to_string()),
+                done: true,
+                ..StreamEvent::default()
+            });
+        }
+        None
+    }
+}
+
 impl OpenAiChatInbound {
     pub const fn new() -> Self {
         Self
@@ -1046,6 +1099,18 @@ impl InboundTransformer for OpenAiChatInbound {
         Err(ConduitError::internal(
             "OpenAI chat completions inbound error mapping is not implemented yet",
         ))
+    }
+
+    fn transform_stream(
+        &self,
+        events: Box<dyn Iterator<Item = LlmResponse> + Send>,
+    ) -> TransformerResult<Box<dyn Iterator<Item = StreamEvent> + Send>> {
+        // The client-facing transformer owns the terminal wire protocol.
+        // Waiting until the unified iterator reaches EOF keeps a trailing
+        // usage-only chunk ahead of `[DONE]`. It also prevents the pipeline
+        // from replaying a provider-native terminal (for example
+        // `response.completed`) into a Chat Completions response.
+        Ok(Box::new(OpenAiChatClientStream::new(events)))
     }
 
     /// Aggregate provider-side OpenAI streaming chunks into a single
@@ -1171,11 +1236,13 @@ impl InboundTransformer for OpenAiChatInbound {
 /// [`Value`] on [`ResponsesRequest::input`] stays the source of truth so no
 /// data is lost.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct OpenAiResponsesInbound;
+pub struct OpenAiResponsesInbound {
+    compact: bool,
+}
 
 impl OpenAiResponsesInbound {
     pub const fn new() -> Self {
-        Self
+        Self { compact: false }
     }
 
     /// Whether this inbound transformer should handle the compact variant
@@ -1183,7 +1250,7 @@ impl OpenAiResponsesInbound {
     /// compact path forces `RequestType::Compact` +
     /// `APIFormat::OpenAIResponsesCompact`.
     pub fn compact() -> Self {
-        Self
+        Self { compact: true }
     }
 }
 
@@ -1294,26 +1361,34 @@ impl InboundTransformer for OpenAiResponsesInbound {
         Ok(llm_request)
     }
 
-    // The response/stream/error inbound paths depend on the full
-    // input-item conversion and the Responses-shaped response builder
-    // (Go `convertToResponsesAPIResponse`, inbound.go:883-1050). They are
-    // stubbed until that lands.
-    fn inbound_response(&self, _response: HttpResponse) -> TransformerResult<HttpResponse> {
-        Err(ConduitError::internal(
-            "OpenAI responses inbound response transform is not implemented yet",
-        ))
+    fn inbound_response(&self, response: HttpResponse) -> TransformerResult<HttpResponse> {
+        // This legacy hook receives an already Responses-shaped HTTP response.
+        // The production pipeline uses `transform_response` below for the
+        // unified cross-protocol leg, while same-format responses may safely
+        // remain byte-for-byte wire compatible here.
+        Ok(response)
     }
 
-    fn inbound_stream_event(&self, _event: StreamEvent) -> TransformerResult<StreamEvent> {
-        Err(ConduitError::internal(
-            "OpenAI responses inbound stream transform is not implemented yet",
-        ))
+    fn inbound_stream_event(&self, event: StreamEvent) -> TransformerResult<StreamEvent> {
+        Ok(event)
     }
 
-    fn inbound_error(&self, _error: &ConduitError) -> TransformerResult<HttpResponse> {
-        Err(ConduitError::internal(
-            "OpenAI responses inbound error mapping is not implemented yet",
-        ))
+    fn inbound_error(&self, error: &ConduitError) -> TransformerResult<HttpResponse> {
+        crate::openai_responses_inbound::transform_error(error)
+    }
+
+    fn transform_response(
+        &self,
+        response: conduit_llm::LlmResponse,
+    ) -> TransformerResult<HttpResponse> {
+        crate::openai_responses_inbound::transform_response(response, self.compact)
+    }
+
+    fn transform_stream(
+        &self,
+        events: Box<dyn Iterator<Item = conduit_llm::LlmResponse> + Send>,
+    ) -> TransformerResult<Box<dyn Iterator<Item = StreamEvent> + Send>> {
+        crate::openai_responses_inbound::transform_stream(events, self.compact)
     }
 
     fn aggregate_stream_chunks(&self, events: Vec<StreamEvent>) -> TransformerResult<HttpResponse> {
@@ -2290,10 +2365,48 @@ fn compact_content_part_extra(item: &Value) -> BTreeMap<String, Value> {
 
 #[cfg(test)]
 mod tests {
-    use conduit_llm::MessageContent;
+    use conduit_llm::{Choice, MessageContent, Usage};
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn chat_client_stream_owns_done_after_trailing_usage_chunk() -> TransformerResult<()> {
+        let chunks = vec![
+            LlmResponse {
+                id: "chatcmpl_test".to_string(),
+                choices: vec![Choice {
+                    finish_reason: Some("stop".to_string()),
+                    ..Choice::default()
+                }],
+                ..LlmResponse::default()
+            },
+            LlmResponse {
+                id: "chatcmpl_test".to_string(),
+                usage: Some(Usage {
+                    total_tokens: 3,
+                    ..Usage::default()
+                }),
+                ..LlmResponse::default()
+            },
+        ];
+
+        let events: Vec<_> = OpenAiChatInbound::new()
+            .transform_stream(Box::new(chunks.into_iter()))?
+            .collect();
+
+        assert_eq!(events.len(), 3);
+        assert!(
+            events[1]
+                .data
+                .as_deref()
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                .is_some_and(|value| value["usage"]["total_tokens"] == 3)
+        );
+        assert_eq!(events[2].data.as_deref(), Some("[DONE]"));
+        assert!(events[2].done);
+        Ok(())
+    }
 
     #[test]
     fn chat_completions_body_normalizes_basic_fields_and_preserves_extras() -> TransformerResult<()>
@@ -2796,17 +2909,37 @@ mod tests {
     }
 
     #[test]
-    fn responses_inbound_response_stream_error_are_not_yet_implemented() {
-        // The response/stream/error inbound paths are stubbed until the full
-        // input-item conversion + Responses-shaped response builder land.
+    fn responses_legacy_hooks_match_wire_passthrough_and_error_contract() -> TransformerResult<()> {
+        // Production cross-protocol behavior is exercised through
+        // transform_response/transform_stream. The older raw hooks remain
+        // wire-compatible for callers that already hold Responses frames.
         let inbound = OpenAiResponsesInbound::new();
-        assert!(inbound.inbound_response(HttpResponse::default()).is_err());
+        let response = HttpResponse {
+            status: 202,
+            json_body: Some(json!({"object": "response"})),
+            ..HttpResponse::default()
+        };
+        let response = inbound.inbound_response(response)?;
+        assert_eq!(response.status, 202);
+        assert_eq!(response.json_body, Some(json!({"object": "response"})));
+
+        let event = StreamEvent {
+            event_type: Some("response.completed".to_string()),
+            data: Some("{}".to_string()),
+            ..StreamEvent::default()
+        };
+        let event = inbound.inbound_stream_event(event)?;
+        assert_eq!(event.event_type.as_deref(), Some("response.completed"));
+
+        let error = inbound.inbound_error(&ConduitError::invalid_request("bad input"))?;
+        assert_eq!(error.status, 400);
         assert!(
-            inbound
-                .inbound_stream_event(StreamEvent::default())
-                .is_err()
+            error
+                .json_body
+                .as_ref()
+                .is_some_and(|body| body["error"]["message"] == "bad input")
         );
-        assert!(inbound.inbound_error(&ConduitError::internal("x")).is_err());
+        Ok(())
     }
 
     #[test]
@@ -3392,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_chat_inbound_response_stream_error_are_not_yet_implemented() {
+    fn openai_chat_legacy_raw_hooks_remain_explicitly_unsupported() {
         let transformer = OpenAiChatInbound::new();
         let err_response = transformer.inbound_response(HttpResponse::default()).err();
         assert_eq!(

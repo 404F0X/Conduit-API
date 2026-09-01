@@ -31,7 +31,15 @@ pub fn env_entries(config: &AppConfig) -> Vec<EnvEntry> {
         EnvEntry::new("CONDUIT_SERVER_PUBLIC_URL", &config.server.public_url),
         EnvEntry::new("CONDUIT_SERVER_PORT", config.server.port.to_string()),
         EnvEntry::new("CONDUIT_SERVER_BASE_PATH", &config.server.base_path),
+        EnvEntry::new(
+            "CONDUIT_SERVER_TRUSTED_PROXIES",
+            json_array(&config.server.trusted_proxies),
+        ),
         EnvEntry::new("CONDUIT_SERVER_DEBUG", config.server.debug.to_string()),
+        EnvEntry::new(
+            "CONDUIT_SERVER_DISABLE_SSL_VERIFY",
+            config.server.disable_ssl_verify.to_string(),
+        ),
         EnvEntry::new(
             "CONDUIT_SERVER_CORS_ALLOWED_ORIGINS",
             json_array(&config.server.cors.allowed_origins),
@@ -39,10 +47,6 @@ pub fn env_entries(config: &AppConfig) -> Vec<EnvEntry> {
         EnvEntry::new(
             "CONDUIT_SERVER_READ_TIMEOUT",
             duration_format::format_duration(config.server.read_timeout),
-        ),
-        EnvEntry::new(
-            "CONDUIT_SERVER_WRITE_TIMEOUT",
-            duration_format::format_duration(config.server.write_timeout),
         ),
         EnvEntry::new("CONDUIT_DB_DIALECT", &config.db.dialect),
         EnvEntry::new("CONDUIT_DB_DSN", &config.db.dsn),
@@ -167,22 +171,6 @@ pub fn env_entries(config: &AppConfig) -> Vec<EnvEntry> {
         EnvEntry::new("CONDUIT_METRICS_PORT", config.metrics.port.to_string()),
         EnvEntry::new("CONDUIT_METRICS_PATH", &config.metrics.path),
         EnvEntry::new(
-            "CONDUIT_API_AUTH_ENABLED",
-            config.api_auth.enabled.to_string(),
-        ),
-        EnvEntry::new(
-            "CONDUIT_API_AUTH_API_KEY_HEADER",
-            &config.api_auth.api_key_header,
-        ),
-        EnvEntry::new(
-            "CONDUIT_API_AUTH_ALLOW_NO_AUTH_FALLBACK",
-            config.api_auth.allow_no_auth_fallback.to_string(),
-        ),
-        EnvEntry::new(
-            "CONDUIT_API_AUTH_ADMIN_TOKEN",
-            option_string(&config.api_auth.admin_token),
-        ),
-        EnvEntry::new(
             "CONDUIT_API_AUTH_JWT_SECRET",
             option_string(&config.api_auth.jwt_secret),
         ),
@@ -304,6 +292,8 @@ mod tests {
         let text = render_default_env();
 
         assert!(text.contains("CONDUIT_SERVER_PORT=8090"));
+        assert!(text.contains("CONDUIT_SERVER_TRUSTED_PROXIES=[]"));
+        assert!(text.contains("CONDUIT_SERVER_DISABLE_SSL_VERIFY=false"));
         assert!(text.contains("CONDUIT_DB_DIALECT=postgres"));
         assert!(
             text.contains(
@@ -325,6 +315,7 @@ mod tests {
     fn env_entries_render_custom_values_and_json_arrays() {
         let mut config = AppConfig::default();
         config.server.public_url = "https://conduit.example.test".to_string();
+        config.server.disable_ssl_verify = true;
         config.server.cors.allowed_origins = vec!["https://example.test".to_string()];
         config.cache.redis.addrs = vec![
             "redis-a.example.test:6379".to_string(),
@@ -338,6 +329,7 @@ mod tests {
             text.contains(r#"CONDUIT_SERVER_CORS_ALLOWED_ORIGINS="[\"https://example.test\"]""#)
         );
         assert!(text.contains("CONDUIT_SERVER_PUBLIC_URL=https://conduit.example.test"));
+        assert!(text.contains("CONDUIT_SERVER_DISABLE_SSL_VERIFY=true"));
         assert!(text.contains(r#"CONDUIT_CACHE_REDIS_ADDRS="[\"redis-a.example.test:6379\",\"redis-b.example.test:6379\"]""#));
         assert!(text.contains("CONDUIT_LOG_LEVEL=debug"));
     }
@@ -346,16 +338,13 @@ mod tests {
     fn masked_env_hides_secret_values_without_hiding_empty_defaults() {
         let mut config = AppConfig::default();
         config.cache.redis.password = Some("redis-password".to_string());
-        config.api_auth.admin_token = Some("admin-token".to_string());
         config.api_auth.jwt_secret = Some("jwt-secret".to_string());
 
         let text = render_masked_env(&config);
 
         assert!(text.contains("CONDUIT_CACHE_REDIS_PASSWORD=********"));
-        assert!(text.contains("CONDUIT_API_AUTH_ADMIN_TOKEN=********"));
         assert!(text.contains("CONDUIT_API_AUTH_JWT_SECRET=********"));
         assert!(!text.contains("redis-password"));
-        assert!(!text.contains("admin-token"));
         assert!(!text.contains("jwt-secret"));
     }
 
@@ -363,8 +352,6 @@ mod tests {
     fn masked_config_preview_masks_nested_secret_key_password_token_fields() {
         let mut config = AppConfig::default();
         config.cache.redis.password = Some("redis-password".to_string());
-        config.api_auth.api_key_header = "X-Api-Key".to_string();
-        config.api_auth.admin_token = Some("admin-token".to_string());
         config.api_auth.jwt_secret = Some("jwt-secret".to_string());
         config.oidc.providers = vec![OidcProviderConfig {
             name: "oidc".to_string(),
@@ -378,8 +365,6 @@ mod tests {
         let preview = masked_config_preview(&config);
 
         assert_eq!(preview["cache"]["redis"]["password"], SECRET_MASK);
-        assert_eq!(preview["api_auth"]["api_key_header"], SECRET_MASK);
-        assert_eq!(preview["api_auth"]["admin_token"], SECRET_MASK);
         assert_eq!(preview["api_auth"]["jwt_secret"], SECRET_MASK);
         assert_eq!(
             preview["oidc"]["providers"][0]["client_secret"],
@@ -397,14 +382,12 @@ mod tests {
     fn masked_config_preview_leaves_empty_secret_fields_empty() {
         let mut config = AppConfig::default();
         config.cache.redis.password = Some(String::new());
-        config.api_auth.admin_token = Some(String::new());
         config.api_auth.jwt_secret = None;
         config.oidc.providers = vec![OidcProviderConfig::default()];
 
         let preview = masked_config_preview(&config);
 
         assert_eq!(preview["cache"]["redis"]["password"], "");
-        assert_eq!(preview["api_auth"]["admin_token"], "");
         assert!(preview["api_auth"]["jwt_secret"].is_null());
         assert_eq!(preview["oidc"]["providers"][0]["client_secret"], "");
     }

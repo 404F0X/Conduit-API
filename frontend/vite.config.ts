@@ -1,25 +1,43 @@
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react-swc';
-// import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite';
 import tanstackRouter from '@tanstack/router-plugin/vite';
 
+const MAX_JS_CHUNK_BYTES = 1_250_000;
+
+function enforceJavaScriptChunkBudget(): Plugin {
+  return {
+    name: 'conduit-javascript-chunk-budget',
+    apply: 'build',
+    generateBundle(_options, bundle) {
+      for (const output of Object.values(bundle)) {
+        if (output.type !== 'chunk') continue;
+
+        const size = Buffer.byteLength(output.code);
+        if (size > MAX_JS_CHUNK_BYTES) {
+          this.error(
+            `${output.fileName} is ${(size / 1_000_000).toFixed(2)} MB, exceeding the ${(MAX_JS_CHUNK_BYTES / 1_000_000).toFixed(2)} MB JavaScript chunk budget`
+          );
+        }
+      }
+    },
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig({
+  // The production server injects a document <base> at runtime. Relative
+  // chunk URLs let the same build work at both / and server.base_path.
+  base: './',
   plugins: [
     tanstackRouter({
       target: 'react',
       autoCodeSplitting: true,
     }),
     react(),
-    // React table does not work with react-compiler, disable for now.
-    // react({
-    //   babel: {
-    //     plugins: ['babel-plugin-react-compiler'],
-    //   },
-    // }),
     tailwindcss(),
+    enforceJavaScriptChunkBudget(),
   ],
   resolve: {
     alias: {

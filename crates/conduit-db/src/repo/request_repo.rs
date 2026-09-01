@@ -68,11 +68,24 @@ pub struct CreateRequestInput {
 }
 
 /// Dashboard list filter (RUST-P3-005 S17).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestListOrderField {
+    Id,
+    #[default]
+    CreatedAt,
+    UpdatedAt,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RequestListQuery {
     pub project_id: String,
+    pub id: Option<String>,
     pub api_key_id: Option<String>,
     pub channel_id: Option<String>,
+    pub trace_id: Option<String>,
+    pub trace_id_is_nil: Option<bool>,
+    pub api_key_id_is_nil: Option<bool>,
+    pub channel_id_is_nil: Option<bool>,
     pub model_id: Option<String>,
     pub source: Option<String>,
     pub status: Option<String>,
@@ -80,6 +93,8 @@ pub struct RequestListQuery {
     pub end_at: Option<String>,
     pub limit: u32,
     pub offset: u32,
+    pub order_field: RequestListOrderField,
+    pub descending: bool,
 }
 
 impl RequestListQuery {
@@ -270,6 +285,43 @@ pub trait RequestRepo: Send + Sync {
         ctx: &RequestContext,
         query: &RequestListQuery,
     ) -> RepoResult<RequestListResult>;
+
+    async fn count_requests_unchecked(
+        &self,
+        ctx: &RequestContext,
+        query: &RequestListQuery,
+    ) -> RepoResult<u64> {
+        // Keep this method source-compatible for repository decorators and
+        // test doubles. PostgreSQL overrides it with `COUNT(*)`; the fallback
+        // deliberately pages instead of imposing the old 1,000-row ceiling.
+        let mut page_query = query.clone();
+        page_query.limit = 1_000;
+        page_query.offset = 0;
+        let mut total = 0_u64;
+        loop {
+            let page = self.list_requests_unchecked(ctx, &page_query).await?;
+            let fetched = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+            total = total.saturating_add(u64::from(fetched));
+            if !page.has_more || fetched == 0 {
+                break;
+            }
+            let next_offset = page_query.offset.saturating_add(fetched);
+            if next_offset == page_query.offset {
+                break;
+            }
+            page_query.offset = next_offset;
+        }
+        Ok(total)
+    }
+
+    async fn count_requests(
+        &self,
+        ctx: &RequestContext,
+        query: &RequestListQuery,
+    ) -> RepoResult<u64> {
+        guard_project_access(ctx, &query.project_id, ProjectAccess::Read)?;
+        self.count_requests_unchecked(ctx, query).await
+    }
 
     async fn list_requests(
         &self,
@@ -486,6 +538,21 @@ impl RequestRepo for InMemoryRequestRepo {
         sort_and_paginate(&mut matched, query)
     }
 
+    async fn count_requests_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        query: &RequestListQuery,
+    ) -> RepoResult<u64> {
+        let guard = self
+            .rows
+            .lock()
+            .map_err(|_| RepoError::LockPoisoned("request repo"))?;
+        Ok(guard
+            .values()
+            .filter(|row| matches_query(row, query))
+            .count() as u64)
+    }
+
     async fn transition_request_status_unchecked(
         &self,
         _ctx: &RequestContext,
@@ -601,7 +668,12 @@ impl RequestRepo for InMemoryRequestRepo {
 // --- shared helpers --------------------------------------------------------
 
 fn matches_query(row: &RequestRow, query: &RequestListQuery) -> bool {
-    if row.project_id != query.project_id {
+    if !query.project_id.is_empty() && row.project_id != query.project_id {
+        return false;
+    }
+    if let Some(v) = &query.id
+        && row.id != *v
+    {
         return false;
     }
     if let Some(v) = &query.api_key_id
@@ -611,6 +683,23 @@ fn matches_query(row: &RequestRow, query: &RequestListQuery) -> bool {
     }
     if let Some(v) = &query.channel_id
         && row.channel_id.as_deref() != Some(v.as_str())
+    {
+        return false;
+    }
+    if let Some(v) = &query.trace_id
+        && row.trace_id.as_deref() != Some(v.as_str())
+    {
+        return false;
+    }
+    if query
+        .trace_id_is_nil
+        .is_some_and(|nil| nil == row.trace_id.is_some())
+        || query
+            .api_key_id_is_nil
+            .is_some_and(|nil| nil == row.api_key_id.is_some())
+        || query
+            .channel_id_is_nil
+            .is_some_and(|nil| nil == row.channel_id.is_some())
     {
         return false;
     }
@@ -649,9 +738,21 @@ fn sort_and_paginate(
     query: &RequestListQuery,
 ) -> RepoResult<RequestListResult> {
     rows.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
+        let id_ordering = || match (a.id.parse::<i64>(), b.id.parse::<i64>()) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => a.id.cmp(&b.id),
+        };
+        let ordering = match query.order_field {
+            RequestListOrderField::Id => id_ordering(),
+            RequestListOrderField::CreatedAt => a.created_at.cmp(&b.created_at),
+            RequestListOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+        }
+        .then_with(id_ordering);
+        if query.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
     });
 
     let limit = query.limit as usize;

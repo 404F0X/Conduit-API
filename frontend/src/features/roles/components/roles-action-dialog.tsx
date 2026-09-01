@@ -48,64 +48,66 @@ export function CreateRoleDialog() {
 
   return (
     <Dialog open={isDialogOpen.create} onOpenChange={handleClose}>
-      <DialogContent className='max-w-2xl' ref={setDialogContent}>
-        <DialogHeader>
+      <DialogContent className='flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-2xl' ref={setDialogContent}>
+        <DialogHeader className='shrink-0 pr-8'>
           <DialogTitle>{t('roles.dialogs.create.title')}</DialogTitle>
           <DialogDescription>{t('roles.dialogs.create.description')}</DialogDescription>
         </DialogHeader>
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className='space-y-6'>
-            <FormField
-              control={form.control}
-              name='name'
-              render={({ field, fieldState }) => (
-                <FormItem>
-                  <FormLabel>{t('roles.dialogs.fields.name.label')}</FormLabel>
-                  <FormControl>
-                    <Input placeholder={t('roles.dialogs.fields.name.placeholder')} aria-invalid={!!fieldState.error} {...field} />
-                  </FormControl>
-                  <FormDescription>{t('roles.dialogs.fields.name.description')}</FormDescription>
-                  <div className='min-h-[1.25rem]'>
+          <form onSubmit={form.handleSubmit(onSubmit)} className='flex min-h-0 flex-1 flex-col'>
+            <div className='min-h-0 flex-1 [scrollbar-gutter:stable] space-y-6 overflow-y-auto overscroll-contain px-1 pr-2'>
+              <FormField
+                control={form.control}
+                name='name'
+                render={({ field, fieldState }) => (
+                  <FormItem>
+                    <FormLabel>{t('roles.dialogs.fields.name.label')}</FormLabel>
+                    <FormControl>
+                      <Input placeholder={t('roles.dialogs.fields.name.placeholder')} aria-invalid={!!fieldState.error} {...field} />
+                    </FormControl>
+                    <FormDescription>{t('roles.dialogs.fields.name.description')}</FormDescription>
+                    <div className='min-h-[1.25rem]'>
+                      <FormMessage />
+                    </div>
+                  </FormItem>
+                )}
+              />
+
+              <SystemRoleTemplatePicker
+                onApply={(name, scopes) => {
+                  if (!form.getValues('name').trim()) {
+                    form.setValue('name', name, { shouldDirty: true, shouldValidate: true });
+                  }
+                  form.setValue('scopes', scopes, { shouldDirty: true, shouldValidate: true });
+                }}
+              />
+
+              <FormField
+                control={form.control}
+                name='scopes'
+                render={({ field }) => (
+                  <FormItem>
+                    <div className='mb-4'>
+                      <FormLabel className='text-base'>{t('roles.dialogs.fields.scopes.label')}</FormLabel>
+                      <FormDescription>{t('roles.dialogs.fields.scopes.description')}</FormDescription>
+                      <FormDescription>{t('roles.dialogs.fields.scopes.securityHint')}</FormDescription>
+                    </div>
+                    <FormControl>
+                      <ScopesSelect
+                        level='system'
+                        value={field.value || []}
+                        onChange={field.onChange}
+                        portalContainer={dialogContent}
+                        enablePermissionFilter={true}
+                      />
+                    </FormControl>
                     <FormMessage />
-                  </div>
-                </FormItem>
-              )}
-            />
+                  </FormItem>
+                )}
+              />
+            </div>
 
-            <SystemRoleTemplatePicker
-              onApply={(name, scopes) => {
-                if (!form.getValues('name').trim()) {
-                  form.setValue('name', name, { shouldDirty: true, shouldValidate: true });
-                }
-                form.setValue('scopes', scopes, { shouldDirty: true, shouldValidate: true });
-              }}
-            />
-
-            <FormField
-              control={form.control}
-              name='scopes'
-              render={({ field }) => (
-                <FormItem>
-                  <div className='mb-4'>
-                    <FormLabel className='text-base'>{t('roles.dialogs.fields.scopes.label')}</FormLabel>
-                    <FormDescription>{t('roles.dialogs.fields.scopes.description')}</FormDescription>
-                    <FormDescription>{t('roles.dialogs.fields.scopes.securityHint')}</FormDescription>
-                  </div>
-                  <FormControl>
-                    <ScopesSelect
-                      level='system'
-                      value={field.value || []}
-                      onChange={field.onChange}
-                      portalContainer={dialogContent}
-                      enablePermissionFilter={true}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <DialogFooter>
+            <DialogFooter className='bg-background shrink-0 border-t pt-4'>
               <Button type='button' variant='outline' onClick={handleClose}>
                 {t('common.buttons.cancel')}
               </Button>
@@ -164,55 +166,57 @@ export function EditRoleDialog() {
 
   return (
     <Dialog open={isDialogOpen.edit} onOpenChange={handleClose}>
-      <DialogContent className='max-w-2xl' ref={setDialogContent}>
-        <DialogHeader>
+      <DialogContent className='flex max-h-[calc(100dvh-2rem)] flex-col sm:max-w-2xl' ref={setDialogContent}>
+        <DialogHeader className='shrink-0 pr-8'>
           <DialogTitle>{t('roles.dialogs.edit.title')}</DialogTitle>
           <DialogDescription>{t('roles.dialogs.edit.description')}</DialogDescription>
         </DialogHeader>
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className='space-y-6'>
-            <FormField
-              control={form.control}
-              name='name'
-              render={({ field, fieldState }) => (
-                <FormItem>
-                  <FormLabel>{t('roles.dialogs.fields.name.label')}</FormLabel>
-                  <FormControl>
-                    <Input placeholder={t('roles.dialogs.fields.name.placeholder')} aria-invalid={!!fieldState.error} {...field} />
-                  </FormControl>
-                  <FormDescription>{t('roles.dialogs.fields.name.description')}</FormDescription>
-                  <div className='min-h-[1.25rem]'>
+          <form onSubmit={form.handleSubmit(onSubmit)} className='flex min-h-0 flex-1 flex-col'>
+            <div className='min-h-0 flex-1 [scrollbar-gutter:stable] space-y-6 overflow-y-auto overscroll-contain px-1 pr-2'>
+              <FormField
+                control={form.control}
+                name='name'
+                render={({ field, fieldState }) => (
+                  <FormItem>
+                    <FormLabel>{t('roles.dialogs.fields.name.label')}</FormLabel>
+                    <FormControl>
+                      <Input placeholder={t('roles.dialogs.fields.name.placeholder')} aria-invalid={!!fieldState.error} {...field} />
+                    </FormControl>
+                    <FormDescription>{t('roles.dialogs.fields.name.description')}</FormDescription>
+                    <div className='min-h-[1.25rem]'>
+                      <FormMessage />
+                    </div>
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name='scopes'
+                render={({ field }) => (
+                  <FormItem>
+                    <div className='mb-4'>
+                      <FormLabel className='text-base'>{t('roles.dialogs.fields.scopes.label')}</FormLabel>
+                      <FormDescription>{t('roles.dialogs.fields.scopes.description')}</FormDescription>
+                      <FormDescription>{t('roles.dialogs.fields.scopes.securityHint')}</FormDescription>
+                    </div>
+                    <FormControl>
+                      <ScopesSelect
+                        value={field.value || []}
+                        onChange={field.onChange}
+                        portalContainer={dialogContent}
+                        level='system'
+                        enablePermissionFilter={true}
+                      />
+                    </FormControl>
                     <FormMessage />
-                  </div>
-                </FormItem>
-              )}
-            />
+                  </FormItem>
+                )}
+              />
+            </div>
 
-            <FormField
-              control={form.control}
-              name='scopes'
-              render={({ field }) => (
-                <FormItem>
-                  <div className='mb-4'>
-                    <FormLabel className='text-base'>{t('roles.dialogs.fields.scopes.label')}</FormLabel>
-                    <FormDescription>{t('roles.dialogs.fields.scopes.description')}</FormDescription>
-                    <FormDescription>{t('roles.dialogs.fields.scopes.securityHint')}</FormDescription>
-                  </div>
-                  <FormControl>
-                    <ScopesSelect
-                      value={field.value || []}
-                      onChange={field.onChange}
-                      portalContainer={dialogContent}
-                      level='system'
-                      enablePermissionFilter={true}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <DialogFooter>
+            <DialogFooter className='bg-background shrink-0 border-t pt-4'>
               <Button type='button' variant='outline' onClick={handleClose}>
                 {t('common.buttons.cancel')}
               </Button>

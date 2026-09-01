@@ -1,7 +1,8 @@
 import { AuthUser, getTokenFromStorage } from '@/stores/authStore';
+import { APP_BASE_PATH, withBasePath } from '@/lib/base-path';
 
 // Same domain, no need to add baseURL.
-export const API_BASE_URL = '';
+export const API_BASE_URL = APP_BASE_PATH;
 
 type ErrorResponseBody = {
   message?: string;
@@ -49,7 +50,7 @@ class ApiError extends Error {
 export async function apiRequest<T>(endpoint: string, options: ApiRequestOptions = {}): Promise<T> {
   const { method = 'GET', headers = {}, body, requireAuth = false } = options;
 
-  const url = `${API_BASE_URL}${endpoint}`;
+  const url = withBasePath(endpoint);
 
   const requestHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -124,6 +125,9 @@ export const systemApi = {
     ownerLastName: string;
     brandName: string;
     preferLanguage?: string;
+    accountingCurrencyCode: string;
+    creditDisplayName: string;
+    creditsPerAccountingUnit: string;
   }): Promise<{ success: boolean; message: string }> =>
     apiRequest('/admin/system/initialize', {
       method: 'POST',

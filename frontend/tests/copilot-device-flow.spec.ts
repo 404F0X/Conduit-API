@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test'
 import { gotoAndEnsureAuth } from './auth.utils'
 
+const mockOrigin = process.env.CONDUIT_E2E_MOCK_ORIGIN
+if (!mockOrigin) {
+  throw new Error('CONDUIT_E2E_MOCK_ORIGIN is required; run tests through test:e2e')
+}
+const mockVerificationURL = `${mockOrigin}/device`
+
 test.describe('GitHub Copilot Device Flow', () => {
   test.beforeEach(async ({ page }) => {
     test.setTimeout(60000)
@@ -40,7 +46,7 @@ test.describe('GitHub Copilot Device Flow', () => {
         body: JSON.stringify({
           device_code: 'test-device-code',
           user_code: 'ABCD-EFGH',
-          verification_uri: 'https://github.com/login/device',
+          verification_uri: mockVerificationURL,
           expires_in: 900,
           interval: 5,
           session_id: 'test-session-id',
@@ -84,7 +90,7 @@ test.describe('GitHub Copilot Device Flow', () => {
         body: JSON.stringify({
           device_code: 'test-device-code',
           user_code: 'WXYZ-1234',
-          verification_uri: 'https://github.com/login/device',
+          verification_uri: mockVerificationURL,
           expires_in: 900,
           interval: 5,
           session_id: 'test-session-id',
@@ -116,7 +122,7 @@ test.describe('GitHub Copilot Device Flow', () => {
     await expect(userCode).toBeVisible({ timeout: 5000 })
 
     // Verify verification URL is displayed
-    const verificationUrl = createDialog.getByText('https://github.com/login/device')
+    const verificationUrl = createDialog.getByText(mockVerificationURL)
     await expect(verificationUrl).toBeVisible()
 
     // Verify "Open GitHub" button exists
@@ -169,7 +175,7 @@ test.describe('GitHub Copilot Device Flow', () => {
         body: JSON.stringify({
           device_code: 'test-device-code',
           user_code: 'RESET-TEST',
-          verification_uri: 'https://github.com/login/device',
+          verification_uri: mockVerificationURL,
           expires_in: 900,
           interval: 5,
           session_id: 'test-session-id',
@@ -230,7 +236,7 @@ test.describe('GitHub Copilot Device Flow', () => {
         body: JSON.stringify({
           device_code: 'test-device-code',
           user_code: 'POLL-TEST',
-          verification_uri: 'https://github.com/login/device',
+          verification_uri: mockVerificationURL,
           expires_in: 900,
           interval: 1, // Short interval for testing
           session_id: 'test-session-id',
@@ -296,7 +302,7 @@ test.describe('GitHub Copilot Device Flow', () => {
         body: JSON.stringify({
           device_code: 'test-device-code',
           user_code: 'SLOW-TEST',
-          verification_uri: 'https://github.com/login/device',
+          verification_uri: mockVerificationURL,
           expires_in: 900,
           interval: 1,
           session_id: 'test-session-id',
@@ -353,7 +359,7 @@ test.describe('GitHub Copilot Device Flow', () => {
         body: JSON.stringify({
           device_code: 'test-device-code',
           user_code: 'EXP-TEST',
-          verification_uri: 'https://github.com/login/device',
+          verification_uri: mockVerificationURL,
           expires_in: 2, // Very short expiration
           interval: 1,
           session_id: 'test-session-id',

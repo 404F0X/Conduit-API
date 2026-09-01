@@ -13,10 +13,11 @@
 //!   - `Query.apiKeyProfileTemplates` (`ent.resolvers.go:310`): thin ent
 //!     `Paginate` with the `CREATED_AT → Default<...>Order` (order-by-id)
 //!     remap already lowered by the crate layer into
-//!     `APIKeyProfileTemplateOrderSelection`. Go applies NO project filter on
-//!     the root query; clients scope via `where.projectID`. The repository
-//!     owns this cross-project admin projection, so the adapter contains no
-//!     database-specific SQL.
+//!     `APIKeyProfileTemplateOrderSelection`. Go applies no project filter for
+//!     globally authorized admins. Conduit API additionally carries the
+//!     resolver's `AdminAccessScope`: project-only callers use the repository's
+//!     project-keyed query, while global callers retain the cross-project
+//!     projection. The adapter contains no database-specific SQL.
 //!   - `createApiKeyProfileTemplate` →
 //!     `biz.APIKeyProfileTemplateService.CreateTemplate`
 //!     (`biz/api_key_profile_template.go:34`): `profile.Name` is FORCED to
@@ -87,6 +88,7 @@ use conduit_admin_graphql::apikey::{
 use conduit_admin_graphql::channel::{ModelMapping as GqlModelMapping, OrderDirection};
 use conduit_admin_graphql::node::parse_guid;
 use conduit_admin_graphql::pagination::{connection_from_offset_page, decode_offset_cursor};
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::profile_template::{
     APIKeyProfileTemplate, APIKeyProfileTemplateConnection, APIKeyProfileTemplateConnectionArgs,
     APIKeyProfileTemplateEdge, APIKeyProfileTemplateOrderTerm, APIKeyProfileTemplateWhereInput,
@@ -101,13 +103,15 @@ use conduit_core::objects::apikey::{
     APIKeyQuotaPeriod as CoreQuotaPeriod, ModelMapping as CoreModelMapping,
 };
 use conduit_db::repo::ApiKeyRepo;
-use conduit_db::repo::api_key_repo::UpdateApiKeyInput as RepoUpdateApiKeyInput;
+use conduit_db::repo::api_key_repo::{
+    ListApiKeysQuery, UpdateApiKeyInput as RepoUpdateApiKeyInput,
+};
 use conduit_db::repo::profile_template_repo::{
     ApiKeyProfileTemplateRow, CreateProfileTemplateInput as RepoCreateTemplateInput,
     ProfileTemplateRepo, UpdateProfileTemplateInput as RepoUpdateTemplateInput,
 };
 use conduit_db::row::ApiKeyRow;
-use conduit_db::{PolicyContext, Principal, RepoError, RequestContext};
+use conduit_db::{PolicyContext, Principal, ProjectScope, RepoError, RequestContext, scope_slug};
 
 // ===========================================================================
 // Adapter
@@ -122,6 +126,11 @@ pub struct ProfileTemplateServiceAdapter {
     api_key_repo: Arc<dyn ApiKeyRepo>,
 }
 
+struct ProfileTemplateDbContext {
+    context: RequestContext,
+    authorized_project_id: Option<String>,
+}
+
 impl ProfileTemplateServiceAdapter {
     pub fn new(
         template_repo: Arc<dyn ProfileTemplateRepo>,
@@ -133,35 +142,73 @@ impl ProfileTemplateServiceAdapter {
         }
     }
 
-    /// The per-request context for repo calls. Mirrors
-    /// `wiring::boot_request_context` (a trusted, fully-authorized principal —
-    /// the admin GraphQL layer performs its own auth before reaching the
-    /// service), same convention as every sibling adapter.
-    fn ctx() -> RequestContext {
-        RequestContext::new(PolicyContext::new(Principal::test()))
+    /// Lower the already-authorized GraphQL capability into the narrower DB
+    /// policy model. The synthetic user is intentionally not an owner and is
+    /// never a System/Test principal: project-scoped access remains confined
+    /// to the selected project by the repository's project guard. Global is
+    /// only constructed from `AdminAccessScope::Global`, which the resolver
+    /// derives from an authenticated owner or an equivalent global grant.
+    fn db_context(
+        access: &AdminAccessScope,
+        write: bool,
+    ) -> Result<ProfileTemplateDbContext, ProfileTemplateServiceError> {
+        let authorized_project_id = match access {
+            AdminAccessScope::Global => None,
+            AdminAccessScope::Project(project_id) => {
+                Some(decode_db_id(project_id).ok_or_else(|| {
+                    ProfileTemplateServiceError::PermissionDenied(
+                        "authorized project id is invalid".to_owned(),
+                    )
+                })?)
+            }
+        };
+        let project_scope = authorized_project_id
+            .as_ref()
+            .map_or(ProjectScope::All, |project_id| {
+                ProjectScope::project_ids([project_id.as_str()])
+            });
+        let mut scope_slugs = vec![scope_slug::READ_API_KEYS];
+        if write {
+            scope_slugs.push(scope_slug::WRITE_API_KEYS);
+        }
+        let principal = Principal::user("admin-graphql/profile-template", project_scope)
+            .with_scope_slugs(scope_slugs);
+        let mut context = RequestContext::new(PolicyContext::new(principal));
+        if let Some(project_id) = &authorized_project_id {
+            context = context.with_project_id(project_id.clone());
+        }
+        Ok(ProfileTemplateDbContext {
+            context,
+            authorized_project_id,
+        })
     }
 
-    /// Materialize every live template row across all projects. The repo only
-    /// lists per project, so the live project ids are enumerated with one raw
-    /// query over the repo's pool (established gap-fill precedent —
-    /// `wiring_prompt.rs::load_all`) and each project is then listed through
-    /// the repo so row decoding stays repo-owned.
-    async fn load_all(&self) -> Result<Vec<ApiKeyProfileTemplateRow>, ProfileTemplateServiceError> {
-        let ctx = Self::ctx();
-        self.template_repo
-            .list_all_profile_templates_unchecked(&ctx)
-            .await
-            .map_err(|error| ProfileTemplateServiceError::Query(error.to_string()))
+    async fn load_template_rows(
+        &self,
+        scoped: &ProfileTemplateDbContext,
+    ) -> Result<Vec<ApiKeyProfileTemplateRow>, ProfileTemplateServiceError> {
+        match scoped.authorized_project_id.as_deref() {
+            Some(project_id) => {
+                self.template_repo
+                    .list_profile_templates(&scoped.context, project_id)
+                    .await
+            }
+            None => {
+                self.template_repo
+                    .list_all_profile_templates_unchecked(&scoped.context)
+                    .await
+            }
+        }
+        .map_err(|error| ProfileTemplateServiceError::Query(error.to_string()))
     }
 
-    /// Find one LIVE template row by id across all projects (Go
-    /// `client.APIKeyProfileTemplate.Get(ctx, id)` is id-only; the repo keys by
-    /// `(project_id, id)`, so the owning project is resolved with one raw
-    /// query and the row is then fetched through the repo). `Ok(None)` = no
-    /// such live row; `Err(msg)` = backend failure (caller picks the wrapping
-    /// error variant).
+    /// Find one live template inside the authorized boundary. Project access
+    /// uses the repository's `(project_id, id)` lookup so a foreign id is
+    /// indistinguishable from a missing row. Only a previously authorized
+    /// global capability may use the id-only lookup.
     async fn find_template_row(
         &self,
+        scoped: &ProfileTemplateDbContext,
         db_id: &str,
     ) -> Result<Option<ApiKeyProfileTemplateRow>, String> {
         // decode_db_id validated the id as numeric already; a non-parse here
@@ -169,10 +216,66 @@ impl ProfileTemplateServiceAdapter {
         let Ok(id_i) = db_id.parse::<i64>() else {
             return Ok(None);
         };
-        self.template_repo
-            .find_profile_template_by_id_unchecked(&Self::ctx(), &id_i.to_string())
-            .await
-            .map_err(|error| error.to_string())
+        match scoped.authorized_project_id.as_deref() {
+            Some(project_id) => {
+                self.template_repo
+                    .find_profile_template(&scoped.context, project_id, &id_i.to_string())
+                    .await
+            }
+            None => {
+                self.template_repo
+                    .find_profile_template_by_id_unchecked(&scoped.context, &id_i.to_string())
+                    .await
+            }
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    /// Resolve an API key without widening a project capability. The API-key
+    /// repository has no `(project_id, id)` lookup, so project-scoped callers
+    /// enumerate only that project's checked list and never observe a foreign
+    /// row. Global callers may use the id lookup because their capability is
+    /// already global.
+    async fn find_api_key_row(
+        &self,
+        scoped: &ProfileTemplateDbContext,
+        api_key_id: &str,
+    ) -> Result<Option<ApiKeyRow>, String> {
+        let Some(project_id) = scoped.authorized_project_id.as_deref() else {
+            return self
+                .api_key_repo
+                .find_api_key_by_id(&scoped.context, api_key_id)
+                .await
+                .map_err(|error| error.to_string());
+        };
+
+        const PAGE_SIZE: u32 = 500;
+        let mut offset = 0_u32;
+        loop {
+            let page = self
+                .api_key_repo
+                .list_api_keys_by_project(
+                    &scoped.context,
+                    project_id,
+                    &ListApiKeysQuery {
+                        limit: PAGE_SIZE,
+                        offset,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(row) = page.rows.into_iter().find(|row| row.id == api_key_id) {
+                return Ok(Some(row));
+            }
+            if !page.has_more {
+                return Ok(None);
+            }
+            let Some(next_offset) = offset.checked_add(PAGE_SIZE) else {
+                return Ok(None);
+            };
+            offset = next_offset;
+        }
     }
 }
 
@@ -487,11 +590,13 @@ fn api_key_row_to_gql(row: ApiKeyRow) -> APIKey {
 
 #[async_trait]
 impl ProfileTemplateQueryServices for ProfileTemplateServiceAdapter {
-    async fn api_key_profile_templates(
+    async fn api_key_profile_templates_with_access(
         &self,
+        access: &AdminAccessScope,
         args: APIKeyProfileTemplateConnectionArgs,
     ) -> Result<APIKeyProfileTemplateConnection, ProfileTemplateServiceError> {
-        let rows = self.load_all().await?;
+        let scoped = Self::db_context(access, false)?;
+        let rows = self.load_template_rows(&scoped).await?;
 
         // `where` filter (in-memory; FULL predicate coverage — module doc).
         let mut rows: Vec<ApiKeyProfileTemplateRow> = match &args.where_filter {
@@ -571,14 +676,20 @@ impl ProfileTemplateQueryServices for ProfileTemplateServiceAdapter {
 
 #[async_trait]
 impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
-    async fn create_api_key_profile_template(
+    async fn create_api_key_profile_template_with_access(
         &self,
+        access: &AdminAccessScope,
         input: CreateAPIKeyProfileTemplateInput,
         profile: APIKeyProfileInput,
     ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError> {
-        let ctx = Self::ctx();
+        let scoped = Self::db_context(access, true)?;
         let project_db = decode_db_id(input.project_id.as_str())
             .ok_or_else(|| ProfileTemplateServiceError::Create("invalid project id".to_owned()))?;
+        if !access.allows_project(&project_db) {
+            return Err(ProfileTemplateServiceError::PermissionDenied(
+                "cannot create a template outside the authorized project".to_owned(),
+            ));
+        }
 
         // biz/api_key_profile_template.go:37-39 — profile.Name is FORCED to
         // the template name before persisting.
@@ -589,8 +700,8 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
 
         let row = self
             .template_repo
-            .create_profile_template_unchecked(
-                &ctx,
+            .create_profile_template(
+                &scoped.context,
                 RepoCreateTemplateInput {
                     project_id: project_db,
                     name: input.name.clone(),
@@ -608,13 +719,14 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         Ok(template_row_to_gql(row))
     }
 
-    async fn update_api_key_profile_template(
+    async fn update_api_key_profile_template_with_access(
         &self,
+        access: &AdminAccessScope,
         id: &str,
         input: UpdateAPIKeyProfileTemplateInput,
         profile: Option<APIKeyProfileInput>,
     ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError> {
-        let ctx = Self::ctx();
+        let scoped = Self::db_context(access, true)?;
         let not_found = || {
             ProfileTemplateServiceError::Update(ProfileTemplateServiceError::NotFound.to_string())
         };
@@ -624,7 +736,7 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         // keys by `(project_id, id)`) and, when a profile is supplied, the
         // name fallback (Go biz:121-131 gets the template inside the txn).
         let existing = self
-            .find_template_row(&db_id)
+            .find_template_row(&scoped, &db_id)
             .await
             .map_err(ProfileTemplateServiceError::Update)?
             .ok_or_else(not_found)?;
@@ -645,8 +757,8 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
 
         let row = self
             .template_repo
-            .update_profile_template_unchecked(
-                &ctx,
+            .update_profile_template(
+                &scoped.context,
                 &existing.project_id,
                 &db_id,
                 RepoUpdateTemplateInput {
@@ -668,11 +780,12 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         Ok(template_row_to_gql(row))
     }
 
-    async fn delete_api_key_profile_template(
+    async fn delete_api_key_profile_template_with_access(
         &self,
+        access: &AdminAccessScope,
         id: &str,
     ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError> {
-        let ctx = Self::ctx();
+        let scoped = Self::db_context(access, true)?;
         let not_found = || {
             ProfileTemplateServiceError::Delete(ProfileTemplateServiceError::NotFound.to_string())
         };
@@ -681,14 +794,14 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         // Go biz:156-179 — get first, then DeleteOneID; the PRE-delete
         // snapshot is what the mutation returns.
         let existing = self
-            .find_template_row(&db_id)
+            .find_template_row(&scoped, &db_id)
             .await
             .map_err(ProfileTemplateServiceError::Delete)?
             .ok_or_else(not_found)?;
 
         self.template_repo
-            .soft_delete_profile_template_unchecked(
-                &ctx,
+            .soft_delete_profile_template(
+                &scoped.context,
                 &existing.project_id,
                 &db_id,
                 chrono::Utc::now().to_rfc3339(),
@@ -701,11 +814,12 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         Ok(template_row_to_gql(existing))
     }
 
-    async fn load_api_key_profile_template(
+    async fn load_api_key_profile_template_with_access(
         &self,
+        access: &AdminAccessScope,
         input: LoadApiKeyProfileTemplateInput,
     ) -> Result<APIKey, ProfileTemplateServiceError> {
-        let ctx = Self::ctx();
+        let scoped = Self::db_context(access, true)?;
         // Error surfaces mirror the crate's in-memory double (the golden
         // behavior): a missing template wraps the ent template-not-found
         // string, a missing key wraps "ent: apikey not found".
@@ -719,16 +833,15 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         let api_key_db = decode_db_id(input.api_key_id.as_str()).ok_or_else(key_not_found)?;
 
         let template = self
-            .find_template_row(&template_db)
+            .find_template_row(&scoped, &template_db)
             .await
             .map_err(ProfileTemplateServiceError::Load)?
             .ok_or_else(template_not_found)?;
 
         let api_key = self
-            .api_key_repo
-            .find_api_key_by_id(&ctx, &api_key_db)
+            .find_api_key_row(&scoped, &api_key_db)
             .await
-            .map_err(|e| ProfileTemplateServiceError::Load(e.to_string()))?
+            .map_err(ProfileTemplateServiceError::Load)?
             .ok_or_else(key_not_found)?;
 
         // biz:196-198 — same-project guard.
@@ -766,7 +879,7 @@ impl ProfileTemplateMutationServices for ProfileTemplateServiceAdapter {
         let row = self
             .api_key_repo
             .update_api_key(
-                &ctx,
+                &scoped.context,
                 &api_key_db,
                 RepoUpdateApiKeyInput {
                     profiles: Some(profiles_json),
@@ -1171,8 +1284,11 @@ mod postgres_tests {
         let adapter = ProfileTemplateServiceAdapter::new(template_repo, api_key_service_repo);
 
         let project_id = "41";
+        let access_41 = AdminAccessScope::Project(project_id.to_owned());
+        let access_42 = AdminAccessScope::Project("42".to_owned());
         let created = adapter
-            .create_api_key_profile_template(
+            .create_api_key_profile_template_with_access(
+                &access_41,
                 CreateAPIKeyProfileTemplateInput {
                     name: "Restricted".to_string(),
                     description: Some("PostgreSQL profile".to_string()),
@@ -1204,7 +1320,7 @@ mod postgres_tests {
 
         let key = api_key_repo
             .create_api_key(
-                &ProfileTemplateServiceAdapter::ctx(),
+                &ProfileTemplateServiceAdapter::db_context(&access_41, true)?.context,
                 RepoCreateApiKeyInput {
                     id: String::new(),
                     user_id: None,
@@ -1220,7 +1336,7 @@ mod postgres_tests {
             .await?;
         let foreign_key = api_key_repo
             .create_api_key(
-                &ProfileTemplateServiceAdapter::ctx(),
+                &ProfileTemplateServiceAdapter::db_context(&access_42, true)?.context,
                 RepoCreateApiKeyInput {
                     id: String::new(),
                     user_id: None,
@@ -1234,11 +1350,101 @@ mod postgres_tests {
                 },
             )
             .await?;
+        let foreign_template = adapter
+            .create_api_key_profile_template_with_access(
+                &access_42,
+                CreateAPIKeyProfileTemplateInput {
+                    name: "Foreign Restricted".to_owned(),
+                    description: None,
+                    project_id: ID::from("42"),
+                },
+                APIKeyProfileInput {
+                    name: "ignored".to_owned(),
+                    model_mappings: None,
+                    channel_ids: None,
+                    channel_tags: None,
+                    channel_tags_match_mode: None,
+                    model_ids: None,
+                    valid_from: None,
+                    valid_until: None,
+                    quota: None,
+                    load_balance_strategy: None,
+                    max_concurrent_requests: None,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            adapter
+                .create_api_key_profile_template_with_access(
+                    &access_41,
+                    CreateAPIKeyProfileTemplateInput {
+                        name: "Cross Project Create".to_owned(),
+                        description: None,
+                        project_id: ID::from("42"),
+                    },
+                    APIKeyProfileInput {
+                        name: "ignored".to_owned(),
+                        model_mappings: None,
+                        channel_ids: None,
+                        channel_tags: None,
+                        channel_tags_match_mode: None,
+                        model_ids: None,
+                        valid_from: None,
+                        valid_until: None,
+                        quota: None,
+                        load_balance_strategy: None,
+                        max_concurrent_requests: None,
+                    },
+                )
+                .await,
+            Err(ProfileTemplateServiceError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            adapter
+                .update_api_key_profile_template_with_access(
+                    &access_41,
+                    foreign_template.id.as_str(),
+                    UpdateAPIKeyProfileTemplateInput {
+                        name: Some("must-not-update".to_owned()),
+                        description: None,
+                    },
+                    None,
+                )
+                .await,
+            Err(ProfileTemplateServiceError::Update(message))
+                if message == ProfileTemplateServiceError::NotFound.to_string()
+        ));
+        assert!(matches!(
+            adapter
+                .delete_api_key_profile_template_with_access(
+                    &access_41,
+                    foreign_template.id.as_str(),
+                )
+                .await,
+            Err(ProfileTemplateServiceError::Delete(message))
+                if message == ProfileTemplateServiceError::NotFound.to_string()
+        ));
+        assert!(matches!(
+            adapter
+                .load_api_key_profile_template_with_access(
+                    &access_41,
+                    LoadApiKeyProfileTemplateInput {
+                        template_id: foreign_template.id.clone(),
+                        api_key_id: ID::from(foreign_key.id.clone()),
+                    },
+                )
+                .await,
+            Err(ProfileTemplateServiceError::Load(message))
+                if message == ProfileTemplateServiceError::NotFound.to_string()
+        ));
         let foreign_load = adapter
-            .load_api_key_profile_template(LoadApiKeyProfileTemplateInput {
-                template_id: created.id.clone(),
-                api_key_id: ID::from(foreign_key.id),
-            })
+            .load_api_key_profile_template_with_access(
+                &AdminAccessScope::Global,
+                LoadApiKeyProfileTemplateInput {
+                    template_id: created.id.clone(),
+                    api_key_id: ID::from(foreign_key.id),
+                },
+            )
             .await;
         assert!(matches!(
             foreign_load,
@@ -1246,10 +1452,13 @@ mod postgres_tests {
         ));
 
         let loaded = adapter
-            .load_api_key_profile_template(LoadApiKeyProfileTemplateInput {
-                template_id: created.id.clone(),
-                api_key_id: ID::from(key.id),
-            })
+            .load_api_key_profile_template_with_access(
+                &access_41,
+                LoadApiKeyProfileTemplateInput {
+                    template_id: created.id.clone(),
+                    api_key_id: ID::from(key.id),
+                },
+            )
             .await?;
         let profiles = loaded
             .profiles
@@ -1260,14 +1469,20 @@ mod postgres_tests {
         assert_eq!(profiles[0].channel_ids.as_deref(), Some(&[7, 8][..]));
 
         let connection = adapter
-            .api_key_profile_templates(APIKeyProfileTemplateConnectionArgs::default())
+            .api_key_profile_templates_with_access(
+                &access_41,
+                APIKeyProfileTemplateConnectionArgs::default(),
+            )
             .await?;
         assert_eq!(connection.total_count, 1);
         adapter
-            .delete_api_key_profile_template(created.id.as_str())
+            .delete_api_key_profile_template_with_access(&access_41, created.id.as_str())
             .await?;
         let connection = adapter
-            .api_key_profile_templates(APIKeyProfileTemplateConnectionArgs::default())
+            .api_key_profile_templates_with_access(
+                &access_41,
+                APIKeyProfileTemplateConnectionArgs::default(),
+            )
             .await?;
         assert_eq!(connection.total_count, 0);
 

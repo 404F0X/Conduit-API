@@ -1,96 +1,198 @@
-import { test, expect } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 import { gotoAndEnsureAuth, waitForGraphQLOperation } from './auth.utils'
+
+const mockUpstreamURL = process.env.CONDUIT_E2E_MOCK_UPSTREAM_URL
+if (!mockUpstreamURL) {
+  throw new Error('CONDUIT_E2E_MOCK_UPSTREAM_URL is required; run tests through test:e2e')
+}
+
+async function performGraphQLOperation(page: Page, operationName: string, action: () => Promise<void>) {
+  const responsePromise = page.waitForResponse(
+    (response) => {
+      if (!response.url().includes('/admin/graphql')) return false
+      return response.request().postData()?.includes(operationName) ?? false
+    },
+    { timeout: 15000 }
+  )
+
+  await action()
+  const response = await responsePromise
+  expect(response.ok()).toBe(true)
+  const payload = await response.json()
+  expect(payload.errors, JSON.stringify(payload.errors)).toBeUndefined()
+}
+
+async function completeModelSettingsOnboarding(page: Page) {
+  const driverPopover = page.locator('#driver-popover-content')
+  const onboardingAppeared = await driverPopover
+    .waitFor({ state: 'visible', timeout: 3000 })
+    .then(() => true)
+    .catch(() => false)
+  if (!onboardingAppeared) return
+
+  const driverOverlay = page.locator('.driver-overlay')
+  const settingsButton = page.locator('[data-settings-button].driver-active-element')
+  const settingsDialog = page
+    .locator('[data-slot="dialog-content"]')
+    .filter({ hasText: /Model Settings|模型设置/i })
+
+  await expect(settingsButton).toBeVisible()
+  const [response] = await Promise.all([
+    page.waitForResponse(
+      (candidate) => {
+        if (!candidate.url().includes('/admin/graphql')) return false
+        return candidate.request().postData()?.includes('CompleteSystemModelSettingOnboarding') ?? false
+      },
+      { timeout: 15000 }
+    ),
+    settingsButton.click(),
+  ])
+
+  await expect(driverOverlay).not.toBeVisible({ timeout: 5000 })
+  expect(response.ok()).toBe(true)
+  const payload = await response.json()
+  expect(payload.errors, JSON.stringify(payload.errors)).toBeUndefined()
+
+  // Completing the tour intentionally opens model settings. Close it before
+  // the test starts interacting with catalog controls.
+  if (await settingsDialog.isVisible().catch(() => false)) {
+    await settingsDialog.locator('[data-slot="dialog-close"]').click()
+    await expect(settingsDialog).not.toBeVisible({ timeout: 5000 })
+  }
+}
+
+async function openModelsManagement(page: Page) {
+  const publicModelsView = page.getByTestId('models-catalog-view-models')
+  await publicModelsView.waitFor({ state: 'visible', timeout: 20000 })
+  await publicModelsView.click()
+
+  const enterpriseToggle = page.getByTestId('models-enterprise-toggle')
+  await enterpriseToggle.waitFor({ state: 'visible', timeout: 20000 })
+  if ((await enterpriseToggle.getAttribute('aria-expanded')) !== 'true') {
+    await enterpriseToggle.click()
+  }
+  await expect(page.getByTestId('models-enterprise-panel')).toBeVisible()
+  await expect(page.getByTestId('models-table')).toBeVisible({ timeout: 20000 })
+}
+
+async function createRouteChannel(page: Page, uniqueSuffix: string) {
+  const channelName = `pw-model-route-${uniqueSuffix}`
+  await gotoAndEnsureAuth(page, '/channels')
+
+  const channelsTable = page.getByTestId('channels-table')
+  await expect(channelsTable).toBeVisible({ timeout: 20000 })
+  await page.getByTestId('add-channel-button').click()
+
+  const createDialog = page.getByRole('dialog').filter({ has: page.getByTestId('channel-submit-button') })
+  await expect(createDialog).toBeVisible()
+  await createDialog.getByTestId('channel-name-input').fill(channelName)
+  await createDialog.locator('#channel-billing-currency').fill('CNY')
+  await createDialog.locator('#channel-recharge-multiplier').fill('1')
+  await createDialog.getByTestId('provider-openai').click()
+  await createDialog.getByTestId('channel-base-url-input').fill(mockUpstreamURL)
+  await createDialog.getByTestId('channel-api-key-input').fill(`sk-model-route-${uniqueSuffix}`)
+
+  await createDialog.getByTestId('quick-model-gpt-4o').click()
+  const addSelected = createDialog.getByTestId('add-selected-models-button')
+  await expect(addSelected).toBeEnabled()
+  await addSelected.click()
+
+  const defaultModel = createDialog.getByTestId('default-test-model-select')
+  await expect(defaultModel).toBeEnabled()
+  await defaultModel.click()
+  await page.getByRole('option', { name: 'gpt-4o', exact: true }).click()
+
+  await performGraphQLOperation(page, 'CreateChannel', () => createDialog.getByTestId('channel-submit-button').click())
+  await expect(createDialog).not.toBeVisible({ timeout: 10000 })
+
+  const channelRow = channelsTable.locator('tbody tr').filter({ hasText: channelName })
+  await expect(channelRow).toBeVisible({ timeout: 10000 })
+  const statusSwitch = channelRow.getByTestId('channel-status-switch')
+  await expect(statusSwitch).not.toBeChecked()
+  await statusSwitch.click()
+
+  const statusDialog = page.getByRole('alertdialog').filter({ hasText: channelName })
+  await expect(statusDialog).toBeVisible()
+  await performGraphQLOperation(page, 'UpdateChannelStatus', () =>
+    statusDialog.getByRole('button', { name: /Enable|启用/i, exact: true }).click()
+  )
+  await expect(statusDialog).not.toBeVisible({ timeout: 10000 })
+  await expect(statusSwitch).toBeChecked()
+
+  return channelName
+}
+
+async function deleteRouteChannel(page: Page, channelName: string) {
+  await gotoAndEnsureAuth(page, '/channels')
+  const channelsTable = page.getByTestId('channels-table')
+  await expect(channelsTable).toBeVisible({ timeout: 20000 })
+  const channelRow = channelsTable.locator('tbody tr').filter({ hasText: channelName })
+  await expect(channelRow).toBeVisible({ timeout: 10000 })
+  await channelRow.getByTestId('row-actions').click()
+  await page.getByRole('menuitem', { name: /Delete|删除/i, exact: true }).click()
+
+  const deleteDialog = page.getByRole('alertdialog').filter({ hasText: channelName })
+  await expect(deleteDialog).toBeVisible()
+  await deleteDialog.getByLabel(/Please enter Channel name|请输入渠道名称/i).fill(channelName)
+  await performGraphQLOperation(page, 'DeleteChannel', () =>
+    deleteDialog.getByRole('button', { name: /Delete Channel|删除渠道/i, exact: true }).click()
+  )
+  await expect(deleteDialog).not.toBeVisible({ timeout: 10000 })
+  await expect(channelRow).toHaveCount(0)
+}
 
 test.describe('Admin Models Management', () => {
   test.beforeEach(async ({ page }) => {
     test.setTimeout(60000)
     await gotoAndEnsureAuth(page, '/models')
 
-    // The public-model catalog is the default product view. Enterprise model
-    // entities and association tools intentionally live behind this disclosure.
-    const publicModelsView = page.getByTestId('models-catalog-view-models')
-    await publicModelsView.waitFor({ state: 'visible', timeout: 20000 })
-    await publicModelsView.click()
-
-    const enterpriseToggle = page.getByTestId('models-enterprise-toggle')
-    await enterpriseToggle.waitFor({ state: 'visible', timeout: 20000 })
-    if ((await enterpriseToggle.getAttribute('aria-expanded')) !== 'true') {
-      await enterpriseToggle.click()
-    }
-    await expect(page.getByTestId('models-enterprise-panel')).toBeVisible()
-
-    const modelsTable = page.getByTestId('models-table')
-    await modelsTable.waitFor({ state: 'visible', timeout: 20000 })
-
-    // The one-step tour is intentionally completed by clicking its highlighted
-    // settings button; wait for its delayed mount before opening other dialogs.
-    await page.waitForTimeout(700)
-    const driverOverlay = page.locator('.driver-overlay')
-    if (await driverOverlay.isVisible().catch(() => false)) {
-      const settingsButton = page.locator('[data-settings-button]')
-      if (await settingsButton.isVisible().catch(() => false)) {
-        await Promise.all([
-          waitForGraphQLOperation(page, 'CompleteSystemModelSettingOnboarding'),
-          settingsButton.click(),
-        ])
-      }
-      await expect(driverOverlay).not.toBeVisible({ timeout: 10000 })
-    }
-
-    // Close any dialog that may have opened (e.g., settings dialog from clicking the button)
-    const settingsDialog = page.getByRole('dialog').filter({ hasText: /Model Settings|模型设置/i })
-    if (await settingsDialog.isVisible().catch(() => false)) {
-      await page.keyboard.press('Escape')
-      await expect(settingsDialog).not.toBeVisible({ timeout: 5000 })
-    }
+    await completeModelSettingsOnboarding(page)
+    await openModelsManagement(page)
   })
 
   test('can create, edit, filter, toggle status, and delete a model', async ({ page }) => {
+    test.setTimeout(120000)
     const uniqueSuffix = Date.now().toString().slice(-6)
     const baseName = `pw-model-${uniqueSuffix}`
     const updatedName = `${baseName}-updated`
 
+    // Create one real, loopback-only channel. The production channel inventory
+    // trigger materializes its supported model as an upstream deployment.
+    const channelName = await createRouteChannel(page, uniqueSuffix)
+    await gotoAndEnsureAuth(page, '/models')
+    await openModelsManagement(page)
+
     // Open create dialog
     const createButton = page
-      .getByRole('button', { name: /Add Model|创建模型|新增模型/i, exact: true })
+      .getByRole('button', { name: /Add Public Model|添加对外模型/i, exact: true })
       .first()
     await expect(createButton).toBeVisible()
     await createButton.click()
 
-    const dialog = page.locator('[data-slot="dialog-content"]')
+    const dialog = page
+      .getByRole('dialog')
+      .filter({ has: page.getByRole('button', { name: /Create model and routes|创建模型与路由/i }) })
     await expect(dialog).toBeVisible()
 
-    // Select developer
-    const developerCombo = dialog.locator('[role="combobox"]').first()
-    await developerCombo.fill('moonshot')
-    await developerCombo.press('Enter')
-
-    // Select a modelId from provider list
-    const modelIdInput = dialog.getByPlaceholder(/model id/i).first()
-    await modelIdInput.click()
-    await modelIdInput.fill('kimi')
-    const modelOption = page.getByRole('option', { name: /kimi-k2-thinking/i }).first()
-    await expect(modelOption).toBeVisible()
-    await modelOption.click()
-
-    // Override default name/group with deterministic values
-    const nameInput = dialog.getByLabel(/Name|名称/i)
-    await nameInput.fill(baseName)
-    const groupInput = dialog.getByLabel(/Group|分组/i)
-    await groupInput.fill(`group-${uniqueSuffix}`)
-    const remarkInput = dialog.getByLabel(/Remark|备注/i)
-    if (await remarkInput.count()) {
-      await remarkInput.fill('Created via Playwright E2E')
-    }
-
-    const createResponsePromise = page.waitForResponse((response) => {
-      if (!response.url().includes('/admin/graphql')) return false
-      return response.request().postData()?.includes('CreateModel') ?? false
+    const upstreamSearch = dialog.getByPlaceholder(/Search upstream model ID|搜索上游模型 ID/i)
+    await upstreamSearch.fill(channelName)
+    const routeButton = dialog.getByRole('button', {
+      name: new RegExp(`${channelName},\\s*gpt-4o`, 'i'),
     })
-    await dialog.getByRole('button', { name: /Create|创建|保存|Save/i }).last().click()
-    const createResponse = await createResponsePromise
-    const createPayload = await createResponse.json()
-    expect(createPayload.errors, JSON.stringify(createPayload.errors)).toBeUndefined()
+    await expect(routeButton).toBeVisible()
+    await routeButton.click()
+    await expect(routeButton).toHaveAttribute('aria-pressed', 'true')
+
+    // The create flow uses labelled native inputs for the public ID and
+    // developer. Scope by accessible name so the adjacent Radix type Select is
+    // never mistaken for an editable combobox.
+    await dialog.getByRole('textbox', { name: /Public model ID|对外模型 ID/i }).fill(baseName)
+    await dialog.getByRole('textbox', { name: /Name|名称/i, exact: true }).fill(baseName)
+    await dialog.getByRole('combobox', { name: /Developer|开发者/i }).fill('openai')
+
+    await performGraphQLOperation(page, 'CreatePublicModelWithRoutes', () =>
+      dialog.getByRole('button', { name: /Create model and routes|创建模型与路由/i, exact: true }).click()
+    )
     await expect(dialog).not.toBeVisible({ timeout: 20000 })
     await waitForGraphQLOperation(page, 'GetModels')
 
@@ -122,10 +224,8 @@ test.describe('Admin Models Management', () => {
     // Verify filtering by name works with the updated name
     const filterInput = page.getByPlaceholder(/Filter by name|名称|搜索/i)
     await filterInput.fill(updatedName)
-    await page.waitForTimeout(800)
     await expect(updatedRow).toBeVisible()
     await filterInput.fill('')
-    await page.waitForTimeout(400)
 
     // Toggle status via switch (enable/disable)
     const statusSwitch = updatedRow.locator('[data-testid="model-status-switch"]').first()
@@ -159,6 +259,7 @@ test.describe('Admin Models Management', () => {
     await waitForGraphQLOperation(page, 'GetModels')
 
     await expect(modelsTable.locator('tbody tr').filter({ hasText: updatedName })).toHaveCount(0)
+    await deleteRouteChannel(page, channelName)
   })
 
   test('opens an upstream deployment detail from a channel model link when fixtures provide one', async ({ page }) => {

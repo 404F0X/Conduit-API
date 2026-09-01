@@ -45,6 +45,7 @@ import { useGeneralSettings } from '@/features/system/data/system';
 import type { User } from '@/features/users/data/schema';
 import { useUsers } from '@/features/users/data/users';
 import { accessPlanIDsForEdit, mergeAccessPlanOptions, normalizeAccessPlanIDs, toggleAccessPlanID } from './access-plan-selection';
+import { RedemptionCodeSection } from './components/redemption-code-section';
 import {
   type ProjectBalance,
   type ProjectWalletComparison,
@@ -395,6 +396,9 @@ export default function BillingPage() {
             canWrite={canWriteSubscriptions}
             creditDisplayName={creditDisplayName}
           />
+        )}
+        {canReadBilling && (
+          <RedemptionCodeSection creditDisplayName={creditDisplayName} canCreate={canGrantCredit} canRevoke={canGrantCredit} />
         )}
       </Main>
     </>

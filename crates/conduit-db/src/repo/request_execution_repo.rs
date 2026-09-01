@@ -239,6 +239,24 @@ pub trait RequestExecutionRepo: Send + Sync {
         limit: u32,
     ) -> RepoResult<Vec<RequestExecutionRow>>;
 
+    /// List every execution attached to `channel_id`, optionally constrained
+    /// to the project already authorized by the caller.
+    async fn list_request_executions_by_channel_unchecked(
+        &self,
+        ctx: &RequestContext,
+        authorized_project_id: Option<&str>,
+        channel_id: &str,
+    ) -> RepoResult<Vec<RequestExecutionRow>>;
+
+    /// List every execution attached to `data_storage_id`, optionally
+    /// constrained to the project already authorized by the caller.
+    async fn list_request_executions_by_data_storage_unchecked(
+        &self,
+        ctx: &RequestContext,
+        authorized_project_id: Option<&str>,
+        data_storage_id: &str,
+    ) -> RepoResult<Vec<RequestExecutionRow>>;
+
     async fn list_request_executions(
         &self,
         ctx: &RequestContext,
@@ -411,6 +429,58 @@ impl RequestExecutionRepo for InMemoryRequestExecutionRepo {
         });
         rows.truncate(limit as usize);
         Ok(rows)
+    }
+
+    async fn list_request_executions_by_channel_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        authorized_project_id: Option<&str>,
+        channel_id: &str,
+    ) -> RepoResult<Vec<RequestExecutionRow>> {
+        let guard = self
+            .rows
+            .lock()
+            .map_err(|_| RepoError::LockPoisoned("request execution repo"))?;
+        let mut matched = guard
+            .values()
+            .filter(|row| {
+                row.channel_id.as_deref() == Some(channel_id)
+                    && authorized_project_id.is_none_or(|project_id| row.project_id == project_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matched.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(matched)
+    }
+
+    async fn list_request_executions_by_data_storage_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        authorized_project_id: Option<&str>,
+        data_storage_id: &str,
+    ) -> RepoResult<Vec<RequestExecutionRow>> {
+        let guard = self
+            .rows
+            .lock()
+            .map_err(|_| RepoError::LockPoisoned("request execution repo"))?;
+        let mut matched = guard
+            .values()
+            .filter(|row| {
+                row.data_storage_id.as_deref() == Some(data_storage_id)
+                    && authorized_project_id.is_none_or(|project_id| row.project_id == project_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matched.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(matched)
     }
 
     async fn update_request_execution_unchecked(
@@ -609,6 +679,92 @@ mod tests {
         let rows = repo.list_request_executions(&ctx, "p-1", "r-1").await?;
         let ids: Vec<_> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["e-1", "e-2", "e-3"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_by_channel_honors_optional_authorized_project() -> RepoResult<()> {
+        let repo = InMemoryRequestExecutionRepo::new();
+        let ctx = ctx_allowed();
+        for (execution_id, project_id, channel_id, created_at) in [
+            ("e-3", "p-1", "ch-shared", "2024-01-02T00:00:00Z"),
+            ("e-1", "p-1", "ch-shared", "2024-01-01T00:00:00Z"),
+            ("e-2", "p-2", "ch-shared", "2024-01-01T00:00:00Z"),
+            ("e-x", "p-1", "ch-other", "2023-12-31T00:00:00Z"),
+        ] {
+            let mut execution = input(execution_id, project_id, "r-1", created_at);
+            execution.channel_id = Some(channel_id.to_owned());
+            repo.create_request_execution(&ctx, execution).await?;
+        }
+
+        let global = repo
+            .list_request_executions_by_channel_unchecked(&ctx, None, "ch-shared")
+            .await?;
+        assert_eq!(
+            global.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["e-1", "e-2", "e-3"]
+        );
+
+        let project = repo
+            .list_request_executions_by_channel_unchecked(&ctx, Some("p-1"), "ch-shared")
+            .await?;
+        assert_eq!(
+            project
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e-1", "e-3"]
+        );
+        assert!(
+            repo.list_request_executions_by_channel_unchecked(&ctx, Some("p-missing"), "ch-shared")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_by_data_storage_honors_optional_authorized_project() -> RepoResult<()> {
+        let repo = InMemoryRequestExecutionRepo::new();
+        let ctx = ctx_allowed();
+        for (execution_id, project_id, data_storage_id, created_at) in [
+            ("e-3", "p-1", "ds-shared", "2024-01-02T00:00:00Z"),
+            ("e-1", "p-1", "ds-shared", "2024-01-01T00:00:00Z"),
+            ("e-2", "p-2", "ds-shared", "2024-01-01T00:00:00Z"),
+            ("e-x", "p-1", "ds-other", "2023-12-31T00:00:00Z"),
+        ] {
+            let mut execution = input(execution_id, project_id, "r-1", created_at);
+            execution.data_storage_id = Some(data_storage_id.to_owned());
+            repo.create_request_execution(&ctx, execution).await?;
+        }
+
+        let global = repo
+            .list_request_executions_by_data_storage_unchecked(&ctx, None, "ds-shared")
+            .await?;
+        assert_eq!(
+            global.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["e-1", "e-2", "e-3"]
+        );
+
+        let project = repo
+            .list_request_executions_by_data_storage_unchecked(&ctx, Some("p-1"), "ds-shared")
+            .await?;
+        assert_eq!(
+            project
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e-1", "e-3"]
+        );
+        assert!(
+            repo.list_request_executions_by_data_storage_unchecked(
+                &ctx,
+                Some("p-missing"),
+                "ds-shared",
+            )
+            .await?
+            .is_empty()
+        );
         Ok(())
     }
 

@@ -10,6 +10,7 @@ import { FontProvider } from './context/font-context';
 import { SearchProvider } from './context/search-context';
 import { ThemeProvider } from './context/theme-context';
 import './index.css';
+import { APP_BASE_PATH } from './lib/base-path';
 // Initialize i18n
 import './lib/i18n';
 import i18n from './lib/i18n';
@@ -89,6 +90,7 @@ const queryClient = new QueryClient({
 // Create a new router instance
 const router = createRouter({
   routeTree,
+  basepath: APP_BASE_PATH || '/',
   context: { queryClient },
   defaultPreload: 'intent',
   defaultPreloadStaleTime: 0,

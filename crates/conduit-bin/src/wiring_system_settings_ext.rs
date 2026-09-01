@@ -179,7 +179,10 @@ fn proxy_from_wire(w: WireProxyConfig) -> GqlProxyConfig {
         proxy_type: proxy_type_from_wire(&w.proxy_type),
         url: non_empty(w.url),
         username: non_empty(w.username),
-        password: non_empty(w.password),
+        // Stored proxy credentials are write-only. Discard the wire value at
+        // the adapter boundary as defense in depth; ProxyConfig's GraphQL
+        // resolver independently guarantees that it can never be projected.
+        password: None,
     }
 }
 
@@ -531,5 +534,24 @@ impl SystemSettingsExtServices for SystemSettingsExtAdapter {
             .complete_auto_disable_channel_onboarding(&ctx)
             .await
             .map_err(|err| ExtErr::CompleteAutoDisableOnboarding(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod proxy_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn webhook_proxy_password_is_discarded_on_read() {
+        let proxy = proxy_from_wire(WireProxyConfig {
+            proxy_type: "URL".to_owned(),
+            url: "http://proxy.example".to_owned(),
+            username: "operator".to_owned(),
+            password: "must-not-leak".to_owned(),
+        });
+
+        assert_eq!(proxy.url.as_deref(), Some("http://proxy.example"));
+        assert_eq!(proxy.username.as_deref(), Some("operator"));
+        assert_eq!(proxy.password, None);
     }
 }

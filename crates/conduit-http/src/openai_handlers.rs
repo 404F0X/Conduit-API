@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::io::{Cursor, Read};
 
 use axum::Json;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -304,6 +305,7 @@ fn model_not_found_response(model_id: &str) -> Response {
 use conduit_llm::model::HttpRequest;
 
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, State};
 use axum::http::{Method, Uri};
 
@@ -311,6 +313,19 @@ use crate::app_state::AppState;
 use crate::error_middleware::{ErrorResponseFormat, conduit_error_response};
 use crate::middleware::api_key_auth::{ValidatedApiKeyMetadata, api_key_meta_keys};
 use crate::middleware::{TraceThreadContext, TracingHeaderConfig, resolve_trace_id};
+
+/// Maximum aggregate request size for multipart image/audio uploads. This is
+/// intentionally larger than axum's 2 MiB default while remaining bounded;
+/// the limit covers all parts plus multipart framing, not each file alone.
+pub const MULTIPART_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Axum's existing default for JSON/protocol request bodies. Compressed input
+/// is allowed only when its expanded form still fits this same boundary.
+const PROTOCOL_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Bound CPU/memory amplification independently of the absolute route limit.
+const MAX_DECOMPRESSION_RATIO: usize = 100;
+/// Small compressed payloads need room for codec framing and ordinary JSON.
+const DECOMPRESSION_RATIO_SLACK_BYTES: usize = 1024;
 
 /// Non-stream response materialised by [`OpenAiOrchestratorService::process`].
 ///
@@ -429,6 +444,13 @@ pub enum OpenAiHandlerOutput {
     /// [`crate::middleware::sse_stream::into_sse_response`]) rather than
     /// collecting the whole stream first (the `Stream` variant's buffered path).
     LiveStream(LiveEventStream),
+    /// Live raw-audio response. Each event carries one provider body chunk in
+    /// `StreamEvent::binary`; the HTTP writer forwards those chunks without
+    /// collecting the complete speech response.
+    LiveBinary {
+        stream: LiveEventStream,
+        content_type: Option<String>,
+    },
 }
 
 /// Wrapper carrying the live client-facing event receiver so
@@ -652,6 +674,15 @@ impl OpenAiRoute {
             _ => ErrorResponseFormat::OpenAiCompatibleJson,
         }
     }
+
+    const fn request_body_limit(self) -> usize {
+        match self {
+            Self::ImageEdits | Self::AudioTranscriptions | Self::AudioTranslations => {
+                MULTIPART_BODY_LIMIT_BYTES
+            }
+            _ => PROTOCOL_BODY_LIMIT_BYTES,
+        }
+    }
 }
 
 /// POST /v1/audio/speech — Go `OpenAIHandlers.CreateSpeech`
@@ -670,9 +701,10 @@ impl OpenAiRoute {
 ///    `handlers.SpeechHandlers.StreamWriter` between `WriteBinaryStream` and
 ///    the default SSE writer at openai.go:330-335.
 ///
-/// The actual binary stream framing (chat.go:175-239) is a gap pending the
-/// host-side orchestrator bridge: the trait surface carries the routing
-/// decision; the host wiring decides the concrete output shape.
+/// Binary responses stay live across the host bridge: provider body chunks
+/// arrive as [`OpenAiHandlerOutput::LiveBinary`] and are written verbatim via
+/// an Axum streaming body. The provider Content-Type is preserved, with
+/// `application/octet-stream` used only when the upstream omitted it.
 pub async fn create_speech(
     State(state): State<AppState>,
     api_key_meta: Option<axum::Extension<ValidatedApiKeyMetadata>>,
@@ -681,6 +713,17 @@ pub async fn create_speech(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let (headers, body) = match decode_request_body(
+        &headers,
+        body,
+        OpenAiRoute::AudioSpeech.request_body_limit(),
+    )
+    .await
+    {
+        Ok(decoded) => decoded,
+        Err(error) => return request_decode_error_response(error, OpenAiRoute::AudioSpeech),
+    };
+
     // chat.go:67-70 — empty body rejected before the orchestrator is called.
     if let Err(err) = validate_chat_request(&body) {
         return conduit_error_response(&err, ErrorResponseFormat::OpenAiCompatibleJson);
@@ -765,6 +808,12 @@ pub async fn create_video(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let (headers, body) =
+        match decode_request_body(&headers, body, OpenAiRoute::Videos.request_body_limit()).await {
+            Ok(decoded) => decoded,
+            Err(error) => return request_decode_error_response(error, OpenAiRoute::Videos),
+        };
+
     // chat.go:67-70 — empty body rejected before the orchestrator is called.
     if let Err(err) = validate_chat_request(&body) {
         return conduit_error_response(&err, ErrorResponseFormat::OpenAiCompatibleJson);
@@ -1122,8 +1171,12 @@ pub async fn create_image_edit(
     uri: Uri,
     method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let body = match multipart_body(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     dispatch_openai(
         &state,
         OpenAiRoute::ImageEdits,
@@ -1146,8 +1199,12 @@ pub async fn create_transcription(
     uri: Uri,
     method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let body = match multipart_body(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     dispatch_openai(
         &state,
         OpenAiRoute::AudioTranscriptions,
@@ -1170,8 +1227,12 @@ pub async fn create_translation(
     uri: Uri,
     method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let body = match multipart_body(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     dispatch_openai(
         &state,
         OpenAiRoute::AudioTranslations,
@@ -1182,6 +1243,174 @@ pub async fn create_translation(
         api_key_meta.as_ref().map(|ext| &ext.0),
     )
     .await
+}
+
+fn multipart_body(body: Result<Bytes, BytesRejection>) -> Result<Bytes, Response> {
+    body.map_err(|rejection| {
+        let status = rejection.into_response().status();
+        let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            format!(
+                "request body exceeds the {} byte upload limit",
+                MULTIPART_BODY_LIMIT_BYTES
+            )
+        } else {
+            "request body could not be read".to_string()
+        };
+        let error = ConduitError::invalid_request(message).with_http_status(status.as_u16());
+        conduit_error_response(&error, ErrorResponseFormat::OpenAiCompatibleJson)
+    })
+}
+
+#[derive(Debug)]
+enum RequestBodyDecodeError {
+    UnsupportedEncoding,
+    MultipleEncodings,
+    InvalidEncodingHeader,
+    InvalidCompressedBody(String),
+    LimitExceeded,
+    WorkerFailure,
+}
+
+/// Decode a single HTTP Content-Encoding while bounding both expanded bytes
+/// and the compressed-to-expanded ratio. Returning sanitized headers is part
+/// of the contract: downstream protocol transformers and upstream providers
+/// must never see stale Content-Encoding/Content-Length values for a body that
+/// has already been decoded.
+async fn decode_request_body(
+    headers: &HeaderMap,
+    body: Bytes,
+    absolute_limit: usize,
+) -> Result<(HeaderMap, Bytes), RequestBodyDecodeError> {
+    let values = headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .map_err(|_| RequestBodyDecodeError::InvalidEncodingHeader)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if values.is_empty() {
+        return Ok((headers.clone(), body));
+    }
+    if values.len() != 1 || values[0].contains(',') {
+        return Err(RequestBodyDecodeError::MultipleEncodings);
+    }
+
+    let encoding = values[0].as_str();
+    if encoding == "identity" {
+        let mut sanitized = headers.clone();
+        sanitized.remove(header::CONTENT_ENCODING);
+        return Ok((sanitized, body));
+    }
+    if !matches!(encoding, "gzip" | "deflate" | "zstd") {
+        return Err(RequestBodyDecodeError::UnsupportedEncoding);
+    }
+    if body.len() > absolute_limit {
+        return Err(RequestBodyDecodeError::LimitExceeded);
+    }
+
+    let expansion_limit = body
+        .len()
+        .saturating_mul(MAX_DECOMPRESSION_RATIO)
+        .saturating_add(DECOMPRESSION_RATIO_SLACK_BYTES)
+        .min(absolute_limit);
+    let owned_encoding = encoding.to_string();
+    let decoded = tokio::task::spawn_blocking(move || {
+        decode_request_body_sync(&owned_encoding, body, expansion_limit)
+    })
+    .await
+    .map_err(|_| RequestBodyDecodeError::WorkerFailure)??;
+
+    let mut sanitized = headers.clone();
+    sanitized.remove(header::CONTENT_ENCODING);
+    sanitized.remove(header::CONTENT_LENGTH);
+    Ok((sanitized, Bytes::from(decoded)))
+}
+
+fn decode_request_body_sync(
+    encoding: &str,
+    body: Bytes,
+    limit: usize,
+) -> Result<Vec<u8>, RequestBodyDecodeError> {
+    match encoding {
+        "gzip" => read_decoded_body(flate2::read::GzDecoder::new(Cursor::new(body)), limit),
+        // RFC 9110's `deflate` coding is a zlib-wrapped deflate stream.
+        "deflate" => read_decoded_body(flate2::read::ZlibDecoder::new(Cursor::new(body)), limit),
+        "zstd" => {
+            let mut decoder =
+                zstd::stream::read::Decoder::new(Cursor::new(body)).map_err(|error| {
+                    RequestBodyDecodeError::InvalidCompressedBody(error.to_string())
+                })?;
+            // Refuse frames asking the decoder to reserve an excessive window
+            // before any expanded bytes reach the regular size checks.
+            decoder.window_log_max(23).map_err(|error| {
+                RequestBodyDecodeError::InvalidCompressedBody(error.to_string())
+            })?;
+            read_decoded_body(decoder, limit)
+        }
+        _ => Err(RequestBodyDecodeError::UnsupportedEncoding),
+    }
+}
+
+fn read_decoded_body(
+    mut reader: impl Read,
+    limit: usize,
+) -> Result<Vec<u8>, RequestBodyDecodeError> {
+    let mut decoded = Vec::with_capacity(limit.min(16 * 1024));
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| RequestBodyDecodeError::InvalidCompressedBody(error.to_string()))?;
+        if read == 0 {
+            return Ok(decoded);
+        }
+        if decoded.len().saturating_add(read) > limit {
+            return Err(RequestBodyDecodeError::LimitExceeded);
+        }
+        decoded.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn request_decode_error_response(error: RequestBodyDecodeError, route: OpenAiRoute) -> Response {
+    let (status, message) = match &error {
+        RequestBodyDecodeError::UnsupportedEncoding => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported Content-Encoding; expected gzip, deflate, zstd, or identity",
+        ),
+        RequestBodyDecodeError::MultipleEncodings => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "multiple Content-Encoding values are not supported",
+        ),
+        RequestBodyDecodeError::InvalidEncodingHeader => {
+            (StatusCode::BAD_REQUEST, "invalid Content-Encoding header")
+        }
+        RequestBodyDecodeError::InvalidCompressedBody(detail) => {
+            tracing::debug!(%detail, "request body decompression failed");
+            (StatusCode::BAD_REQUEST, "invalid compressed request body")
+        }
+        RequestBodyDecodeError::LimitExceeded => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "decompressed request body exceeds the size or expansion-ratio limit",
+        ),
+        RequestBodyDecodeError::WorkerFailure => {
+            tracing::error!("request decompression worker terminated unexpectedly");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request body decompression failed",
+            )
+        }
+    };
+    let conduit_error = if status == StatusCode::INTERNAL_SERVER_ERROR {
+        ConduitError::internal(message)
+    } else {
+        ConduitError::invalid_request(message).with_http_status(status.as_u16())
+    };
+    conduit_error_response(&conduit_error, route.error_format())
 }
 
 /// Shared dispatch flow for the three openai main-chain endpoints
@@ -1197,11 +1426,9 @@ pub async fn create_translation(
 ///    (S07 — chat.go:84-95, via [`resolve_response_content_type`]).
 ///
 /// Body decompression (Content-Encoding: gzip/deflate/zstd — utils.go:50-108)
-/// is intentionally NOT handled here: the bounded scope contract captures
-/// only the bytes axum hands us. The orchestrator-side bridge (host wiring)
-/// is responsible for the equivalent of `decodeRequestBody` before invoking
-/// the transformer pipeline, mirroring how Go runs `ReadHTTPRequest` before
-/// the handler prologue.
+/// happens before body validation and transformer dispatch. The decoded size
+/// and expansion ratio are bounded, and stale encoding/length headers are
+/// removed before the normalized request enters the orchestrator.
 /// Shared dispatcher for all LLM proxy routes (OpenAI + Anthropic). Public
 /// within the crate so `anthropic_handlers::create_message` can reuse the
 /// exact same orchestrator dispatch with a different route variant.
@@ -1221,6 +1448,12 @@ pub(crate) async fn dispatch_openai(
     // client gets `{type, error{...}, request_id}` and a Gemini client gets
     // `{error{code,message,status}}`. Previously every route emitted the OpenAI
     // envelope, so Claude/Gemini SDKs could not parse gateway-side failures.
+    let (headers, body) = match decode_request_body(headers, body, route.request_body_limit()).await
+    {
+        Ok(decoded) => decoded,
+        Err(error) => return request_decode_error_response(error, route),
+    };
+
     // chat.go:67-70 — empty body rejected before the orchestrator is called.
     if let Err(err) = validate_chat_request(&body) {
         return conduit_error_response(&err, route.error_format());
@@ -1245,7 +1478,7 @@ pub(crate) async fn dispatch_openai(
         route,
         uri,
         method,
-        headers,
+        &headers,
         body,
         api_key_meta,
         &tracing_header_config(state),
@@ -1289,6 +1522,10 @@ fn materialise_openai_output(
             live_gemini_json_stream_response(rx)
         }
         OpenAiHandlerOutput::LiveStream(LiveEventStream(rx)) => live_sse_response(route, rx),
+        OpenAiHandlerOutput::LiveBinary {
+            stream: LiveEventStream(rx),
+            content_type,
+        } => live_binary_stream_response(rx, content_type),
     }
 }
 
@@ -1408,6 +1645,56 @@ fn write_sse_stream_response(
 /// `OpenAiHandlerOutput::Binary` carries `Vec<u8>`, not a live stream), so the
 /// status is fixed at the response builder's default OK.
 fn materialise_binary_stream_response(body: Vec<u8>, content_type: Option<String>) -> Response {
+    materialise_binary_body(Body::from(body), content_type)
+}
+
+/// Build an Axum body over incremental binary events. `Body::from_stream`
+/// polls the bounded receiver on demand, so downstream socket pressure
+/// propagates through the orchestrator channels to the reqwest reader. The
+/// internal `binary.done` persistence sentinel has no payload and is skipped;
+/// a mid-body upstream error terminates the HTTP body without exposing provider
+/// details to the client.
+fn live_binary_stream_response(
+    rx: tokio::sync::mpsc::Receiver<Result<conduit_llm::StreamEvent, ConduitError>>,
+    content_type: Option<String>,
+) -> Response {
+    struct LiveBinaryBody {
+        rx: tokio::sync::mpsc::Receiver<Result<conduit_llm::StreamEvent, ConduitError>>,
+    }
+
+    impl futures_core::Stream for LiveBinaryBody {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            loop {
+                match this.rx.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(Ok(mut event))) => {
+                        if let Some(binary) = event.binary.take() {
+                            return std::task::Poll::Ready(Some(Ok(Bytes::from(binary))));
+                        }
+                        // Control-only event (`binary.done`): do not put an
+                        // SSE marker or any synthetic bytes on the audio wire.
+                    }
+                    std::task::Poll::Ready(Some(Err(_))) => {
+                        return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                            "upstream binary stream failed",
+                        ))));
+                    }
+                    std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+        }
+    }
+
+    materialise_binary_body(Body::from_stream(LiveBinaryBody { rx }), content_type)
+}
+
+fn materialise_binary_body(body: Body, content_type: Option<String>) -> Response {
     let resolved_ct = content_type
         .filter(|ct| !ct.trim().is_empty())
         .unwrap_or_else(|| BINARY_STREAM_DEFAULT_CONTENT_TYPE.to_string());
@@ -1421,7 +1708,7 @@ fn materialise_binary_stream_response(body: Vec<u8>, content_type: Option<String
 
     match axum::http::Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from(body))
+        .body(body)
     {
         Ok(mut response) => {
             *response.headers_mut() = headers;
@@ -4008,6 +4295,7 @@ mod tests {
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request, header};
+    use axum::routing::post;
     use conduit_config::AppConfig;
     use conduit_llm::model::HttpRequest;
     use tower::Service;
@@ -4106,6 +4394,27 @@ mod tests {
         )))
     }
 
+    fn compress_request(encoding: &str, body: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        use std::io::Write;
+
+        match encoding {
+            "gzip" => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(body)?;
+                Ok(encoder.finish()?)
+            }
+            "deflate" => {
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(body)?;
+                Ok(encoder.finish()?)
+            }
+            "zstd" => Ok(zstd::stream::encode_all(Cursor::new(body), 1)?),
+            _ => Err("unsupported test encoding".into()),
+        }
+    }
+
     async fn call_openai(
         app: &mut Router,
         method: Method,
@@ -4126,6 +4435,127 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
         Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    #[tokio::test]
+    async fn compressed_requests_are_decoded_and_stale_headers_are_removed()
+    -> Result<(), Box<dyn Error>> {
+        let original = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+
+        for encoding in ["gzip", "deflate", "zstd"] {
+            let orchestrator = Arc::new(FakeOpenAiOrchestrator {
+                seen: Mutex::new(Vec::new()),
+                response: fake_response(r#"{"ok":true}"#),
+                fail_quota_exhausted: false,
+                fail_message: String::new(),
+            });
+            let mut app = app_with_orchestrator(Arc::clone(&orchestrator));
+            let encoded = compress_request(encoding, original)?;
+            let response = app
+                .call(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/chat/completions")
+                        .header(header::AUTHORIZATION, "Bearer test-api-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::CONTENT_ENCODING, encoding)
+                        .header(header::CONTENT_LENGTH, encoded.len())
+                        .body(Body::from(encoded))?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "encoding {encoding}");
+
+            let seen = orchestrator
+                .seen
+                .lock()
+                .map_err(|error| error.to_string())?;
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].1.body.as_deref(), Some(&original[..]));
+            assert!(!seen[0].1.headers.contains_key("content-encoding"));
+            assert!(!seen[0].1.headers.contains_key("content-length"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decompression_ratio_limit_rejects_compression_bombs_before_dispatch()
+    -> Result<(), Box<dyn Error>> {
+        let orchestrator = Arc::new(FakeOpenAiOrchestrator {
+            seen: Mutex::new(Vec::new()),
+            response: fake_response(r#"{"ok":true}"#),
+            fail_quota_exhausted: false,
+            fail_message: String::new(),
+        });
+        let mut app = app_with_orchestrator(Arc::clone(&orchestrator));
+        let encoded = compress_request("gzip", &vec![b'a'; 256 * 1024])?;
+        let response = app
+            .call(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, "Bearer test-api-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .body(Body::from(encoded))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(body["error"]["type"], "invalid_request");
+        assert!(
+            orchestrator
+                .seen
+                .lock()
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_and_chained_content_encodings_fail_with_protocol_errors()
+    -> Result<(), Box<dyn Error>> {
+        let orchestrator = Arc::new(FakeOpenAiOrchestrator {
+            seen: Mutex::new(Vec::new()),
+            response: fake_response(r#"{"ok":true}"#),
+            fail_quota_exhausted: false,
+            fail_message: String::new(),
+        });
+        let mut encoded = compress_request("gzip", br#"{"model":"gpt-4o"}"#)?;
+        let last = encoded.last_mut().ok_or("gzip fixture must not be empty")?;
+        *last ^= 0xff;
+
+        for (content_encoding, body, expected) in [
+            ("gzip", encoded, StatusCode::BAD_REQUEST),
+            (
+                "gzip, deflate",
+                compress_request("gzip", br#"{"model":"gpt-4o"}"#)?,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let mut app = app_with_orchestrator(Arc::clone(&orchestrator));
+            let response = app
+                .call(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/v1/chat/completions")
+                        .header(header::AUTHORIZATION, "Bearer test-api-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::CONTENT_ENCODING, content_encoding)
+                        .body(Body::from(body))?,
+                )
+                .await?;
+            assert_eq!(response.status(), expected);
+        }
+        assert!(
+            orchestrator
+                .seen
+                .lock()
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+        Ok(())
     }
 
     // ---- happy path: chat / responses / embeddings ----------------------
@@ -4889,6 +5319,72 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn multipart_upload_larger_than_axum_default_limit_reaches_handler()
+    -> Result<(), Box<dyn Error>> {
+        let orchestrator = Arc::new(FakeOpenAiOrchestrator {
+            seen: Mutex::new(Vec::new()),
+            response: fake_response(r#"{"created":1700,"data":[]}"#),
+            fail_quota_exhausted: false,
+            fail_message: String::new(),
+        });
+        let mut app = app_with_orchestrator(orchestrator.clone());
+        let body = vec![b'x'; 2 * 1024 * 1024 + 1];
+
+        let response = app
+            .call(
+                Request::builder()
+                    .header(header::AUTHORIZATION, "Bearer test-api-key")
+                    .method(Method::POST)
+                    .uri("/v1/images/edits")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=upload-boundary",
+                    )
+                    .body(Body::from(body))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            orchestrator.seen.lock().map_err(|e| e.to_string())?.len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multipart_limit_rejection_uses_openai_error_envelope() -> Result<(), Box<dyn Error>> {
+        async fn limited_handler(body: Result<Bytes, BytesRejection>) -> Response {
+            match multipart_body(body) {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(response) => response,
+            }
+        }
+
+        let mut app = Router::new()
+            .route("/upload", post(limited_handler))
+            .layer(axum::extract::DefaultBodyLimit::max(16));
+        let response = app
+            .call(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload")
+                    .body(Body::from(vec![0_u8; 17]))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(body["error"]["type"], "invalid_request");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| { message.contains("upload limit") })
+        );
+        Ok(())
+    }
+
     /// Mirrors Go `OpenAIHandlers.CreateTranscription` (openai.go:362-365):
     /// multipart audio upload (`audio` file + `model` field). Verifies the
     /// raw multipart bytes reach the orchestrator with the right route tag.
@@ -5270,6 +5766,87 @@ mod tests {
                 .ok_or("content-type missing")?,
             BINARY_STREAM_DEFAULT_CONTENT_TYPE
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audio_speech_live_binary_forwards_body_frames_without_sse_or_buffering()
+    -> Result<(), Box<dyn Error>> {
+        use futures_core::Stream;
+
+        let first = vec![0xff, 0x00, b'd', b'a', b't', b'a', b':'];
+        let second = vec![b'[', b'D', b'O', b'N', b'E', b']', b'\n', b'\n', 0x80];
+        let (tx, rx) = tokio::sync::mpsc::channel(3);
+        tx.send(Ok(conduit_llm::StreamEvent {
+            event_type: Some("audio/mpeg; codec=mp3".to_string()),
+            binary: Some(first.clone()),
+            ..conduit_llm::StreamEvent::default()
+        }))
+        .await?;
+        tx.send(Ok(conduit_llm::StreamEvent {
+            event_type: Some("binary.done".to_string()),
+            ..conduit_llm::StreamEvent::default()
+        }))
+        .await?;
+        tx.send(Ok(conduit_llm::StreamEvent {
+            event_type: Some("audio/mpeg; codec=mp3".to_string()),
+            binary: Some(second.clone()),
+            ..conduit_llm::StreamEvent::default()
+        }))
+        .await?;
+        drop(tx);
+
+        let response = live_binary_stream_response(rx, Some("audio/mpeg; codec=mp3".to_string()));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("audio/mpeg; codec=mp3")
+        );
+
+        let mut body = response.into_body().into_data_stream();
+        let first_frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_next(cx))
+            .await
+            .ok_or("missing first live binary frame")??;
+        let second_frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_next(cx))
+            .await
+            .ok_or("missing second live binary frame")??;
+        assert_eq!(first_frame.as_ref(), first.as_slice());
+        assert_eq!(second_frame.as_ref(), second.as_slice());
+        assert!(
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_next(cx))
+                .await
+                .is_none(),
+            "binary.done must stay internal and the stream must end at provider EOF"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audio_speech_live_binary_missing_content_type_falls_back_to_octet_stream()
+    -> Result<(), Box<dyn Error>> {
+        let payload = vec![0xff, 0x00, 0x80, b'd', b'a', b't', b'a', b':'];
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Ok(conduit_llm::StreamEvent {
+            binary: Some(payload.clone()),
+            ..conduit_llm::StreamEvent::default()
+        }))
+        .await?;
+        drop(tx);
+
+        let response = live_binary_stream_response(rx, None);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(BINARY_STREAM_DEFAULT_CONTENT_TYPE)
+        );
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
+        assert_eq!(bytes.as_ref(), payload.as_slice());
         Ok(())
     }
 

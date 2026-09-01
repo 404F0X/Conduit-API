@@ -145,8 +145,15 @@ pub struct Project {
 #[ComplexObject]
 impl Project {
     async fn project_users(&self, ctx: &Context<'_>) -> Result<Vec<UserProject>, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_USERS)
+            .map_err(|error| error.to_string())?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         user_query_services(ctx)?
-            .project_users(self.id.as_str())
+            .project_users_with_access(&access, self.id.as_str())
             .await
             .map_err(|err| err.to_string())
     }
@@ -165,21 +172,31 @@ impl Project {
         order_by: Option<RoleOrder>,
         #[graphql(name = "where")] where_filter: Option<RoleWhereInput>,
     ) -> Result<RoleConnection, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_ROLES)
+            .map_err(|error| error.to_string())?;
         let services = role_query_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_ROLES,
+        )
+        .map_err(|error| error.to_string())?;
         let project_filter = RoleWhereInput {
             project_id: Some(self.id.clone()),
             and: where_filter.map(|filter| vec![filter]),
             ..RoleWhereInput::default()
         };
         services
-            .roles(RoleConnectionArgs {
-                after: after.map(|cursor| cursor.0),
-                first,
-                before: before.map(|cursor| cursor.0),
-                last,
-                order_by: resolve_role_order(order_by),
-                where_filter: Some(project_filter),
-            })
+            .roles_with_access(
+                &access,
+                RoleConnectionArgs {
+                    after: after.map(|cursor| cursor.0),
+                    first,
+                    before: before.map(|cursor| cursor.0),
+                    last,
+                    order_by: resolve_role_order(order_by),
+                    where_filter: Some(project_filter),
+                },
+            )
             .await
             .map_err(|err| err.to_string())
     }
@@ -511,6 +528,21 @@ pub trait ProjectQueryServices: Send + Sync {
         &self,
         args: ProjectConnectionArgs,
     ) -> Result<ProjectConnection, ProjectServiceError>;
+
+    async fn projects_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        args: ProjectConnectionArgs,
+    ) -> Result<ProjectConnection, ProjectServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.projects(args).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(ProjectServiceError::PermissionDenied(
+                    "project-scoped project listing requires a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
 }
 
 /// Backs the five CRUD mutations (Go `biz.ProjectService`). `id` is the raw
@@ -527,6 +559,21 @@ pub trait ProjectMutationServices: Send + Sync {
         input: CreateProjectInput,
     ) -> Result<Project, ProjectServiceError>;
 
+    async fn create_project_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        input: CreateProjectInput,
+    ) -> Result<Project, ProjectServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.create_project(input).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(ProjectServiceError::PermissionDenied(
+                    "project-scoped permission cannot create global projects".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `ProjectService.UpdateProject` (biz/project.go:158): partial
     /// merge of name / description; `clearUsers` wins over add/remove
     /// (Go if-else ordering: project.go:165-175).
@@ -536,6 +583,22 @@ pub trait ProjectMutationServices: Send + Sync {
         input: UpdateProjectInput,
     ) -> Result<Project, ProjectServiceError>;
 
+    async fn update_project_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+        input: UpdateProjectInput,
+    ) -> Result<Project, ProjectServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.update_project(id, input).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(ProjectServiceError::PermissionDenied(
+                    "project-scoped project updates require a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `ProjectService.UpdateProjectStatus` (biz/project.go:299):
     /// SetStatus + cache invalidation.
     async fn update_project_status(
@@ -543,6 +606,22 @@ pub trait ProjectMutationServices: Send + Sync {
         id: &str,
         status: ProjectStatus,
     ) -> Result<Project, ProjectServiceError>;
+
+    async fn update_project_status_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+        status: ProjectStatus,
+    ) -> Result<Project, ProjectServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.update_project_status(id, status).await,
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(ProjectServiceError::PermissionDenied(
+                    "project-scoped status updates require a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
 
     /// Mirrors `ProjectService.UpdateProjectProfiles` (biz/project.go:235):
     /// `ValidateProjectProfiles` (unique non-empty names, valid active
@@ -554,10 +633,39 @@ pub trait ProjectMutationServices: Send + Sync {
         input: UpdateProjectProfilesInput,
     ) -> Result<Project, ProjectServiceError>;
 
+    async fn update_project_profiles_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+        input: UpdateProjectProfilesInput,
+    ) -> Result<Project, ProjectServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => {
+                self.update_project_profiles(id, input).await
+            }
+            crate::policy::AdminAccessScope::Project(_) => {
+                Err(ProjectServiceError::PermissionDenied(
+                    "project-scoped profile updates require a scoped service boundary".to_owned(),
+                ))
+            }
+        }
+    }
+
     /// Mirrors `ProjectService.DeleteProject` (biz/project.go:333):
     /// permission guard → cascade delete (user_projects, project-level
     /// roles, project API keys, soft delete project, cache invalidation).
     async fn delete_project(&self, id: &str) -> Result<(), ProjectServiceError>;
+
+    async fn delete_project_with_access(
+        &self,
+        access: &crate::policy::AdminAccessScope,
+        id: &str,
+    ) -> Result<(), ProjectServiceError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.delete_project(id).await,
+            crate::policy::AdminAccessScope::Project(_) => Err(ProjectServiceError::NotSystemOwner),
+        }
+    }
 }
 
 /// Resolves the injected [`ProjectQueryServices`] from the async-graphql data
@@ -826,11 +934,21 @@ mod tests {
     fn schema_with(store: &InMemoryProjectService) -> AdminSchema {
         let query: Arc<dyn ProjectQueryServices> = Arc::new(store.clone());
         let mutation: Arc<dyn ProjectMutationServices> = Arc::new(store.clone());
-        admin_schema_builder().data(query).data(mutation).finish()
+        admin_schema_builder()
+            .data(query)
+            .data(mutation)
+            .data(system_context())
+            .finish()
     }
 
     fn bare_schema() -> AdminSchema {
-        crate::build_admin_schema()
+        admin_schema_builder().data(system_context()).finish()
+    }
+
+    fn system_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(conduit_auth::Principal::system());
+        context
     }
 
     // ---------------------------------------------------------------------

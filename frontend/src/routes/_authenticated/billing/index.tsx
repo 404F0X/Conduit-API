@@ -4,7 +4,7 @@ import BillingPage from '@/features/billing';
 
 function ProtectedBilling() {
   return (
-    <RouteGuard requiredScopes={['read_users', 'read_settings']} requireAll>
+    <RouteGuard requiredScopes={['read_billing', 'read_subscriptions']}>
       <BillingPage />
     </RouteGuard>
   );

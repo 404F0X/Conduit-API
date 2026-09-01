@@ -9790,3 +9790,81 @@ extend type Query {
 extend type Mutation {
   clearCache(input: ClearCacheInput!): ClearCachePayload!
 }
+
+# ---- credit-redemptions.graphql ----
+# Conduit API extension: bounded-use Project wallet credit codes.
+
+enum CreditRedemptionCodeStatus {
+  ACTIVE
+  REDEEMED
+  REVOKED
+  EXPIRED
+}
+
+type CreditRedemptionCode {
+  id: ID!
+  batchID: ID!
+  codeHint: String!
+  amount: String!
+  currency: String!
+  description: String
+  maxRedemptions: Int!
+  redemptionCount: Int!
+  remainingRedemptions: Int!
+  status: CreditRedemptionCodeStatus!
+  expiresAt: String
+  redeemedAt: String
+  revokedAt: String
+  createdAt: String!
+}
+
+type CreditRedemptionCodePage {
+  items: [CreditRedemptionCode!]!
+  total: Int!
+  limit: Int!
+  offset: Int!
+}
+
+type GeneratedCreditRedemptionCode {
+  id: ID!
+  code: String!
+  codeHint: String!
+}
+
+input CreateCreditRedemptionCodesInput {
+  amount: String!
+  quantity: Int!
+  maxRedemptions: Int! = 1
+  expiresAt: String
+  description: String
+}
+
+type CreateCreditRedemptionCodesPayload {
+  batchID: ID!
+  amount: String!
+  currency: String!
+  quantity: Int!
+  maxRedemptions: Int!
+  expiresAt: String
+  codes: [GeneratedCreditRedemptionCode!]!
+}
+
+type CreditRedemptionReceipt {
+  id: ID!
+  codeID: ID!
+  projectID: ID!
+  userID: ID!
+  amount: String!
+  currency: String!
+  redeemedAt: String!
+}
+
+extend type Query {
+  creditRedemptionCodes(limit: Int! = 50, offset: Int! = 0): CreditRedemptionCodePage!
+}
+
+extend type Mutation {
+  createCreditRedemptionCodes(input: CreateCreditRedemptionCodesInput!): CreateCreditRedemptionCodesPayload!
+  revokeCreditRedemptionCode(id: ID!): CreditRedemptionCode!
+  redeemCreditCode(code: String!): CreditRedemptionReceipt!
+}

@@ -33,90 +33,75 @@ use conduit_llm::{ChatMessage, ToolCall};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 
 /// Maximum content length the parser will inspect, to prevent ReDoS. Mirrors
 /// Go `maxXMLParseLength` (xml_parser.go:17).
 pub const MAX_XML_PARSE_LENGTH: usize = 100_000;
 
 // Compile-once regexes mirroring Go's package-level `regexp.MustCompile`
-// patterns (xml_parser.go:22-43). We compile lazily via `Regex::new` on each
-// call; correctness is identical to Go's compiled-once patterns, only
-// cold-start cost differs. The patterns are verbatim from the Go source.
-fn tool_call_re() -> Regex {
+// patterns (xml_parser.go:22-43). A bad hard-coded pattern is a programmer
+// error: fail immediately instead of silently changing matching semantics or
+// entering an unbounded CPU loop.
+fn compile_regex(pattern: &str) -> Regex {
+    match Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid hard-coded NanoGPT regex: {error}"),
+    }
+}
+
+static TOOL_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
     // Matches <Tag attr>content</Tag>. Allows optional whitespace after the
     // tag name for formats like <Write_File>{...}</Write_File>.
-    Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)[\s]*([^>]*)>([^<]*)</([a-zA-Z_][a-zA-Z0-9_-]*)>")
-        .unwrap_or_else(|_| never_match_re())
-}
-
-fn self_closing_re() -> Regex {
-    Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)[\s]*([^>]*)/>").unwrap_or_else(|_| never_match_re())
-}
-
-fn attr_re() -> Regex {
-    Regex::new(r#"([a-zA-Z_][a-zA-Z0-9_-]*)[\s]*=[\s]*["']([^"']*)["']"#)
-        .unwrap_or_else(|_| never_match_re())
-}
-
-fn normalize_tag_re() -> Regex {
-    Regex::new(r"([^\s])/>").unwrap_or_else(|_| never_match_re())
-}
-
-fn nested_xml_re() -> Regex {
-    Regex::new(
+    compile_regex(r"<([a-zA-Z_][a-zA-Z0-9_-]*)[\s]*([^>]*)>([^<]*)</([a-zA-Z_][a-zA-Z0-9_-]*)>")
+});
+static SELF_CLOSING_RE: LazyLock<Regex> =
+    LazyLock::new(|| compile_regex(r"<([a-zA-Z_][a-zA-Z0-9_-]*)[\s]*([^>]*)/>"));
+static ATTR_RE: LazyLock<Regex> =
+    LazyLock::new(|| compile_regex(r#"([a-zA-Z_][a-zA-Z0-9_-]*)[\s]*=[\s]*["']([^"']*)["']"#));
+static NORMALIZE_TAG_RE: LazyLock<Regex> = LazyLock::new(|| compile_regex(r"([^\s])/>"));
+static NESTED_XML_RE: LazyLock<Regex> = LazyLock::new(|| {
+    compile_regex(
         r"(?s)<(Write|Read)[^>]*>\s*<file_path>([^<]*)</file_path>\s*<content>(.*?)</content>\s*</(Write|Read)>",
     )
-    .unwrap_or_else(|_| never_match_re())
-}
-
-fn mismatch_tag_re() -> Regex {
-    Regex::new(r"<(Write|Read|Write_FILE|Write_file|Read_FILE|Read_file)([^>]*)>([^<]*)</use_tool>")
-        .unwrap_or_else(|_| never_match_re())
-}
-
-fn unclosed_re() -> Regex {
-    Regex::new(
+});
+static MISMATCH_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+    compile_regex(
+        r"<(Write|Read|Write_FILE|Write_file|Read_FILE|Read_file)([^>]*)>([^<]*)</use_tool>",
+    )
+});
+static UNCLOSED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    compile_regex(
         r"(?s)<(Write|Read|Write_FILE|Write_file|Read_FILE|Read_file)([^>]*)\n(.*?)</use_tool>",
     )
-    .unwrap_or_else(|_| never_match_re())
+});
+
+fn tool_call_re() -> &'static Regex {
+    &TOOL_CALL_RE
 }
 
-/// Fallback never-match regex, used only if a compile-time-constant pattern
-/// ever fails to compile (a regex crate version regression). The patterns
-/// above are all valid against the regex crate; this exists to keep clippy's
-/// `unwrap_used` lint calm while preserving identical runtime behavior.
-fn never_match_re() -> Regex {
-    // `$` immediately followed by `^` never matches in single-line mode.
-    Regex::new(r"$^").unwrap_or_else(|_| Regex::new("").unwrap_or_else(|_| empty_never_re()))
+fn self_closing_re() -> &'static Regex {
+    &SELF_CLOSING_RE
 }
 
-/// Last-ditch fallback regex that compiles from an empty pattern — used only
-/// if `never_match_re`'s pattern somehow also fails (it cannot, but the
-/// `unwrap_or_else` chain requires a total function).
-fn empty_never_re() -> Regex {
-    // An empty regex matches every position; we only reach here if the regex
-    // crate is broken, in which case any fallback is equally arbitrary.
-    Regex::new(r"\A\z\A\z\A\z").unwrap_or_else(|_| {
-        // Truly last resort: this branch is unreachable in practice. Use a
-        // static-lifetime leak to satisfy the type rather than panicking.
-        // SAFETY (lints): no `unsafe`; just pick any compilable pattern.
-        Regex::new("xyzqwkpb").unwrap_or_else(|_| panic_unreachable())
-    })
+fn attr_re() -> &'static Regex {
+    &ATTR_RE
 }
 
-/// Unreachable terminal for the fallback chain. In practice the chain above
-/// never reaches here; this exists only to make the type system happy without
-/// using `.expect()` (which clippy denies).
-fn panic_unreachable() -> Regex {
-    // This is dead code; if we ever reach it, the regex crate is unusable.
-    // Construct manually via the only pattern guaranteed to compile.
-    Regex::new("a").unwrap_or_else(|_| {
-        // If even "a" fails, the crate is fundamentally broken — there is no
-        // safe way to produce a Regex. We loop here so the function returns
-        // (the caller will hit the recursion-limit / abort instead of a panic
-        // from our side). This branch has never executed in practice.
-        loop {}
-    })
+fn normalize_tag_re() -> &'static Regex {
+    &NORMALIZE_TAG_RE
+}
+
+fn nested_xml_re() -> &'static Regex {
+    &NESTED_XML_RE
+}
+
+fn mismatch_tag_re() -> &'static Regex {
+    &MISMATCH_TAG_RE
+}
+
+fn unclosed_re() -> &'static Regex {
+    &UNCLOSED_RE
 }
 
 /// Fast pre-check for whether content likely contains XML tool calls. Mirrors

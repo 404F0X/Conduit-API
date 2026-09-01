@@ -394,6 +394,22 @@ pub async fn api_key_auth(
     next.run(request).await
 }
 
+/// Authorization boundary for management routes that accept service-account
+/// keys only. This layer must run after [`api_key_auth`], which authenticates
+/// the key and inserts [`ValidatedApiKeyMetadata`]. Keeping the check at the
+/// route-group boundary prevents new handlers from accidentally inheriting
+/// plain user-key access.
+pub async fn require_service_account(request: Request<Body>, next: Next) -> Response {
+    let is_service_account = request
+        .extensions()
+        .get::<ValidatedApiKeyMetadata>()
+        .is_some_and(|metadata| metadata.key_type == "service_account");
+    if !is_service_account {
+        return json_error(StatusCode::UNAUTHORIZED, MISSING_KEY_MESSAGE);
+    }
+    next.run(request).await
+}
+
 /// Extraction-only API-key layer: pulls the key out of the request and inserts
 /// [`ApiKeyExtension`] **without validating it**, then continues (missing key
 /// still short-circuits with 401).

@@ -121,6 +121,7 @@ use async_trait::async_trait;
 
 use conduit_admin_graphql::channel::OrderDirection;
 use conduit_admin_graphql::pagination::{connection_from_offset_page, decode_offset_cursor};
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::prompt::{
     CreatePromptInput, CreatePromptProtectionRuleInput, Prompt as GqlPrompt,
     PromptAction as GqlPromptAction, PromptActionType,
@@ -164,11 +165,30 @@ const DEFAULT_PROJECT_ID: &str = "1";
 /// Implements both [`PromptQueryServices`] and [`PromptMutationServices`].
 pub struct PromptCrudAdapter {
     prompt_repo: Arc<dyn PromptRepo>,
+    mutation_project_id: String,
 }
 
 impl PromptCrudAdapter {
     pub fn new(prompt_repo: Arc<dyn PromptRepo>) -> Self {
-        Self { prompt_repo }
+        Self {
+            prompt_repo,
+            mutation_project_id: DEFAULT_PROJECT_ID.to_owned(),
+        }
+    }
+
+    fn for_access(&self, access: &AdminAccessScope) -> Result<Self, PromptServiceError> {
+        let AdminAccessScope::Project(project_id) = access else {
+            return Err(PromptServiceError::PermissionDenied(
+                "current project is required; send X-Project-ID".to_owned(),
+            ));
+        };
+        let project_id = prompt_db_id(project_id).ok_or_else(|| {
+            PromptServiceError::PermissionDenied("authorized project id is invalid".to_owned())
+        })?;
+        Ok(Self {
+            prompt_repo: Arc::clone(&self.prompt_repo),
+            mutation_project_id: project_id,
+        })
     }
 
     /// Materialize every live prompt row across all projects. The repo only
@@ -517,6 +537,29 @@ impl PromptQueryServices for PromptCrudAdapter {
             total_count,
         })
     }
+
+    async fn prompts_with_access(
+        &self,
+        access: &AdminAccessScope,
+        mut args: PromptConnectionArgs,
+    ) -> Result<PromptConnection, PromptServiceError> {
+        if let AdminAccessScope::Project(project_id) = access {
+            let project_id = prompt_db_id(project_id)
+                .and_then(|id| id.parse::<i64>().ok())
+                .ok_or_else(|| {
+                    PromptServiceError::PermissionDenied(
+                        "authorized project id is invalid".to_owned(),
+                    )
+                })?;
+            let caller_filter = args.where_filter.take();
+            args.where_filter = Some(PromptWhereInput {
+                project_id: Some(project_id),
+                and: caller_filter.map(|filter| vec![filter]),
+                ..Default::default()
+            });
+        }
+        self.prompts(args).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +587,7 @@ impl PromptMutationServices for PromptCrudAdapter {
             // Go: project id from context (module doc, "Project scoping").
             // `input.projectIDs` is the pending `projects(...)` edge field and
             // is NOT applied by the Go service either.
-            project_id: DEFAULT_PROJECT_ID.to_string(),
+            project_id: self.mutation_project_id.clone(),
             name: input.name,
             description: input.description,
             role: input.role,
@@ -601,7 +644,7 @@ impl PromptMutationServices for PromptCrudAdapter {
 
         let row = self
             .prompt_repo
-            .update_prompt_unchecked(&ctx, DEFAULT_PROJECT_ID, &db_id, repo_input)
+            .update_prompt_unchecked(&ctx, &self.mutation_project_id, &db_id, repo_input)
             .await
             .map_err(|e| match e {
                 RepoError::NameConflict => {
@@ -628,7 +671,7 @@ impl PromptMutationServices for PromptCrudAdapter {
         self.prompt_repo
             .soft_delete_prompt_unchecked(
                 &ctx,
-                DEFAULT_PROJECT_ID,
+                &self.mutation_project_id,
                 &db_id,
                 chrono::Utc::now().to_rfc3339(),
             )
@@ -655,7 +698,7 @@ impl PromptMutationServices for PromptCrudAdapter {
             .prompt_repo
             .set_prompt_status_unchecked(
                 &ctx,
-                DEFAULT_PROJECT_ID,
+                &self.mutation_project_id,
                 &db_id,
                 prompt_status_to_wire(status).to_string(),
                 chrono::Utc::now().to_rfc3339(),
@@ -682,7 +725,7 @@ impl PromptMutationServices for PromptCrudAdapter {
                 .prompt_repo
                 .soft_delete_prompt_unchecked(
                     &ctx,
-                    DEFAULT_PROJECT_ID,
+                    &self.mutation_project_id,
                     &db_id,
                     chrono::Utc::now().to_rfc3339(),
                 )
@@ -704,6 +747,66 @@ impl PromptMutationServices for PromptCrudAdapter {
     async fn bulk_disable_prompts(&self, ids: Vec<String>) -> Result<(), PromptServiceError> {
         self.bulk_set_status(ids, PromptStatus::Disabled).await
     }
+
+    async fn create_prompt_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: CreatePromptInput,
+    ) -> Result<GqlPrompt, PromptServiceError> {
+        self.for_access(access)?.create_prompt(input).await
+    }
+
+    async fn update_prompt_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        input: UpdatePromptInput,
+    ) -> Result<GqlPrompt, PromptServiceError> {
+        self.for_access(access)?.update_prompt(id, input).await
+    }
+
+    async fn delete_prompt_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+    ) -> Result<(), PromptServiceError> {
+        self.for_access(access)?.delete_prompt(id).await
+    }
+
+    async fn update_prompt_status_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        status: PromptStatus,
+    ) -> Result<GqlPrompt, PromptServiceError> {
+        self.for_access(access)?
+            .update_prompt_status(id, status)
+            .await
+    }
+
+    async fn bulk_delete_prompts_with_access(
+        &self,
+        access: &AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), PromptServiceError> {
+        self.for_access(access)?.bulk_delete_prompts(ids).await
+    }
+
+    async fn bulk_enable_prompts_with_access(
+        &self,
+        access: &AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), PromptServiceError> {
+        self.for_access(access)?.bulk_enable_prompts(ids).await
+    }
+
+    async fn bulk_disable_prompts_with_access(
+        &self,
+        access: &AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), PromptServiceError> {
+        self.for_access(access)?.bulk_disable_prompts(ids).await
+    }
 }
 
 impl PromptCrudAdapter {
@@ -724,7 +827,7 @@ impl PromptCrudAdapter {
                 .prompt_repo
                 .set_prompt_status_unchecked(
                     &ctx,
-                    DEFAULT_PROJECT_ID,
+                    &self.mutation_project_id,
                     &db_id,
                     prompt_status_to_wire(status).to_string(),
                     chrono::Utc::now().to_rfc3339(),
@@ -1763,6 +1866,19 @@ mod postgres_tests {
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
 
+        // The adapter's unscoped compatibility path targets project 1, while
+        // a freshly migrated test schema does not seed a project row. Reserve
+        // that id explicitly so the later A/B authorization matrix genuinely
+        // uses two different projects instead of allocating project 1 twice.
+        let default_project_id: i64 = sqlx::query_scalar(
+            "INSERT INTO projects (name, status, description, profiles) \
+             VALUES ($1, 'active', '', '{}'::jsonb) RETURNING id",
+        )
+        .bind(format!("prompt-default-{}", uuid::Uuid::new_v4().simple()))
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(default_project_id, 1);
+
         let prompt_adapter = PromptCrudAdapter::new(Arc::new(conduit_db::PgPromptRepo::new(
             database.pool.clone(),
         )));
@@ -1788,6 +1904,69 @@ mod postgres_tests {
                 .map_err(|error| error.to_string())?
                 .total_count,
             0
+        );
+
+        let second_project_id: i64 = sqlx::query_scalar(
+            "INSERT INTO projects (name, status, description, profiles) \
+             VALUES ($1, 'active', '', '{}'::jsonb) RETURNING id",
+        )
+        .bind(format!("prompt-scope-{}", uuid::Uuid::new_v4().simple()))
+        .fetch_one(&database.pool)
+        .await?;
+        let first_access = AdminAccessScope::Project("1".to_owned());
+        let second_access = AdminAccessScope::Project(second_project_id.to_string());
+        let first_prompt = prompt_adapter
+            .create_prompt_with_access(&first_access, prompt_input("scoped-first"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let second_prompt = prompt_adapter
+            .create_prompt_with_access(&second_access, prompt_input("scoped-second"))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(second_prompt.project_id, second_project_id);
+
+        let first_project_prompts = prompt_adapter
+            .prompts_with_access(&first_access, PromptConnectionArgs::default())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(first_project_prompts.total_count, 1);
+        assert_eq!(
+            first_project_prompts
+                .edges
+                .as_ref()
+                .and_then(|edges| edges.first())
+                .and_then(Option::as_ref)
+                .and_then(|edge| edge.node.as_ref())
+                .map(|prompt| prompt.id.as_str()),
+            Some(first_prompt.id.as_str())
+        );
+        assert!(matches!(
+            prompt_adapter
+                .update_prompt_with_access(
+                    &first_access,
+                    second_prompt.id.as_str(),
+                    UpdatePromptInput {
+                        content: Some("must-not-cross-project".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            Err(PromptServiceError::UpdatePrompt(_))
+        ));
+        let second_project_prompts = prompt_adapter
+            .prompts_with_access(&second_access, PromptConnectionArgs::default())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(second_project_prompts.total_count, 1);
+        assert_eq!(
+            second_project_prompts
+                .edges
+                .as_ref()
+                .and_then(|edges| edges.first())
+                .and_then(Option::as_ref)
+                .and_then(|edge| edge.node.as_ref())
+                .map(|prompt| prompt.content.as_str()),
+            Some("postgres prompt")
         );
 
         let rule_adapter = PromptProtectionRuleAdapter::new(Arc::new(

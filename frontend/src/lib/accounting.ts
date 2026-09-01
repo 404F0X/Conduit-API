@@ -4,6 +4,7 @@ export const DEFAULT_CREDITS_PER_ACCOUNTING_UNIT = '10000';
 
 const CURRENCY_CODE_PATTERN = /^[A-Z]{3}$/;
 const POSITIVE_DECIMAL_PATTERN = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+const MAX_DECIMAL_MANTISSA = 79_228_162_514_264_337_593_543_950_335n;
 
 export type AccountingExchangeRate = {
   currencyCode: string;
@@ -13,6 +14,18 @@ export type AccountingExchangeRate = {
 export type AccountingConversionSettings = {
   accountingCurrencyCode: string;
   exchangeRates: AccountingExchangeRate[];
+};
+
+export type InitialAccountingSettingsInput = {
+  accountingCurrencyCode: string;
+  creditDisplayName: string;
+  creditsPerAccountingUnit: string;
+};
+
+export type InitialAccountingSettingsValidation = {
+  normalized: InitialAccountingSettingsInput;
+  fields: Record<keyof InitialAccountingSettingsInput, boolean>;
+  isValid: boolean;
 };
 
 export function normalizeCurrencyCode(value: string) {
@@ -26,8 +39,28 @@ export function isCurrencyCode(value: string) {
 export function isPositiveDecimal(value: string) {
   const normalized = value.trim();
   if (!POSITIVE_DECIMAL_PATTERN.test(normalized)) return false;
-  const parsed = Number(normalized);
-  return Number.isFinite(parsed) && parsed > 0;
+  const [whole = '', fraction = ''] = normalized.split('.');
+  if (fraction.length > 28) return false;
+  const mantissa = BigInt(`${whole || '0'}${fraction}`);
+  return mantissa > 0n && mantissa <= MAX_DECIMAL_MANTISSA;
+}
+
+export function validateInitialAccountingSettings(input: InitialAccountingSettingsInput): InitialAccountingSettingsValidation {
+  const normalized = {
+    accountingCurrencyCode: normalizeCurrencyCode(input.accountingCurrencyCode),
+    creditDisplayName: input.creditDisplayName.trim(),
+    creditsPerAccountingUnit: input.creditsPerAccountingUnit.trim(),
+  };
+  const fields = {
+    accountingCurrencyCode: isCurrencyCode(normalized.accountingCurrencyCode),
+    creditDisplayName: normalized.creditDisplayName.length > 0,
+    creditsPerAccountingUnit: isPositiveDecimal(normalized.creditsPerAccountingUnit),
+  };
+  return {
+    normalized,
+    fields,
+    isValid: Object.values(fields).every(Boolean),
+  };
 }
 
 /**

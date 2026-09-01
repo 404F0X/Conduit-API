@@ -859,7 +859,12 @@ mod tests {
                     name: "primary".to_owned(),
                     enabled: true,
                     url: "https://hooks.example/1".to_owned(),
-                    proxy: None,
+                    proxy: Some(ProxyConfig {
+                        proxy_type: crate::channel::ProxyType::Url,
+                        url: Some("http://proxy.example".to_owned()),
+                        username: Some("operator".to_owned()),
+                        password: Some("must-not-leak".to_owned()),
+                    }),
                     timeout_ms: 5000,
                     headers: vec![HeaderEntry {
                         key: "X-Token".to_owned(),
@@ -877,13 +882,15 @@ mod tests {
         let schema = schema_with(fake);
         let resp = schema
             .execute(
-                "{ webhookNotifierConfig { targets { name url timeoutMs headers { key value } } subscriptions { event targetNames } } }",
+                "{ webhookNotifierConfig { targets { name url proxy { type url username password } timeoutMs headers { key value } } subscriptions { event targetNames } } }",
             )
             .await;
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let s = resp.data.to_string();
         assert!(s.contains("name: \"primary\""), "target missing: {s}");
         assert!(s.contains("event: \"request.failed\""), "sub missing: {s}");
+        assert!(s.contains("password: \"\""), "password not masked: {s}");
+        assert!(!s.contains("must-not-leak"), "password leaked: {s}");
     }
 
     #[tokio::test]

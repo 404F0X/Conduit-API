@@ -398,7 +398,10 @@ fn proxy_value_to_gql(v: Value) -> Option<ProxyConfig> {
         proxy_type,
         url: Some(get_str("url").unwrap_or_default()),
         username: Some(get_str("username").unwrap_or_default()),
-        password: Some(get_str("password").unwrap_or_default()),
+        // Passwords are write-only. Returning the persisted value through any
+        // Channel projection would let an otherwise read-only nested edge
+        // disclose upstream proxy credentials.
+        password: Some(String::new()),
     })
 }
 
@@ -1066,5 +1069,25 @@ pub fn model_price_core_to_gql(price: core_pricing::ModelPrice) -> GqlModelPrice
             .into_iter()
             .map(price_item_core_to_gql)
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn channel_proxy_password_is_write_only() {
+        let proxy = proxy_value_to_gql(serde_json::json!({
+            "type": "URL",
+            "url": "http://proxy.internal",
+            "username": "proxy-user",
+            "password": "must-not-leak"
+        }))
+        .expect("proxy");
+
+        assert_eq!(proxy.url.as_deref(), Some("http://proxy.internal"));
+        assert_eq!(proxy.username.as_deref(), Some("proxy-user"));
+        assert_eq!(proxy.password.as_deref(), Some(""));
     }
 }

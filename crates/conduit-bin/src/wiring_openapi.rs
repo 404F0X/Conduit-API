@@ -94,6 +94,7 @@ use conduit_openapi_graphql::{
     OpenApiQuotaService, OpenApiServices, ProfileQuotaUsage as GqlProfileQuotaUsage,
     QuotaUsage as GqlQuotaUsage, QuotaWindow as GqlQuotaWindow,
 };
+use conduit_services::apikey_service::validate_all_profiles;
 use conduit_services::{
     QuotaService, QuotaUsageAggregate, QuotaUsageRepo, QuotaWindow as ServiceQuotaWindow,
 };
@@ -699,6 +700,9 @@ impl OpenApiApiKeyService for OpenApiApiKeyAdapter {
         // building the core objects and serializing them (guarantees the exact
         // camelCase + omitempty layout Go persists and the read path parses).
         let core = gql_profiles_to_core(profiles);
+        validate_all_profiles(&core).map_err(|error| {
+            ConduitError::invalid_request(format!("invalid API key profiles: {error}"))
+        })?;
         let profiles_json = serde_json::to_value(&core).map_err(|e| {
             ConduitError::new(
                 ErrorKind::Internal,
