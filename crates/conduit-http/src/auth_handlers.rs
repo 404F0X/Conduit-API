@@ -116,6 +116,7 @@ pub trait SigninService: Send + Sync {
 pub enum SignupError {
     EmailTaken,
     SystemNotInitialized,
+    RateLimited,
     Internal(String),
 }
 
@@ -203,6 +204,14 @@ pub async fn sign_up(
     State(state): State<AppState>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    // Password signup is a public account-creation and bcrypt endpoint. Keep
+    // it unavailable unless the operator explicitly opts in; check before
+    // parsing the request so disabled deployments do no attacker-controlled
+    // work beyond normal HTTP framing.
+    if !state.config().api_auth.allow_password_signup {
+        return json_error(StatusCode::FORBIDDEN, "Password signup is disabled");
+    }
+
     let request = match body
         .ok()
         .and_then(|bytes| serde_json::from_slice::<SignUpRequest>(&bytes).ok())
@@ -229,6 +238,9 @@ pub async fn sign_up(
         }
         Err(SignupError::SystemNotInitialized) => {
             return json_error(StatusCode::CONFLICT, "System is not initialized");
+        }
+        Err(SignupError::RateLimited) => {
+            return json_error(StatusCode::TOO_MANY_REQUESTS, "Too many signup attempts");
         }
         Err(SignupError::Internal(_)) => {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error");
@@ -275,6 +287,7 @@ mod tests {
     struct FakeSignupService {
         email_taken: bool,
         system_not_initialized: bool,
+        rate_limited: bool,
     }
 
     /// Frontend-compatible sample user (same golden shape as the S06 tests in
@@ -342,6 +355,9 @@ mod tests {
             if self.system_not_initialized {
                 return Err(SignupError::SystemNotInitialized);
             }
+            if self.rate_limited {
+                return Err(SignupError::RateLimited);
+            }
             Ok(AuthenticatedUser {
                 id: 2,
                 info: UserInfo {
@@ -366,13 +382,16 @@ mod tests {
     }
 
     fn app_with_signup(signup: FakeSignupService) -> Router {
+        app_with_signup_config(signup, true)
+    }
+
+    fn app_with_signup_config(signup: FakeSignupService, allow_password_signup: bool) -> Router {
         let services = AppServices::new()
             .with_signin_service(Arc::new(FakeSigninService::default()))
             .with_signup_service(Arc::new(signup));
-        build_router(AppState::new(
-            Arc::new(AppConfig::default()),
-            Arc::new(services),
-        ))
+        let mut config = AppConfig::default();
+        config.api_auth.allow_password_signup = allow_password_signup;
+        build_router(AppState::new(Arc::new(config), Arc::new(services)))
     }
 
     async fn post_signin(
@@ -449,6 +468,39 @@ mod tests {
         let (status, body) = post_signup(&mut app, &payload).await?;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"]["message"], "Email is already registered");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn password_signup_is_disabled_by_default() -> Result<(), Box<dyn StdError>> {
+        let mut app = app_with_signup_config(FakeSignupService::default(), false);
+        let payload = json!({
+            "email": "new@example.com",
+            "password": "Password123!"
+        })
+        .to_string();
+
+        let (status, body) = post_signup(&mut app, &payload).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["message"], "Password signup is disabled");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_signup_service_returns_too_many_requests() -> Result<(), Box<dyn StdError>> {
+        let mut app = app_with_signup(FakeSignupService {
+            rate_limited: true,
+            ..Default::default()
+        });
+        let payload = json!({
+            "email": "new@example.com",
+            "password": "Password123!"
+        })
+        .to_string();
+
+        let (status, body) = post_signup(&mut app, &payload).await?;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["message"], "Too many signup attempts");
         Ok(())
     }
 

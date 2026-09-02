@@ -19,6 +19,8 @@ security, licensing, or data-integrity checks.
 - [ ] `cargo test --locked --workspace --all-targets`
 - [ ] `cargo clippy --locked --workspace --all-targets`
 - [ ] `bash scripts/generate_config_schema.sh --check`
+- [ ] `node scripts/rust/security-static-check.mjs`
+- [ ] `node scripts/rust/security-static-check.mjs --self-test`
 
 ## Frontend
 
@@ -27,6 +29,9 @@ security, licensing, or data-integrity checks.
 - [ ] `pnpm --dir frontend lint`
 - [ ] `pnpm --dir frontend test:unit`
 - [ ] `pnpm --dir frontend build`
+- [ ] `pnpm --dir frontend test:e2e:check`
+- [ ] `pnpm --dir frontend test:e2e -- --reporter=line` against a fresh,
+      dedicated `conduit_e2e*` PostgreSQL database and the local mock upstream
 
 ## PostgreSQL And Runtime
 
@@ -45,6 +50,25 @@ security, licensing, or data-integrity checks.
 - [ ] `pnpm --dir frontend audit --prod` has no critical or high finding.
 - [ ] Container runs as a non-root user with loopback-safe source defaults.
 - [ ] Release artifacts include checksums, build provenance, and an SBOM.
+
+The Rust security-invariant check is intentionally repository-specific. It
+blocks test/system bypass principals at request boundaries, empty project-id
+fallbacks in authorization/query code, raw sensitive values passed to tracing
+macros, and regressions in the process-wide TLS setting or usage-query project
+guards. Inline `#[cfg(test)]` modules and integration-test directories are
+excluded. Fourteen legacy `Principal::test()` fallbacks are pinned by exact
+file and occurrence count in the script: any new occurrence fails, and removal
+makes the baseline stale so it must shrink in the same change. This is a
+containment measure, not closure of HLT-002/MNT-002; those fallbacks can only be
+removed by carrying an authenticated request context through the legacy wiring
+trait interfaces.
+
+This gate does not replace a Rust-aware whole-program SAST engine. CodeQL does
+not currently support Rust, and broad regex rules for taint flow, SQL injection,
+or async correctness would create an unactionable false-positive baseline.
+Likewise, the existing Clippy debt remains a separate maintenance task: the
+release gate runs workspace Clippy with the repository lint policy, but does not
+turn every stylistic/pedantic lint into a release blocker.
 
 ## Automated publication
 

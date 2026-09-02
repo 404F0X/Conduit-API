@@ -3,11 +3,13 @@
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS frontend-build
 WORKDIR /workspace
 
-COPY frontend/package.json frontend/pnpm-lock.yaml ./frontend/
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/.npmrc ./frontend/
 RUN corepack enable \
     && cd frontend \
     && HUSKY=0 pnpm install --frozen-lockfile
 
+COPY LICENSE NOTICE LICENSING.md ./
+COPY LICENSES ./LICENSES
 COPY frontend ./frontend
 RUN cd frontend && pnpm run build
 
@@ -55,8 +57,10 @@ RUN apt-get update \
 
 COPY --from=rust-build --chown=conduit:conduit /workspace/target/release/conduit-api /app/conduit-api
 COPY --from=frontend-build --chown=conduit:conduit /workspace/frontend/dist /app/frontend/dist
-COPY --chown=conduit:conduit LICENSE NOTICE /app/licenses/
-COPY --chown=conduit:conduit LICENSES /app/licenses/third-party/
+COPY --chown=conduit:conduit LICENSE NOTICE LICENSING.md /app/licenses/
+COPY --chown=conduit:conduit LICENSES /app/licenses/LICENSES/
+COPY --chown=conduit:conduit frontend/NOTICE /app/licenses/frontend/NOTICE
+COPY --from=frontend-build --chown=conduit:conduit /workspace/frontend/dist/licenses/frontend/THIRD_PARTY_LICENSES.md /app/licenses/frontend/THIRD_PARTY_LICENSES.md
 
 USER conduit
 

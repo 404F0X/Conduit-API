@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use conduit_auth::encode_password_bcrypt_hex;
 use conduit_cache::{Cache, CacheError};
+use conduit_core::objects::money::AccountingSettings;
 use conduit_db::{
     CreateProjectInput, CreateRoleInput, CreateUserInput, CreateUserProjectInput, ProjectRepo,
     RepoError, RequestContext, RoleRepo, SystemRepo, SystemRow, UserProjectRepo, UserRepo,
@@ -157,10 +158,35 @@ pub struct InitializeParams {
     pub brand_name: String,
     /// Defaults to `"en"` when empty, matching Go (`system.go` lines 695-698).
     pub prefer_language: Option<String>,
+    /// Required first-run accounting and internal-credit configuration.
+    pub accounting_settings: AccountingSettings,
     /// Recorded build version (Go sets `build.Version`). Empty skips the write.
     pub version: String,
     /// Caller-supplied timestamp for created rows (epoch millis or ISO-8601).
     pub now: String,
+}
+
+/// Build the canonical `system_general_settings` value written during first-run
+/// bootstrap. Initialization intentionally starts with no exchange rates and
+/// accounting version 1; the internal ledger code remains `STATION_CREDIT` and
+/// is not part of this display-only configuration.
+pub fn bootstrap_general_settings_value(settings: &AccountingSettings) -> Result<Value, String> {
+    let normalized = AccountingSettings {
+        accounting_currency: settings.accounting_currency.trim().to_ascii_uppercase(),
+        credit_display_name: settings.credit_display_name.trim().to_string(),
+        credits_per_accounting_unit: settings.credits_per_accounting_unit,
+        exchange_rates: Vec::new(),
+        version: 1,
+    };
+    normalized.validate()?;
+    Ok(serde_json::json!({
+        "accounting_currency_code": normalized.accounting_currency,
+        "timezone": "UTC",
+        "credit_display_name": normalized.credit_display_name,
+        "credits_per_accounting_unit": normalized.credits_per_accounting_unit,
+        "exchange_rates": [],
+        "accounting_rate_version": 1,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1002,6 +1028,12 @@ impl SystemService {
         ctx: &RequestContext,
         params: &InitializeParams,
     ) -> ServiceResult<SecretKey> {
+        let general_settings = bootstrap_general_settings_value(&params.accounting_settings)
+            .map_err(|message| ServiceError::InvalidSystemValue {
+                key: system_key::GENERAL_SETTINGS.to_string(),
+                message,
+            })?;
+
         // 1. Idempotency — refuse a double initialize.
         if self.is_initialized(ctx).await? {
             return Err(ServiceError::SystemAlreadyInitialized);
@@ -1066,6 +1098,7 @@ impl SystemService {
             .initialize_tail(
                 ctx,
                 params,
+                &general_settings,
                 &project_repo,
                 &role_repo,
                 &user_project_repo,
@@ -1103,6 +1136,7 @@ impl SystemService {
         &self,
         ctx: &RequestContext,
         params: &InitializeParams,
+        general_settings: &Value,
         project_repo: &Arc<dyn ProjectRepo>,
         role_repo: &Arc<dyn RoleRepo>,
         user_project_repo: &Arc<dyn UserProjectRepo>,
@@ -1192,6 +1226,8 @@ impl SystemService {
             self.set_system_value(ctx, SYSTEM_VERSION, Value::from(params.version.clone()))
                 .await?;
         }
+        self.set_system_value(ctx, system_key::GENERAL_SETTINGS, general_settings.clone())
+            .await?;
         self.set_system_value(ctx, SYSTEM_INITIALIZED, Value::from(true))
             .await?;
         Ok(())
@@ -1932,6 +1968,7 @@ mod tests {
     #[derive(Default)]
     struct InMemorySettingsRepo {
         values: Mutex<BTreeMap<String, Value>>,
+        writes: Mutex<Vec<String>>,
         get_calls: AtomicUsize,
     }
 
@@ -1946,6 +1983,10 @@ mod tests {
 
         fn get_calls(&self) -> usize {
             self.get_calls.load(Ordering::SeqCst)
+        }
+
+        async fn writes(&self) -> Vec<String> {
+            self.writes.lock().await.clone()
         }
     }
 
@@ -1966,6 +2007,7 @@ mod tests {
             key: &str,
             value: Value,
         ) -> ServiceResult<Value> {
+            self.writes.lock().await.push(key.to_string());
             self.values
                 .lock()
                 .await
@@ -2403,6 +2445,13 @@ mod tests {
             owner_last_name: Some("Owner".to_string()),
             brand_name: "Test Brand".to_string(),
             prefer_language: None,
+            accounting_settings: AccountingSettings {
+                accounting_currency: "CNY".to_string(),
+                credit_display_name: "Credits".to_string(),
+                credits_per_accounting_unit: rust_decimal::Decimal::from(10_000),
+                exchange_rates: Vec::new(),
+                version: 1,
+            },
             version: "0.1.0-test".to_string(),
             now: "2026-06-27T00:00:00Z".to_string(),
         }
@@ -2486,6 +2535,25 @@ mod tests {
             settings.value(SYSTEM_VERSION).await,
             Some(json!("0.1.0-test"))
         );
+        assert_eq!(
+            settings.value(system_key::GENERAL_SETTINGS).await,
+            Some(
+                bootstrap_general_settings_value(
+                    &init_params("unused@example.com").accounting_settings
+                )
+                .expect("test accounting settings are valid")
+            )
+        );
+        let writes = settings.writes().await;
+        let general_index = writes
+            .iter()
+            .position(|key| key == system_key::GENERAL_SETTINGS)
+            .expect("general settings must be persisted");
+        let initialized_index = writes
+            .iter()
+            .position(|key| key == system_key::INITIALIZED)
+            .expect("initialized flag must be persisted");
+        assert!(general_index < initialized_index);
 
         // Owner user created with is_owner + wildcard scopes.
         assert_eq!(user_repo.len()?, 1);
@@ -2574,6 +2642,27 @@ mod tests {
             err,
             Err(ServiceError::Repo(RepoError::NotFound(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_invalid_accounting_before_any_mutation() {
+        let (service, settings, user_repo, _project_repo, _role_repo, _user_project_repo) =
+            init_service();
+        let mut params = init_params("owner@example.com");
+        params.accounting_settings.credits_per_accounting_unit = rust_decimal::Decimal::ZERO;
+
+        let error = service
+            .initialize(&ctx(), &params)
+            .await
+            .expect_err("zero credit ratio must be rejected");
+
+        assert!(matches!(
+            error,
+            ServiceError::InvalidSystemValue { ref key, .. }
+                if key == system_key::GENERAL_SETTINGS
+        ));
+        assert_eq!(user_repo.len().expect("in-memory repo is available"), 0);
+        assert!(settings.writes().await.is_empty());
     }
 
     #[tokio::test]

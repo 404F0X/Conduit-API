@@ -6,10 +6,12 @@ server:
   public_url: ""
   port: 8090
   base_path: ""
+  # Forwarding headers are ignored unless the TCP peer matches one of these
+  # exact addresses/CIDRs. Add only reverse proxies you operate.
+  trusted_proxies: []
   request_timeout: 30s
   llm_request_timeout: 600s
   read_timeout: 30s
-  write_timeout: 30s          # Rust-only (no Go server.Config counterpart)
   graceful_shutdown_timeout: 10s  # Rust-only (no Go server.Config counterpart)
   trace:
     thread_header: Conduit-Thread-Id
@@ -130,14 +132,11 @@ oidc:
   providers: []
 
 api_auth:
-  enabled: true
-  api_key_header: Authorization
-  allow_no_auth_fallback: false
-  no_auth_sentinel: CONDUIT_API_KEY_NO_AUTH
-  admin_token:
   jwt_secret:
   session_ttl: 24h
   bcrypt_cost: 12
+  # Public password registration is disabled unless explicitly opted in.
+  allow_password_signup: false
 
 retry:
   enabled: true

@@ -1,8 +1,8 @@
 # 前端 GraphQL Operation 静态清单
 
-生成基准：2026-08-19 当前工作树。该清单记录源码中可静态识别的具名 GraphQL operation；它不等价于“页面正在使用”，也不证明后端已正确接线。动态拼接、匿名 operation 和运行时生成字段需要另行审计。
+生成基准：2026-08-31 当前工作树。该清单记录源码中可静态识别的具名 GraphQL operation；它不等价于“页面正在使用”，也不证明后端已正确接线。动态拼接、匿名 operation 和运行时生成字段需要另行审计。
 
-总计：261 个定义，257 个唯一 operation 名；Query 118，Mutation 143。
+总计：265 个定义，261 个唯一 operation 名；Query 119，Mutation 146。
 
 | 类型 | Operation | Root field | 定义文件 |
 |---|---|---|---|
@@ -28,6 +28,8 @@
 | query | BillingAccessBundles | simpleGroups | frontend/src/features/billing/data.ts |
 | mutation | CancelUserSubscription | cancelUserSubscription | frontend/src/features/billing/data.ts |
 | mutation | CreateSubscriptionPlan | createSubscriptionPlan | frontend/src/features/billing/data.ts |
+| query | CreditRedemptionCodes | creditRedemptionCodes | frontend/src/features/billing/redemption-data.ts |
+| mutation | CreateCreditRedemptionCodes | createCreditRedemptionCodes | frontend/src/features/billing/redemption-data.ts |
 | mutation | GrantProjectCredit | grantProjectCredit | frontend/src/features/billing/data.ts |
 | mutation | GrantUserCredit | grantUserCredit | frontend/src/features/billing/data.ts |
 | query | MyBalance | myBalance | frontend/src/features/billing/data.ts |
@@ -39,6 +41,8 @@
 | query | ProjectWalletComparison | projectWalletComparison | frontend/src/features/billing/data.ts |
 | mutation | RefreshSubscriptionAllowance | refreshSubscriptionAllowance | frontend/src/features/billing/data.ts |
 | mutation | RenewUserSubscription | renewUserSubscription | frontend/src/features/billing/data.ts |
+| mutation | RedeemCreditCode | redeemCreditCode | frontend/src/features/billing/redemption-data.ts |
+| mutation | RevokeCreditRedemptionCode | revokeCreditRedemptionCode | frontend/src/features/billing/redemption-data.ts |
 | mutation | ResumeUserSubscription | resumeUserSubscription | frontend/src/features/billing/data.ts |
 | mutation | SetSubscriptionAutoRenew | setSubscriptionAutoRenew | frontend/src/features/billing/data.ts |
 | query | SubscriptionPlans | subscriptionPlans | frontend/src/features/billing/data.ts |

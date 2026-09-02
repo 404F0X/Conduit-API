@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { driver } from 'driver.js';
 import 'driver.js/dist/driver.css';
 import { useTranslation } from 'react-i18next';
@@ -12,25 +12,51 @@ interface ModelsOnboardingFlowProps {
 
 export function ModelsOnboardingFlow({ onComplete }: ModelsOnboardingFlowProps) {
   const { t } = useTranslation();
-  const completeOnboarding = useCompleteSystemModelSettingOnboarding();
-  const hasStartedRef = useRef(false);
+  const { mutate: completeOnboarding } = useCompleteSystemModelSettingOnboarding();
 
   useEffect(() => {
-    if (hasStartedRef.current) {
-      return;
-    }
-
     const settingsButton = document.querySelector('[data-settings-button]') as HTMLButtonElement;
     if (!settingsButton) {
       return;
     }
 
-    hasStartedRef.current = true;
-
     let driverObj: ReturnType<typeof driver> | null = null;
-    let clickHandlerAdded = false;
+    let animationFrame: number | null = null;
+    let completed = false;
 
-    setTimeout(() => {
+    // Register completion before the tour can expose its highlighted target.
+    // driver.js calls `onHighlighted` only after its entrance animation, while
+    // the target is interactive as soon as the popover is mounted. Installing
+    // the listener here keeps that first click atomic: it always tears down the
+    // overlay before the button's normal React handler opens model settings.
+    const handleSettingsClick = () => {
+      if (completed) return;
+      completed = true;
+
+      if (animationFrame !== null) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = null;
+      }
+      if (driverObj) {
+        driverObj.destroy();
+        driverObj = null;
+      }
+
+      completeOnboarding(undefined, {
+        onSuccess: () => {
+          onComplete?.();
+        },
+      });
+    };
+
+    settingsButton.addEventListener('click', handleSettingsClick, { once: true });
+
+    // Wait for one paint so driver.js measures the committed button layout.
+    // The completion listener above is already active during this boundary.
+    animationFrame = window.requestAnimationFrame(() => {
+      animationFrame = null;
+      if (completed) return;
+
       driverObj = driver({
         showProgress: false,
         showButtons: [],
@@ -45,34 +71,17 @@ export function ModelsOnboardingFlow({ onComplete }: ModelsOnboardingFlowProps) 
               align: 'end',
               showButtons: [],
             },
-            onHighlighted: () => {
-              if (clickHandlerAdded) return;
-              clickHandlerAdded = true;
-
-              const highlightedElement = document.querySelector('[data-settings-button]') as HTMLButtonElement;
-              if (!highlightedElement) return;
-
-              const handleClick = () => {
-                if (driverObj) {
-                  driverObj.destroy();
-                  driverObj = null;
-                }
-                completeOnboarding.mutate(undefined, {
-                  onSuccess: () => {
-                    onComplete?.();
-                  },
-                });
-              };
-
-              highlightedElement.addEventListener('click', handleClick, { once: true });
-            },
           },
         ],
       });
       driverObj.drive();
-    }, 500);
+    });
 
     return () => {
+      if (animationFrame !== null) {
+        window.cancelAnimationFrame(animationFrame);
+      }
+      settingsButton.removeEventListener('click', handleSettingsClick);
       if (driverObj) {
         driverObj.destroy();
       }

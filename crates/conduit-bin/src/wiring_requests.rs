@@ -27,6 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use conduit_admin_graphql::pagination::PageInfo;
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::request_usage::{
     CostItem, PriceItemCode, Request, RequestConnection, RequestConnectionArgs, RequestEdge,
     RequestOrderSelection, RequestOrderTerm, RequestQueryError, RequestQueryServices,
@@ -38,8 +39,12 @@ use conduit_admin_graphql::scalars::{
     CursorScalar, DecimalScalar, JsonRawMessageScalar, TimeScalar,
 };
 use conduit_db::RequestContext;
-use conduit_db::repo::request_repo::{RequestListQuery, RequestListResult, RequestRepo};
-use conduit_db::repo::usage_repo::{UsageListQuery, UsageListResult, UsageRepo};
+use conduit_db::repo::request_repo::{
+    RequestListOrderField, RequestListQuery, RequestListResult, RequestRepo,
+};
+use conduit_db::repo::usage_repo::{
+    UsageListOrderField, UsageListQuery, UsageListResult, UsageRepo,
+};
 use conduit_db::row::{RequestRow, UsageLogRow};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -59,7 +64,8 @@ impl RequestAdapter {
         Self { repo }
     }
 
-    /// Trusted admin context — no user/project filtering.
+    /// Internal repository context. Caller visibility is already represented
+    /// by the authorized `AdminAccessScope` passed to this adapter.
     fn ctx() -> RequestContext {
         RequestContext::new(conduit_db::PolicyContext::new(conduit_db::Principal::test()))
     }
@@ -72,45 +78,47 @@ impl RequestQueryServices for RequestAdapter {
         args: RequestConnectionArgs,
     ) -> Result<RequestConnection, RequestQueryError> {
         let ctx = Self::ctx();
-
-        // Build repo query from GraphQL args. For now, use a simple query
-        // that loads all rows (bounded materialization). Filter/pagination
-        // happens in-memory.
-        let query = RequestListQuery {
-            project_id: String::new(), // Admin sees all
-            api_key_id: None,
-            channel_id: None,
-            model_id: None,
-            source: None,
-            status: None,
-            start_at: None,
-            end_at: None,
-            limit: 1000, // Admin page load
-            offset: 0,
-        };
-
+        let order = args.order_by.unwrap_or(RequestOrderSelection {
+            direction: conduit_admin_graphql::request_usage::OrderDirection::Desc,
+            term: RequestOrderTerm::Id,
+        });
+        let mut query = request_list_query(&args.access, args.where_filter.as_ref(), order)?;
+        if project_filter_conflicts(
+            &args.access,
+            args.where_filter
+                .as_ref()
+                .and_then(|f| f.project_id.as_ref()),
+        ) {
+            return Ok(empty_request_connection());
+        }
+        let total_count = self
+            .repo
+            .count_requests_unchecked(&ctx, &query)
+            .await
+            .map_err(|e| RequestQueryError::Query(e.to_string()))?;
+        let total_len = usize::try_from(total_count).unwrap_or(usize::MAX);
+        let (start_idx, end_idx) =
+            pagination_window(total_len, args.first, args.after, args.last, args.before);
+        query.offset = u32::try_from(start_idx).unwrap_or(u32::MAX);
+        query.limit = u32::try_from(end_idx.saturating_sub(start_idx)).unwrap_or(u32::MAX);
         let result: RequestListResult = self
             .repo
             .list_requests_unchecked(&ctx, &query)
             .await
             .map_err(|e| RequestQueryError::Query(e.to_string()))?;
-
-        // Convert rows to GraphQL nodes
-        let mut nodes: Vec<Request> = result.rows.into_iter().map(request_row_to_gql).collect();
-        if let Some(filter) = args.where_filter.as_ref() {
-            nodes.retain(|request| request_matches_filter(request, filter));
-        }
-
-        // Sort by the requested order (default: CREATED_AT DESC)
-        let order = args.order_by.unwrap_or(RequestOrderSelection {
-            direction: conduit_admin_graphql::request_usage::OrderDirection::Desc,
-            term: RequestOrderTerm::Id,
-        });
-        sort_requests(&mut nodes, &order);
-
-        // Apply forward pagination (after/first)
-        let (edges, total_count, has_next_page, has_previous_page) =
-            paginate_requests(nodes, args.first, args.after, args.last, args.before);
+        let edges: Vec<_> = result
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                Some(RequestEdge {
+                    node: Some(request_row_to_gql(row)),
+                    cursor: CursorScalar((start_idx + index).to_string()),
+                })
+            })
+            .collect();
+        let has_next_page = end_idx < total_len;
+        let has_previous_page = start_idx > 0;
         let start_cursor = edges
             .first()
             .and_then(|edge| edge.as_ref())
@@ -128,51 +136,114 @@ impl RequestQueryServices for RequestAdapter {
                 start_cursor,
                 end_cursor,
             },
-            total_count,
+            total_count: i64::try_from(total_count).unwrap_or(i64::MAX),
         })
     }
 }
 
-fn request_matches_filter(
-    request: &Request,
-    filter: &conduit_admin_graphql::request_usage::RequestWhereInput,
+fn database_id(value: &str, expected_type: &str) -> String {
+    conduit_admin_graphql::node::parse_guid(value)
+        .ok()
+        .filter(|guid| guid.typ == expected_type)
+        .map_or_else(|| value.to_owned(), |guid| guid.id.to_string())
+}
+
+fn project_filter_conflicts(
+    access: &AdminAccessScope,
+    requested: Option<&async_graphql::ID>,
 ) -> bool {
-    if filter.id.as_ref().is_some_and(|id| id != &request.id)
-        || filter
+    match (access, requested) {
+        (AdminAccessScope::Project(project_id), Some(requested)) => {
+            database_id(project_id, "Project") != database_id(requested.as_str(), "Project")
+        }
+        _ => false,
+    }
+}
+
+fn nil_filter(is_nil: Option<bool>, not_nil: Option<bool>) -> Option<bool> {
+    if is_nil == Some(true) {
+        Some(true)
+    } else if not_nil == Some(true) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn request_list_query(
+    access: &AdminAccessScope,
+    filter: Option<&conduit_admin_graphql::request_usage::RequestWhereInput>,
+    order: RequestOrderSelection,
+) -> Result<RequestListQuery, RequestQueryError> {
+    let filter = filter.cloned().unwrap_or_default();
+    let project_id = match access {
+        AdminAccessScope::Project(project_id) => database_id(project_id, "Project"),
+        AdminAccessScope::Global => filter
             .project_id
             .as_ref()
-            .is_some_and(|id| id != &request.project_id)
-        || filter
-            .trace_id
+            .map(|id| database_id(id.as_str(), "Project"))
+            .unwrap_or_default(),
+    };
+    Ok(RequestListQuery {
+        project_id,
+        id: filter
+            .id
             .as_ref()
-            .is_some_and(|id| request.trace_id.as_ref() != Some(id))
-        || filter
+            .map(|id| database_id(id.as_str(), "Request")),
+        api_key_id: filter
             .api_key_id
             .as_ref()
-            .is_some_and(|id| request.api_key_id.as_ref() != Some(id))
-        || filter
+            .map(|id| database_id(id.as_str(), "APIKey")),
+        channel_id: filter
             .channel_id
             .as_ref()
-            .is_some_and(|id| request.channel_id.as_ref() != Some(id))
-        || filter
-            .model_id
+            .map(|id| database_id(id.as_str(), "Channel")),
+        trace_id: filter
+            .trace_id
             .as_ref()
-            .is_some_and(|id| id != &request.model_id)
-        || filter.status.is_some_and(|status| status != request.status)
-        || filter.source.is_some_and(|source| source != request.source)
-    {
-        return false;
+            .map(|id| database_id(id.as_str(), "Trace")),
+        trace_id_is_nil: nil_filter(filter.trace_id_is_nil, filter.trace_id_not_nil),
+        api_key_id_is_nil: nil_filter(filter.api_key_id_is_nil, filter.api_key_id_not_nil),
+        channel_id_is_nil: nil_filter(filter.channel_id_is_nil, filter.channel_id_not_nil),
+        model_id: filter.model_id,
+        source: filter.source.map(|source| match source {
+            RequestSource::Api => "api".to_string(),
+            RequestSource::Playground => "playground".to_string(),
+            RequestSource::Test => "test".to_string(),
+        }),
+        status: filter.status.map(|status| match status {
+            RequestStatus::Pending => "pending".to_string(),
+            RequestStatus::Processing => "processing".to_string(),
+            RequestStatus::Completed => "completed".to_string(),
+            RequestStatus::Failed => "failed".to_string(),
+            RequestStatus::Canceled => "canceled".to_string(),
+        }),
+        start_at: None,
+        end_at: None,
+        limit: 0,
+        offset: 0,
+        order_field: match order.term {
+            RequestOrderTerm::Id => RequestListOrderField::Id,
+            RequestOrderTerm::UpdatedAt => RequestListOrderField::UpdatedAt,
+        },
+        descending: matches!(
+            order.direction,
+            conduit_admin_graphql::request_usage::OrderDirection::Desc
+        ),
+    })
+}
+
+fn empty_request_connection() -> RequestConnection {
+    RequestConnection {
+        edges: Some(Vec::new()),
+        page_info: PageInfo {
+            has_next_page: false,
+            has_previous_page: false,
+            start_cursor: None,
+            end_cursor: None,
+        },
+        total_count: 0,
     }
-    if filter.trace_id_is_nil == Some(true) && request.trace_id.is_some()
-        || filter.trace_id_not_nil == Some(true) && request.trace_id.is_none()
-        || filter.api_key_id_is_nil == Some(true) && request.api_key_id.is_some()
-        || filter.api_key_id_not_nil == Some(true) && request.api_key_id.is_none()
-        || filter.channel_id_is_nil == Some(true) && request.channel_id.is_some()
-        || filter.channel_id_not_nil == Some(true) && request.channel_id.is_none()
-    {
-        return false;
-    }
-    true
 }
 
 /// Convert a [`RequestRow`] to the GraphQL [`Request`] shape.
@@ -243,46 +314,6 @@ fn request_status_from_str(s: &str) -> RequestStatus {
     }
 }
 
-fn sort_requests(nodes: &mut [Request], order: &RequestOrderSelection) {
-    use RequestOrderTerm::*;
-    use conduit_admin_graphql::request_usage::OrderDirection;
-    match order.term {
-        Id => match order.direction {
-            OrderDirection::Asc => nodes.sort_by_key(|r| r.created_at.0),
-            OrderDirection::Desc => nodes.sort_by_key(|r| std::cmp::Reverse(r.created_at.0)),
-        },
-        UpdatedAt => match order.direction {
-            OrderDirection::Asc => nodes.sort_by_key(|r| r.updated_at.0),
-            OrderDirection::Desc => nodes.sort_by_key(|r| std::cmp::Reverse(r.updated_at.0)),
-        },
-    }
-}
-
-fn paginate_requests(
-    mut nodes: Vec<Request>,
-    first: Option<i32>,
-    after: Option<String>,
-    last: Option<i32>,
-    before: Option<String>,
-) -> (Vec<Option<RequestEdge>>, i64, bool, bool) {
-    let total = nodes.len() as i64;
-    let (start_idx, end_idx) = pagination_window(nodes.len(), first, after, last, before);
-    let page: Vec<_> = nodes.drain(start_idx..end_idx).collect();
-
-    let edges: Vec<_> = page
-        .into_iter()
-        .enumerate()
-        .map(|(i, node)| {
-            Some(RequestEdge {
-                node: Some(node),
-                cursor: CursorScalar(format!("{}", start_idx + i)),
-            })
-        })
-        .collect();
-
-    (edges, total, end_idx < total as usize, start_idx > 0)
-}
-
 // ---------------------------------------------------------------------------
 // UsageLog adapter
 // ---------------------------------------------------------------------------
@@ -310,39 +341,47 @@ impl UsageLogQueryServices for UsageLogAdapter {
         args: UsageLogConnectionArgs,
     ) -> Result<UsageLogConnection, UsageLogQueryError> {
         let ctx = Self::ctx();
-
-        let query = UsageListQuery {
-            project_id: String::new(),
-            api_key_id: None,
-            channel_id: None,
-            model_id: None,
-            source: None,
-            request_id: None,
-            start_at: None,
-            end_at: None,
-            limit: 1000,
-            offset: 0,
-        };
-
+        let order = args.order_by.unwrap_or(UsageLogOrderSelection {
+            direction: conduit_admin_graphql::request_usage::OrderDirection::Desc,
+            term: UsageLogOrderTerm::Id,
+        });
+        let mut query = usage_list_query(&args.access, args.where_filter.as_ref(), order);
+        if project_filter_conflicts(
+            &args.access,
+            args.where_filter
+                .as_ref()
+                .and_then(|f| f.project_id.as_ref()),
+        ) {
+            return Ok(empty_usage_connection());
+        }
+        let total_count = self
+            .repo
+            .count_usage_unchecked(&ctx, &query)
+            .await
+            .map_err(|e| UsageLogQueryError::Query(e.to_string()))?;
+        let total_len = usize::try_from(total_count).unwrap_or(usize::MAX);
+        let (start_idx, end_idx) =
+            pagination_window(total_len, args.first, args.after, args.last, args.before);
+        query.offset = u32::try_from(start_idx).unwrap_or(u32::MAX);
+        query.limit = u32::try_from(end_idx.saturating_sub(start_idx)).unwrap_or(u32::MAX);
         let result: UsageListResult = self
             .repo
             .list_usage_unchecked(&ctx, &query)
             .await
             .map_err(|e| UsageLogQueryError::Query(e.to_string()))?;
-
-        let mut nodes: Vec<UsageLog> = result.rows.into_iter().map(usage_log_row_to_gql).collect();
-        if let Some(filter) = args.where_filter.as_ref() {
-            nodes.retain(|usage| usage_log_matches_filter(usage, filter));
-        }
-
-        let order = args.order_by.unwrap_or(UsageLogOrderSelection {
-            direction: conduit_admin_graphql::request_usage::OrderDirection::Desc,
-            term: UsageLogOrderTerm::Id,
-        });
-        sort_usage_logs(&mut nodes, &order);
-
-        let (edges, total_count, has_next_page, has_previous_page) =
-            paginate_usage_logs(nodes, args.first, args.after, args.last, args.before);
+        let edges: Vec<_> = result
+            .rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                Some(UsageLogEdge {
+                    node: Some(usage_log_row_to_gql(row)),
+                    cursor: CursorScalar((start_idx + index).to_string()),
+                })
+            })
+            .collect();
+        let has_next_page = end_idx < total_len;
+        let has_previous_page = start_idx > 0;
         let start_cursor = edges
             .first()
             .and_then(|edge| edge.as_ref())
@@ -360,32 +399,68 @@ impl UsageLogQueryServices for UsageLogAdapter {
                 start_cursor,
                 end_cursor,
             },
-            total_count,
+            total_count: i64::try_from(total_count).unwrap_or(i64::MAX),
         })
     }
 }
 
-fn usage_log_matches_filter(
-    usage: &UsageLog,
-    filter: &conduit_admin_graphql::request_usage::UsageLogWhereInput,
-) -> bool {
-    !(filter.id.as_ref().is_some_and(|id| id != &usage.id)
-        || filter
-            .request_id
-            .as_ref()
-            .is_some_and(|id| id != &usage.request_id)
-        || filter
+fn usage_list_query(
+    access: &AdminAccessScope,
+    filter: Option<&conduit_admin_graphql::request_usage::UsageLogWhereInput>,
+    order: UsageLogOrderSelection,
+) -> UsageListQuery {
+    let filter = filter.cloned().unwrap_or_default();
+    let project_id = match access {
+        AdminAccessScope::Project(project_id) => database_id(project_id, "Project"),
+        AdminAccessScope::Global => filter
             .project_id
             .as_ref()
-            .is_some_and(|id| id != &usage.project_id)
-        || filter
+            .map(|id| database_id(id.as_str(), "Project"))
+            .unwrap_or_default(),
+    };
+    UsageListQuery {
+        project_id,
+        id: filter
+            .id
+            .as_ref()
+            .map(|id| database_id(id.as_str(), "UsageLog")),
+        api_key_id: None,
+        channel_id: filter
             .channel_id
             .as_ref()
-            .is_some_and(|id| usage.channel_id.as_ref() != Some(id))
-        || filter
-            .model_id
+            .map(|id| database_id(id.as_str(), "Channel")),
+        model_id: filter.model_id.clone(),
+        source: None,
+        request_id: filter
+            .request_id
             .as_ref()
-            .is_some_and(|id| id != &usage.model_id))
+            .map(|id| database_id(id.as_str(), "Request")),
+        start_at: None,
+        end_at: None,
+        limit: 0,
+        offset: 0,
+        order_field: match order.term {
+            UsageLogOrderTerm::Id => UsageListOrderField::Id,
+            UsageLogOrderTerm::UpdatedAt => UsageListOrderField::UpdatedAt,
+        },
+        descending: matches!(
+            order.direction,
+            conduit_admin_graphql::request_usage::OrderDirection::Desc
+        ),
+    }
+}
+
+fn empty_usage_connection() -> UsageLogConnection {
+    UsageLogConnection {
+        edges: Some(Vec::new()),
+        page_info: PageInfo {
+            has_next_page: false,
+            has_previous_page: false,
+            start_cursor: None,
+            end_cursor: None,
+        },
+        total_count: 0,
+    }
 }
 
 pub(crate) fn usage_log_row_to_gql(row: UsageLogRow) -> UsageLog {
@@ -466,46 +541,6 @@ fn usage_log_source_from_str(s: &str) -> conduit_admin_graphql::request_usage::U
         "test" => conduit_admin_graphql::request_usage::UsageLogSource::Test,
         _ => conduit_admin_graphql::request_usage::UsageLogSource::Api,
     }
-}
-
-fn sort_usage_logs(nodes: &mut [UsageLog], order: &UsageLogOrderSelection) {
-    use UsageLogOrderTerm::*;
-    use conduit_admin_graphql::request_usage::OrderDirection;
-    match order.term {
-        Id => match order.direction {
-            OrderDirection::Asc => nodes.sort_by_key(|r| r.created_at.0),
-            OrderDirection::Desc => nodes.sort_by_key(|r| std::cmp::Reverse(r.created_at.0)),
-        },
-        UpdatedAt => match order.direction {
-            OrderDirection::Asc => nodes.sort_by_key(|r| r.updated_at.0),
-            OrderDirection::Desc => nodes.sort_by_key(|r| std::cmp::Reverse(r.updated_at.0)),
-        },
-    }
-}
-
-fn paginate_usage_logs(
-    mut nodes: Vec<UsageLog>,
-    first: Option<i32>,
-    after: Option<String>,
-    last: Option<i32>,
-    before: Option<String>,
-) -> (Vec<Option<UsageLogEdge>>, i64, bool, bool) {
-    let total = nodes.len() as i64;
-    let (start_idx, end_idx) = pagination_window(nodes.len(), first, after, last, before);
-    let page: Vec<_> = nodes.drain(start_idx..end_idx).collect();
-
-    let edges: Vec<_> = page
-        .into_iter()
-        .enumerate()
-        .map(|(i, node)| {
-            Some(UsageLogEdge {
-                node: Some(node),
-                cursor: CursorScalar(format!("{}", start_idx + i)),
-            })
-        })
-        .collect();
-
-    (edges, total, end_idx < total as usize, start_idx > 0)
 }
 
 fn pagination_window(

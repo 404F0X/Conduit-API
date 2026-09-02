@@ -4,7 +4,7 @@ This directory is Conduit API's only runtime migration catalog. The Rust databas
 crate embeds these files in version order and records applied versions in
 `schema_migrations`.
 
-The current catalog ends at `000032_change_sets.sql`. The workspace is
+The current catalog ends at `000034_credit_redemption_limits.sql`. The workspace is
 still in its pre-release, rebuildable-database phase. The earlier `000028`
 money-unit contract still requires recreation for databases that recorded its
 superseded draft.
@@ -31,6 +31,15 @@ changes and their audit rows are committed in the same transaction.
 `000032` adds a review queue for upstream price changes. Synchronization can
 create or supersede drafts, but only an explicit approval transaction may
 update formal channel procurement prices and their immutable versions.
+
+`000033` adds one-time Project credit redemption batches, digest-only codes,
+immutable redemption receipts, and transaction-local audit rows. Plaintext
+codes are returned once by the application and must never be persisted or
+logged.
+
+`000034` adds a bounded redemption limit to each batch and changes receipt
+uniqueness to `(code_id, user_id)`. Existing batches default to one redemption,
+while new batches may explicitly allow up to 100,000 distinct users per code.
 
 After this contract is released, schema changes must add the next numbered file
 and update the embedded catalog in `crates/conduit-db/src/migrate.rs`.

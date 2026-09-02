@@ -71,7 +71,10 @@ use crate::prompt::{
     UpdatePromptInput, UpdatePromptProtectionRuleInput, prompt_mutation_services,
     prompt_protection_rule_mutation_services,
 };
-use crate::role::{CreateRoleInput, Role, UpdateRoleInput, role_mutation_services};
+use crate::role::{
+    CreateRoleInput, Role, RoleConnectionArgs, RoleWhereInput, UpdateRoleInput,
+    role_mutation_services, role_query_services,
+};
 use crate::scalars::QuotaEnforcementMode;
 use crate::simple_group::{
     AssignSimpleGroupUsersInput, CreateSimpleGroupInput, SimpleGroup, UpdateSimpleGroupInput,
@@ -87,6 +90,7 @@ use crate::system::{
 use crate::user::{
     AddUserToProjectInput, CreateUserInput, RemoveUserFromProjectInput, UpdateProjectUserInput,
     UpdateUserInput, User, UserProject, UserStatus, user_mutation_services,
+    validate_create_user_input, validate_update_user_input,
 };
 
 fn require_owner_for_internal_admin_scope<'a>(
@@ -109,6 +113,55 @@ fn require_owner_for_internal_admin_scope<'a>(
     } else {
         Err("authz: only an owner may grant the system:admin scope".to_string())
     }
+}
+
+async fn guard_role_grants(
+    ctx: &Context<'_>,
+    role_ids: Option<&[async_graphql::ID]>,
+) -> Result<(), String> {
+    let Some(role_ids) = role_ids.filter(|ids| !ids.is_empty()) else {
+        return Ok(());
+    };
+    let access = crate::policy::AdminAccessScope::from_graphql_context(
+        ctx,
+        conduit_auth::scopes::slug::WRITE_USERS,
+    )
+    .map_err(|error| error.to_string())?;
+    let services = role_query_services(ctx)?;
+    for role_id in role_ids {
+        let connection = services
+            .roles_with_access(
+                &access,
+                RoleConnectionArgs {
+                    where_filter: Some(RoleWhereInput {
+                        id: Some(role_id.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let wanted = canonical_node_id(role_id.as_str(), "Role");
+        let role = connection
+            .edges
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter_map(|edge| edge.node)
+            .find(|role| canonical_node_id(role.id.as_str(), "Role") == wanted)
+            .ok_or_else(|| "permission denied: role is outside the authorized scope".to_owned())?;
+        crate::policy::guard_scope_grant(ctx, None, role.scopes.iter().flatten())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn canonical_node_id(raw: &str, expected_type: &str) -> String {
+    crate::node::parse_guid(raw)
+        .ok()
+        .filter(|guid| guid.typ == expected_type)
+        .map_or_else(|| raw.to_owned(), |guid| guid.id.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +521,71 @@ impl MutationRoot {
         audit.currency = Some(conduit_core::objects::money::STATION_CREDIT_CODE.into());
         audit.idempotency_key = Some(input.idempotency_key.clone());
         let result = services.grant_project_credit(input).await;
+        finish_billing_audit(&services, audit, result).await
+    }
+
+    async fn create_credit_redemption_codes(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::billing::CreateCreditRedemptionCodesInput,
+    ) -> Result<crate::billing::CreateCreditRedemptionCodesPayload, String> {
+        crate::billing::validate_create_credit_redemption_codes_input(&input)
+            .map_err(|error| error.to_string())?;
+        let services = crate::billing::billing_services(ctx)?;
+        let actor = crate::billing::CreditRedemptionActor::for_request(ctx)?;
+        let mut audit = crate::billing::CommercialOperationAudit::for_request(
+            ctx,
+            "create_credit_redemption_codes",
+        );
+        audit.amount = Some(input.amount.clone());
+        audit.currency = Some(conduit_core::objects::money::STATION_CREDIT_CODE.into());
+        let result = services.create_credit_redemption_codes(actor, input).await;
+        finish_billing_audit(&services, audit, result).await
+    }
+
+    async fn revoke_credit_redemption_code(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+    ) -> Result<crate::billing::CreditRedemptionCode, String> {
+        let services = crate::billing::billing_services(ctx)?;
+        let actor = crate::billing::CreditRedemptionActor::for_request(ctx)?;
+        let audit = crate::billing::CommercialOperationAudit::for_request(
+            ctx,
+            "revoke_credit_redemption_code",
+        );
+        let result = services
+            .revoke_credit_redemption_code(actor, id.as_str())
+            .await;
+        finish_billing_audit(&services, audit, result).await
+    }
+
+    async fn redeem_credit_code(
+        &self,
+        ctx: &Context<'_>,
+        code: String,
+    ) -> Result<crate::billing::CreditRedemptionReceipt, String> {
+        let current = ctx
+            .data::<crate::me::CurrentUser>()
+            .map_err(|_| "authentication required".to_string())?;
+        let project_id = crate::policy::request_context(ctx)
+            .and_then(|request| request.project_id.as_deref())
+            .ok_or_else(|| "current project is required; send X-Project-ID".to_string())?;
+        let code = crate::billing::normalize_credit_redemption_code(&code)
+            .map_err(|error| error.to_string())?;
+        let services = crate::billing::billing_services(ctx)?;
+        let actor = crate::billing::CreditRedemptionActor::for_request(ctx)?;
+        let mut audit =
+            crate::billing::CommercialOperationAudit::for_request(ctx, "redeem_credit_code");
+        audit.target_user_id = Some(current.user_id.to_string());
+        audit.target_project_id = Some(project_id.to_string());
+        let result = services
+            .redeem_credit_code(actor, &current.user_id.to_string(), project_id, &code)
+            .await;
+        if let Ok(receipt) = &result {
+            audit.amount = Some(receipt.amount.clone());
+            audit.currency = Some(receipt.currency.clone());
+        }
         finish_billing_audit(&services, audit, result).await
     }
 
@@ -1486,8 +1604,13 @@ impl MutationRoot {
         profile: crate::apikey::APIKeyProfileInput,
     ) -> Result<APIKeyProfileTemplate, String> {
         let services = profile_template_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_API_KEYS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .create_api_key_profile_template(input, profile)
+            .create_api_key_profile_template_with_access(&access, input, profile)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1508,8 +1631,13 @@ impl MutationRoot {
         profile: Option<crate::apikey::APIKeyProfileInput>,
     ) -> Result<APIKeyProfileTemplate, String> {
         let services = profile_template_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_API_KEYS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_api_key_profile_template(id.as_str(), input, profile)
+            .update_api_key_profile_template_with_access(&access, id.as_str(), input, profile)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1526,8 +1654,13 @@ impl MutationRoot {
         id: async_graphql::ID,
     ) -> Result<APIKeyProfileTemplate, String> {
         let services = profile_template_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_API_KEYS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .delete_api_key_profile_template(id.as_str())
+            .delete_api_key_profile_template_with_access(&access, id.as_str())
             .await
             .map_err(|err| err.to_string())
     }
@@ -1545,8 +1678,13 @@ impl MutationRoot {
         input: LoadApiKeyProfileTemplateInput,
     ) -> Result<APIKey, String> {
         let services = profile_template_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_API_KEYS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .load_api_key_profile_template(input)
+            .load_api_key_profile_template_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1567,8 +1705,13 @@ impl MutationRoot {
         input: CreateProjectInput,
     ) -> Result<Project, String> {
         let services = project_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .create_project(input)
+            .create_project_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1584,8 +1727,13 @@ impl MutationRoot {
         input: UpdateProjectInput,
     ) -> Result<Project, String> {
         let services = project_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_project(id.as_str(), input)
+            .update_project_with_access(&access, id.as_str(), input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1600,8 +1748,13 @@ impl MutationRoot {
         status: ProjectStatus,
     ) -> Result<Project, String> {
         let services = project_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_project_status(id.as_str(), status)
+            .update_project_status_with_access(&access, id.as_str(), status)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1619,8 +1772,13 @@ impl MutationRoot {
         input: UpdateProjectProfilesInput,
     ) -> Result<Project, String> {
         let services = project_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_project_profiles(id.as_str(), input)
+            .update_project_profiles_with_access(&access, id.as_str(), input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1634,8 +1792,13 @@ impl MutationRoot {
         id: async_graphql::ID,
     ) -> Result<bool, String> {
         let services = project_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .delete_project(id.as_str())
+            .delete_project_with_access(&access, id.as_str())
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1653,12 +1816,19 @@ impl MutationRoot {
     /// `UserService.CreateUser` (hash password unless OIDC-only placeholder,
     /// SetNillableFirstName/LastName, SetEmail, SetScopes, AddRoleIDs).
     async fn create_user(&self, ctx: &Context<'_>, input: CreateUserInput) -> Result<User, String> {
+        validate_create_user_input(&input).map_err(|err| err.to_string())?;
         // P-31: a non-owner may not create an owner or seed scopes they lack.
         crate::policy::guard_scope_grant(ctx, input.is_owner, input.scopes.iter().flatten())
             .map_err(|err| err.to_string())?;
+        guard_role_grants(ctx, input.role_ids.as_deref()).await?;
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .create_user(input)
+            .create_user_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1672,6 +1842,7 @@ impl MutationRoot {
         id: async_graphql::ID,
         input: UpdateUserInput,
     ) -> Result<User, String> {
+        validate_update_user_input(&input).map_err(|err| err.to_string())?;
         // P-31: a non-owner may not self-promote to owner or grant scopes they
         // do not already hold.
         crate::policy::guard_scope_grant(
@@ -1684,9 +1855,15 @@ impl MutationRoot {
                 .chain(input.append_scopes.iter().flatten()),
         )
         .map_err(|err| err.to_string())?;
+        guard_role_grants(ctx, input.add_role_ids.as_deref()).await?;
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_user(id.as_str(), input)
+            .update_user_with_access(&access, id.as_str(), input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1701,8 +1878,13 @@ impl MutationRoot {
         status: UserStatus,
     ) -> Result<User, String> {
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_user_status(id.as_str(), status)
+            .update_user_status_with_access(&access, id.as_str(), status)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1712,8 +1894,13 @@ impl MutationRoot {
     /// failure, `true` on success.
     async fn delete_user(&self, ctx: &Context<'_>, id: async_graphql::ID) -> Result<bool, String> {
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .delete_user(id.as_str())
+            .delete_user_with_access(&access, id.as_str())
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1728,9 +1915,17 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: AddUserToProjectInput,
     ) -> Result<UserProject, String> {
+        crate::policy::guard_scope_grant(ctx, input.is_owner, input.scopes.iter().flatten())
+            .map_err(|err| err.to_string())?;
+        guard_role_grants(ctx, input.role_ids.as_deref()).await?;
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .add_user_to_project(input)
+            .add_user_to_project_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1744,8 +1939,13 @@ impl MutationRoot {
         input: RemoveUserFromProjectInput,
     ) -> Result<bool, String> {
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .remove_user_from_project(input)
+            .remove_user_from_project_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1760,9 +1960,17 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpdateProjectUserInput,
     ) -> Result<UserProject, String> {
+        crate::policy::guard_scope_grant(ctx, input.is_owner, input.scopes.iter().flatten())
+            .map_err(|err| err.to_string())?;
+        guard_role_grants(ctx, input.add_role_ids.as_deref()).await?;
         let services = user_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_project_user(input)
+            .update_project_user_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1783,8 +1991,13 @@ impl MutationRoot {
         crate::policy::guard_scope_grant(ctx, None, input.scopes.iter().flatten())
             .map_err(|err| err.to_string())?;
         let services = role_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_ROLES,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .create_role(input)
+            .create_role_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1811,8 +2024,13 @@ impl MutationRoot {
         )
         .map_err(|err| err.to_string())?;
         let services = role_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_ROLES,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_role(id.as_str(), input)
+            .update_role_with_access(&access, id.as_str(), input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1822,8 +2040,13 @@ impl MutationRoot {
     /// failure, `true` on success.
     async fn delete_role(&self, ctx: &Context<'_>, id: async_graphql::ID) -> Result<bool, String> {
         let services = role_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_ROLES,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .delete_role(id.as_str())
+            .delete_role_with_access(&access, id.as_str())
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1839,9 +2062,14 @@ impl MutationRoot {
         ids: Vec<async_graphql::ID>,
     ) -> Result<bool, String> {
         let services = role_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_ROLES,
+        )
+        .map_err(|error| error.to_string())?;
         let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         services
-            .bulk_delete_roles(id_strs)
+            .bulk_delete_roles_with_access(&access, id_strs)
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1863,8 +2091,13 @@ impl MutationRoot {
         input: CreatePromptInput,
     ) -> Result<Prompt, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .create_prompt(input)
+            .create_prompt_with_access(&access, input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1880,8 +2113,13 @@ impl MutationRoot {
         input: UpdatePromptInput,
     ) -> Result<Prompt, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_prompt(id.as_str(), input)
+            .update_prompt_with_access(&access, id.as_str(), input)
             .await
             .map_err(|err| err.to_string())
     }
@@ -1895,8 +2133,13 @@ impl MutationRoot {
         id: async_graphql::ID,
     ) -> Result<bool, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .delete_prompt(id.as_str())
+            .delete_prompt_with_access(&access, id.as_str())
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1912,8 +2155,13 @@ impl MutationRoot {
         status: PromptStatus,
     ) -> Result<bool, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         services
-            .update_prompt_status(id.as_str(), status)
+            .update_prompt_status_with_access(&access, id.as_str(), status)
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1927,9 +2175,14 @@ impl MutationRoot {
         ids: Vec<async_graphql::ID>,
     ) -> Result<bool, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         services
-            .bulk_delete_prompts(id_strs)
+            .bulk_delete_prompts_with_access(&access, id_strs)
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1943,9 +2196,14 @@ impl MutationRoot {
         ids: Vec<async_graphql::ID>,
     ) -> Result<bool, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         services
-            .bulk_enable_prompts(id_strs)
+            .bulk_enable_prompts_with_access(&access, id_strs)
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -1959,9 +2217,14 @@ impl MutationRoot {
         ids: Vec<async_graphql::ID>,
     ) -> Result<bool, String> {
         let services = prompt_mutation_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_PROMPTS,
+        )
+        .map_err(|error| error.to_string())?;
         let id_strs: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         services
-            .bulk_disable_prompts(id_strs)
+            .bulk_disable_prompts_with_access(&access, id_strs)
             .await
             .map_err(|err| err.to_string())?;
         Ok(true)

@@ -20,11 +20,11 @@
 //!   `UPDATED_AT` sorts on `updated_at`. When no order is supplied the adapter
 //!   defaults to CREATED_AT DESC (newest first — matches the admin UI and the
 //!   `wiring_requests.rs` template).
-//! - Pagination: bounded materialization (repo loads up to
-//!   [`EXECUTION_LOAD_LIMIT`] rows — admin-scale table), then Relay forward
-//!   pagination in-memory with absolute-index cursors, same strategy as
-//!   `wiring_requests.rs`. `last`/`before` (backward pagination) are DEFERRED —
-//!   the frontend only paginates forward.
+//! - Pagination: edge queries first load every row for the exact injected FK;
+//!   only the defensive non-edge fallback is bounded by
+//!   [`EXECUTION_LOAD_LIMIT`]. Relay forward pagination then uses in-memory
+//!   absolute-index cursors, matching `wiring_requests.rs`. `last`/`before`
+//!   (backward pagination) are DEFERRED — the frontend only paginates forward.
 //!
 //! ## Where-filter coverage
 //!
@@ -63,6 +63,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use conduit_admin_graphql::pagination::PageInfo;
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::request_execution::{
     OrderDirection, RequestExecution, RequestExecutionConnection, RequestExecutionConnectionArgs,
     RequestExecutionEdge, RequestExecutionOrderSelection, RequestExecutionOrderTerm,
@@ -109,19 +110,46 @@ impl RequestExecutionAdapter {
     }
 }
 
+fn constrain_to_authorized_project(
+    args: &mut RequestExecutionConnectionArgs,
+) -> Result<(), RequestExecutionQueryError> {
+    let AdminAccessScope::Project(project_id) = &args.access else {
+        return Ok(());
+    };
+    let project_id = project_id
+        .rsplit('/')
+        .next()
+        .and_then(|id| id.parse::<i64>().ok())
+        .ok_or_else(|| {
+            RequestExecutionQueryError::Query("authorized project id is invalid".to_owned())
+        })?;
+    let mut filter = args.where_filter.take().unwrap_or_default();
+    if let Some(caller_project_id) = filter.project_id.replace(project_id) {
+        filter
+            .and
+            .get_or_insert_with(Vec::new)
+            .push(RequestExecutionWhereInput {
+                project_id: Some(caller_project_id),
+                ..Default::default()
+            });
+    }
+    args.where_filter = Some(filter);
+    Ok(())
+}
+
 #[async_trait]
 impl RequestExecutionQueryServices for RequestExecutionAdapter {
     async fn request_executions(
         &self,
-        args: RequestExecutionConnectionArgs,
+        mut args: RequestExecutionConnectionArgs,
     ) -> Result<RequestExecutionConnection, RequestExecutionQueryError> {
-        // Request edge resolvers inject both requestID and projectID. Use the
-        // repository's indexed request-scoped query for that hot path; loading
-        // the oldest EXECUTION_LOAD_LIMIT rows globally before filtering made
-        // executions disappear once the table exceeded the cap and put
-        // avoidable pressure on the PostgreSQL pool. Non-edge callers retain
-        // the bounded global fallback. Remaining predicates, ordering and
-        // Relay pagination are still applied below.
+        constrain_to_authorized_project(&mut args)?;
+        // Edge resolvers inject an exact request, channel, or data-storage ID.
+        // Use the corresponding repository query before applying the remaining
+        // predicates: loading the oldest EXECUTION_LOAD_LIMIT rows globally
+        // first made valid executions disappear once the table exceeded that
+        // cap and produced an incorrect totalCount. Only callers without an
+        // exact edge predicate retain the bounded global fallback.
         let ctx = conduit_db::RequestContext::new(conduit_db::PolicyContext::new(
             conduit_db::Principal::test(),
         ));
@@ -130,10 +158,46 @@ impl RequestExecutionQueryServices for RequestExecutionAdapter {
             let project_id = filter.project_id?;
             Some((project_id.to_string(), raw_id(request_id).to_string()))
         });
+        let channel_scope = args
+            .where_filter
+            .as_ref()
+            .and_then(|filter| filter.channel_id.as_ref())
+            .map(|channel_id| raw_id(channel_id).to_owned());
+        let data_storage_scope = args
+            .where_filter
+            .as_ref()
+            .and_then(|filter| filter.data_storage_id.as_ref())
+            .map(|data_storage_id| raw_id(data_storage_id).to_owned());
+        let authorized_project_id = match &args.access {
+            AdminAccessScope::Project(_) => args
+                .where_filter
+                .as_ref()
+                .and_then(|filter| filter.project_id)
+                .map(|project_id| project_id.to_string()),
+            AdminAccessScope::Global => None,
+        };
         let mut rows: Vec<RequestExecutionRow> = match request_scope {
             Some((project_id, request_id)) => {
                 self.repo
                     .list_request_executions_unchecked(&ctx, &project_id, &request_id)
+                    .await
+            }
+            None if channel_scope.is_some() => {
+                self.repo
+                    .list_request_executions_by_channel_unchecked(
+                        &ctx,
+                        authorized_project_id.as_deref(),
+                        channel_scope.as_deref().unwrap_or_default(),
+                    )
+                    .await
+            }
+            None if data_storage_scope.is_some() => {
+                self.repo
+                    .list_request_executions_by_data_storage_unchecked(
+                        &ctx,
+                        authorized_project_id.as_deref(),
+                        data_storage_scope.as_deref().unwrap_or_default(),
+                    )
                     .await
             }
             None => {
@@ -877,3 +941,142 @@ fn row_matches(filter: &RequestExecutionWhereInput, row: &RequestExecutionRow) -
 // `request_executions_applies_status_where_filter`) plus the edge-injected
 // requestID predicate semantics, against the real adapter + repository.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conduit_db::repo::request_execution_repo::InMemoryRequestExecutionRepo;
+
+    fn execution_row(
+        id: i64,
+        project_id: &str,
+        channel_id: Option<&str>,
+        data_storage_id: Option<&str>,
+    ) -> RequestExecutionRow {
+        let timestamp = DateTime::<Utc>::from_timestamp(id, 0).unwrap_or_default();
+        RequestExecutionRow {
+            id: id.to_string(),
+            project_id: project_id.to_owned(),
+            request_id: "1".to_owned(),
+            channel_id: channel_id.map(str::to_owned),
+            credential_identity: None,
+            data_storage_id: data_storage_id.map(str::to_owned),
+            external_id: None,
+            model_id: "test-model".to_owned(),
+            format: "openai/chat_completions".to_owned(),
+            request_body: serde_json::json!({}),
+            response_body: None,
+            response_chunks: None,
+            error_message: None,
+            response_status_code: None,
+            status: "completed".to_owned(),
+            stream: false,
+            metrics_latency_ms: None,
+            metrics_first_token_latency_ms: None,
+            metrics_reasoning_duration_ms: None,
+            request_headers: None,
+            request_url: None,
+            pass_through_applied: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    }
+
+    fn node_ids(connection: RequestExecutionConnection) -> Vec<String> {
+        connection
+            .edges
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|edge| edge.node.map(|node| node.id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn authorized_project_is_anded_with_conflicting_caller_filter()
+    -> Result<(), RequestExecutionQueryError> {
+        let mut args = RequestExecutionConnectionArgs {
+            access: AdminAccessScope::Project("gid://conduit/Project/41".to_owned()),
+            where_filter: Some(RequestExecutionWhereInput {
+                request_id: Some(ID::from("gid://conduit/Request/7")),
+                project_id: Some(42),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        constrain_to_authorized_project(&mut args)?;
+        let Some(filter) = args.where_filter else {
+            return Err(RequestExecutionQueryError::Query(
+                "authorized project filter is missing".to_owned(),
+            ));
+        };
+        assert_eq!(filter.project_id, Some(41));
+        assert_eq!(
+            filter.request_id.as_ref().map(|id| id.as_str()),
+            Some("gid://conduit/Request/7")
+        );
+        assert_eq!(
+            filter.and.as_deref().and_then(|filters| filters.first()),
+            Some(&RequestExecutionWhereInput {
+                project_id: Some(42),
+                ..Default::default()
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_edge_queries_bypass_global_cap_and_exclude_other_projects()
+    -> Result<(), RequestExecutionQueryError> {
+        let mut rows = (1..=EXECUTION_LOAD_LIMIT)
+            .map(|id| execution_row(id, "41", None, None))
+            .collect::<Vec<_>>();
+
+        // Every scoped row sorts after the bounded global fallback. If either
+        // edge accidentally uses `list_all_request_executions_unchecked`, its
+        // target therefore disappears behind EXECUTION_LOAD_LIMIT unrelated
+        // rows. Reusing each edge id across projects also exercises the
+        // adapter-to-repository authorization scope.
+        rows.extend([
+            execution_row(1_001, "41", Some("7"), None),
+            execution_row(1_002, "42", Some("7"), None),
+            execution_row(1_003, "41", None, Some("9")),
+            execution_row(1_004, "42", None, Some("9")),
+        ]);
+        let repo = Arc::new(InMemoryRequestExecutionRepo::from_rows(rows));
+        let adapter = RequestExecutionAdapter::new(repo);
+
+        let channel = adapter
+            .request_executions(RequestExecutionConnectionArgs {
+                access: AdminAccessScope::Project("gid://conduit/Project/41".to_owned()),
+                first: Some(100),
+                where_filter: Some(RequestExecutionWhereInput {
+                    channel_id: Some(ID::from("gid://conduit/Channel/7")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(channel.total_count, 1);
+        assert_eq!(node_ids(channel), ["gid://conduit/RequestExecution/1001"]);
+
+        let data_storage = adapter
+            .request_executions(RequestExecutionConnectionArgs {
+                access: AdminAccessScope::Project("41".to_owned()),
+                first: Some(100),
+                where_filter: Some(RequestExecutionWhereInput {
+                    data_storage_id: Some(ID::from("gid://conduit/DataStorage/9")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(data_storage.total_count, 1);
+        assert_eq!(
+            node_ids(data_storage),
+            ["gid://conduit/RequestExecution/1003"]
+        );
+        Ok(())
+    }
+}

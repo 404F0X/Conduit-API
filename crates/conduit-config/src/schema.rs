@@ -166,14 +166,10 @@ mod tests {
             (
                 "ApiAuthConfig",
                 &[
-                    "enabled",
-                    "api_key_header",
-                    "allow_no_auth_fallback",
-                    "no_auth_sentinel",
-                    "admin_token",
                     "jwt_secret",
                     "session_ttl",
                     "bcrypt_cost",
+                    "allow_password_signup",
                 ][..],
             ),
             (

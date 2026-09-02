@@ -267,6 +267,13 @@ impl ScopeSet {
         project_id: impl AsRef<str>,
         scope: impl AsRef<str>,
     ) -> Option<&Scope> {
+        let scope = scope.as_ref();
+        // `*` is also queried as the project-ownership marker. It may prove
+        // ownership, but callers still cannot use it to satisfy an unsupported
+        // concrete system scope because those checks return above.
+        if scope != slug::WILDCARD && !supports_project_role(scope) {
+            return None;
+        }
         let project_id = project_id.as_ref();
         let membership_scope = Scope::project_membership(project_id, scope);
         self.scopes.get(&membership_scope).or_else(|| {
@@ -280,6 +287,10 @@ impl ScopeSet {
         project_id: impl AsRef<str>,
         scope: impl AsRef<str>,
     ) -> Option<&Scope> {
+        let scope = scope.as_ref();
+        if scope != slug::WILDCARD && !supports_project_role(scope) {
+            return None;
+        }
         let project_id = project_id.as_ref();
         let role_scope = Scope::project_role(project_id, scope);
         self.scopes.get(&role_scope).or_else(|| {
@@ -335,20 +346,20 @@ mod tests {
     fn scope_set_supports_rbac_source_scopes() {
         let scopes = ScopeSet::from_strings([
             slug::SYSTEM_ADMIN.to_string(),
-            Scope::project_membership("p1", slug::READ_PROJECTS).to_string(),
-            Scope::project_role("p1", slug::WRITE_PROJECTS).to_string(),
+            Scope::project_membership("p1", slug::READ_USERS).to_string(),
+            Scope::project_role("p1", slug::WRITE_USERS).to_string(),
             Scope::api_key_project("p1", slug::READ_REQUESTS).to_string(),
         ]);
 
         assert!(scopes.matched_system_role_scope(slug::READ_USERS).is_some());
         assert!(
             scopes
-                .matched_project_membership_scope("p1", slug::READ_PROJECTS)
+                .matched_project_membership_scope("p1", slug::READ_USERS)
                 .is_some()
         );
         assert!(
             scopes
-                .matched_project_role_scope("p1", slug::WRITE_PROJECTS)
+                .matched_project_role_scope("p1", slug::WRITE_USERS)
                 .is_some()
         );
         assert!(
@@ -381,15 +392,46 @@ mod tests {
         );
         assert!(
             scopes
-                .matched_project_role_scope("p2", slug::WRITE_PROJECTS)
+                .matched_project_role_scope("p2", slug::WRITE_USERS)
                 .is_some()
         );
         assert!(
             scopes
-                .matched_project_role_scope("p1", slug::WRITE_PROJECTS)
+                .matched_project_role_scope("p1", slug::WRITE_USERS)
                 .is_none()
         );
         assert!(!scopes.contains(slug::WRITE_USERS));
+    }
+
+    #[test]
+    fn project_membership_and_role_cannot_grant_system_only_scopes() {
+        let scopes = ScopeSet::from_strings([
+            Scope::project_membership("p1", slug::WILDCARD).to_string(),
+            Scope::project_membership("p1", slug::GRANT_CREDIT).to_string(),
+            Scope::project_role("p1", slug::WILDCARD).to_string(),
+            Scope::project_role("p1", slug::WRITE_SETTINGS).to_string(),
+        ]);
+
+        assert!(
+            scopes
+                .matched_project_membership_scope("p1", slug::WRITE_API_KEYS)
+                .is_some()
+        );
+        assert!(
+            scopes
+                .matched_project_role_scope("p1", slug::READ_REQUESTS)
+                .is_some()
+        );
+        assert!(
+            scopes
+                .matched_project_membership_scope("p1", slug::GRANT_CREDIT)
+                .is_none()
+        );
+        assert!(
+            scopes
+                .matched_project_role_scope("p1", slug::WRITE_SETTINGS)
+                .is_none()
+        );
     }
 
     // ---- Go `internal/scopes/scopes_test.go` parity (adapted) -------------

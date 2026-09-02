@@ -1,6 +1,7 @@
 //! PostgreSQL-backed request lifecycle repository.
 use crate::repo::request_repo::{
-    ContentSavedInput, RequestListQuery, RequestListResult, RequestRepo, UpdateRequestInput,
+    ContentSavedInput, RequestListOrderField, RequestListQuery, RequestListResult, RequestRepo,
+    UpdateRequestInput,
 };
 use crate::repo::{RepoError, RepoResult, RequestContext};
 use crate::row::RequestRow;
@@ -35,6 +36,50 @@ fn ts(v: &str) -> DateTime<Utc> {
 }
 fn err(c: &str, e: sqlx::Error) -> RepoError {
     RepoError::Database(format!("postgres request repo {c} failed: {e}"))
+}
+
+fn list_filters(b: &mut QueryBuilder<Postgres>, q: &RequestListQuery) -> RepoResult<()> {
+    if !q.project_id.is_empty() {
+        b.push(" AND project_id=").push_bind(id(&q.project_id)?);
+    }
+    if let Some(v) = &q.id {
+        b.push(" AND id=").push_bind(id(v)?);
+    }
+    if let Some(v) = &q.api_key_id {
+        b.push(" AND api_key_id=").push_bind(id(v)?);
+    }
+    if let Some(v) = &q.channel_id {
+        b.push(" AND channel_id=").push_bind(id(v)?);
+    }
+    if let Some(v) = &q.trace_id {
+        b.push(" AND trace_id=").push_bind(id(v)?);
+    }
+    for (column, is_nil) in [
+        ("trace_id", q.trace_id_is_nil),
+        ("api_key_id", q.api_key_id_is_nil),
+        ("channel_id", q.channel_id_is_nil),
+    ] {
+        if let Some(is_nil) = is_nil {
+            b.push(" AND ").push(column);
+            b.push(if is_nil { " IS NULL" } else { " IS NOT NULL" });
+        }
+    }
+    if let Some(v) = &q.model_id {
+        b.push(" AND model_id=").push_bind(v.clone());
+    }
+    if let Some(v) = &q.source {
+        b.push(" AND \"source\"=").push_bind(v.clone());
+    }
+    if let Some(v) = &q.status {
+        b.push(" AND \"status\"=").push_bind(v.clone());
+    }
+    if let Some(v) = &q.start_at {
+        b.push(" AND created_at>=").push_bind(ts(v));
+    }
+    if let Some(v) = &q.end_at {
+        b.push(" AND created_at<=").push_bind(ts(v));
+    }
+    Ok(())
 }
 #[async_trait]
 impl RequestRepo for PgRequestRepo {
@@ -89,34 +134,18 @@ impl RequestRepo for PgRequestRepo {
         q: &RequestListQuery,
     ) -> RepoResult<RequestListResult> {
         let mut b = QueryBuilder::<Postgres>::new(format!("SELECT {C} FROM requests WHERE TRUE"));
-        // An empty project id is the explicit admin cross-project query used
-        // by the request list adapter. Do not parse that empty sentinel as an
-        // id.
-        if !q.project_id.is_empty() {
-            b.push(" AND project_id=").push_bind(id(&q.project_id)?);
-        }
-        if let Some(v) = &q.api_key_id {
-            b.push(" AND api_key_id=").push_bind(id(v)?);
-        }
-        if let Some(v) = &q.channel_id {
-            b.push(" AND channel_id=").push_bind(id(v)?);
-        }
-        if let Some(v) = &q.model_id {
-            b.push(" AND model_id=").push_bind(v.clone());
-        }
-        if let Some(v) = &q.source {
-            b.push(" AND \"source\"=").push_bind(v.clone());
-        }
-        if let Some(v) = &q.status {
-            b.push(" AND \"status\"=").push_bind(v.clone());
-        }
-        if let Some(v) = &q.start_at {
-            b.push(" AND created_at>=").push_bind(ts(v));
-        }
-        if let Some(v) = &q.end_at {
-            b.push(" AND created_at<=").push_bind(ts(v));
-        }
-        b.push(" ORDER BY created_at,id LIMIT ")
+        list_filters(&mut b, q)?;
+        b.push(" ORDER BY ").push(match q.order_field {
+            RequestListOrderField::Id => "id",
+            RequestListOrderField::CreatedAt => "created_at",
+            RequestListOrderField::UpdatedAt => "updated_at",
+        });
+        b.push(if q.descending {
+            " DESC,id DESC"
+        } else {
+            " ASC,id ASC"
+        });
+        b.push(" LIMIT ")
             .push_bind(i64::from(q.limit) + 1)
             .push(" OFFSET ")
             .push_bind(i64::from(q.offset));
@@ -128,6 +157,21 @@ impl RequestRepo for PgRequestRepo {
         let has_more = rows.len() > q.limit as usize;
         rows.truncate(q.limit as usize);
         Ok(RequestListResult { rows, has_more })
+    }
+    async fn count_requests_unchecked(
+        &self,
+        _: &RequestContext,
+        q: &RequestListQuery,
+    ) -> RepoResult<u64> {
+        let mut b =
+            QueryBuilder::<Postgres>::new("SELECT COUNT(*)::BIGINT FROM requests WHERE TRUE");
+        list_filters(&mut b, q)?;
+        let count = b
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| err("count", e))?;
+        Ok(count.max(0) as u64)
     }
     async fn transition_request_status_unchecked(
         &self,

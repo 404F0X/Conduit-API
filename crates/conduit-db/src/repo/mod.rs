@@ -299,6 +299,7 @@ impl DashboardFilter {
             end_at: self.end_at.clone(),
             limit,
             offset,
+            ..Default::default()
         }
     }
 
@@ -320,6 +321,7 @@ impl DashboardFilter {
             end_at: self.end_at.clone(),
             limit,
             offset,
+            ..Default::default()
         }
     }
 

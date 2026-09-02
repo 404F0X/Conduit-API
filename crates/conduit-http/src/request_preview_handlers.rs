@@ -30,10 +30,10 @@
 //! that the host (and the orchestrator's live-preview middleware, once wired)
 //! can register per in-flight request.
 //!
-//! Route middleware parity gap: as with the content endpoint, Go wraps the
-//! route in `WithJWTAuth` + `WithProjectID` (routes.go:96); the JWT layer is
-//! not yet ported and the project-id header semantics are reproduced via
-//! `request_content_handlers::resolve_project_id`.
+//! The route is protected by the shared JWT middleware. Project selection is
+//! resolved through `request_content_handlers::resolve_project_id`, then the
+//! handler verifies both the caller's project scope and the request row's
+//! project ownership before returning preview data.
 
 use std::convert::Infallible;
 use std::pin::Pin;

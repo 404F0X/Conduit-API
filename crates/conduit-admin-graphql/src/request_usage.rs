@@ -214,6 +214,8 @@ impl Request {
         let Some(id) = self.api_key_id.clone() else {
             return Ok(None);
         };
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_API_KEYS)
+            .map_err(|error| error.to_string())?;
         let services = crate::apikey::apikey_query_services(ctx)?;
         let scope = crate::apikey::api_key_access_scope(ctx)?;
         services
@@ -223,16 +225,26 @@ impl Request {
     }
 
     async fn project(&self, ctx: &Context<'_>) -> Result<crate::project::Project, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_PROJECTS)
+            .map_err(|error| error.to_string())?;
         let services = crate::project::project_query_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         let conn = services
-            .projects(crate::project::ProjectConnectionArgs {
-                first: Some(1),
-                where_filter: Some(crate::project::ProjectWhereInput {
-                    id: Some(self.project_id.clone()),
+            .projects_with_access(
+                &access,
+                crate::project::ProjectConnectionArgs {
+                    first: Some(1),
+                    where_filter: Some(crate::project::ProjectWhereInput {
+                        id: Some(self.project_id.clone()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
         conn.edges
@@ -248,6 +260,8 @@ impl Request {
         let Some(id) = self.channel_id.clone() else {
             return Ok(None);
         };
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_CHANNELS)
+            .map_err(|error| error.to_string())?;
         let services = crate::channel::channel_query_services(ctx)?;
         let conn = services
             .channels(crate::channel::ChannelConnectionArgs {
@@ -287,6 +301,7 @@ impl Request {
         };
         services
             .usage_logs(UsageLogConnectionArgs {
+                access: request_read_access_scope(ctx)?,
                 after: after.map(|cursor| cursor.0),
                 first,
                 before: before.map(|cursor| cursor.0),
@@ -331,6 +346,7 @@ impl Request {
             ..where_filter.unwrap_or_default()
         };
         let args = crate::request_execution::RequestExecutionConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -1106,6 +1122,7 @@ pub enum UsageLogQueryError {
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestConnectionArgs {
+    pub access: crate::policy::AdminAccessScope,
     pub after: Option<String>,
     pub first: Option<i32>,
     pub before: Option<String>,
@@ -1116,12 +1133,28 @@ pub struct RequestConnectionArgs {
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageLogConnectionArgs {
+    pub access: crate::policy::AdminAccessScope,
     pub after: Option<String>,
     pub first: Option<i32>,
     pub before: Option<String>,
     pub last: Option<i32>,
     pub order_by: Option<UsageLogOrderSelection>,
     pub where_filter: Option<UsageLogWhereInput>,
+}
+
+/// Resolve and authorize the request-domain visibility carried into host
+/// services. A selected project can use a project membership/role grant; an
+/// unscoped request requires a global `read_requests` grant.
+pub fn request_read_access_scope(
+    ctx: &Context<'_>,
+) -> Result<crate::policy::AdminAccessScope, String> {
+    let request = crate::policy::request_context(ctx)
+        .ok_or_else(|| "authz: request carries no authenticated principal".to_string())?;
+    crate::policy::AdminAccessScope::from_request_context(
+        request,
+        conduit_auth::scopes::slug::READ_REQUESTS,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[async_trait::async_trait]
@@ -1309,12 +1342,27 @@ mod tests {
 
     fn schema_with_request_services(services: FakeRequestServices) -> TestSchema {
         let arc: Arc<dyn RequestQueryServices> = Arc::new(services);
-        crate::admin_schema_builder().data(arc).finish()
+        crate::admin_schema_builder()
+            .data(arc)
+            .data(read_requests_context())
+            .finish()
     }
 
     fn schema_with_usage_services(services: FakeUsageLogServices) -> TestSchema {
         let arc: Arc<dyn UsageLogQueryServices> = Arc::new(services);
-        crate::admin_schema_builder().data(arc).finish()
+        crate::admin_schema_builder()
+            .data(arc)
+            .data(read_requests_context())
+            .finish()
+    }
+
+    fn read_requests_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(
+            conduit_auth::Principal::user("request-usage-test")
+                .with_scope(conduit_auth::scopes::slug::READ_REQUESTS),
+        );
+        context
     }
 
     // ---- order-lowering semantics -----------------------------------
@@ -1744,7 +1792,11 @@ mod tests {
         let req: Arc<dyn RequestQueryServices> = Arc::new(requests_fake);
         let exec: Arc<dyn crate::request_execution::RequestExecutionQueryServices> =
             Arc::new(exec_fake.clone());
-        let schema = crate::admin_schema_builder().data(req).data(exec).finish();
+        let schema = crate::admin_schema_builder()
+            .data(req)
+            .data(exec)
+            .data(read_requests_context())
+            .finish();
 
         let resp = schema
             .execute("{ requests { edges { node { executions(first: 5) { totalCount } } } } }")
@@ -1777,7 +1829,10 @@ mod tests {
             ..FakeRequestServices::default()
         };
         let req: Arc<dyn RequestQueryServices> = Arc::new(requests_fake);
-        let schema = crate::admin_schema_builder().data(req).finish();
+        let schema = crate::admin_schema_builder()
+            .data(req)
+            .data(read_requests_context())
+            .finish();
         let resp = schema
             .execute("{ requests { edges { node { executions { totalCount } } } } }")
             .await;

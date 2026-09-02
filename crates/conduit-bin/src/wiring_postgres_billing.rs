@@ -1956,6 +1956,41 @@ impl gql::BillingServices for PgBillingAdapter {
         self.project_balance_value(project_id).await
     }
 
+    async fn credit_redemption_codes(
+        &self,
+        limit: i32,
+        offset: i32,
+    ) -> Result<gql::CreditRedemptionCodePage, gql::BillingError> {
+        crate::wiring_postgres_redemption::list_codes(&self.pool, limit, offset).await
+    }
+
+    async fn create_credit_redemption_codes(
+        &self,
+        actor: gql::CreditRedemptionActor,
+        input: gql::CreateCreditRedemptionCodesInput,
+    ) -> Result<gql::CreateCreditRedemptionCodesPayload, gql::BillingError> {
+        crate::wiring_postgres_redemption::create_codes(&self.pool, actor, input).await
+    }
+
+    async fn revoke_credit_redemption_code(
+        &self,
+        actor: gql::CreditRedemptionActor,
+        code_id: &str,
+    ) -> Result<gql::CreditRedemptionCode, gql::BillingError> {
+        crate::wiring_postgres_redemption::revoke_code(&self.pool, actor, code_id).await
+    }
+
+    async fn redeem_credit_code(
+        &self,
+        actor: gql::CreditRedemptionActor,
+        user_id: &str,
+        project_id: &str,
+        code: &str,
+    ) -> Result<gql::CreditRedemptionReceipt, gql::BillingError> {
+        crate::wiring_postgres_redemption::redeem_code(&self.pool, actor, user_id, project_id, code)
+            .await
+    }
+
     async fn create_subscription_plan(
         &self,
         input: gql::CreateSubscriptionPlanInput,

@@ -1,0 +1,41 @@
+{
+  "$schema": "../../../../crates/conduit-testkit/src/golden_case.schema.json",
+  "case_name": "speech_stream_binary",
+  "api_format": "openai_audio_speech",
+  "stream": true,
+  "source": {
+    "note": "Regression contract for COR-005. stream_format=audio is a raw byte stream and must use the ordinary binary-capable HTTP executor, never the SSE parser."
+  },
+  "inbound_http": {
+    "method": "POST",
+    "path": "/v1/audio/speech",
+    "content_type": "application/json",
+    "body_json": {
+      "model": "gpt-4o-mini-tts",
+      "input": "hello",
+      "voice": "alloy",
+      "stream_format": "audio"
+    }
+  },
+  "unified_request": {
+    "request_type": "speech",
+    "api_format": "openai/audio_speech",
+    "stream": true
+  },
+  "selected_channel": null,
+  "outbound_http": {
+    "method": "POST",
+    "path": "/v1/audio/speech",
+    "headers": {"Accept": ["*/*"]}
+  },
+  "upstream_http": {
+    "status_code": 200,
+    "content_type": "audio/mpeg",
+    "body_bytes": [73, 68, 51, 4, 0, 255]
+  },
+  "client_http": {
+    "status_code": 200,
+    "content_type": "audio/mpeg",
+    "body_bytes": [73, 68, 51, 4, 0, 255]
+  }
+}

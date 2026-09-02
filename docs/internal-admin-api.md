@@ -36,12 +36,19 @@ test.
 | Model groups | `simpleGroups` | `createSimpleGroup`, `updateSimpleGroup`, `assignSimpleGroupUsers`, `updateSimpleGroupModels`, `updateSimpleGroupPrice`, `deleteSimpleGroup` | `read_groups`, `write_groups` |
 | Subscriptions | `subscriptionPlans`, `userSubscriptions`, `subscriptionProjects` | `createSubscriptionPlan`, `updateSubscriptionPlan`, `assignUserSubscription`, `pauseUserSubscription`, `resumeUserSubscription`, `cancelUserSubscription`, `renewUserSubscription`, `setSubscriptionAutoRenew` | `read_subscriptions`, `write_subscriptions` |
 | Wallet | `userBalance`, `projectBalance`, `projectWalletComparison` | `grantUserCredit`, `grantProjectCredit` | `read_billing`, `grant_credit` |
+| Redemption codes | `creditRedemptionCodes` (masked inventory only) | `createCreditRedemptionCodes`, `revokeCreditRedemptionCode` | `read_billing`, `grant_credit` |
 | API keys | `apiKeys`, `apiKeyProfileTemplates`, `apiKeyQuotaUsages`, `apiKeyTokenUsageStats` | `createAPIKey`, `updateAPIKey`, `updateAPIKeyStatus`, `rotateAPIKey`, `updateAPIKeyProfiles`, profile-template mutations | `read_api_keys`, `write_api_keys` |
 | Channels/models | `channels`, `models`, `modelRoutes`, `upstreamModelDeployments` | channel/model CRUD, `upsertModelRoute`, `createPublicModelWithRoutes` | `read_channels`, `write_channels` |
 
 GraphQL introspection is available over this authenticated POST endpoint. There
 is deliberately no unauthenticated playground. The live schema is authoritative
 for complete input objects and newly added fields.
+
+`createCreditRedemptionCodes` is the only response that contains newly
+generated plaintext codes. Store or deliver that response immediately; later
+inventory queries expose only a non-secret suffix hint. Project members redeem
+through the authenticated console using the current Project context, not by
+supplying a target user or Project ID.
 
 ## HTTP and GraphQL errors
 

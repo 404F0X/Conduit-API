@@ -14,6 +14,7 @@ use conduit_admin_graphql::apikey::ChannelTagsMatchMode as GqlTagsMatchMode;
 use conduit_admin_graphql::channel::OrderDirection;
 use conduit_admin_graphql::node::parse_guid;
 use conduit_admin_graphql::pagination::{connection_from_offset_page, decode_offset_cursor};
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::project::{
     CreateProjectInput as GqlCreateProjectInput, Project as GqlProject, ProjectConnection,
     ProjectConnectionArgs, ProjectEdge, ProjectMutationServices, ProjectOrderTerm,
@@ -786,6 +787,22 @@ impl ProjectQueryServices for PgProjectAdapter {
             total_count,
         })
     }
+
+    async fn projects_with_access(
+        &self,
+        access: &AdminAccessScope,
+        mut args: ProjectConnectionArgs,
+    ) -> Result<ProjectConnection, ProjectServiceError> {
+        if let AdminAccessScope::Project(project_id) = access {
+            let caller_filter = args.where_filter.take();
+            args.where_filter = Some(ProjectWhereInput {
+                id: Some(project_id.clone().into()),
+                and: caller_filter.map(|filter| vec![filter]),
+                ..Default::default()
+            });
+        }
+        self.projects(args).await
+    }
 }
 
 #[async_trait]
@@ -867,6 +884,19 @@ impl ProjectMutationServices for PgProjectAdapter {
         Ok(project_row_to_gql(row))
     }
 
+    async fn create_project_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: GqlCreateProjectInput,
+    ) -> Result<GqlProject, ProjectServiceError> {
+        match access {
+            AdminAccessScope::Global => self.create_project(input).await,
+            AdminAccessScope::Project(_) => Err(ProjectServiceError::PermissionDenied(
+                "project-scoped permission cannot create global projects".to_owned(),
+            )),
+        }
+    }
+
     async fn update_project(
         &self,
         id: &str,
@@ -893,6 +923,20 @@ impl ProjectMutationServices for PgProjectAdapter {
         Ok(project_row_to_gql(row))
     }
 
+    async fn update_project_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        input: GqlUpdateProjectInput,
+    ) -> Result<GqlProject, ProjectServiceError> {
+        if !access.allows_project(id) {
+            return Err(ProjectServiceError::PermissionDenied(
+                "cannot update a project outside the authorized project".to_owned(),
+            ));
+        }
+        self.update_project(id, input).await
+    }
+
     async fn update_project_status(
         &self,
         id: &str,
@@ -914,6 +958,20 @@ impl ProjectMutationServices for PgProjectAdapter {
             .await
             .map_err(|e| ProjectServiceError::UpdateStatus(e.to_string()))?;
         Ok(project_row_to_gql(row))
+    }
+
+    async fn update_project_status_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        status: ProjectStatus,
+    ) -> Result<GqlProject, ProjectServiceError> {
+        if !access.allows_project(id) {
+            return Err(ProjectServiceError::PermissionDenied(
+                "cannot update status outside the authorized project".to_owned(),
+            ));
+        }
+        self.update_project_status(id, status).await
     }
 
     async fn update_project_profiles(
@@ -953,6 +1011,20 @@ impl ProjectMutationServices for PgProjectAdapter {
             .await
             .map_err(|e| ProjectServiceError::UpdateProfiles(e.to_string()))?;
         Ok(project_row_to_gql(row))
+    }
+
+    async fn update_project_profiles_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        input: UpdateProjectProfilesInput,
+    ) -> Result<GqlProject, ProjectServiceError> {
+        if !access.allows_project(id) {
+            return Err(ProjectServiceError::PermissionDenied(
+                "cannot update profiles outside the authorized project".to_owned(),
+            ));
+        }
+        self.update_project_profiles(id, input).await
     }
 
     async fn delete_project(&self, id: &str) -> Result<(), ProjectServiceError> {
@@ -1049,6 +1121,17 @@ impl ProjectMutationServices for PgProjectAdapter {
             .map_err(|e| ProjectServiceError::Delete(e.to_string()))?;
         Ok(())
     }
+
+    async fn delete_project_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+    ) -> Result<(), ProjectServiceError> {
+        match access {
+            AdminAccessScope::Global => self.delete_project(id).await,
+            AdminAccessScope::Project(_) => Err(ProjectServiceError::NotSystemOwner),
+        }
+    }
 }
 
 // ===========================================================================
@@ -1096,12 +1179,52 @@ impl PgRoleAdapter {
         }
         Ok(rows)
     }
+
+    async fn ensure_role_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+    ) -> Result<(), RoleServiceError> {
+        let AdminAccessScope::Project(_) = access else {
+            return Ok(());
+        };
+        let Some(db_id) = db_id_from_gql(id) else {
+            return Err(RoleServiceError::PermissionDenied(
+                "role does not belong to the authorized project".to_owned(),
+            ));
+        };
+        let row = self
+            .role_repo
+            .find_role(&boot_ctx(), &db_id)
+            .await
+            .map_err(|error| RoleServiceError::Query(error.to_string()))?;
+        if !row.is_some_and(|row| row.level == "project" && access.allows_project(&row.project_id))
+        {
+            return Err(RoleServiceError::PermissionDenied(
+                "role does not belong to the authorized project".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl RoleQueryServices for PgRoleAdapter {
     async fn roles(&self, args: RoleConnectionArgs) -> Result<RoleConnection, RoleServiceError> {
-        let rows = self.load_all().await?;
+        self.roles_with_access(&AdminAccessScope::Global, args)
+            .await
+    }
+
+    async fn roles_with_access(
+        &self,
+        access: &AdminAccessScope,
+        args: RoleConnectionArgs,
+    ) -> Result<RoleConnection, RoleServiceError> {
+        let mut rows = self.load_all().await?;
+        if let Some(project_id) = access.project_id() {
+            let project_id = db_id_from_gql(project_id).unwrap_or_else(|| project_id.to_owned());
+            rows.retain(|row| row.level == "project" && row.project_id == project_id);
+        }
 
         let mut rows: Vec<RoleRow> = match &args.where_filter {
             Some(w) => rows
@@ -1238,6 +1361,16 @@ impl RoleMutationServices for PgRoleAdapter {
         Ok(role_row_to_gql(row))
     }
 
+    async fn update_role_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        input: GqlUpdateRoleInput,
+    ) -> Result<GqlRole, RoleServiceError> {
+        self.ensure_role_access(access, id).await?;
+        self.update_role(id, input).await
+    }
+
     async fn update_role(
         &self,
         id: &str,
@@ -1353,6 +1486,15 @@ impl RoleMutationServices for PgRoleAdapter {
         Ok(())
     }
 
+    async fn delete_role_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+    ) -> Result<(), RoleServiceError> {
+        self.ensure_role_access(access, id).await?;
+        self.delete_role(id).await
+    }
+
     async fn bulk_delete_roles(&self, ids: Vec<String>) -> Result<(), RoleServiceError> {
         // Empty ids is a no-op (Go iterates the empty slice, returns nil).
         if ids.is_empty() {
@@ -1409,6 +1551,17 @@ impl RoleMutationServices for PgRoleAdapter {
             .map_err(|e| RoleServiceError::BulkDelete(e.to_string()))?;
         Ok(())
     }
+
+    async fn bulk_delete_roles_with_access(
+        &self,
+        access: &AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), RoleServiceError> {
+        for id in &ids {
+            self.ensure_role_access(access, id).await?;
+        }
+        self.bulk_delete_roles(ids).await
+    }
 }
 
 #[cfg(test)]
@@ -1463,6 +1616,59 @@ mod tests {
         let second_id = db_id_from_gql(second.id.as_str())
             .ok_or_else(|| "second project has an invalid id".to_string())?
             .parse::<i64>()?;
+        let project_access = AdminAccessScope::Project(project_id.to_string());
+        let scoped_projects = projects
+            .projects_with_access(
+                &project_access,
+                ProjectConnectionArgs {
+                    where_filter: Some(ProjectWhereInput {
+                        name_has_prefix: Some(format!("PG GraphQL Project {suffix}")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert_eq!(scoped_projects.total_count, 1);
+        assert_eq!(
+            scoped_projects
+                .edges
+                .as_ref()
+                .and_then(|edges| edges
+                    .first()
+                    .and_then(Option::as_ref)
+                    .and_then(|edge| edge.node.as_ref()))
+                .map(|project| project.id.as_str()),
+            Some(created.id.as_str())
+        );
+        assert!(matches!(
+            projects
+                .update_project_with_access(
+                    &project_access,
+                    second.id.as_str(),
+                    GqlUpdateProjectInput {
+                        name: Some("must-not-cross-project".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await,
+            Err(ProjectServiceError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            projects
+                .create_project_with_access(
+                    &project_access,
+                    project_input("must-not-create-project".to_owned()),
+                )
+                .await,
+            Err(ProjectServiceError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            projects
+                .delete_project_with_access(&project_access, created.id.as_str())
+                .await,
+            Err(ProjectServiceError::NotSystemOwner)
+        ));
         // The service trait has no current-actor argument. Verify that project
         // creation does not silently invent an owner or broaden membership.
         assert_eq!(
@@ -1607,6 +1813,28 @@ mod tests {
                 project_id: Some(created.id.clone()),
             })
             .await?;
+        let project_b_role_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM roles WHERE project_id = $1 AND deleted_at = 0 ORDER BY id LIMIT 1",
+        )
+        .bind(second_id)
+        .fetch_one(&pool)
+        .await?;
+        for forbidden_id in [
+            system_role.id.as_str().to_owned(),
+            format!("gid://conduit/Role/{project_b_role_id}"),
+        ] {
+            let result = roles
+                .update_role_with_access(
+                    &project_access,
+                    &forbidden_id,
+                    GqlUpdateRoleInput {
+                        name: Some("must-not-change".to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(matches!(result, Err(RoleServiceError::PermissionDenied(_))));
+        }
         let disallowed_scope = roles
             .update_role(
                 project_role.id.as_str(),
@@ -1622,7 +1850,8 @@ mod tests {
                 if scope == "read_channels"
         ));
         let updated_role = roles
-            .update_role(
+            .update_role_with_access(
+                &project_access,
                 project_role.id.as_str(),
                 GqlUpdateRoleInput {
                     scopes: Some(vec!["write_users".to_string()]),
@@ -1633,14 +1862,17 @@ mod tests {
         assert_eq!(updated_role.scopes, Some(vec!["write_users".to_string()]));
 
         let project_roles = roles
-            .roles(RoleConnectionArgs {
-                where_filter: Some(RoleWhereInput {
-                    project_id: Some(created.id.clone()),
-                    name_contains: Some("Role".to_string()),
+            .roles_with_access(
+                &project_access,
+                RoleConnectionArgs {
+                    where_filter: Some(RoleWhereInput {
+                        project_id: Some(created.id.clone()),
+                        name_contains: Some("Role".to_string()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+            )
             .await?;
         assert_eq!(project_roles.total_count, 1);
 

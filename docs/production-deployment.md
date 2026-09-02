@@ -95,6 +95,7 @@ trailing slash):
 ```sh
 CONDUIT_PUBLIC_URL=https://conduit.example.com
 CONDUIT_CORS_ALLOWED_ORIGINS='["https://conduit.example.com"]'
+CONDUIT_TRUSTED_PROXIES='["127.0.0.1"]'
 ```
 
 `CONDUIT_PUBLIC_URL` is used for externally visible callback URLs.
@@ -103,7 +104,17 @@ call the unauthenticated first-owner initialization endpoint. The Compose
 default accepts only its two local HTTP origins; do not set it to `*` in
 production. Configure the reverse proxy to replace, rather than append to,
 client-supplied `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host`
-headers.
+headers. `CONDUIT_TRUSTED_PROXIES` must contain only the exact IP addresses or
+CIDR ranges of reverse proxies that connect directly to Conduit API. With the
+default empty list, all forwarding headers are ignored and the TCP peer is the
+client address.
+
+When several trusted proxies form a chain, each proxy must remove any
+client-supplied forwarding fields and then append only the address it actually
+observed. Conduit walks the chain from the trusted TCP peer toward the client
+and uses the first untrusted address. Never add a broad client/network range to
+the trusted list merely to make the displayed IP match; doing so restores the
+header-spoofing risk that the trust boundary is intended to prevent.
 
 To enable OIDC, pass provider configuration as JSON without putting it in the
 image:
@@ -173,6 +184,12 @@ the server is running. Use `pg_dump`/`pg_restore` for logical backups, or a
 PostgreSQL-aware volume snapshot procedure. Test restore, not only backup
 creation. There is no legacy `.db` dual-write or automatic import path in this
 deployment.
+
+The application-level JSON archive is a selective configuration/export
+facility, not a financial disaster-recovery backup. It does not include the
+Project wallet ledger, reservations, redemption-code state, or redemption
+receipts. Recoverable Credit deployments must therefore back up and rehearse
+restoring the complete PostgreSQL database.
 
 If an administrator enables a filesystem-backed data storage from the UI,
 configure its directory under a separately mounted persistent path. A path in

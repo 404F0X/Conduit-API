@@ -29,23 +29,31 @@ use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app_state::AppState;
+use conduit_auth::generate_secret_key;
 
-/// Go warning emitted by `NewOIDCHandlers` (oidc.go:35) when
+const OIDC_TRANSACTION_COOKIE: &str = "conduit_oidc_transaction";
+
+/// Warning emitted at wiring time when
 /// [`should_warn_missing_public_url`] is true. Exposed so the host binary can
-/// log the Go-verbatim text at wiring time (this crate carries no logger).
-pub const MISSING_PUBLIC_URL_WARNING: &str = "OIDC is enabled but server.public_url is not \
-     configured. This is insecure and can lead to Host header injection attacks in production.";
+/// log it at wiring time (this crate carries no logger).
+pub const MISSING_PUBLIC_URL_WARNING: &str = "OIDC is enabled but neither oidc.redirect_base_url \
+     nor server.public_url is configured; a trusted canonical URL is required.";
 
-/// `NewOIDCHandlers` warn predicate (oidc.go:34-36):
-/// `params.OIDCService.CountProviders() > 0 && params.PublicURL == ""`.
-pub fn should_warn_missing_public_url(provider_count: usize, public_url: &str) -> bool {
-    provider_count > 0 && public_url.is_empty()
+/// Warn when providers exist but no trusted canonical URL is configured.
+pub fn should_warn_missing_public_url(
+    provider_count: usize,
+    redirect_base_url: Option<&str>,
+    public_url: &str,
+) -> bool {
+    provider_count > 0
+        && redirect_base_url.is_none_or(|value| value.trim().is_empty())
+        && public_url.trim().is_empty()
 }
 
 /// `biz.ProviderInfo` — ported 1:1 from Go (`biz/oidc.go:38-52`). Note the
@@ -155,12 +163,14 @@ pub trait OidcService: Send + Sync {
         &self,
         provider: &str,
         base_url: &str,
+        browser_transaction: &str,
     ) -> Result<(String, String), String>;
     async fn get_link_authorize_url(
         &self,
         provider: &str,
         base_url: &str,
         user_id: i64,
+        browser_transaction: &str,
     ) -> Result<(String, String), String>;
     async fn callback(
         &self,
@@ -168,8 +178,13 @@ pub trait OidcService: Send + Sync {
         code: &str,
         state: &str,
         base_url: &str,
+        browser_transaction: &str,
     ) -> Result<(String, String), String>;
-    async fn exchange_code(&self, code: &str) -> Result<OidcExchangedUser, String>;
+    async fn exchange_code(
+        &self,
+        code: &str,
+        browser_transaction: &str,
+    ) -> Result<OidcExchangedUser, String>;
     async fn generate_jwt_token(&self, user: &OidcExchangedUser) -> Result<String, String>;
 }
 
@@ -183,27 +198,46 @@ pub struct ExchangeRequest {
 
 /// `h.getBaseURL(c)` (oidc.go:176-189), pure form:
 ///
-/// * `server.public_url` wins when non-empty, with one trailing `/` trimmed
-///   (`strings.TrimSuffix(publicURL, "/")`, oidc.go:177-179);
-/// * otherwise `scheme://host` where scheme is `https` iff
-///   `X-Forwarded-Proto == "https"` and `http` otherwise (oidc.go:183-188).
-///   Go additionally checks `c.Request.TLS != nil`, which has no equivalent
-///   here: this crate's server (like Go's `ListenAndServe` path) terminates
-///   plain HTTP only.
-pub fn resolve_base_url(public_url: &str, x_forwarded_proto: Option<&str>, host: &str) -> String {
-    if !public_url.is_empty() {
-        return public_url
-            .strip_suffix('/')
-            .unwrap_or(public_url)
-            .to_string();
+/// `oidc.redirect_base_url` wins over `server.public_url`. An explicit OIDC
+/// redirect base is already the final externally visible base. When falling
+/// back to `server.public_url`, append `server.base_path` so OIDC callbacks and
+/// browser redirects target the same mount point as the HTTP router.
+///
+/// A configured, absolute HTTP(S) URL is mandatory so public OIDC endpoints
+/// never derive a security-sensitive callback URI from untrusted request
+/// headers.
+pub fn resolve_base_url(
+    redirect_base_url: Option<&str>,
+    public_url: &str,
+    base_path: &str,
+) -> Result<String, String> {
+    let explicit_redirect_base = redirect_base_url.filter(|value| !value.trim().is_empty());
+    let configured = explicit_redirect_base
+        .or_else(|| (!public_url.trim().is_empty()).then_some(public_url))
+        .ok_or_else(|| "OIDC requires oidc.redirect_base_url or server.public_url".to_string())?;
+    let parsed = url::Url::parse(configured.trim())
+        .map_err(|_| "OIDC canonical URL is invalid".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("OIDC canonical URL is invalid".to_string());
     }
 
-    let scheme = if x_forwarded_proto == Some("https") {
-        "https"
-    } else {
-        "http"
-    };
-    format!("{scheme}://{host}")
+    let mut canonical = parsed.as_str().trim_end_matches('/').to_string();
+    if explicit_redirect_base.is_none() {
+        crate::router::validate_base_path(base_path)
+            .map_err(|_| "OIDC canonical URL is invalid".to_string())?;
+        let base_path = base_path.trim_end_matches('/');
+        let configured_path = parsed.path().trim_end_matches('/');
+        if !base_path.is_empty() && base_path != "/" && !configured_path.ends_with(base_path) {
+            canonical.push_str(base_path);
+        }
+    }
+    Ok(canonical)
 }
 
 /// Go `url.QueryEscape` (used at oidc.go:161): unreserved bytes
@@ -273,7 +307,6 @@ pub async fn get_providers(State(state): State<AppState>, headers: HeaderMap) ->
 pub async fn get_authorize_url(
     State(state): State<AppState>,
     Path(provider): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
     if provider.is_empty() {
         return flat_error(StatusCode::BAD_REQUEST, "Provider is required");
@@ -287,16 +320,26 @@ pub async fn get_authorize_url(
         );
     };
 
-    // oidc.go:77-78 — config public URL wins over the request host.
-    let base_url = request_base_url(&state, &headers);
+    let base_url = match request_base_url(&state) {
+        Ok(base_url) => base_url,
+        Err(error) => return flat_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let browser_transaction = generate_secret_key();
 
     // oidc.go:80-91.
-    match service.get_authorize_url(&provider, &base_url).await {
-        Ok((url, oidc_state)) => (
-            StatusCode::OK,
-            Json(json!({ "data": { "url": url, "state": oidc_state } })),
-        )
-            .into_response(),
+    match service
+        .get_authorize_url(&provider, &base_url, &browser_transaction)
+        .await
+    {
+        Ok((url, oidc_state)) => {
+            let mut response = (
+                StatusCode::OK,
+                Json(json!({ "data": { "url": url, "state": oidc_state } })),
+            )
+                .into_response();
+            set_transaction_cookie(&state, &mut response, &browser_transaction);
+            response
+        }
         Err(err) => flat_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
@@ -344,19 +387,26 @@ pub async fn get_link_authorize_url(
         return flat_error(StatusCode::UNAUTHORIZED, "Unauthorized");
     };
 
-    // oidc.go:110-111.
-    let base_url = request_base_url(&state, &headers);
+    let base_url = match request_base_url(&state) {
+        Ok(base_url) => base_url,
+        Err(error) => return flat_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let browser_transaction = generate_secret_key();
 
     // oidc.go:113-124.
     match service
-        .get_link_authorize_url(&provider, &base_url, user_id)
+        .get_link_authorize_url(&provider, &base_url, user_id, &browser_transaction)
         .await
     {
-        Ok((url, oidc_state)) => (
-            StatusCode::OK,
-            Json(json!({ "data": { "url": url, "state": oidc_state } })),
-        )
-            .into_response(),
+        Ok((url, oidc_state)) => {
+            let mut response = (
+                StatusCode::OK,
+                Json(json!({ "data": { "url": url, "state": oidc_state } })),
+            )
+                .into_response();
+            set_transaction_cookie(&state, &mut response, &browser_transaction);
+            response
+        }
         Err(err) => flat_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 }
@@ -434,13 +484,27 @@ async fn callback_impl(
         return flat_error(StatusCode::BAD_REQUEST, "Code and state are required");
     }
 
-    // oidc.go:158-166 — Go resolves the base URL identically in every branch.
-    let base_url = request_base_url(&state, headers);
+    let base_url = match request_base_url(&state) {
+        Ok(base_url) => base_url,
+        Err(error) => return flat_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let Some(browser_transaction) = transaction_cookie(headers) else {
+        return redirect_found(&format!(
+            "{base_url}/oauth/oidc/idp-callback?error=auth_failed&error_description={}",
+            query_escape("invalid or expired OIDC browser transaction")
+        ));
+    };
 
     let outcome = match service {
         Some(service) => {
             service
-                .callback(&provider, &code, &state_param, &base_url)
+                .callback(
+                    &provider,
+                    &code,
+                    &state_param,
+                    &base_url,
+                    browser_transaction,
+                )
                 .await
         }
         // Rust-only skeleton state; degrades to the Go error-redirect branch.
@@ -460,7 +524,10 @@ async fn callback_impl(
 
     // oidc.go:168-171.
     if intent == "link" {
-        return redirect_found(&format!("{base_url}/settings/profile?oidc_link=success"));
+        let mut response =
+            redirect_found(&format!("{base_url}/settings/profile?oidc_link=success"));
+        clear_transaction_cookie(&state, &mut response);
+        return response;
     }
 
     // oidc.go:173 — plain string concatenation, no escaping, as in Go.
@@ -480,6 +547,7 @@ async fn callback_impl(
 /// | success                                     | 200    | `{"data":{"token":"<jwt>","user":<ent.User JSON>}}` (oidc.go:219-224) |
 pub async fn exchange(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     // oidc.go:195-198 — ShouldBindJSON failure embeds the binding error text.
@@ -498,9 +566,18 @@ pub async fn exchange(
             "OIDC service is not configured",
         );
     };
+    let Some(browser_transaction) = transaction_cookie(&headers) else {
+        return flat_error(
+            StatusCode::BAD_REQUEST,
+            "invalid or expired OIDC browser transaction",
+        );
+    };
 
     // oidc.go:200-211 — "invalid or expired" exchange errors map to 400.
-    let user = match service.exchange_code(&request.code).await {
+    let user = match service
+        .exchange_code(&request.code, browser_transaction)
+        .await
+    {
         Ok(user) => user,
         Err(err) if err.contains("invalid or expired") => {
             return flat_error(StatusCode::BAD_REQUEST, err);
@@ -520,11 +597,13 @@ pub async fn exchange(
     };
 
     // oidc.go:219-224 — the ent.User JSON is embedded verbatim.
-    (
+    let mut response = (
         StatusCode::OK,
         Json(json!({ "data": { "token": token, "user": user.user } })),
     )
-        .into_response()
+        .into_response();
+    clear_transaction_cookie(&state, &mut response);
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -595,18 +674,47 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-/// `h.getBaseURL(c)` over live request parts (oidc.go:176-189): config
-/// `server.public_url` (Go fx `name:"public_url"` ← `server.Config.PublicURL`,
-/// server.go:100) wins; otherwise scheme://Host from the request headers.
-fn request_base_url(state: &AppState, headers: &HeaderMap) -> String {
-    let x_forwarded_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok());
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    resolve_base_url(&state.config().server.public_url, x_forwarded_proto, host)
+/// Resolve the callback origin exclusively from trusted canonical config.
+fn request_base_url(state: &AppState) -> Result<String, String> {
+    resolve_base_url(
+        state.config().oidc.redirect_base_url.as_deref(),
+        &state.config().server.public_url,
+        state.base_path(),
+    )
+}
+
+fn transaction_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| (name == OIDC_TRANSACTION_COOKIE).then_some(value))
+        .filter(|value| !value.is_empty())
+}
+
+fn set_transaction_cookie(state: &AppState, response: &mut Response, value: &str) {
+    let secure = request_base_url(state).is_ok_and(|base| base.starts_with("https://"));
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    let max_age = state.config().oidc.state_ttl.as_secs();
+    let cookie = format!(
+        "{OIDC_TRANSACTION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure_attribute}"
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+}
+
+fn clear_transaction_cookie(state: &AppState, response: &mut Response) {
+    let secure = request_base_url(state).is_ok_and(|base| base.starts_with("https://"));
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "{OIDC_TRANSACTION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure_attribute}"
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
 }
 
 /// gin `c.Query(name)` over the raw query string: pairs split on `&`,
@@ -755,6 +863,7 @@ mod tests {
             &self,
             provider: &str,
             base_url: &str,
+            _browser_transaction: &str,
         ) -> Result<(String, String), String> {
             record(
                 &self.seen_authorize,
@@ -777,6 +886,7 @@ mod tests {
             provider: &str,
             base_url: &str,
             user_id: i64,
+            _browser_transaction: &str,
         ) -> Result<(String, String), String> {
             record(
                 &self.seen_link,
@@ -797,6 +907,7 @@ mod tests {
             code: &str,
             state: &str,
             base_url: &str,
+            _browser_transaction: &str,
         ) -> Result<(String, String), String> {
             record(
                 &self.seen_callback,
@@ -812,7 +923,11 @@ mod tests {
                 .unwrap_or_else(|| Ok(("exchange-code-1".to_string(), "login".to_string())))
         }
 
-        async fn exchange_code(&self, code: &str) -> Result<OidcExchangedUser, String> {
+        async fn exchange_code(
+            &self,
+            code: &str,
+            _browser_transaction: &str,
+        ) -> Result<OidcExchangedUser, String> {
             match code {
                 "good-code" => Ok(OidcExchangedUser {
                     id: 7,
@@ -849,7 +964,7 @@ mod tests {
     }
 
     fn app_with(service: Arc<FakeOidcService>) -> Router {
-        app_with_public_url(service, "")
+        app_with_public_url(service, "http://gateway.test")
     }
 
     /// Shared HS256 secret for the admin-group JWT guard in these tests.
@@ -873,11 +988,29 @@ mod tests {
     }
 
     fn app_with_public_url(service: Arc<FakeOidcService>, public_url: &str) -> Router {
+        app_with_public_url_and_base_path(service, public_url, "")
+    }
+
+    fn app_with_public_url_and_base_path(
+        service: Arc<FakeOidcService>,
+        public_url: &str,
+        base_path: &str,
+    ) -> Router {
         let mut config = AppConfig::default();
         config.server.public_url = public_url.to_string();
+        config.server.base_path = base_path.to_string();
         // Wire the secret the admin JWT guard reads (routes.go:96 adminGroup)
         // so the guarded `/admin/oidc/link/{provider}` route can be reached
         // with a token minted by `mint_admin_jwt`.
+        config.api_auth.jwt_secret = Some(TEST_JWT_SECRET.to_string());
+        let services = AppServices::new().with_oidc_service(service);
+        build_router(AppState::new(Arc::new(config), Arc::new(services)))
+    }
+
+    fn app_with_redirect_base(service: Arc<FakeOidcService>, redirect_base_url: &str) -> Router {
+        let mut config = AppConfig::default();
+        config.server.public_url = "https://public.example.test".to_string();
+        config.oidc.redirect_base_url = Some(redirect_base_url.to_string());
         config.api_auth.jwt_secret = Some(TEST_JWT_SECRET.to_string());
         let services = AppServices::new().with_oidc_service(service);
         build_router(AppState::new(Arc::new(config), Arc::new(services)))
@@ -906,6 +1039,10 @@ mod tests {
         Ok(Request::builder()
             .uri(uri)
             .header(header::HOST, "gateway.test")
+            .header(
+                header::COOKIE,
+                format!("{OIDC_TRANSACTION_COOKIE}=test-browser-transaction"),
+            )
             .body(Body::empty())?)
     }
 
@@ -1044,7 +1181,7 @@ mod tests {
     // ---- GET /oauth/oidc/authorize/{provider} (oidc.go:70-92) -------------
 
     /// Happy path: 200 {"data":{"url","state"}} and the service receives the
-    /// request-host base URL (public_url empty → "http://<Host>").
+    /// configured canonical base URL.
     #[tokio::test]
     async fn authorize_url_happy_path() -> Result<(), Box<dyn StdError>> {
         let service = Arc::new(FakeOidcService {
@@ -1069,8 +1206,34 @@ mod tests {
         Ok(())
     }
 
-    /// getBaseURL (oidc.go:176-189): configured public_url wins with one
-    /// trailing "/" trimmed; X-Forwarded-Proto=https upgrades the fallback.
+    #[tokio::test]
+    async fn authorize_sets_secure_browser_transaction_cookie() -> Result<(), Box<dyn StdError>> {
+        let service = Arc::new(FakeOidcService {
+            providers: vec![sample_provider()],
+            ..FakeOidcService::default()
+        });
+        let mut app = app_with_public_url(service, "https://gateway.test");
+        let request = Request::builder()
+            .uri("/oauth/oidc/authorize/google")
+            .header(header::HOST, "attacker.example")
+            .body(Body::empty())?;
+        let (status, headers, _) = call(&mut app, request).await?;
+
+        assert_eq!(status, StatusCode::OK);
+        let cookie = headers
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(cookie.starts_with("conduit_oidc_transaction="), "{cookie}");
+        assert!(cookie.contains("; Path=/"), "{cookie}");
+        assert!(cookie.contains("; HttpOnly"), "{cookie}");
+        assert!(cookie.contains("; SameSite=Lax"), "{cookie}");
+        assert!(cookie.contains("; Max-Age=600"), "{cookie}");
+        assert!(cookie.contains("; Secure"), "{cookie}");
+        Ok(())
+    }
+
+    /// Canonical configured URLs win over request Host/forwarding headers.
     #[tokio::test]
     async fn authorize_url_base_url_resolution() -> Result<(), Box<dyn StdError>> {
         // public_url with trailing slash → trimmed once.
@@ -1086,7 +1249,7 @@ mod tests {
             Some("https://ax.example".to_string())
         );
 
-        // X-Forwarded-Proto: https → https scheme on the Host fallback.
+        // Forwarded headers cannot override the configured canonical URL.
         let service = Arc::new(FakeOidcService {
             providers: vec![sample_provider()],
             ..FakeOidcService::default()
@@ -1101,7 +1264,56 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             seen(&service.seen_authorize).map(|(_, base)| base),
-            Some("https://gateway.test".to_string())
+            Some("http://gateway.test".to_string())
+        );
+
+        let service = Arc::new(FakeOidcService {
+            providers: vec![sample_provider()],
+            ..FakeOidcService::default()
+        });
+        let mut app = app_with_redirect_base(service.clone(), "https://login.example.test/oidc/");
+        let (status, _) = call_json(&mut app, get("/oauth/oidc/authorize/google")?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen(&service.seen_authorize).map(|(_, base)| base),
+            Some("https://login.example.test/oidc".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_url_inherits_server_base_path_for_oidc_round_trip()
+    -> Result<(), Box<dyn StdError>> {
+        let service = Arc::new(FakeOidcService {
+            providers: vec![sample_provider()],
+            ..FakeOidcService::default()
+        });
+        let mut app = app_with_public_url_and_base_path(
+            service.clone(),
+            "https://gateway.example.test",
+            "/gateway",
+        );
+
+        let (status, _) = call_json(&mut app, get("/gateway/oauth/oidc/authorize/google")?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen(&service.seen_authorize).map(|(_, base)| base),
+            Some("https://gateway.example.test/gateway".to_string())
+        );
+
+        let (status, headers, _) = call(
+            &mut app,
+            get("/gateway/oauth/oidc/callback/google?code=abc&state=xyz")?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FOUND);
+        assert_eq!(
+            location(&headers),
+            "https://gateway.example.test/gateway/oauth/oidc/idp-callback?code=exchange-code-1"
+        );
+        assert_eq!(
+            seen(&service.seen_callback).map(|(_, _, _, base)| base),
+            Some("https://gateway.example.test/gateway".to_string())
         );
         Ok(())
     }
@@ -1275,6 +1487,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn callback_without_browser_transaction_cookie_is_rejected()
+    -> Result<(), Box<dyn StdError>> {
+        let service = Arc::new(FakeOidcService {
+            providers: vec![sample_provider()],
+            ..FakeOidcService::default()
+        });
+        let mut app = app_with(service.clone());
+        let request = Request::builder()
+            .uri("/oauth/oidc/callback/google?code=abc&state=xyz")
+            .header(header::HOST, "gateway.test")
+            .body(Body::empty())?;
+        let (status, headers, _) = call(&mut app, request).await?;
+
+        assert_eq!(status, StatusCode::FOUND);
+        assert!(location(&headers).contains("invalid+or+expired+OIDC+browser+transaction"));
+        assert_eq!(seen(&service.seen_callback), None);
+        Ok(())
+    }
+
     /// Link intent: 302 → {base}/settings/profile?oidc_link=success
     /// (oidc.go:168-171; biz returns "" as the exchange code for link flows).
     #[tokio::test]
@@ -1442,6 +1674,10 @@ mod tests {
             .uri("/oauth/oidc/exchange")
             .header(header::HOST, "gateway.test")
             .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::COOKIE,
+                format!("{OIDC_TRANSACTION_COOKIE}=test-browser-transaction"),
+            )
             .body(Body::from(payload.to_string()))?;
         call_json(app, request).await
     }
@@ -1464,6 +1700,28 @@ mod tests {
                 "token": "jwt-for-7",
                 "user": {"id": 7, "email": "ada@example.com", "firstName": "Ada"},
             }})
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exchange_without_browser_transaction_cookie_is_rejected()
+    -> Result<(), Box<dyn StdError>> {
+        let mut app = app_with(Arc::new(FakeOidcService {
+            providers: vec![sample_provider()],
+            ..FakeOidcService::default()
+        }));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/oauth/oidc/exchange")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"code":"good-code"}"#))?;
+        let (status, body) = call_json(&mut app, request).await?;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({ "error": "invalid or expired OIDC browser transaction" })
         );
         Ok(())
     }
@@ -1551,40 +1809,50 @@ mod tests {
 
     // ---- pure helpers ------------------------------------------------------
 
-    /// NewOIDCHandlers warn predicate (oidc.go:34-36).
+    /// Providers require at least one configured canonical URL.
     #[test]
-    fn warn_predicate_matches_go_condition() {
-        assert!(should_warn_missing_public_url(1, ""));
-        assert!(should_warn_missing_public_url(3, ""));
-        assert!(!should_warn_missing_public_url(0, ""));
-        assert!(!should_warn_missing_public_url(1, "https://ax.example"));
+    fn warn_predicate_accounts_for_redirect_and_public_urls() {
+        assert!(should_warn_missing_public_url(1, None, ""));
+        assert!(should_warn_missing_public_url(3, Some(""), ""));
+        assert!(!should_warn_missing_public_url(0, None, ""));
+        assert!(!should_warn_missing_public_url(
+            1,
+            None,
+            "https://ax.example"
+        ));
+        assert!(!should_warn_missing_public_url(
+            1,
+            Some("https://login.example"),
+            ""
+        ));
     }
 
-    /// getBaseURL (oidc.go:176-189).
+    /// Canonical OIDC base URL selection and validation.
     #[test]
-    fn resolve_base_url_matches_go_get_base_url() {
-        // public_url wins; exactly one trailing "/" trimmed (TrimSuffix).
+    fn resolve_base_url_uses_redirect_then_public_url_without_header_fallback() {
         assert_eq!(
-            resolve_base_url("https://ax.example/", None, "ignored"),
-            "https://ax.example"
+            resolve_base_url(
+                Some("https://login.example/"),
+                "https://public.example",
+                "/gateway",
+            )
+            .as_deref(),
+            Ok("https://login.example")
         );
         assert_eq!(
-            resolve_base_url("https://ax.example//", Some("https"), "ignored"),
-            "https://ax.example/"
-        );
-        // Fallback: scheme from X-Forwarded-Proto (exact "https" match only).
-        assert_eq!(
-            resolve_base_url("", None, "gateway.test:8090"),
-            "http://gateway.test:8090"
+            resolve_base_url(None, "https://public.example/", "/gateway").as_deref(),
+            Ok("https://public.example/gateway")
         );
         assert_eq!(
-            resolve_base_url("", Some("https"), "gateway.test"),
-            "https://gateway.test"
+            resolve_base_url(None, "https://public.example/gateway/", "/gateway").as_deref(),
+            Ok("https://public.example/gateway")
         );
         assert_eq!(
-            resolve_base_url("", Some("HTTPS"), "gateway.test"),
-            "http://gateway.test"
+            resolve_base_url(None, "https://gateway", "/gateway").as_deref(),
+            Ok("https://gateway/gateway")
         );
+        assert!(resolve_base_url(None, "", "").is_err());
+        assert!(resolve_base_url(Some("https://user:secret@example.test"), "", "").is_err());
     }
 
     /// Go url.QueryEscape golden values (oidc.go:161).

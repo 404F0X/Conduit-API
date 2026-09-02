@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useRouter } from '@tanstack/react-router';
 import { isAuthError } from '@/gql/graphql';
 import { useAuthStore } from '@/stores/authStore';
+import { withoutBasePath } from '@/lib/base-path';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useMe } from '@/features/auth/data/auth';
 
@@ -19,7 +20,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
   useEffect(() => {
     // If no token, redirect to sign-in
     if (!accessToken) {
-      const currentPath = window.location.pathname;
+      const currentPath = withoutBasePath(window.location.pathname);
       // Don't redirect if already on auth pages
       if (
         !currentPath.startsWith('/sign-in') &&
@@ -43,7 +44,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
 
   // Show loading while checking auth
   if (!accessToken) {
-    const currentPath = window.location.pathname;
+    const currentPath = withoutBasePath(window.location.pathname);
     // Don't show loading on auth pages
     if (
       currentPath.startsWith('/sign-in') ||

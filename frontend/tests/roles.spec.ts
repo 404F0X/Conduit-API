@@ -33,9 +33,12 @@ test.describe('Admin Roles Management', () => {
     // Close the popover
     await page.keyboard.press('Escape')
 
+    const createButton = dialog.getByRole('button', { name: /^(保存|Save|创建|Create)$/i })
+    await expect(createButton).toBeVisible()
+    await expect(createButton).toBeInViewport({ ratio: 1 })
     await Promise.all([
       waitForGraphQLOperation(page, 'CreateRole'),
-      dialog.getByRole('button', { name: /保存|Save|创建|Create/i }).click()
+      createButton.click(),
     ])
     
     // Wait for dialog to close
@@ -134,9 +137,12 @@ test.describe('Admin Roles Management', () => {
     // Close the popover
     await page.keyboard.press('Escape')
 
+    const createButton = createDialog.getByRole('button', { name: /^(保存|Save|创建|Create)$/i })
+    await expect(createButton).toBeVisible()
+    await expect(createButton).toBeInViewport({ ratio: 1 })
     await Promise.all([
       waitForGraphQLOperation(page, 'CreateRole'),
-      createDialog.getByRole('button', { name: /保存|Save|创建|Create/i }).click()
+      createButton.click(),
     ])
     
     await expect(createDialog).not.toBeVisible({ timeout: 5000 })

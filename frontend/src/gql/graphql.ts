@@ -1,6 +1,7 @@
 import { toast } from 'sonner';
 import { getTokenFromStorage, removeTokenFromStorage } from '@/stores/authStore';
 import { getProjectIdFromStorage } from '@/stores/projectStore';
+import { withBasePath } from '@/lib/base-path';
 import i18n from '@/lib/i18n';
 
 export class GraphQLRequestError extends Error {
@@ -33,18 +34,19 @@ export function extractOperationName(query: string): string | undefined {
   return undefined;
 }
 
-export const GRAPHQL_ENDPOINT = '/admin/graphql';
+export const GRAPHQL_ENDPOINT = withBasePath('/admin/graphql');
 let authRedirectStarted = false;
 
 export function expireSessionAndRedirect() {
   removeTokenFromStorage();
-  if (authRedirectStarted || window.location.pathname === '/sign-in') return;
+  const signInPath = withBasePath('/sign-in');
+  if (authRedirectStarted || window.location.pathname === signInPath) return;
   authRedirectStarted = true;
   toast.error(i18n.t('common.errors.sessionExpiredSignIn'));
   // A document-level navigation also replaces a stale Vite bundle after a
   // backend restart or deployment. Client-side routing can otherwise try to
   // import chunk names from the previous build and render the generic 500 UI.
-  window.location.replace('/sign-in');
+  window.location.replace(signInPath);
 }
 
 function isForbiddenGraphQLError(error: any): boolean {

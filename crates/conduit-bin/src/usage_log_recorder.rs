@@ -34,7 +34,7 @@
 //!   persist middlewares' responsibility, and a failed request has no usage to
 //!   bill.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -83,7 +83,11 @@ pub struct UsageLogRecorder {
     /// finalizes request/execution rows. This pool is used only by the stream
     /// recorder callbacks to close those already-created rows and save chunks.
     stream_persistence: Option<StreamPersistence>,
-    api_key_concurrency: Mutex<HashMap<i64, u32>>,
+    /// Active request-scoped lease ids grouped by API key. Tracking the lease
+    /// rather than only a counter makes release idempotent: a timeout cleanup
+    /// racing a normal recorder callback cannot decrement a later request's
+    /// slot.
+    api_key_concurrency: Mutex<HashMap<i64, HashSet<String>>>,
 }
 
 enum StreamPersistence {
@@ -598,36 +602,83 @@ impl RequestRecorder for UsageLogRecorder {
             .api_key_concurrency
             .lock()
             .map_err(|_| ConduitError::internal("API key concurrency lock poisoned"))?;
-        let current = counts.get(&api_key_id).copied().unwrap_or(0);
-        if current >= limit {
+        let leases = counts.entry(api_key_id).or_default();
+        let current = leases.len();
+        if current >= limit as usize {
             return Err(ConduitError::rate_limited(format!(
                 "API key concurrency limit exceeded ({current}/{limit})"
             )));
         }
-        counts.insert(api_key_id, current + 1);
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        leases.insert(lease_id.clone());
         ctx.metadata.insert(
             "api_key_concurrency_slot".to_string(),
             api_key_id.to_string(),
         );
+        ctx.metadata
+            .insert("api_key_concurrency_lease".to_string(), lease_id);
         Ok(())
     }
 
     fn release_api_key_slot(&self, ctx: &OrchestratorContext) {
-        let Some(api_key_id) = ctx
-            .metadata
-            .get("api_key_concurrency_slot")
-            .and_then(|value| value.parse::<i64>().ok())
-        else {
+        let (Some(api_key_id), Some(lease_id)) = (
+            ctx.metadata
+                .get("api_key_concurrency_slot")
+                .and_then(|value| value.parse::<i64>().ok()),
+            ctx.metadata.get("api_key_concurrency_lease"),
+        ) else {
             return;
         };
-        if let Ok(mut counts) = self.api_key_concurrency.lock()
-            && let Some(current) = counts.get_mut(&api_key_id)
-        {
-            *current = current.saturating_sub(1);
-            if *current == 0 {
-                counts.remove(&api_key_id);
-            }
+        let Ok(mut counts) = self.api_key_concurrency.lock() else {
+            return;
+        };
+        let remove_key = counts.get_mut(&api_key_id).is_some_and(|leases| {
+            leases.remove(lease_id);
+            leases.is_empty()
+        });
+        if remove_key {
+            counts.remove(&api_key_id);
         }
+    }
+
+    fn abandon_request(&self, ctx: &OrchestratorContext, reason: &'static str) {
+        // In-memory admission is released synchronously from Drop so a second
+        // request can proceed immediately after timeout/cancellation.
+        self.release_api_key_slot(ctx);
+
+        // Durable wallet cleanup is async. PostgreSQL release is idempotent,
+        // and reservations also carry a 15-minute expiry consumed by the
+        // reconciler, so a runtime shutting down before this task runs cannot
+        // leave funds reserved indefinitely.
+        let (Some(settler), Some(reservation_key)) = (
+            self.charge_settler.as_ref().cloned(),
+            ctx.metadata
+                .get("billing_reservation_key")
+                .or_else(|| {
+                    ctx.metadata.get(
+                        conduit_orchestrator::orchestrator::BILLING_ADMISSION_REQUEST_KEY_METADATA,
+                    )
+                })
+                .cloned(),
+        ) else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                reservation_key = %reservation_key,
+                "wallet cancellation cleanup deferred to reservation expiry because no Tokio runtime is active"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            if let Err(error) = settler.release_request(&reservation_key, reason).await {
+                warn!(
+                    %error,
+                    reservation_key = %reservation_key,
+                    "wallet cancellation cleanup failed; reservation expiry will retry"
+                );
+            }
+        });
     }
 
     async fn reserve_request(
@@ -1138,9 +1189,36 @@ mod tests {
     use conduit_cache::MemoryCache;
     use conduit_core::objects::money::CurrencyExchangeRate;
     use conduit_db::repo::usage_repo::InMemoryUsageRepo;
-    use conduit_db::{InMemoryRouteAffinityRepo, RouteAffinityKey, RouteAffinityRepo};
+    use conduit_db::{InMemoryRouteAffinityRepo, RouteAffinityKey, RouteAffinityRepo, UsageLogRow};
     use conduit_llm::Usage;
     use conduit_pipeline::pipeline::{AttemptRecord, ExecutionMode};
+
+    #[derive(Default)]
+    struct CapturingChargeSettler {
+        releases: Mutex<Vec<(String, String)>>,
+        released: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl crate::usage_charge_settler::UsageChargeSettler for CapturingChargeSettler {
+        async fn settle_usage(
+            &self,
+            _usage_log: &UsageLogRow,
+            _usage: &Usage,
+            _reservation_key: Option<&str>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn release_request(&self, reservation_key: &str, reason: &str) -> Result<(), String> {
+            self.releases
+                .lock()
+                .map_err(|_| "release capture lock poisoned".to_string())?
+                .push((reservation_key.to_string(), reason.to_string()));
+            self.released.notify_one();
+            Ok(())
+        }
+    }
 
     /// A succeeded attempt against `channel` (mirrors the orchestrator recorder
     /// test helper).
@@ -1430,6 +1508,68 @@ mod tests {
         recorder
             .acquire_api_key_slot(&mut still_blocked, 8, 1)
             .expect("other key released independently");
+    }
+
+    #[test]
+    fn duplicate_api_key_release_does_not_free_another_request_lease() {
+        let recorder = UsageLogRecorder::new(Arc::new(InMemoryUsageRepo::new()));
+        let mut first = OrchestratorContext::new();
+        recorder
+            .acquire_api_key_slot(&mut first, 7, 1)
+            .expect("first lease");
+        recorder.release_api_key_slot(&first);
+
+        let mut second = OrchestratorContext::new();
+        recorder
+            .acquire_api_key_slot(&mut second, 7, 1)
+            .expect("second lease after first release");
+
+        // A timeout finalizer can race a recorder callback for the first
+        // request. Replaying that first release must not decrement the active
+        // second request.
+        recorder.release_api_key_slot(&first);
+        let mut third = OrchestratorContext::new();
+        assert!(
+            recorder.acquire_api_key_slot(&mut third, 7, 1).is_err(),
+            "duplicate release of the first lease must not free the second lease"
+        );
+
+        recorder.release_api_key_slot(&second);
+        recorder
+            .acquire_api_key_slot(&mut third, 7, 1)
+            .expect("slot is reusable after releasing the active lease");
+    }
+
+    #[tokio::test]
+    async fn abandoned_request_releases_slot_and_schedules_wallet_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let settler = Arc::new(CapturingChargeSettler::default());
+        let recorder = UsageLogRecorder::new(Arc::new(InMemoryUsageRepo::new()))
+            .with_charge_settler(settler.clone());
+        let mut abandoned = OrchestratorContext::new();
+        abandoned.metadata.insert(
+            conduit_orchestrator::orchestrator::BILLING_ADMISSION_REQUEST_KEY_METADATA.to_string(),
+            "request-canceled".to_string(),
+        );
+        recorder.acquire_api_key_slot(&mut abandoned, 7, 1)?;
+
+        let released = settler.released.notified();
+        recorder.abandon_request(&abandoned, "outer timeout");
+
+        let mut replacement = OrchestratorContext::new();
+        recorder
+            .acquire_api_key_slot(&mut replacement, 7, 1)
+            .expect("in-memory slot must be available synchronously");
+        tokio::time::timeout(std::time::Duration::from_secs(1), released).await?;
+        assert_eq!(
+            settler
+                .releases
+                .lock()
+                .map_err(|_| "release capture lock poisoned")?
+                .as_slice(),
+            &[("request-canceled".to_string(), "outer timeout".to_string())]
+        );
+        Ok(())
     }
 
     #[test]

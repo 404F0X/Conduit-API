@@ -68,11 +68,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use conduit_auth::generate_secret_key;
@@ -192,11 +195,16 @@ fn build_authorize_url(
     redirect_uri: &str,
     scopes: &[String],
     state: &str,
+    nonce: &str,
+    code_challenge: &str,
 ) -> String {
     let scope_value = scopes.join(" ");
     let pairs: &[(&str, &str)] = &[
+        ("code_challenge", code_challenge),
+        ("code_challenge_method", "S256"),
         ("response_type", "code"),
         ("client_id", client_id),
+        ("nonce", nonce),
         ("redirect_uri", redirect_uri),
         ("scope", &scope_value),
         ("state", state),
@@ -295,6 +303,16 @@ impl OidcDiscovery for ReqwestDiscovery {
 struct CachedState {
     value: String,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OidcTransactionState {
+    nonce: String,
+    code_verifier: String,
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
 /// In-process TTL map mirroring Go `xcache` Set/Get/Delete semantics: an
@@ -580,6 +598,7 @@ impl OidcPersistence for PostgresOidcPersistence {
 pub struct OidcAdapter {
     oidc: OidcConfig,
     jwt_secret: Option<String>,
+    session_ttl: Duration,
     discovery: Box<dyn OidcDiscovery>,
     /// Cached `authorization_endpoint` per issuer (oidc.go:295 providers map).
     discovered_endpoints: Mutex<HashMap<String, String>>,
@@ -592,8 +611,18 @@ impl OidcAdapter {
     /// Production constructor. `oidc` is `config.oidc`; `jwt_secret` is
     /// `config.api_auth.jwt_secret` — the same secret the admin JWT guard
     /// reads, so bearer tokens round-trip across the OIDC routes.
-    pub fn new_postgres(oidc: OidcConfig, jwt_secret: Option<String>, pool: PgPool) -> Self {
-        let mut adapter = Self::with_discovery(oidc, jwt_secret, Box::new(ReqwestDiscovery::new()));
+    pub fn new_postgres(
+        oidc: OidcConfig,
+        jwt_secret: Option<String>,
+        session_ttl: Duration,
+        pool: PgPool,
+    ) -> Self {
+        let mut adapter = Self::with_discovery(
+            oidc,
+            jwt_secret,
+            session_ttl,
+            Box::new(ReqwestDiscovery::new()),
+        );
         adapter.persistence = Some(Arc::new(PostgresOidcPersistence::new(pool)));
         adapter
     }
@@ -603,11 +632,13 @@ impl OidcAdapter {
     fn with_discovery(
         oidc: OidcConfig,
         jwt_secret: Option<String>,
+        session_ttl: Duration,
         discovery: Box<dyn OidcDiscovery>,
     ) -> Self {
         Self {
             oidc,
             jwt_secret,
+            session_ttl,
             discovery,
             discovered_endpoints: Mutex::new(HashMap::new()),
             state_cache: StateCache::default(),
@@ -666,6 +697,8 @@ impl OidcAdapter {
         provider: &OidcProviderConfig,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
+        expected_nonce: &str,
     ) -> Result<VerifiedOidcIdentity, String> {
         let document = self.discovery.fetch_document(&provider.issuer_url).await?;
         if document.issuer.trim_end_matches('/') != provider.issuer_url.trim_end_matches('/') {
@@ -680,6 +713,7 @@ impl OidcAdapter {
                 ("client_id", provider.client_id.as_str()),
                 ("client_secret", provider.client_secret.as_str()),
                 ("redirect_uri", redirect_uri),
+                ("code_verifier", code_verifier),
             ])
             .send()
             .await
@@ -727,12 +761,11 @@ impl OidcAdapter {
         let claims = decode::<IdTokenClaims>(&id_token, &key, &validation)
             .map_err(|error| format!("OIDC id_token verification failed: {error}"))?
             .claims;
+        if claims.nonce.as_deref() != Some(expected_nonce) {
+            return Err("OIDC id_token nonce does not match the login transaction".to_string());
+        }
 
-        let verified_email = if claims.email_verified == Some(false) {
-            None
-        } else {
-            claims.email
-        };
+        let verified_email = explicitly_verified_email(claims.email, claims.email_verified);
         let mut identity = VerifiedOidcIdentity {
             issuer: claims.iss,
             subject: claims.sub,
@@ -760,11 +793,7 @@ impl OidcAdapter {
             if info.sub != identity.subject {
                 return Err("OIDC userinfo subject does not match id_token".to_string());
             }
-            identity.email = if info.email_verified == Some(false) {
-                None
-            } else {
-                info.email
-            };
+            identity.email = explicitly_verified_email(info.email, info.email_verified);
             identity.name = identity.name.or(info.name).or(info.preferred_username);
         }
         Ok(identity)
@@ -887,6 +916,8 @@ struct IdTokenClaims {
     #[serde(default)]
     email_verified: Option<bool>,
     #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     preferred_username: Option<String>,
@@ -912,6 +943,13 @@ struct VerifiedOidcIdentity {
     subject: String,
     email: Option<String>,
     name: Option<String>,
+}
+
+fn explicitly_verified_email(
+    email: Option<String>,
+    email_verified: Option<bool>,
+) -> Option<String> {
+    (email_verified == Some(true)).then_some(email).flatten()
 }
 
 fn split_name(name: &str) -> (String, String) {
@@ -1027,12 +1065,14 @@ impl OidcService for OidcAdapter {
     ///   (oidc.go:513-559) collapses to lazy discovery here — the Rust host
     ///   does not pre-seed a live provider map at startup, so every authorize
     ///   URL triggers discovery (cached after first success).
-    /// * PKCE is skipped (no `enable_pkce` field in the Rust config).
+    /// * PKCE S256 is always enabled and bound to the browser transaction;
+    ///   there is no configuration switch that can disable it.
     /// * `response_type=code` is always set (Go's `AuthCodeURL` default).
     async fn get_authorize_url(
         &self,
         provider: &str,
         base_url: &str,
+        browser_transaction: &str,
     ) -> Result<(String, String), String> {
         if !self.oidc.enabled {
             return Err("OIDC is disabled".to_string());
@@ -1050,11 +1090,19 @@ impl OidcService for OidcAdapter {
         // oidc.go:567-575 — mint + cache the CSRF state. Go uses base64url; the
         // hex-encoded `generate_secret_key()` is documented in the module doc.
         let state = generate_secret_key();
+        let nonce = generate_secret_key();
+        let code_verifier = generate_secret_key();
+        let transaction_state = serde_json::to_string(&OidcTransactionState {
+            nonce: nonce.clone(),
+            code_verifier: code_verifier.clone(),
+        })
+        .map_err(|_| "failed to create OIDC transaction state".to_string())?;
         self.state_cache.set(
-            format!("oidc_state:{state}"),
-            "1".to_string(),
+            format!("oidc_state:{browser_transaction}:{state}"),
+            transaction_state,
             self.oidc.state_ttl,
         )?;
+        let code_challenge = pkce_challenge(&code_verifier);
 
         let url = build_authorize_url(
             &authorize_endpoint,
@@ -1062,6 +1110,8 @@ impl OidcService for OidcAdapter {
             &redirect_uri,
             &effective_scopes(provider_config),
             &state,
+            &nonce,
+            &code_challenge,
         );
         Ok((url, state))
     }
@@ -1074,12 +1124,15 @@ impl OidcService for OidcAdapter {
         provider: &str,
         base_url: &str,
         user_id: i64,
+        browser_transaction: &str,
     ) -> Result<(String, String), String> {
-        let (url, state) = self.get_authorize_url(provider, base_url).await?;
+        let (url, state) = self
+            .get_authorize_url(provider, base_url, browser_transaction)
+            .await?;
 
         // oidc.go:607-611 — cache the link intent for the authenticated user.
         self.state_cache.set(
-            format!("oidc_link_state:{state}"),
+            format!("oidc_link_state:{browser_transaction}:{state}"),
             user_id.to_string(),
             self.oidc.state_ttl,
         )?;
@@ -1101,25 +1154,31 @@ impl OidcService for OidcAdapter {
         code: &str,
         state: &str,
         base_url: &str,
+        browser_transaction: &str,
     ) -> Result<(String, String), String> {
-        let csrf = self
+        let transaction_state = self
             .state_cache
-            .consume(&format!("oidc_state:{state}"))?
+            .consume(&format!("oidc_state:{browser_transaction}:{state}"))?
             .ok_or_else(|| "invalid or expired OIDC state".to_string())?;
-        if csrf != "1" {
-            return Err("invalid or expired OIDC state".to_string());
-        }
+        let transaction_state: OidcTransactionState = serde_json::from_str(&transaction_state)
+            .map_err(|_| "invalid or expired OIDC state".to_string())?;
         let provider_config = find_provider(&self.oidc.providers, provider)
             .ok_or_else(|| format!("OIDC provider not found: {provider}"))?;
         let provider_id = provider_identifier(provider_config);
         let redirect_path = default_redirect_path(&provider_id, self.oidc.providers.len());
         let redirect_uri = absolutize_redirect(&redirect_path, base_url);
         let identity = self
-            .exchange_and_verify(provider_config, code, &redirect_uri)
+            .exchange_and_verify(
+                provider_config,
+                code,
+                &redirect_uri,
+                &transaction_state.code_verifier,
+                &transaction_state.nonce,
+            )
             .await?;
         let link_user_id = self
             .state_cache
-            .consume(&format!("oidc_link_state:{state}"))?
+            .consume(&format!("oidc_link_state:{browser_transaction}:{state}"))?
             .map(|value| value.parse::<i64>())
             .transpose()
             .map_err(|_| "invalid OIDC link state".to_string())?;
@@ -1131,7 +1190,7 @@ impl OidcService for OidcAdapter {
         }
         let exchange_code = generate_secret_key();
         self.state_cache.set(
-            format!("oidc_exchange:{exchange_code}"),
+            format!("oidc_exchange:{browser_transaction}:{exchange_code}"),
             user.id.to_string(),
             self.oidc.state_ttl,
         )?;
@@ -1141,26 +1200,28 @@ impl OidcService for OidcAdapter {
     /// Go `OIDCService.ExchangeCode` (oidc.go:1252-1297) consumes the
     /// short-lived exchange code cached by `Callback` and loads the user. It is
     /// strictly downstream of `callback` and is deliberately one-shot.
-    async fn exchange_code(&self, code: &str) -> Result<OidcExchangedUser, String> {
+    async fn exchange_code(
+        &self,
+        code: &str,
+        browser_transaction: &str,
+    ) -> Result<OidcExchangedUser, String> {
         let user_id = self
             .state_cache
-            .consume(&format!("oidc_exchange:{code}"))?
+            .consume(&format!("oidc_exchange:{browser_transaction}:{code}"))?
             .ok_or_else(|| "invalid or expired exchange code".to_string())?
             .parse::<i64>()
             .map_err(|_| "invalid or expired exchange code".to_string())?;
         self.load_oidc_user(user_id).await
     }
 
-    /// Go `AuthService.GenerateJWTToken` (auth.go:100-119): mint an HS256 JWT
-    /// for the exchanged user id with the api-auth secret. Go's claims are
-    /// `{user_id, exp(+7d)}`; the Rust `Claims::new` adds `iat` + a
-    /// `session_scope` (required by `decode_hs256`'s `Claims` struct, jwt.rs:
-    /// 8-19). The `session_scope` follows the `"user:{id}"` convention used by
-    /// the oidc_handlers test mock (oidc_handlers.rs:869) and the admin guard.
-    /// `exp` is `DEFAULT_JWT_TTL` = 7 days (jwt.rs:6), matching Go.
+    /// Mint an HS256 JWT for the exchanged user using the api-auth secret and
+    /// configured `api_auth.session_ttl`. The `session_scope` follows the
+    /// `"user:{id}"` convention used by the admin guard.
     async fn generate_jwt_token(&self, user: &OidcExchangedUser) -> Result<String, String> {
         let secret = self.secret().await?;
-        let claims = Claims::new(user.id, format!("user:{}", user.id));
+        let ttl = chrono::Duration::from_std(self.session_ttl)
+            .map_err(|_| "configured JWT session TTL is too large".to_string())?;
+        let claims = Claims::with_ttl(user.id, format!("user:{}", user.id), ttl);
         encode_hs256(&claims, &secret).map_err(|err| err.to_string())
     }
 }
@@ -1213,6 +1274,7 @@ mod tests {
         iat: u64,
         email: &'a str,
         email_verified: bool,
+        nonce: &'a str,
         name: &'a str,
     }
 
@@ -1236,6 +1298,7 @@ mod tests {
         issuer: &str,
         subject: &str,
         email: &str,
+        nonce: &str,
     ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1252,6 +1315,7 @@ mod tests {
                 iat: now,
                 email,
                 email_verified: true,
+                nonce,
                 name: "Ada Lovelace",
             },
             &EncodingKey::from_ed_pem(TEST_ED25519_PRIVATE_KEY.as_bytes())?,
@@ -1260,20 +1324,9 @@ mod tests {
 
     async fn fake_idp_adapter_with_persistence(
         persistence: Arc<dyn OidcPersistence>,
-        subject: &str,
-        email: &str,
     ) -> Result<(OidcAdapter, MockServer), Box<dyn std::error::Error>> {
         let server = MockServer::start().await;
         let issuer = server.uri();
-        let id_token = signed_test_id_token(&issuer, subject, email)?;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "access_token": "fake-access-token",
-                "id_token": id_token
-            })))
-            .mount(&server)
-            .await;
         Mock::given(method("GET"))
             .and(path("/jwks"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1313,6 +1366,7 @@ mod tests {
                 providers: vec![provider],
             },
             Some(SECRET.to_string()),
+            Duration::from_secs(24 * 60 * 60),
             Box::new(discovery),
         );
         adapter.persistence = Some(persistence);
@@ -1375,7 +1429,12 @@ mod tests {
             "google",
             "https://accounts.google.com/o/oauth2/v2/auth",
         ));
-        OidcAdapter::with_discovery(oidc, jwt_secret.map(str::to_string), discovery)
+        OidcAdapter::with_discovery(
+            oidc,
+            jwt_secret.map(str::to_string),
+            Duration::from_secs(24 * 60 * 60),
+            discovery,
+        )
     }
 
     fn google_provider() -> OidcProviderConfig {
@@ -1404,6 +1463,20 @@ mod tests {
         };
         let token = adapter.generate_jwt_token(&user).await?;
         assert_eq!(adapter.authenticate_jwt_token(&token).await?, 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jwt_uses_configured_session_ttl() -> TestResult {
+        let mut adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
+        adapter.session_ttl = Duration::from_secs(90);
+        let user = OidcExchangedUser {
+            id: 43,
+            user: serde_json::json!({"id": 43}),
+        };
+        let token = adapter.generate_jwt_token(&user).await?;
+        let claims = decode_hs256(&token, SECRET)?;
+        assert_eq!(claims.exp - claims.iat, 90);
         Ok(())
     }
 
@@ -1524,7 +1597,7 @@ mod tests {
     async fn authorize_url_builds_go_sorted_query_and_caches_state() -> TestResult {
         let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
         let (url, state) = adapter
-            .get_authorize_url("google", "https://gateway.example")
+            .get_authorize_url("google", "https://gateway.example", "browser-a")
             .await?;
 
         // Discovered endpoint is the URL base.
@@ -1544,6 +1617,9 @@ mod tests {
             keys,
             vec![
                 "client_id",
+                "code_challenge",
+                "code_challenge_method",
+                "nonce",
                 "redirect_uri",
                 "response_type",
                 "scope",
@@ -1571,9 +1647,12 @@ mod tests {
         // The CSRF state was cached — consume it like Callback would.
         let cached = adapter
             .state_cache
-            .consume(&format!("oidc_state:{state}"))
+            .consume(&format!("oidc_state:browser-a:{state}"))
             .map_err(|err| err.to_string())?;
-        assert_eq!(cached.as_deref(), Some("1"));
+        let cached: OidcTransactionState =
+            serde_json::from_str(cached.as_deref().ok_or("missing transaction state")?)?;
+        assert!(!cached.nonce.is_empty());
+        assert!(!cached.code_verifier.is_empty());
         Ok(())
     }
 
@@ -1594,10 +1673,15 @@ mod tests {
             state_ttl: Duration::from_secs(10 * 60),
             providers: vec![google_provider(), github],
         };
-        let adapter = OidcAdapter::with_discovery(oidc, Some(SECRET.to_string()), discovery);
+        let adapter = OidcAdapter::with_discovery(
+            oidc,
+            Some(SECRET.to_string()),
+            Duration::from_secs(24 * 60 * 60),
+            discovery,
+        );
 
         let (url, _) = adapter
-            .get_authorize_url("github", "https://gateway.example")
+            .get_authorize_url("github", "https://gateway.example", "browser-a")
             .await?;
         assert!(
             url.contains(
@@ -1613,7 +1697,7 @@ mod tests {
     async fn authorize_url_unknown_provider_errors() -> TestResult {
         let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
         let result = adapter
-            .get_authorize_url("ghost", "https://gateway.example")
+            .get_authorize_url("ghost", "https://gateway.example", "browser-a")
             .await;
         match result {
             Err(message) => assert!(message.contains("not found"), "{message}"),
@@ -1627,7 +1711,9 @@ mod tests {
     #[tokio::test]
     async fn authorize_url_matches_provider_case_insensitively() -> TestResult {
         let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
-        let (url, _) = adapter.get_authorize_url(" Google ", "https://gw").await?;
+        let (url, _) = adapter
+            .get_authorize_url(" Google ", "https://gw", "browser-a")
+            .await?;
         assert!(url.contains("client_id=g-client-id"), "{url}");
         Ok(())
     }
@@ -1649,11 +1735,16 @@ mod tests {
                 providers: vec![google_provider()],
             },
             Some(SECRET.to_string()),
+            Duration::from_secs(24 * 60 * 60),
             discovery,
         );
 
-        adapter.get_authorize_url("google", "https://gw").await?;
-        adapter.get_authorize_url("google", "https://gw").await?;
+        adapter
+            .get_authorize_url("google", "https://gw", "browser-a")
+            .await?;
+        adapter
+            .get_authorize_url("google", "https://gw", "browser-a")
+            .await?;
 
         // Only the first call hit discovery; the second used the cache.
         assert_eq!(*call_count.lock().map_err(|_| "poisoned")?, 1);
@@ -1668,7 +1759,7 @@ mod tests {
     async fn link_authorize_url_caches_user_intent() -> TestResult {
         let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
         let (url, state) = adapter
-            .get_link_authorize_url("google", "https://gateway.example", 11)
+            .get_link_authorize_url("google", "https://gateway.example", 11, "browser-a")
             .await?;
 
         // Same URL shape as a login authorize.
@@ -1681,7 +1772,7 @@ mod tests {
         // The link intent was cached for the user.
         let intent = adapter
             .state_cache
-            .consume(&format!("oidc_link_state:{state}"))
+            .consume(&format!("oidc_link_state:browser-a:{state}"))
             .map_err(|err| err.to_string())?;
         assert_eq!(intent.as_deref(), Some("11"));
         Ok(())
@@ -1703,27 +1794,48 @@ mod tests {
         );
         let subject = format!("pg-subject-{suffix}");
         let email = format!("pg-oidc-{suffix}@example.test");
-        let (adapter, server) = fake_idp_adapter_with_persistence(
-            Arc::new(PostgresOidcPersistence::new(pool.clone())),
-            &subject,
-            &email,
-        )
-        .await?;
-        let (_, state) = adapter
-            .get_authorize_url("fake-idp", "https://gateway.example")
+        let (adapter, server) =
+            fake_idp_adapter_with_persistence(Arc::new(PostgresOidcPersistence::new(pool.clone())))
+                .await?;
+        let (authorize_url, state) = adapter
+            .get_authorize_url("fake-idp", "https://gateway.example", "browser-a")
             .await?;
+        let nonce = authorize_url
+            .split_once('?')
+            .and_then(|(_, query)| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("nonce="))
+            })
+            .map(str::to_string)
+            .ok_or("authorize URL did not include a nonce")?;
+        let id_token = signed_test_id_token(&server.uri(), &subject, &email, &nonce)?;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fake-access-token",
+                "id_token": id_token
+            })))
+            .mount(&server)
+            .await;
         let (exchange_code, intent) = adapter
             .callback(
                 "fake-idp",
                 "postgres-authorization-code",
                 &state,
                 "https://gateway.example",
+                "browser-a",
             )
             .await?;
         assert_eq!(intent, "login");
-        let exchanged = adapter.exchange_code(&exchange_code).await?;
+        let exchanged = adapter.exchange_code(&exchange_code, "browser-a").await?;
         assert_eq!(exchanged.user["email"], email);
-        assert!(adapter.exchange_code(&exchange_code).await.is_err());
+        assert!(
+            adapter
+                .exchange_code(&exchange_code, "browser-a")
+                .await
+                .is_err()
+        );
 
         let identity_owner: i64 = sqlx::query_scalar(
             "SELECT user_id FROM oidc_identities \
@@ -1760,7 +1872,7 @@ mod tests {
         assert_eq!(adapter.count_providers(), 0);
         assert!(adapter.get_providers(None).await.is_empty());
         let error = adapter
-            .get_authorize_url("google", "https://gateway.example")
+            .get_authorize_url("google", "https://gateway.example", "browser-a")
             .await
             .err()
             .ok_or("disabled OIDC unexpectedly produced an authorize URL")?;
@@ -1773,7 +1885,7 @@ mod tests {
     async fn callback_rejects_unknown_state() -> TestResult {
         let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
         let result = adapter
-            .callback("google", "code", "state", "https://gw")
+            .callback("google", "code", "state", "https://gw", "browser-a")
             .await;
         match result {
             Err(message) => assert!(message.contains("invalid or expired"), "{message}"),
@@ -1786,11 +1898,61 @@ mod tests {
     #[tokio::test]
     async fn exchange_code_rejects_unknown_code() -> TestResult {
         let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
-        let result = adapter.exchange_code("any-code").await;
+        let result = adapter.exchange_code("any-code", "browser-a").await;
         match result {
             Err(message) => assert!(message.contains("invalid or expired"), "{message}"),
             Ok(user) => return Err(format!("expected exchange-code error, got {user:?}").into()),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_state_and_exchange_code_are_bound_to_one_browser() -> TestResult {
+        let adapter = adapter_with_providers(vec![google_provider()], Some(SECRET));
+        let (_, state) = adapter
+            .get_authorize_url("google", "https://gateway.example", "browser-a")
+            .await?;
+
+        let wrong_browser = adapter
+            .callback(
+                "google",
+                "code",
+                &state,
+                "https://gateway.example",
+                "browser-b",
+            )
+            .await;
+        assert!(
+            wrong_browser
+                .err()
+                .is_some_and(|message| message.contains("invalid or expired"))
+        );
+        assert!(
+            adapter
+                .state_cache
+                .consume(&format!("oidc_state:browser-a:{state}"))?
+                .is_some(),
+            "a callback from another browser must not consume the real transaction"
+        );
+
+        adapter.state_cache.set(
+            "oidc_exchange:browser-a:exchange-code".to_string(),
+            "7".to_string(),
+            Duration::from_secs(60),
+        )?;
+        assert!(
+            adapter
+                .exchange_code("exchange-code", "browser-b")
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .state_cache
+                .consume("oidc_exchange:browser-a:exchange-code")?
+                .is_some(),
+            "an exchange attempt from another browser must not consume the code"
+        );
         Ok(())
     }
 
@@ -1807,6 +1969,21 @@ mod tests {
             ]),
             "client_id=a+b&scope=openid+profile&state=z"
         );
+    }
+
+    #[test]
+    fn email_is_usable_only_when_verification_is_explicitly_true() {
+        for (verified, expected) in [
+            (Some(true), Some("verified@example.test")),
+            (Some(false), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                explicitly_verified_email(Some("verified@example.test".to_string()), verified,)
+                    .as_deref(),
+                expected
+            );
+        }
     }
 
     /// default_redirect_path: single → /oauth/oidc/callback; multi → per-id.
@@ -1829,11 +2006,14 @@ mod tests {
             "https://gw/callback",
             &["openid".to_string(), "email".to_string()],
             "st",
+            "nonce-value",
+            "challenge-value",
         );
         assert_eq!(
             url,
             "https://idp.example/authorize?\
-             client_id=cid&redirect_uri=https%3A%2F%2Fgw%2Fcallback&\
+             client_id=cid&code_challenge=challenge-value&code_challenge_method=S256&\
+             nonce=nonce-value&redirect_uri=https%3A%2F%2Fgw%2Fcallback&\
              response_type=code&scope=openid+email&state=st"
         );
     }

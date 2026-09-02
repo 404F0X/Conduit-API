@@ -1,8 +1,19 @@
 //! User Credit and subscription allowance admin API (Rust extension).
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use async_graphql::{Context, Enum, ID, InputObject, SimpleObject};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+
+pub const DEFAULT_CREDIT_REDEMPTION_PAGE_LIMIT: i32 = 50;
+pub const MAX_CREDIT_REDEMPTION_PAGE_LIMIT: i32 = 200;
+pub const MAX_CREDIT_REDEMPTION_QUANTITY: i32 = 1_000;
+pub const DEFAULT_CREDIT_REDEMPTIONS_PER_CODE: i32 = 1;
+pub const MAX_CREDIT_REDEMPTIONS_PER_CODE: i32 = 100_000;
+pub const MAX_CREDIT_REDEMPTION_DESCRIPTION_CHARS: usize = 500;
+pub const CREDIT_REDEMPTION_CODE_MIN_CHARS: usize = 8;
+pub const CREDIT_REDEMPTION_CODE_MAX_CHARS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 pub enum BillingStatus {
@@ -70,6 +81,110 @@ pub struct CreditLedgerEntry {
     pub entry_type: String,
     pub description: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum CreditRedemptionCodeStatus {
+    Active,
+    Redeemed,
+    Revoked,
+    Expired,
+}
+
+/// Administrative view of a redemption code. The plaintext code is
+/// intentionally absent; it is returned only once in
+/// [`GeneratedCreditRedemptionCode`].
+#[derive(Debug, Clone, SimpleObject)]
+pub struct CreditRedemptionCode {
+    pub id: ID,
+    #[graphql(name = "batchID")]
+    pub batch_id: ID,
+    pub code_hint: String,
+    pub amount: String,
+    pub currency: String,
+    pub description: Option<String>,
+    pub max_redemptions: i32,
+    pub redemption_count: i32,
+    pub remaining_redemptions: i32,
+    pub status: CreditRedemptionCodeStatus,
+    pub expires_at: Option<String>,
+    pub redeemed_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct CreditRedemptionCodePage {
+    pub items: Vec<CreditRedemptionCode>,
+    pub total: i32,
+    pub limit: i32,
+    pub offset: i32,
+}
+
+/// One-time secret returned by code creation. Deliberately does not derive
+/// `Debug`, which keeps accidental structured logging from exposing `code`.
+#[derive(Clone, SimpleObject)]
+pub struct GeneratedCreditRedemptionCode {
+    pub id: ID,
+    pub code: String,
+    pub code_hint: String,
+}
+
+#[derive(Clone, SimpleObject)]
+pub struct CreateCreditRedemptionCodesPayload {
+    #[graphql(name = "batchID")]
+    pub batch_id: ID,
+    pub amount: String,
+    pub currency: String,
+    pub quantity: i32,
+    pub max_redemptions: i32,
+    pub expires_at: Option<String>,
+    pub codes: Vec<GeneratedCreditRedemptionCode>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct CreditRedemptionReceipt {
+    pub id: ID,
+    #[graphql(name = "codeID")]
+    pub code_id: ID,
+    #[graphql(name = "projectID")]
+    pub project_id: ID,
+    #[graphql(name = "userID")]
+    pub user_id: ID,
+    pub amount: String,
+    pub currency: String,
+    pub redeemed_at: String,
+}
+
+#[derive(Debug, Clone, InputObject)]
+pub struct CreateCreditRedemptionCodesInput {
+    pub amount: String,
+    pub quantity: i32,
+    #[graphql(default = 1)]
+    pub max_redemptions: i32,
+    pub expires_at: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Authenticated actor metadata forwarded to the PostgreSQL adapter so the
+/// state change and its audit row can commit in one transaction. It contains
+/// no raw redemption code or other request secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditRedemptionActor {
+    pub actor_type: String,
+    pub actor_id: Option<String>,
+}
+
+impl CreditRedemptionActor {
+    pub(crate) fn for_request(ctx: &Context<'_>) -> Result<Self, String> {
+        let principal = crate::policy::request_context(ctx)
+            .and_then(|request| request.principal.as_ref())
+            .ok_or_else(|| "authentication required".to_string())?;
+        Ok(Self {
+            actor_type: principal.kind.to_string(),
+            actor_id: principal.id.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -312,8 +427,112 @@ pub enum BillingError {
     NotFound(String),
     #[error("invalid billing input: {0}")]
     Invalid(String),
+    /// Public redemption failures intentionally collapse unknown, expired,
+    /// redeemed, and revoked codes into one response to prevent enumeration.
+    #[error("credit redemption code is invalid or unavailable")]
+    RedemptionCodeUnavailable,
     #[error("billing operation failed: {0}")]
     Storage(String),
+}
+
+pub fn validate_credit_redemption_pagination(limit: i32, offset: i32) -> Result<(), BillingError> {
+    if !(1..=MAX_CREDIT_REDEMPTION_PAGE_LIMIT).contains(&limit) {
+        return Err(BillingError::Invalid(format!(
+            "limit must be between 1 and {MAX_CREDIT_REDEMPTION_PAGE_LIMIT}"
+        )));
+    }
+    if offset < 0 {
+        return Err(BillingError::Invalid(
+            "offset cannot be negative".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_create_credit_redemption_codes_input(
+    input: &CreateCreditRedemptionCodesInput,
+) -> Result<(), BillingError> {
+    validate_credit_redemption_amount(&input.amount)?;
+    if !(1..=MAX_CREDIT_REDEMPTION_QUANTITY).contains(&input.quantity) {
+        return Err(BillingError::Invalid(format!(
+            "quantity must be between 1 and {MAX_CREDIT_REDEMPTION_QUANTITY}"
+        )));
+    }
+    let max_redemptions = input.max_redemptions;
+    if !(1..=MAX_CREDIT_REDEMPTIONS_PER_CODE).contains(&max_redemptions) {
+        return Err(BillingError::Invalid(format!(
+            "maxRedemptions must be between 1 and {MAX_CREDIT_REDEMPTIONS_PER_CODE}"
+        )));
+    }
+    if input
+        .description
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_CREDIT_REDEMPTION_DESCRIPTION_CHARS)
+    {
+        return Err(BillingError::Invalid(format!(
+            "description cannot exceed {MAX_CREDIT_REDEMPTION_DESCRIPTION_CHARS} characters"
+        )));
+    }
+    if let Some(expires_at) = input.expires_at.as_deref() {
+        let expires_at = DateTime::parse_from_rfc3339(expires_at.trim())
+            .map_err(|_| BillingError::Invalid("expiresAt must be RFC 3339".to_string()))?
+            .with_timezone(&Utc);
+        if expires_at <= Utc::now() {
+            return Err(BillingError::Invalid(
+                "expiresAt must be in the future".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Accept a plain positive decimal without signs, exponent notation, or more
+/// than six fractional digits. This exactly matches the micros ledger scale.
+pub fn validate_credit_redemption_amount(value: &str) -> Result<(), BillingError> {
+    let value = value.trim();
+    let mut components = value.split('.');
+    let integer = components.next().unwrap_or_default();
+    let fraction = components.next();
+    if value.is_empty()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|digits| {
+            digits.is_empty()
+                || digits.len() > 6
+                || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        || components.next().is_some()
+    {
+        return Err(BillingError::Invalid(
+            "amount must be a positive decimal with at most 6 fractional digits".to_string(),
+        ));
+    }
+    let amount = Decimal::from_str(value).map_err(|_| {
+        BillingError::Invalid(
+            "amount must be a positive decimal with at most 6 fractional digits".to_string(),
+        )
+    })?;
+    let largest = Decimal::from(i64::MAX) / Decimal::from(1_000_000_i64);
+    if amount <= Decimal::ZERO || amount > largest {
+        return Err(BillingError::Invalid(
+            "amount must be positive and fit the credit ledger range".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize the human-entered code before hashing. All invalid shapes use the
+/// same public error as unknown or unavailable codes.
+pub fn normalize_credit_redemption_code(value: &str) -> Result<String, BillingError> {
+    let code = value.trim().to_ascii_uppercase();
+    if !(CREDIT_REDEMPTION_CODE_MIN_CHARS..=CREDIT_REDEMPTION_CODE_MAX_CHARS).contains(&code.len())
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(BillingError::RedemptionCodeUnavailable);
+    }
+    Ok(code)
 }
 
 #[async_trait::async_trait]
@@ -362,6 +581,28 @@ pub trait BillingServices: Send + Sync {
         &self,
         input: GrantProjectCreditInput,
     ) -> Result<ProjectBalance, BillingError>;
+    async fn credit_redemption_codes(
+        &self,
+        limit: i32,
+        offset: i32,
+    ) -> Result<CreditRedemptionCodePage, BillingError>;
+    async fn create_credit_redemption_codes(
+        &self,
+        actor: CreditRedemptionActor,
+        input: CreateCreditRedemptionCodesInput,
+    ) -> Result<CreateCreditRedemptionCodesPayload, BillingError>;
+    async fn revoke_credit_redemption_code(
+        &self,
+        actor: CreditRedemptionActor,
+        code_id: &str,
+    ) -> Result<CreditRedemptionCode, BillingError>;
+    async fn redeem_credit_code(
+        &self,
+        actor: CreditRedemptionActor,
+        user_id: &str,
+        project_id: &str,
+        code: &str,
+    ) -> Result<CreditRedemptionReceipt, BillingError>;
     async fn create_subscription_plan(
         &self,
         input: CreateSubscriptionPlanInput,
@@ -410,4 +651,96 @@ pub(crate) fn billing_services(ctx: &Context<'_>) -> Result<Arc<dyn BillingServi
     ctx.data::<Arc<dyn BillingServices>>()
         .cloned()
         .map_err(|_| BillingError::Unavailable.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redemption_amount_matches_exact_micros_contract() {
+        for valid in ["1", "0.000001", "12.340000", " 7.5 "] {
+            assert!(
+                validate_credit_redemption_amount(valid).is_ok(),
+                "{valid:?} must be valid"
+            );
+        }
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            ".5",
+            "1.",
+            "1.0000000",
+            "1e2",
+            "1_000",
+            "9223372036854.775808",
+        ] {
+            assert!(
+                validate_credit_redemption_amount(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn redemption_creation_bounds_quantity_description_and_expiry() {
+        let mut input = CreateCreditRedemptionCodesInput {
+            amount: "10.25".into(),
+            quantity: MAX_CREDIT_REDEMPTION_QUANTITY,
+            max_redemptions: DEFAULT_CREDIT_REDEMPTIONS_PER_CODE,
+            expires_at: Some("2999-01-01T00:00:00Z".into()),
+            description: Some("campaign".into()),
+        };
+        assert!(validate_create_credit_redemption_codes_input(&input).is_ok());
+
+        input.quantity = MAX_CREDIT_REDEMPTION_QUANTITY + 1;
+        assert!(validate_create_credit_redemption_codes_input(&input).is_err());
+        input.quantity = 1;
+        input.max_redemptions = MAX_CREDIT_REDEMPTIONS_PER_CODE;
+        assert!(validate_create_credit_redemption_codes_input(&input).is_ok());
+        input.max_redemptions = 0;
+        assert!(validate_create_credit_redemption_codes_input(&input).is_err());
+        input.max_redemptions = MAX_CREDIT_REDEMPTIONS_PER_CODE + 1;
+        assert!(validate_create_credit_redemption_codes_input(&input).is_err());
+        input.max_redemptions = DEFAULT_CREDIT_REDEMPTIONS_PER_CODE;
+        input.description = Some("x".repeat(MAX_CREDIT_REDEMPTION_DESCRIPTION_CHARS + 1));
+        assert!(validate_create_credit_redemption_codes_input(&input).is_err());
+        input.description = None;
+        input.expires_at = Some("2020-01-01T00:00:00Z".into());
+        assert!(validate_create_credit_redemption_codes_input(&input).is_err());
+    }
+
+    #[test]
+    fn redemption_code_normalization_is_bounded_and_uses_one_public_error() {
+        assert_eq!(
+            normalize_credit_redemption_code("  cr-ab12-cd34  ").expect("valid normalized code"),
+            "CR-AB12-CD34"
+        );
+        for invalid in [
+            "short",
+            "contains space",
+            "兑换码-12345678",
+            "A/B/C/12345678",
+        ] {
+            assert!(matches!(
+                normalize_credit_redemption_code(invalid),
+                Err(BillingError::RedemptionCodeUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn redemption_pagination_is_strictly_bounded() {
+        assert!(validate_credit_redemption_pagination(1, 0).is_ok());
+        assert!(
+            validate_credit_redemption_pagination(MAX_CREDIT_REDEMPTION_PAGE_LIMIT, 10).is_ok()
+        );
+        assert!(validate_credit_redemption_pagination(0, 0).is_err());
+        assert!(
+            validate_credit_redemption_pagination(MAX_CREDIT_REDEMPTION_PAGE_LIMIT + 1, 0).is_err()
+        );
+        assert!(validate_credit_redemption_pagination(1, -1).is_err());
+    }
 }

@@ -1,4 +1,5 @@
 use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,6 +7,7 @@ use std::time::Duration;
 use axum::Extension;
 use axum::Router;
 use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Response, Uri, header};
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
@@ -24,7 +26,6 @@ use crate::oidc_handlers;
 use crate::openai_handlers;
 use crate::request_content_handlers;
 use crate::request_preview_handlers;
-use crate::static_files::serve_from_asset_source;
 use crate::system_handlers;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,12 +452,10 @@ pub fn build_router_with_asset_source(
 
     let mut router = Router::new();
 
-    // Root-level `/health` is only registered when the base path is empty/root
-    // or the compat flag opts back in. (The compat flag is not yet exposed via
-    // config; default to false until a config knob lands — matches S16.)
-    if should_expose_root_health(&base_path, false) {
-        router = router.route(&mount_path(&base_path, "/health"), get(health::health));
-    }
+    // Health follows the same mount contract as every other endpoint. With a
+    // non-empty base path it is available at `<base_path>/health`; the legacy
+    // root route remains suppressed unless a future compatibility flag opts in.
+    router = router.route(&mount_path(&base_path, "/health"), get(health::health));
 
     // ===== Public routes (no auth required) =====
     // Go routes.go:76-89 — "System Status and Initialize - DO NOT AUTH",
@@ -553,9 +552,9 @@ pub fn build_router_with_asset_source(
         ));
     router = router.merge(admin_protected);
 
-    // Service-account-only management API. The API-key middleware performs
-    // database validation; the handler additionally rejects non-service-
-    // account key types before injecting the scoped principal into GraphQL.
+    // Service-account-only management API. Authentication runs first and the
+    // group-level authorization layer then rejects every non-service-account
+    // key before any handler executes.
     let openapi_graphql = Router::new()
         .route(
             &mount_path(&base_path, "/openapi/v1/graphql"),
@@ -568,6 +567,9 @@ pub fn build_router_with_asset_source(
             &mount_path(&base_path, "/openapi/webhook/echo"),
             post(crate::webhook_handlers::webhook_echo),
         )
+        .route_layer(axum::middleware::from_fn(
+            crate::middleware::api_key_auth::require_service_account,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::api_key_auth::api_key_auth,
@@ -591,6 +593,22 @@ pub fn build_router_with_asset_source(
 
     // ===== LLM API routes (API key auth) =====
     // Go routes.go:155-180 — llmAPIGroup with `middleware.WithAPIKeyAuth`.
+    let llm_uploads = Router::new()
+        .route(
+            &mount_path(&base_path, "/v1/images/edits"),
+            post(openai_handlers::create_image_edit),
+        )
+        .route(
+            &mount_path(&base_path, "/v1/audio/transcriptions"),
+            post(openai_handlers::create_transcription),
+        )
+        .route(
+            &mount_path(&base_path, "/v1/audio/translations"),
+            post(openai_handlers::create_translation),
+        )
+        .layer(DefaultBodyLimit::max(
+            openai_handlers::MULTIPART_BODY_LIMIT_BYTES,
+        ));
     let llm_api = Router::new()
         .route(
             &mount_path(&base_path, "/v1/models"),
@@ -701,18 +719,7 @@ pub fn build_router_with_asset_source(
             &mount_path(&base_path, "/v1/images/generations"),
             post(openai_handlers::create_image),
         )
-        .route(
-            &mount_path(&base_path, "/v1/images/edits"),
-            post(openai_handlers::create_image_edit),
-        )
-        .route(
-            &mount_path(&base_path, "/v1/audio/transcriptions"),
-            post(openai_handlers::create_transcription),
-        )
-        .route(
-            &mount_path(&base_path, "/v1/audio/translations"),
-            post(openai_handlers::create_translation),
-        )
+        .merge(llm_uploads)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::api_key_auth::api_key_auth,
@@ -887,7 +894,7 @@ pub fn mount_path(base_path: &str, route: &str) -> String {
     if trimmed_base.is_empty() || trimmed_base == "/" {
         return route.to_string();
     }
-    if route.starts_with(trimmed_base) {
+    if strip_base_path_for_mount(route, trimmed_base).is_some() {
         // Idempotent: route is already mounted under the base path.
         return route.to_string();
     }
@@ -907,10 +914,18 @@ pub fn should_expose_root_health(base_path: &str, compat_flag: bool) -> bool {
 }
 
 async fn asset_fallback_handler(
+    State(state): State<AppState>,
     uri: Uri,
     Extension(source): Extension<Arc<dyn AssetSource>>,
 ) -> Response<Body> {
-    serve_from_asset_source(uri.path(), source.as_ref())
+    let Some(path) = strip_base_path_for_mount(uri.path(), state.base_path()) else {
+        return crate::static_files::api_not_found_response();
+    };
+    crate::static_files::serve_from_asset_source_with_base_path(
+        path,
+        state.base_path(),
+        source.as_ref(),
+    )
 }
 
 pub async fn serve_listener<S>(
@@ -921,9 +936,12 @@ pub async fn serve_listener<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// Serve until a shutdown signal arrives, then give active connections a
@@ -940,11 +958,14 @@ where
     S: Future<Output = ()> + Send,
 {
     let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, build_router(state))
-        .with_graceful_shutdown(async move {
-            let _ = drain_rx.await;
-        })
-        .into_future();
+    let server = axum::serve(
+        listener,
+        build_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = drain_rx.await;
+    })
+    .into_future();
     tokio::pin!(server);
     tokio::pin!(shutdown);
 
@@ -1217,6 +1238,63 @@ mod tests {
             route_group_for_path("/internal/v1/graphql").kind,
             RouteGroupKind::Admin
         );
+    }
+
+    #[tokio::test]
+    async fn openapi_webhook_rejects_authenticated_user_keys() -> Result<(), Box<dyn Error>> {
+        let metadata = crate::middleware::api_key_auth::ValidatedApiKeyMetadata {
+            api_key_id: 7,
+            project_id: 1,
+            key_type: "user".to_string(),
+            ..Default::default()
+        };
+        let mut app = build_router(state_with_metadata(metadata));
+        let response = app
+            .call(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/openapi/webhook/echo")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"event":"test"}"#))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn openapi_webhook_accepts_service_accounts_without_reflecting_credentials()
+    -> Result<(), Box<dyn Error>> {
+        let metadata = crate::middleware::api_key_auth::ValidatedApiKeyMetadata {
+            api_key_id: 7,
+            project_id: 1,
+            key_type: "service_account".to_string(),
+            ..Default::default()
+        };
+        let mut app = build_router(state_with_metadata(metadata));
+        let response = app
+            .call(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/openapi/webhook/echo?topic=hello%20world")
+                    .header(header::AUTHORIZATION, "Bearer test-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-request-id", "request-7")
+                    .body(Body::from(r#"{"event":"test"}"#))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(body["query"]["topic"], serde_json::json!(["hello world"]));
+        assert_eq!(
+            body["headers"]["X-Request-Id"],
+            serde_json::json!(["request-7"])
+        );
+        assert!(body["headers"].get("Authorization").is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1658,7 +1736,12 @@ mod tests {
         assert!(content_type.starts_with("text/html"));
         // Go-parity: serveSPAIndex sets the full no-cache directive.
         assert_eq!(cache_control, crate::static_files::SPA_INDEX_CACHE_CONTROL);
-        assert_eq!(body, "<html>conduit</html>");
+        assert!(body.contains("<base href=\"/\">"), "{body}");
+        assert!(
+            body.contains("<meta name=\"conduit-base-path\" content=\"\">"),
+            "{body}"
+        );
+        assert!(body.ends_with("<html>conduit</html>"), "{body}");
 
         Ok(())
     }
@@ -1875,6 +1958,7 @@ mod tests {
             mount_path("/gateway", "/gateway/v1/models"),
             "/gateway/v1/models"
         );
+        assert_eq!(mount_path("/v1", "/v1beta/models"), "/v1/v1beta/models");
     }
 
     #[test]
@@ -2267,14 +2351,20 @@ mod tests {
     /// root containing a single `index.html` (so the SPA fallback is live).
     fn router_with_base_path(base_path: &str) -> Result<(Router, AppConfig), Box<dyn Error>> {
         let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("index.html"), "<html>conduit</html>")?;
+        std::fs::create_dir_all(dir.path().join("assets"))?;
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<html><head></head><body>conduit</body></html>",
+        )?;
+        std::fs::write(dir.path().join("assets/app.js"), "console.log('ok')")?;
+        let static_root = dir.path().to_path_buf();
         // Leak the tempdir for the test duration (the test process exits soon).
         std::mem::forget(dir);
 
         let mut config = AppConfig::default();
         config.server.base_path = base_path.to_string();
         let state = AppState::from_config(config.clone());
-        let router = build_router(state);
+        let router = build_router_with_static_root(state, static_root);
         Ok((router, config))
     }
 
@@ -2313,6 +2403,15 @@ mod tests {
     async fn base_path_suppresses_root_health_when_set() -> Result<(), Box<dyn Error>> {
         let (mut app, _config) = router_with_base_path("/gateway")?;
 
+        let response = app
+            .call(
+                Request::builder()
+                    .uri("/gateway/health")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
         // Root-level /health is NOT registered when base_path is non-empty.
         // It must NOT return the health JSON — instead it falls through to the
         // static fallback, which classifies `/health` as an API path and
@@ -2328,6 +2427,46 @@ mod tests {
             "root /health must not return the health JSON when base_path is set"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn base_path_mounts_spa_and_assets_without_leaking_root_fallback()
+    -> Result<(), Box<dyn Error>> {
+        let (mut app, _config) = router_with_base_path("/gateway")?;
+
+        let response = app
+            .clone()
+            .call(
+                Request::builder()
+                    .uri("/gateway/assets/app.js")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .call(
+                Request::builder()
+                    .uri("/gateway/projects/1")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await?;
+        let html = std::str::from_utf8(&body)?;
+        assert!(html.contains("<base href=\"/gateway/\">"));
+        assert!(html.contains("content=\"/gateway\""));
+
+        let response = app
+            .call(
+                Request::builder()
+                    .uri("/assets/app.js")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 

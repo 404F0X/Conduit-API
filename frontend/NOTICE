@@ -1,10 +1,29 @@
-This project includes code from shadcn-admin (https://github.com/satnaing/shadcn-admin), which is licensed under the MIT License.
+Conduit API web console source-derived notices
+
+The production build also generates `THIRD_PARTY_LICENSES.md` alongside this
+file. It contains the licenses for npm packages that are actually bundled.
+
+This distribution includes or derives code from:
+
+- shadcn-admin (https://github.com/satnaing/shadcn-admin),
+  Copyright (c) 2024 Sat Naing.
+- `src/components/auto-complete.tsx`,
+  Copyright (c) 2025 Leonardo Montini.
+- `src/components/json-tree-view.tsx`,
+  Copyright (c) 2024 monto.
+- LobeHub Icons (https://github.com/lobehub/lobe-icons),
+  Copyright (c) 2023 LobeHub.
+
+Each component listed above is licensed under the following MIT License:
 
 ---
 
 MIT License
 
 Copyright (c) 2024 Sat Naing
+Copyright (c) 2025 Leonardo Montini
+Copyright (c) 2024 monto
+Copyright (c) 2023 LobeHub
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

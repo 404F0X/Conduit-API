@@ -192,6 +192,7 @@ impl RequestExecution {
             ..Default::default()
         };
         let args = crate::request_usage::RequestConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             after: None,
             first: Some(1),
             before: None,
@@ -228,6 +229,8 @@ impl RequestExecution {
             Some(id) => id,
             None => return Ok(None),
         };
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_CHANNELS)
+            .map_err(|error| error.to_string())?;
         let services = crate::channel::channel_query_services(ctx)?;
         let injected = crate::channel::ChannelWhereInput {
             id: Some(channel_id),
@@ -679,6 +682,7 @@ pub enum RequestExecutionQueryError {
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestExecutionConnectionArgs {
+    pub access: crate::policy::AdminAccessScope,
     pub after: Option<String>,
     pub first: Option<i32>,
     pub before: Option<String>,
@@ -835,6 +839,7 @@ mod tests {
         ) -> Result<RequestExecutionConnection, String> {
             let services = request_execution_query_services(ctx)?;
             let args = RequestExecutionConnectionArgs {
+                access: crate::policy::AdminAccessScope::Global,
                 after: after.map(|cursor| cursor.0),
                 first,
                 before: before.map(|cursor| cursor.0),
@@ -1209,7 +1214,18 @@ mod tests {
             .data(exec)
             .data(req)
             .data(chan)
+            .data(read_requests_context())
             .finish()
+    }
+
+    fn read_requests_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(
+            conduit_auth::Principal::user("request-execution-test")
+                .with_scope(conduit_auth::scopes::slug::READ_REQUESTS)
+                .with_scope(conduit_auth::scopes::slug::READ_CHANNELS),
+        );
+        context
     }
 
     fn sample_request(id: &str) -> crate::request_usage::Request {

@@ -1,6 +1,6 @@
 //! PostgreSQL-backed append-only usage/accounting repository.
 
-use crate::repo::usage_repo::{UsageListQuery, UsageListResult, UsageRepo};
+use crate::repo::usage_repo::{UsageListOrderField, UsageListQuery, UsageListResult, UsageRepo};
 use crate::repo::{RepoError, RepoResult, RequestContext, UsageAggregate, UsageAggregateQuery};
 use crate::row::UsageLogRow;
 use async_trait::async_trait;
@@ -48,6 +48,9 @@ fn error(c: &str, e: sqlx::Error) -> RepoError {
 fn list_filters(b: &mut QueryBuilder<Postgres>, q: &UsageListQuery) -> RepoResult<()> {
     if !q.project_id.is_empty() {
         b.push(" AND project_id=").push_bind(id(&q.project_id)?);
+    }
+    if let Some(v) = &q.id {
+        b.push(" AND id=").push_bind(id(v)?);
     }
     if let Some(v) = &q.api_key_id {
         b.push(" AND api_key_id=").push_bind(id(v)?);
@@ -143,7 +146,17 @@ impl UsageRepo for PgUsageRepo {
         let mut b =
             QueryBuilder::<Postgres>::new(format!("SELECT {COLUMNS} FROM usage_logs WHERE TRUE"));
         list_filters(&mut b, q)?;
-        b.push(" ORDER BY created_at,id LIMIT ")
+        b.push(" ORDER BY ").push(match q.order_field {
+            UsageListOrderField::Id => "id",
+            UsageListOrderField::CreatedAt => "created_at",
+            UsageListOrderField::UpdatedAt => "updated_at",
+        });
+        b.push(if q.descending {
+            " DESC,id DESC"
+        } else {
+            " ASC,id ASC"
+        });
+        b.push(" LIMIT ")
             .push_bind(i64::from(q.limit) + 1)
             .push(" OFFSET ")
             .push_bind(i64::from(q.offset));
@@ -155,6 +168,21 @@ impl UsageRepo for PgUsageRepo {
         let has_more = rows.len() > q.limit as usize;
         rows.truncate(q.limit as usize);
         Ok(UsageListResult { rows, has_more })
+    }
+    async fn count_usage_unchecked(
+        &self,
+        _: &RequestContext,
+        q: &UsageListQuery,
+    ) -> RepoResult<u64> {
+        let mut b =
+            QueryBuilder::<Postgres>::new("SELECT COUNT(*)::BIGINT FROM usage_logs WHERE TRUE");
+        list_filters(&mut b, q)?;
+        let count = b
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| error("count", e))?;
+        Ok(count.max(0) as u64)
     }
 }
 

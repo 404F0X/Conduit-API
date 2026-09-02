@@ -8,12 +8,9 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 
-/// Mirrors Go `WebhookDebugResponse` (`conduit/internal/server/api/system.go:68-74`,
-/// `:104-130`): echoes the inbound request verbatim — `method`, `path`,
-/// multi-valued `query` (Go `url.Values` = `map[string][]string`), the
-/// **full** `headers` set with no safe-subset filtering (Go writes
-/// `c.Request.Header` verbatim at `system.go:115`), and the JSON `body`.
-/// Response is forced to `Content-Type: application/json` (Go `system.go:127`).
+/// Webhook debugging response. Query fields retain their multi-valued form,
+/// while headers are restricted to a non-sensitive allowlist so credentials
+/// and proxy-internal routing data can never be reflected to a caller.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct WebhookEchoResponse {
     pub method: String,
@@ -49,18 +46,29 @@ pub fn webhook_echo_response(
         method: method.as_str().to_owned(),
         path: path.into(),
         query: parse_query_multi(query),
-        headers: echo_all_headers_multi(headers),
+        headers: echo_safe_headers_multi(headers),
         body,
     }
 }
 
-/// Collect **every** inbound header into a multi-valued map keyed by the
-/// canonical MIME header name (mirrors Go `http.Header`, whose keys are
-/// produced by `textproto.CanonicalMIMEHeaderKey`). Go echoes the full
-/// header set with no safe-subset filtering (`system.go:115`).
-fn echo_all_headers_multi(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
+/// Headers that are useful for webhook diagnostics and safe to reflect.
+const SAFE_ECHO_HEADERS: &[&str] = &[
+    "accept",
+    "content-length",
+    "content-type",
+    "user-agent",
+    "x-correlation-id",
+    "x-request-id",
+    "x-webhook-id",
+    "x-webhook-timestamp",
+];
+
+fn echo_safe_headers_multi(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, value) in headers.iter() {
+        if !SAFE_ECHO_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
         if let Ok(s) = value.to_str() {
             out.entry(canonical_mime_header(name.as_str()))
                 .or_default()
@@ -70,10 +78,8 @@ fn echo_all_headers_multi(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> 
     out
 }
 
-/// Parse a raw query string into a multi-valued map, mirroring Go
-/// `url.ParseQuery` → `url.Values` (`map[string][]string`). `+` decodes to
-/// space (form encoding); `%XX` is left to the caller's downstream decoder —
-/// the wire contract is the raw form value as Go preserves it.
+/// Parse a raw query string into a multi-valued map using standard URL form
+/// decoding (`+` to space and `%XX` to UTF-8), mirroring Go `url.ParseQuery`.
 fn parse_query_multi(query: Option<&str>) -> BTreeMap<String, Vec<String>> {
     let Some(q) = query else {
         return BTreeMap::new();
@@ -82,12 +88,10 @@ fn parse_query_multi(query: Option<&str>) -> BTreeMap<String, Vec<String>> {
         return BTreeMap::new();
     }
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for pair in q.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        out.entry(k.to_owned()).or_default().push(v.to_owned());
+    for (key, value) in url::form_urlencoded::parse(q.as_bytes()) {
+        out.entry(key.into_owned())
+            .or_default()
+            .push(value.into_owned());
     }
     out
 }
@@ -165,10 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn echo_response_echoes_all_headers_multi_valued_canonical_case() {
-        // Go echoes the full header set (no safe-subset) as map[string][]string
-        // keyed by canonical MIME name. Authorization / x-api-key MUST appear
-        // — Go does not filter them.
+    fn echo_response_only_echoes_allowlisted_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -180,6 +181,8 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer secret"),
         );
+        headers.insert("x-api-key", HeaderValue::from_static("secret-key"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
         // Multi-valued header (Go http.Header preserves all values).
         headers.append("x-multi", HeaderValue::from_static("a"));
         headers.append("x-multi", HeaderValue::from_static("b"));
@@ -187,34 +190,33 @@ mod tests {
         let response =
             webhook_echo_response(&Method::GET, "/webhooks/echo", None, &headers, Value::Null);
 
-        // Full set, canonical keys, multi-valued.
+        // Safe values retain canonical keys; credentials, proxy routing, and
+        // unknown fields are never reflected.
         assert_eq!(
             response.headers.get("Content-Type"),
             Some(&vec!["application/json".to_owned()])
-        );
-        assert_eq!(
-            response.headers.get("Authorization"),
-            Some(&vec!["Bearer secret".to_owned()])
-        );
-        assert_eq!(
-            response.headers.get("X-Multi"),
-            Some(&vec!["a".to_owned(), "b".to_owned()])
         );
         assert_eq!(
             response.headers.get("X-Request-Id"),
             Some(&vec!["req_123".to_owned()])
         );
         assert!(response.headers.contains_key("Accept"));
+        assert!(!response.headers.contains_key("Authorization"));
+        assert!(!response.headers.contains_key("X-Api-Key"));
+        assert!(!response.headers.contains_key("X-Forwarded-For"));
+        assert!(!response.headers.contains_key("X-Multi"));
     }
 
     #[test]
     fn query_multi_valued_groups_repeated_keys() {
-        let table = parse_query_multi(Some("tag=a&tag=b&single=1&empty="));
+        let table = parse_query_multi(Some(
+            "tag=a%2Fb&tag=hello+world&single=%E4%B8%AD%E6%96%87&empty=",
+        ));
         assert_eq!(
             table.get("tag"),
-            Some(&vec!["a".to_owned(), "b".to_owned()])
+            Some(&vec!["a/b".to_owned(), "hello world".to_owned()])
         );
-        assert_eq!(table.get("single"), Some(&vec!["1".to_owned()]));
+        assert_eq!(table.get("single"), Some(&vec!["中文".to_owned()]));
         assert_eq!(table.get("empty"), Some(&vec![String::new()]));
         assert!(parse_query_multi(None).is_empty());
         assert!(parse_query_multi(Some("")).is_empty());

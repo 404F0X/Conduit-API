@@ -22,10 +22,17 @@ const transpiled = ts
     "import { getProjectIdFromStorage } from '@/stores/projectStore';",
     'const getProjectIdFromStorage = () => globalThis.__projectId ?? null;'
   )
+  .replaceAll("import { withBasePath } from '@/lib/base-path';", 'const withBasePath = (path) => path;')
   .replaceAll("import i18n from '@/lib/i18n';", 'const i18n = { t: (key) => key };');
 
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled).toString('base64')}`;
-const { graphqlRequest, isUnauthorizedGraphQLError } = await import(moduleUrl);
+globalThis.window = {
+  location: {
+    pathname: '/wallet',
+    replace() {},
+  },
+};
+const { GraphQLRequestError, graphqlRequest, isAuthError, isUnauthorizedGraphQLError } = await import(moduleUrl);
 
 test('does not classify upstream unauthorized provider failures as login expiration', () => {
   const error = {
@@ -38,6 +45,48 @@ test('does not classify upstream unauthorized provider failures as login expirat
 
 test('classifies explicit GraphQL authentication codes as login expiration', () => {
   assert.equal(isUnauthorizedGraphQLError({ extensions: { code: 'UNAUTHENTICATED' } }), true);
+});
+
+test('marks an HTTP 401 as an authentication error for feature-level failure handling', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 401 });
+
+  try {
+    await assert.rejects(graphqlRequest('mutation RedeemCreditCode { redeemCreditCode(code: "x") { id } }'), (error) => {
+      assert.equal(error instanceof GraphQLRequestError, true);
+      assert.equal(isAuthError(error), true);
+      assert.equal(error.status, 401);
+      return true;
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('marks a 200 GraphQL UNAUTHENTICATED response as an authentication error', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        data: null,
+        errors: [{ message: 'session expired', extensions: { code: 'UNAUTHENTICATED' } }],
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }
+    );
+
+  try {
+    await assert.rejects(graphqlRequest('mutation RedeemCreditCode { redeemCreditCode(code: "x") { id } }'), (error) => {
+      assert.equal(error instanceof GraphQLRequestError, true);
+      assert.equal(isAuthError(error), true);
+      assert.equal(error.status, 401);
+      return true;
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('sends the selected project by default and allows an explicit override', async () => {
@@ -64,4 +113,30 @@ test('sends the selected project by default and allows an explicit override', as
 
   assert.equal(requests[0].headers['X-Project-ID'], 'gid://conduit/Project/7');
   assert.equal(requests[1].headers['X-Project-ID'], 'gid://conduit/Project/9');
+});
+
+test('turns a successful HTTP response with GraphQL errors into a catchable non-auth error', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        data: null,
+        errors: [{ message: 'credit redemption code is invalid or unavailable' }],
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }
+    );
+
+  try {
+    await assert.rejects(graphqlRequest('mutation RedeemCreditCode { redeemCreditCode(code: "invalid") { id } }'), (error) => {
+      assert.equal(error instanceof GraphQLRequestError, true);
+      assert.equal(error.isAuthError, false);
+      assert.equal(error.message, 'credit redemption code is invalid or unavailable');
+      return true;
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

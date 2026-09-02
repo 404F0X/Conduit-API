@@ -13,6 +13,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use conduit_admin_graphql::channel::OrderDirection;
 use conduit_admin_graphql::node::parse_guid;
 use conduit_admin_graphql::pagination::{connection_from_offset_page, decode_offset_cursor};
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::role::{
     Role, RoleConnection, RoleConnectionArgs, RoleEdge, RoleLevel, RoleOrderTerm,
 };
@@ -21,6 +22,7 @@ use conduit_admin_graphql::user::{
     AddUserToProjectInput, CreateUserInput, RemoveUserFromProjectInput, UpdateProjectUserInput,
     UpdateUserInput, User, UserConnection, UserConnectionArgs, UserEdge, UserMutationServices,
     UserOrderTerm, UserProject, UserQueryServices, UserServiceError, UserStatus, UserWhereInput,
+    validate_create_user_input, validate_update_user_input,
 };
 use conduit_auth::encode_password_bcrypt_hex;
 use conduit_db::row::{RoleRow, UserProjectRow, UserRow};
@@ -524,6 +526,25 @@ async fn add_roles(
                 "role {role_id} does not belong to project {project_id}"
             )));
         }
+        if project_constraint.is_none()
+            && level == "project"
+            && let Some(project_id) = role_project_id
+        {
+            let is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM user_projects \
+                 WHERE user_id = $1 AND project_id = $2)",
+            )
+            .bind(user_id)
+            .bind(project_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| wrap(error.to_string()))?;
+            if !is_member {
+                return Err(wrap(format!(
+                    "user {user_id} is not a member of role {role_id}'s project"
+                )));
+            }
+        }
         sqlx::query(
             "INSERT INTO user_roles (user_id, role_id, created_at, updated_at) \
              VALUES ($1, $2, now(), now()) \
@@ -542,12 +563,29 @@ async fn remove_roles(
     tx: &mut Transaction<'_, Postgres>,
     user_id: i64,
     role_ids: &[async_graphql::ID],
+    project_constraint: Option<i64>,
     wrap: fn(String) -> UserServiceError,
 ) -> Result<(), UserServiceError> {
     for raw in role_ids {
+        let role_id = db_id(raw.as_str())?;
+        if let Some(project_id) = project_constraint {
+            let role: Option<(String, Option<i64>)> = sqlx::query_as(
+                "SELECT level, project_id FROM roles WHERE id = $1 AND deleted_at = 0",
+            )
+            .bind(role_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| wrap(error.to_string()))?;
+            if !matches!(role, Some((ref level, Some(role_project_id))) if level == "project" && role_project_id == project_id)
+            {
+                return Err(wrap(format!(
+                    "role {role_id} does not belong to project {project_id}"
+                )));
+            }
+        }
         sqlx::query("DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2")
             .bind(user_id)
-            .bind(db_id(raw.as_str())?)
+            .bind(role_id)
             .execute(&mut **tx)
             .await
             .map_err(|error| wrap(error.to_string()))?;
@@ -608,11 +646,135 @@ async fn ensure_not_last_system_owner(
     Ok(())
 }
 
+async fn add_project_memberships(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: i64,
+    project_ids: &[async_graphql::ID],
+    wrap: fn(String) -> UserServiceError,
+) -> Result<(), UserServiceError> {
+    for raw in project_ids {
+        let project_id = db_id(raw.as_str())?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND deleted_at = 0)",
+        )
+        .bind(project_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|error| wrap(error.to_string()))?;
+        if !exists {
+            return Err(wrap(format!("project {project_id} not found")));
+        }
+        sqlx::query(
+            "INSERT INTO user_projects (user_id, project_id, is_owner, scopes) \
+             VALUES ($1, $2, FALSE, '[]'::jsonb) \
+             ON CONFLICT (user_id, project_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| wrap(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn remove_project_membership(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: i64,
+    project_id: i64,
+    wrap: fn(String) -> UserServiceError,
+) -> Result<(), UserServiceError> {
+    let current_owner: Option<bool> = sqlx::query_scalar(
+        "SELECT is_owner FROM user_projects \
+         WHERE user_id = $1 AND project_id = $2 FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| wrap(error.to_string()))?;
+    let Some(current_owner) = current_owner else {
+        return Ok(());
+    };
+    ensure_not_last_project_owner(tx, user_id, project_id, current_owner, wrap).await?;
+    sqlx::query(
+        "DELETE FROM user_roles WHERE user_id = $1 \
+         AND role_id IN (SELECT id FROM roles WHERE project_id = $2)",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| wrap(error.to_string()))?;
+    sqlx::query("DELETE FROM user_projects WHERE user_id = $1 AND project_id = $2")
+        .bind(user_id)
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| wrap(error.to_string()))?;
+    Ok(())
+}
+
+async fn clear_project_memberships(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: i64,
+    wrap: fn(String) -> UserServiceError,
+) -> Result<(), UserServiceError> {
+    let memberships: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT project_id, is_owner FROM user_projects \
+         WHERE user_id = $1 ORDER BY project_id FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| wrap(error.to_string()))?;
+    for (project_id, is_owner) in memberships {
+        ensure_not_last_project_owner(tx, user_id, project_id, is_owner, wrap).await?;
+    }
+    sqlx::query(
+        "DELETE FROM user_roles WHERE user_id = $1 \
+         AND role_id IN (SELECT id FROM roles WHERE level = 'project')",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| wrap(error.to_string()))?;
+    sqlx::query("DELETE FROM user_projects WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| wrap(error.to_string()))?;
+    Ok(())
+}
+
 #[async_trait]
 impl UserQueryServices for PostgresUserServiceAdapter {
     async fn users(&self, args: UserConnectionArgs) -> Result<UserConnection, UserServiceError> {
+        self.users_with_access(&AdminAccessScope::Global, args)
+            .await
+    }
+
+    async fn users_with_access(
+        &self,
+        access: &AdminAccessScope,
+        args: UserConnectionArgs,
+    ) -> Result<UserConnection, UserServiceError> {
         let facts = self.load_edge_facts().await?;
         let mut rows = self.load_all_users().await?;
+        if let Some(project_id) = access.project_id() {
+            let project_id = db_id(project_id)?;
+            let member_ids: Vec<i64> =
+                sqlx::query_scalar("SELECT user_id FROM user_projects WHERE project_id = $1")
+                    .bind(project_id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|error| UserServiceError::Query(error.to_string()))?;
+            rows.retain(|row| {
+                row.id
+                    .parse::<i64>()
+                    .is_ok_and(|id| member_ids.contains(&id))
+            });
+        }
         if let Some(where_) = &args.where_filter {
             let empty = UserEdgeFacts::default();
             rows.retain(|row| user_matches(row, where_, facts.get(&row.id).unwrap_or(&empty)));
@@ -684,6 +846,16 @@ impl UserQueryServices for PostgresUserServiceAdapter {
         user_id: &str,
         args: RoleConnectionArgs,
     ) -> Result<RoleConnection, UserServiceError> {
+        self.roles_for_user_with_access(&AdminAccessScope::Global, user_id, args)
+            .await
+    }
+
+    async fn roles_for_user_with_access(
+        &self,
+        access: &AdminAccessScope,
+        user_id: &str,
+        args: RoleConnectionArgs,
+    ) -> Result<RoleConnection, UserServiceError> {
         let user_id = db_id(user_id)?;
         let mut rows = sqlx::query_as::<_, RoleRow>(&format!(
             "SELECT {ROLE_COLUMNS} FROM roles r \
@@ -694,6 +866,10 @@ impl UserQueryServices for PostgresUserServiceAdapter {
         .fetch_all(&self.pool)
         .await
         .map_err(|error| UserServiceError::Query(error.to_string()))?;
+        if let Some(project_id) = access.project_id() {
+            let project_id = db_id(project_id)?.to_string();
+            rows.retain(|row| row.level == "project" && row.project_id == project_id);
+        }
         if let Some(project_id) = args
             .where_filter
             .as_ref()
@@ -790,6 +966,7 @@ fn unique_violation(error: &sqlx::Error) -> bool {
 #[async_trait]
 impl UserMutationServices for PostgresUserServiceAdapter {
     async fn create_user(&self, input: CreateUserInput) -> Result<User, UserServiceError> {
+        validate_create_user_input(&input)?;
         let password = if input.password == OIDC_ONLY_PLACEHOLDER {
             OIDC_ONLY_PLACEHOLDER.to_string()
         } else {
@@ -802,14 +979,27 @@ impl UserMutationServices for PostgresUserServiceAdapter {
             .await
             .map_err(|error| UserServiceError::Create(error.to_string()))?;
         let result = sqlx::query_as::<_, UserRow>(&format!(
-            "INSERT INTO users (email, password, first_name, last_name, scopes) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING {USER_COLUMNS}"
+            "INSERT INTO users (email, password, status, prefer_language, \
+             first_name, last_name, avatar, is_owner, scopes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING {USER_COLUMNS}"
         ))
         .bind(&input.email)
         .bind(password)
-        .bind(input.first_name.unwrap_or_default())
-        .bind(input.last_name.unwrap_or_default())
-        .bind(sqlx::types::Json(input.scopes.unwrap_or_default()))
+        .bind(status_to_wire(
+            input.status.unwrap_or(UserStatus::Activated),
+        ))
+        .bind(
+            input
+                .prefer_language
+                .clone()
+                .unwrap_or_else(|| "en".to_owned()),
+        )
+        .bind(input.first_name.clone().unwrap_or_default())
+        .bind(input.last_name.clone().unwrap_or_default())
+        .bind(input.avatar.clone())
+        .bind(input.is_owner.unwrap_or(false))
+        .bind(sqlx::types::Json(input.scopes.clone().unwrap_or_default()))
         .fetch_one(&mut *tx)
         .await;
         let row = match result {
@@ -819,6 +1009,15 @@ impl UserMutationServices for PostgresUserServiceAdapter {
             }
             Err(error) => return Err(UserServiceError::Create(error.to_string())),
         };
+        if let Some(project_ids) = &input.project_ids {
+            add_project_memberships(
+                &mut tx,
+                db_id(&row.id)?,
+                project_ids,
+                UserServiceError::Create,
+            )
+            .await?;
+        }
         if let Some(role_ids) = &input.role_ids {
             add_roles(
                 &mut tx,
@@ -840,6 +1039,7 @@ impl UserMutationServices for PostgresUserServiceAdapter {
         id: &str,
         input: UpdateUserInput,
     ) -> Result<User, UserServiceError> {
+        validate_update_user_input(&input)?;
         let user_id = db_id(id)?;
         let mut tx = self
             .pool
@@ -857,7 +1057,12 @@ impl UserMutationServices for PostgresUserServiceAdapter {
         let Some((current_scopes, current_owner, current_status)) = current else {
             return Err(UserServiceError::Update("user not found".to_string()));
         };
-        if input.is_owner == Some(false) && current_status == "activated" {
+        let demoting_active_owner =
+            input.is_owner == Some(false) && current_owner && current_status == "activated";
+        let deactivating_owner = input.status == Some(UserStatus::Deactivated)
+            && current_owner
+            && current_status == "activated";
+        if demoting_active_owner || deactivating_owner {
             ensure_not_last_system_owner(&mut tx, user_id, current_owner, UserServiceError::Update)
                 .await?;
         }
@@ -886,6 +1091,10 @@ impl UserMutationServices for PostgresUserServiceAdapter {
         let mut set = builder.separated(", ");
         if let Some(value) = input.email.clone() {
             set.push("email = ").push_bind_unseparated(value);
+        }
+        if let Some(value) = input.status {
+            set.push("status = ")
+                .push_bind_unseparated(status_to_wire(value));
         }
         if let Some(value) = input.prefer_language.clone() {
             set.push("prefer_language = ").push_bind_unseparated(value);
@@ -923,6 +1132,24 @@ impl UserMutationServices for PostgresUserServiceAdapter {
             }
             return Err(UserServiceError::Update(error.to_string()));
         }
+        if input.clear_projects == Some(true) {
+            clear_project_memberships(&mut tx, user_id, UserServiceError::Update).await?;
+        } else {
+            if let Some(add) = &input.add_project_ids {
+                add_project_memberships(&mut tx, user_id, add, UserServiceError::Update).await?;
+            }
+            if let Some(remove) = &input.remove_project_ids {
+                for project_id in remove {
+                    remove_project_membership(
+                        &mut tx,
+                        user_id,
+                        db_id(project_id.as_str())?,
+                        UserServiceError::Update,
+                    )
+                    .await?;
+                }
+            }
+        }
         if input.clear_roles == Some(true) {
             sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
                 .bind(user_id)
@@ -934,7 +1161,7 @@ impl UserMutationServices for PostgresUserServiceAdapter {
             add_roles(&mut tx, user_id, add, None, UserServiceError::Update).await?;
         }
         if let Some(remove) = &input.remove_role_ids {
-            remove_roles(&mut tx, user_id, remove, UserServiceError::Update).await?;
+            remove_roles(&mut tx, user_id, remove, None, UserServiceError::Update).await?;
         }
         let row = sqlx::query_as::<_, UserRow>(&format!(
             "SELECT {USER_COLUMNS} FROM users WHERE id = $1 AND deleted_at = 0"
@@ -1259,6 +1486,7 @@ impl UserMutationServices for PostgresUserServiceAdapter {
                 &mut tx,
                 user_id,
                 remove,
+                Some(project_id),
                 UserServiceError::UpdateProjectUser,
             )
             .await?;
@@ -1328,6 +1556,13 @@ mod tests {
         .bind(project_id)
         .fetch_one(&pool)
         .await?;
+        let system_role_id: i64 = sqlx::query_scalar(
+            "INSERT INTO roles (name, level, scopes) \
+             VALUES ($1, 'system', '[\"read_users\"]'::jsonb) RETURNING id",
+        )
+        .bind(format!("pg-user-system-role-{suffix}"))
+        .fetch_one(&pool)
+        .await?;
         let adapter = Arc::new(PostgresUserServiceAdapter::with_bcrypt_cost(
             pool.clone(),
             4,
@@ -1361,6 +1596,36 @@ mod tests {
                 .await?
                 .total_count,
             1
+        );
+        sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)")
+            .bind(first_id)
+            .bind(system_role_id)
+            .execute(&pool)
+            .await?;
+        for (add_role_ids, remove_role_ids) in [
+            (Some(vec![system_role_id.to_string().into()]), None),
+            (None, Some(vec![system_role_id.to_string().into()])),
+        ] {
+            let result = adapter
+                .update_project_user(UpdateProjectUserInput {
+                    project_id: project_id.to_string().into(),
+                    user_id: first_id.to_string().into(),
+                    is_owner: None,
+                    scopes: None,
+                    add_role_ids,
+                    remove_role_ids,
+                })
+                .await;
+            assert!(result.is_err(), "system role mutation must be rejected");
+        }
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM user_roles WHERE user_id = $1 AND role_id = $2)",
+            )
+            .bind(first_id)
+            .bind(system_role_id)
+            .fetch_one(&pool)
+            .await?
         );
         assert!(
             adapter

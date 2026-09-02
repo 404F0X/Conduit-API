@@ -57,8 +57,13 @@ pub async fn ensure_upstream_model_deployments_postgres(pool: &PgPool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conduit_db::repo::channel_repo::{
+        CreateChannelInput as RepoCreateChannelInput, UpdateChannelInput as RepoUpdateChannelInput,
+    };
+    use conduit_db::{ChannelRepo, PgChannelRepo, PolicyContext, Principal, RequestContext};
+
     #[tokio::test]
-    async fn postgres_trigger_tracks_supported_model_inventory_when_dsn_is_provided()
+    async fn postgres_channel_repo_writes_materialize_supported_model_inventory_when_dsn_is_provided()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
             return Ok(());
@@ -67,12 +72,47 @@ mod tests {
         conduit_db::connection::migrate_postgres_with_flag(&pool, false).await?;
         ensure_upstream_model_deployments_postgres(&pool).await?;
         let name = format!("pg-catalog-{}", uuid::Uuid::new_v4().simple());
-        let channel_id=sqlx::query_scalar::<_,i64>("INSERT INTO channels(\"type\",name,status,credentials,supported_models,default_test_model) VALUES('openai',$1,'enabled','{}'::jsonb,'[\"same-model\"]'::jsonb,'same-model') RETURNING id")
-            .bind(name).fetch_one(&pool).await?;
-        sqlx::query("UPDATE channels SET supported_models='[\"other-model\"]'::jsonb WHERE id=$1")
-            .bind(channel_id)
-            .execute(&pool)
+        let repo = PgChannelRepo::new(pool.clone());
+        let ctx = RequestContext::new(PolicyContext::new(Principal::test()));
+        let channel = repo
+            .create_channel(
+                &ctx,
+                RepoCreateChannelInput {
+                    id: String::new(),
+                    channel_type: "openai".into(),
+                    name,
+                    base_url: Some("http://127.0.0.1:18099/v1".into()),
+                    website_url: None,
+                    quota_currency: Some("USD".into()),
+                    actual_quota_used: None,
+                    quota_remaining: None,
+                    credentials: serde_json::json!({}),
+                    supported_models: vec!["same-model".into()],
+                    manual_models: Vec::new(),
+                    default_test_model: "same-model".into(),
+                    auto_sync_supported_models: false,
+                    auto_sync_model_pattern: String::new(),
+                    tags: Vec::new(),
+                    policies: None,
+                    settings: None,
+                    endpoints: Vec::new(),
+                    remark: None,
+                    ordering_weight: 0,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
             .await?;
+        let channel_id = channel.id.parse::<i64>()?;
+        repo.update_channel(
+            &ctx,
+            &channel.id,
+            RepoUpdateChannelInput {
+                supported_models: Some(vec!["other-model".into()]),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
+        )
+        .await?;
         let rows=sqlx::query_as::<_,(String,String)>("SELECT upstream_model_id,status FROM upstream_model_deployments WHERE channel_id=$1 ORDER BY upstream_model_id")
             .bind(channel_id).fetch_all(&pool).await?;
         assert_eq!(
@@ -96,13 +136,28 @@ mod tests {
             .await?,
             "disabled"
         );
-        sqlx::query(
-            "UPDATE channels SET supported_models='[\"other-model\"]'::jsonb,deleted_at=1 \
-             WHERE id=$1",
+        repo.update_channel(
+            &ctx,
+            &channel.id,
+            RepoUpdateChannelInput {
+                supported_models: Some(vec!["other-model".into()]),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            },
         )
-        .bind(channel_id)
-        .execute(&pool)
         .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM upstream_model_deployments \
+                 WHERE channel_id=$1 AND upstream_model_id='other-model'"
+            )
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await?,
+            "enabled"
+        );
+        repo.soft_delete_channel(&ctx, &channel.id, &chrono::Utc::now().to_rfc3339())
+            .await?;
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT status FROM upstream_model_deployments \

@@ -52,6 +52,7 @@ use async_graphql::{Context, Enum, ID, InputObject, SimpleObject};
 
 use crate::channel::OrderDirection;
 use crate::pagination::PageInfo;
+use crate::policy::AdminAccessScope;
 use crate::scalars::{CursorScalar, TimeScalar};
 
 // ---------------------------------------------------------------------------
@@ -353,6 +354,19 @@ pub struct RoleConnectionArgs {
 #[async_trait::async_trait]
 pub trait RoleQueryServices: Send + Sync {
     async fn roles(&self, args: RoleConnectionArgs) -> Result<RoleConnection, RoleServiceError>;
+
+    async fn roles_with_access(
+        &self,
+        access: &AdminAccessScope,
+        args: RoleConnectionArgs,
+    ) -> Result<RoleConnection, RoleServiceError> {
+        match access {
+            AdminAccessScope::Global => self.roles(args).await,
+            AdminAccessScope::Project(_) => Err(RoleServiceError::PermissionDenied(
+                "project-scoped role listing is not supported by this service".to_owned(),
+            )),
+        }
+    }
 }
 
 /// Backs the four CRUD mutations (Go `biz.RoleService`).
@@ -361,16 +375,77 @@ pub trait RoleMutationServices: Send + Sync {
     /// Mirrors `RoleService.CreateRole` (biz/role.go:42).
     async fn create_role(&self, input: CreateRoleInput) -> Result<Role, RoleServiceError>;
 
+    async fn create_role_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: CreateRoleInput,
+    ) -> Result<Role, RoleServiceError> {
+        if let AdminAccessScope::Project(_) = access
+            && (input.level != Some(RoleLevel::Project)
+                || input
+                    .project_id
+                    .as_ref()
+                    .is_none_or(|project_id| !access.allows_project(project_id.as_str())))
+        {
+            return Err(RoleServiceError::PermissionDenied(
+                "project-scoped permission can only create roles in the authorized project"
+                    .to_owned(),
+            ));
+        }
+        self.create_role(input).await
+    }
+
     /// Mirrors `RoleService.UpdateRole` (biz/role.go:115).
     async fn update_role(&self, id: &str, input: UpdateRoleInput)
     -> Result<Role, RoleServiceError>;
 
+    async fn update_role_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        input: UpdateRoleInput,
+    ) -> Result<Role, RoleServiceError> {
+        match access {
+            AdminAccessScope::Global => self.update_role(id, input).await,
+            AdminAccessScope::Project(_) => Err(RoleServiceError::PermissionDenied(
+                "project-scoped role updates require a scoped service boundary".to_owned(),
+            )),
+        }
+    }
+
     /// Mirrors `RoleService.DeleteRole` (biz/role.go:179).
     async fn delete_role(&self, id: &str) -> Result<(), RoleServiceError>;
+
+    async fn delete_role_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+    ) -> Result<(), RoleServiceError> {
+        match access {
+            AdminAccessScope::Global => self.delete_role(id).await,
+            AdminAccessScope::Project(_) => Err(RoleServiceError::PermissionDenied(
+                "project-scoped role deletion requires a scoped service boundary".to_owned(),
+            )),
+        }
+    }
 
     /// Mirrors `RoleService.BulkDeleteRoles` (biz/role.go:214). Empty ids
     /// is a no-op (Go iterates the empty slice and returns nil).
     async fn bulk_delete_roles(&self, ids: Vec<String>) -> Result<(), RoleServiceError>;
+
+    async fn bulk_delete_roles_with_access(
+        &self,
+        access: &AdminAccessScope,
+        ids: Vec<String>,
+    ) -> Result<(), RoleServiceError> {
+        match access {
+            AdminAccessScope::Global => self.bulk_delete_roles(ids).await,
+            AdminAccessScope::Project(_) if ids.is_empty() => Ok(()),
+            AdminAccessScope::Project(_) => Err(RoleServiceError::PermissionDenied(
+                "project-scoped bulk role deletion requires a scoped service boundary".to_owned(),
+            )),
+        }
+    }
 }
 
 pub(crate) fn role_query_services(ctx: &Context<'_>) -> Result<Arc<dyn RoleQueryServices>, String> {
@@ -482,6 +557,30 @@ mod tests {
                 total_count,
             })
         }
+
+        async fn roles_with_access(
+            &self,
+            access: &AdminAccessScope,
+            args: RoleConnectionArgs,
+        ) -> Result<RoleConnection, RoleServiceError> {
+            let mut connection = self.roles(args).await?;
+            if let AdminAccessScope::Project(_) = access {
+                let edges = connection.edges.get_or_insert_default();
+                edges.retain(|edge| {
+                    edge.as_ref()
+                        .and_then(|edge| edge.node.as_ref())
+                        .is_some_and(|role| {
+                            role.level == RoleLevel::Project
+                                && role
+                                    .project_id
+                                    .as_ref()
+                                    .is_some_and(|id| access.allows_project(id.as_str()))
+                        })
+                });
+                connection.total_count = edges.len() as i64;
+            }
+            Ok(connection)
+        }
     }
 
     #[async_trait::async_trait]
@@ -557,6 +656,28 @@ mod tests {
             Ok(role.clone())
         }
 
+        async fn update_role_with_access(
+            &self,
+            access: &AdminAccessScope,
+            id: &str,
+            input: UpdateRoleInput,
+        ) -> Result<Role, RoleServiceError> {
+            let allowed = lock(&self.roles).iter().any(|role| {
+                role.id.as_str() == id
+                    && role.level == RoleLevel::Project
+                    && role
+                        .project_id
+                        .as_ref()
+                        .is_some_and(|project_id| access.allows_project(project_id.as_str()))
+            });
+            if matches!(access, AdminAccessScope::Project(_)) && !allowed {
+                return Err(RoleServiceError::PermissionDenied(
+                    "role does not belong to the authorized project".to_owned(),
+                ));
+            }
+            self.update_role(id, input).await
+        }
+
         async fn delete_role(&self, id: &str) -> Result<(), RoleServiceError> {
             let mut guard = lock(&self.roles);
             let before = guard.len();
@@ -567,6 +688,27 @@ mod tests {
                 )));
             }
             Ok(())
+        }
+
+        async fn delete_role_with_access(
+            &self,
+            access: &AdminAccessScope,
+            id: &str,
+        ) -> Result<(), RoleServiceError> {
+            let allowed = lock(&self.roles).iter().any(|role| {
+                role.id.as_str() == id
+                    && role.level == RoleLevel::Project
+                    && role
+                        .project_id
+                        .as_ref()
+                        .is_some_and(|project_id| access.allows_project(project_id.as_str()))
+            });
+            if matches!(access, AdminAccessScope::Project(_)) && !allowed {
+                return Err(RoleServiceError::PermissionDenied(
+                    "role does not belong to the authorized project".to_owned(),
+                ));
+            }
+            self.delete_role(id).await
         }
 
         async fn bulk_delete_roles(&self, ids: Vec<String>) -> Result<(), RoleServiceError> {
@@ -584,11 +726,41 @@ mod tests {
     fn schema_with(store: &InMemoryRoleService) -> AdminSchema {
         let query: Arc<dyn RoleQueryServices> = Arc::new(store.clone());
         let mutation: Arc<dyn RoleMutationServices> = Arc::new(store.clone());
-        admin_schema_builder().data(query).data(mutation).finish()
+        admin_schema_builder()
+            .data(query)
+            .data(mutation)
+            .data(system_context())
+            .finish()
     }
 
     fn bare_schema() -> AdminSchema {
-        crate::build_admin_schema()
+        admin_schema_builder().data(system_context()).finish()
+    }
+
+    fn system_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(conduit_auth::Principal::system());
+        context
+    }
+
+    fn project_ctx(project_id: &str) -> conduit_auth::request_context::RequestContext {
+        let principal = conduit_auth::Principal::user("actor")
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::WRITE_ROLES,
+            ))
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::READ_ROLES,
+            ))
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::READ_USERS,
+            ));
+        let mut rc = conduit_auth::request_context::RequestContext::new();
+        let _ = rc.set_principal(principal);
+        let _ = rc.set_project_id(project_id);
+        rc
     }
 
     // -----------------------------------------------------------------
@@ -985,5 +1157,97 @@ mod tests {
             msg.contains("role service is not available"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn project_role_grant_ceiling_allows_same_project_and_rejects_other_targets()
+    -> Result<(), TestError> {
+        let store = InMemoryRoleService::default();
+        let schema = schema_with(&store);
+
+        let same_project = schema
+            .execute(
+                async_graphql::Request::new(
+                    r#"mutation {
+                        createRole(input: {
+                            name: "same-project"
+                            level: project
+                            projectID: "A"
+                            scopes: ["read_users"]
+                        }) { id projectID scopes }
+                    }"#,
+                )
+                .data(project_ctx("A")),
+            )
+            .await;
+        assert!(
+            same_project.errors.is_empty(),
+            "same-project grant failed: {:?}",
+            same_project.errors
+        );
+
+        for mutation in [
+            r#"mutation { createRole(input: { name: "project-b", level: project, projectID: "B", scopes: ["read_users"] }) { id } }"#,
+            r#"mutation { createRole(input: { name: "system", level: system, scopes: ["read_users"] }) { id } }"#,
+        ] {
+            let response = schema
+                .execute(async_graphql::Request::new(mutation).data(project_ctx("A")))
+                .await;
+            assert_eq!(response.errors.len(), 1);
+            assert!(
+                response.errors[0].message.contains("permission denied"),
+                "unexpected error: {}",
+                response.errors[0].message
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_scoped_role_operations_hide_system_and_project_b_roles()
+    -> Result<(), TestError> {
+        let store = InMemoryRoleService::default();
+        let mut project_a = sample_role(1, "project-a", RoleLevel::Project);
+        project_a.project_id = Some("A".into());
+        let mut project_b = sample_role(2, "project-b", RoleLevel::Project);
+        project_b.project_id = Some("B".into());
+        let system = sample_role(3, "system", RoleLevel::System);
+        lock(&store.roles).extend([project_a, project_b, system]);
+        let schema = schema_with(&store);
+
+        let listed = schema
+            .execute(
+                async_graphql::Request::new("{ roles { totalCount edges { node { name } } } }")
+                    .data(project_ctx("A")),
+            )
+            .await;
+        assert!(listed.errors.is_empty(), "errors: {:?}", listed.errors);
+        let data = listed.data.into_json()?;
+        assert_eq!(data["roles"]["totalCount"], 1);
+        assert_eq!(data["roles"]["edges"][0]["node"]["name"], "project-a");
+
+        let allowed = schema
+            .execute(
+                async_graphql::Request::new(
+                    r#"mutation { updateRole(id: "1", input: { name: "updated-a" }) { name } }"#,
+                )
+                .data(project_ctx("A")),
+            )
+            .await;
+        assert!(allowed.errors.is_empty(), "errors: {:?}", allowed.errors);
+
+        for mutation in [
+            r#"mutation { updateRole(id: "2", input: { name: "changed-b" }) { id } }"#,
+            r#"mutation { deleteRole(id: "3") }"#,
+        ] {
+            let response = schema
+                .execute(async_graphql::Request::new(mutation).data(project_ctx("A")))
+                .await;
+            assert_eq!(response.errors.len(), 1);
+            assert!(response.errors[0].message.contains("permission denied"));
+        }
+        assert_eq!(lock(&store.roles)[1].name, "project-b");
+        assert_eq!(lock(&store.roles)[2].name, "system");
+        Ok(())
     }
 }

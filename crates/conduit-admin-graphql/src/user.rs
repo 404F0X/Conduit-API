@@ -77,6 +77,7 @@ use async_graphql::{ComplexObject, Context, Enum, ID, InputObject, SimpleObject}
 
 use crate::channel::OrderDirection;
 use crate::pagination::PageInfo;
+use crate::policy::AdminAccessScope;
 use crate::role::{
     RoleConnection, RoleConnectionArgs, RoleOrder, RoleWhereInput, resolve_role_order,
 };
@@ -146,9 +147,15 @@ impl User {
         order_by: Option<RoleOrder>,
         #[graphql(name = "where")] where_filter: Option<RoleWhereInput>,
     ) -> Result<RoleConnection, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_ROLES)
+            .map_err(|error| error.to_string())?;
         let services = user_query_services(ctx)?;
+        let access =
+            AdminAccessScope::from_graphql_context(ctx, conduit_auth::scopes::slug::READ_ROLES)
+                .map_err(|error| error.to_string())?;
         services
-            .roles_for_user(
+            .roles_for_user_with_access(
+                &access,
                 self.id.as_str(),
                 RoleConnectionArgs {
                     after: after.map(|cursor| cursor.0),
@@ -201,15 +208,23 @@ pub struct UserProject {
 #[ComplexObject]
 impl UserProject {
     async fn user(&self, ctx: &Context<'_>) -> Result<User, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_USERS)
+            .map_err(|error| error.to_string())?;
+        let access =
+            AdminAccessScope::from_graphql_context(ctx, conduit_auth::scopes::slug::READ_USERS)
+                .map_err(|error| error.to_string())?;
         let connection = user_query_services(ctx)?
-            .users(UserConnectionArgs {
-                where_filter: Some(UserWhereInput {
-                    id: Some(self.user_id.clone()),
-                    ..UserWhereInput::default()
-                }),
-                first: Some(1),
-                ..UserConnectionArgs::default()
-            })
+            .users_with_access(
+                &access,
+                UserConnectionArgs {
+                    where_filter: Some(UserWhereInput {
+                        id: Some(self.user_id.clone()),
+                        ..UserWhereInput::default()
+                    }),
+                    first: Some(1),
+                    ..UserConnectionArgs::default()
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
         connection
@@ -561,6 +576,8 @@ pub enum UserServiceError {
     DuplicateEmail(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("unsupported user input fields: {0}")]
+    UnsupportedFields(String),
     #[error("failed to create user: {0}")]
     Create(String),
     #[error("failed to update user: {0}")]
@@ -597,13 +614,53 @@ pub struct UserConnectionArgs {
 pub trait UserQueryServices: Send + Sync {
     async fn users(&self, args: UserConnectionArgs) -> Result<UserConnection, UserServiceError>;
 
+    async fn users_with_access(
+        &self,
+        access: &AdminAccessScope,
+        args: UserConnectionArgs,
+    ) -> Result<UserConnection, UserServiceError> {
+        match access {
+            AdminAccessScope::Global => self.users(args).await,
+            AdminAccessScope::Project(_) => Err(UserServiceError::PermissionDenied(
+                "project-scoped user listing is not supported by this service".to_owned(),
+            )),
+        }
+    }
+
     async fn roles_for_user(
         &self,
         user_id: &str,
         args: RoleConnectionArgs,
     ) -> Result<RoleConnection, UserServiceError>;
 
+    async fn roles_for_user_with_access(
+        &self,
+        access: &AdminAccessScope,
+        user_id: &str,
+        args: RoleConnectionArgs,
+    ) -> Result<RoleConnection, UserServiceError> {
+        match access {
+            AdminAccessScope::Global => self.roles_for_user(user_id, args).await,
+            AdminAccessScope::Project(_) => Err(UserServiceError::PermissionDenied(
+                "project-scoped role listing is not supported by this service".to_owned(),
+            )),
+        }
+    }
+
     async fn project_users(&self, project_id: &str) -> Result<Vec<UserProject>, UserServiceError>;
+
+    async fn project_users_with_access(
+        &self,
+        access: &AdminAccessScope,
+        project_id: &str,
+    ) -> Result<Vec<UserProject>, UserServiceError> {
+        if !access.allows_project(project_id) {
+            return Err(UserServiceError::PermissionDenied(
+                "project does not match the authorized project".to_owned(),
+            ));
+        }
+        self.project_users(project_id).await
+    }
 }
 
 /// Backs the six User-domain mutations (Go `biz.UserService`).
@@ -612,9 +669,36 @@ pub trait UserMutationServices: Send + Sync {
     /// Mirrors `UserService.CreateUser` (biz/user.go:48).
     async fn create_user(&self, input: CreateUserInput) -> Result<User, UserServiceError>;
 
+    async fn create_user_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: CreateUserInput,
+    ) -> Result<User, UserServiceError> {
+        match access {
+            AdminAccessScope::Global => self.create_user(input).await,
+            AdminAccessScope::Project(_) => Err(UserServiceError::PermissionDenied(
+                "project-scoped permission cannot create global users".to_owned(),
+            )),
+        }
+    }
+
     /// Mirrors `UserService.UpdateUser` (biz/user.go:84).
     async fn update_user(&self, id: &str, input: UpdateUserInput)
     -> Result<User, UserServiceError>;
+
+    async fn update_user_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        input: UpdateUserInput,
+    ) -> Result<User, UserServiceError> {
+        match access {
+            AdminAccessScope::Global => self.update_user(id, input).await,
+            AdminAccessScope::Project(_) => Err(UserServiceError::PermissionDenied(
+                "project-scoped permission cannot update global users".to_owned(),
+            )),
+        }
+    }
 
     /// Mirrors `UserService.UpdateUserStatus` (biz/user.go:210).
     async fn update_user_status(
@@ -623,8 +707,35 @@ pub trait UserMutationServices: Send + Sync {
         status: UserStatus,
     ) -> Result<User, UserServiceError>;
 
+    async fn update_user_status_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+        status: UserStatus,
+    ) -> Result<User, UserServiceError> {
+        match access {
+            AdminAccessScope::Global => self.update_user_status(id, status).await,
+            AdminAccessScope::Project(_) => Err(UserServiceError::PermissionDenied(
+                "project-scoped permission cannot update global user status".to_owned(),
+            )),
+        }
+    }
+
     /// Mirrors `UserService.DeleteUser` (biz/user.go:533).
     async fn delete_user(&self, id: &str) -> Result<(), UserServiceError>;
+
+    async fn delete_user_with_access(
+        &self,
+        access: &AdminAccessScope,
+        id: &str,
+    ) -> Result<(), UserServiceError> {
+        match access {
+            AdminAccessScope::Global => self.delete_user(id).await,
+            AdminAccessScope::Project(_) => Err(UserServiceError::PermissionDenied(
+                "project-scoped permission cannot delete global users".to_owned(),
+            )),
+        }
+    }
 
     /// Mirrors `UserService.AddUserToProject` (biz/user.go:367).
     async fn add_user_to_project(
@@ -632,17 +743,66 @@ pub trait UserMutationServices: Send + Sync {
         input: AddUserToProjectInput,
     ) -> Result<UserProject, UserServiceError>;
 
+    async fn add_user_to_project_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: AddUserToProjectInput,
+    ) -> Result<UserProject, UserServiceError> {
+        if !access.allows_project(input.project_id.as_str()) {
+            return Err(UserServiceError::PermissionDenied(
+                "project does not match the authorized project".to_owned(),
+            ));
+        }
+        self.add_user_to_project(input).await
+    }
+
     /// Mirrors `UserService.RemoveUserFromProject` (biz/user.go:408).
     async fn remove_user_from_project(
         &self,
         input: RemoveUserFromProjectInput,
     ) -> Result<(), UserServiceError>;
 
+    async fn remove_user_from_project_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: RemoveUserFromProjectInput,
+    ) -> Result<(), UserServiceError> {
+        if !access.allows_project(input.project_id.as_str()) {
+            return Err(UserServiceError::PermissionDenied(
+                "project does not match the authorized project".to_owned(),
+            ));
+        }
+        self.remove_user_from_project(input).await
+    }
+
     /// Mirrors `UserService.UpdateProjectUser` (biz/user.go:447).
     async fn update_project_user(
         &self,
         input: UpdateProjectUserInput,
     ) -> Result<UserProject, UserServiceError>;
+
+    async fn update_project_user_with_access(
+        &self,
+        access: &AdminAccessScope,
+        input: UpdateProjectUserInput,
+    ) -> Result<UserProject, UserServiceError> {
+        if !access.allows_project(input.project_id.as_str()) {
+            return Err(UserServiceError::PermissionDenied(
+                "project does not match the authorized project".to_owned(),
+            ));
+        }
+        self.update_project_user(input).await
+    }
+}
+
+pub fn validate_create_user_input(input: &CreateUserInput) -> Result<(), UserServiceError> {
+    let _ = input;
+    Ok(())
+}
+
+pub fn validate_update_user_input(input: &UpdateUserInput) -> Result<(), UserServiceError> {
+    let _ = input;
+    Ok(())
 }
 
 pub(crate) fn user_query_services(ctx: &Context<'_>) -> Result<Arc<dyn UserQueryServices>, String> {
@@ -710,6 +870,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedRoleQueryService {
+        role: crate::role::Role,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::role::RoleQueryServices for FixedRoleQueryService {
+        async fn roles(
+            &self,
+            _args: crate::role::RoleConnectionArgs,
+        ) -> Result<crate::role::RoleConnection, crate::role::RoleServiceError> {
+            Ok(crate::role::RoleConnection {
+                edges: Some(vec![Some(crate::role::RoleEdge {
+                    node: Some(self.role.clone()),
+                    cursor: CursorScalar("0".to_owned()),
+                })]),
+                page_info: PageInfo::empty(false, false),
+                total_count: 1,
+            })
+        }
+    }
+
     #[async_trait::async_trait]
     impl UserQueryServices for InMemoryUserService {
         async fn users(
@@ -761,6 +943,29 @@ mod tests {
             })
         }
 
+        async fn users_with_access(
+            &self,
+            access: &AdminAccessScope,
+            args: UserConnectionArgs,
+        ) -> Result<UserConnection, UserServiceError> {
+            let mut connection = self.users(args).await?;
+            if let AdminAccessScope::Project(_) = access {
+                let member_ids: std::collections::HashSet<String> = lock(&self.user_projects)
+                    .iter()
+                    .filter(|membership| access.allows_project(membership.project_id.as_str()))
+                    .map(|membership| membership.user_id.to_string())
+                    .collect();
+                let edges = connection.edges.get_or_insert_default();
+                edges.retain(|edge| {
+                    edge.as_ref()
+                        .and_then(|edge| edge.node.as_ref())
+                        .is_some_and(|user| member_ids.contains(user.id.as_str()))
+                });
+                connection.total_count = edges.len() as i64;
+            }
+            Ok(connection)
+        }
+
         async fn roles_for_user(
             &self,
             _user_id: &str,
@@ -788,6 +993,7 @@ mod tests {
     #[async_trait::async_trait]
     impl UserMutationServices for InMemoryUserService {
         async fn create_user(&self, input: CreateUserInput) -> Result<User, UserServiceError> {
+            let project_ids = input.project_ids.clone().unwrap_or_default();
             let mut guard = lock(&self.users);
             // ent unique constraint: email.
             if guard.iter().any(|u| u.email == input.email) {
@@ -810,6 +1016,25 @@ mod tests {
                 scopes: input.scopes,
             };
             guard.push(created.clone());
+            drop(guard);
+            let mut memberships = lock(&self.user_projects);
+            for project_id in project_ids {
+                if memberships.iter().any(|membership| {
+                    membership.user_id == created.id && membership.project_id == project_id
+                }) {
+                    continue;
+                }
+                let membership_id = memberships.len() as i64 + 1;
+                memberships.push(UserProject {
+                    id: ID::from(membership_id.to_string()),
+                    created_at: epoch(),
+                    updated_at: epoch(),
+                    user_id: created.id.clone(),
+                    project_id,
+                    is_owner: false,
+                    scopes: None,
+                });
+            }
             Ok(created)
         }
 
@@ -818,6 +1043,9 @@ mod tests {
             id: &str,
             input: UpdateUserInput,
         ) -> Result<User, UserServiceError> {
+            let add_project_ids = input.add_project_ids.clone().unwrap_or_default();
+            let remove_project_ids = input.remove_project_ids.clone().unwrap_or_default();
+            let clear_projects = input.clear_projects == Some(true);
             let mut guard = lock(&self.users);
             let Some(user) = guard.iter_mut().find(|u| u.id.as_str() == id) else {
                 return Err(UserServiceError::Update(
@@ -829,6 +1057,9 @@ mod tests {
             }
             if let Some(v) = input.status {
                 user.status = v;
+            }
+            if let Some(v) = input.prefer_language {
+                user.prefer_language = v;
             }
             if let Some(v) = input.first_name {
                 user.first_name = v;
@@ -844,7 +1075,45 @@ mod tests {
             if let Some(v) = input.is_owner {
                 user.is_owner = v;
             }
-            Ok(user.clone())
+            if input.clear_scopes == Some(true) {
+                user.scopes = Some(Vec::new());
+            } else if input.scopes.is_some() || input.append_scopes.is_some() {
+                let mut scopes = input
+                    .scopes
+                    .unwrap_or_else(|| user.scopes.clone().unwrap_or_default());
+                scopes.extend(input.append_scopes.unwrap_or_default());
+                user.scopes = Some(scopes);
+            }
+            let updated = user.clone();
+            drop(guard);
+
+            let mut memberships = lock(&self.user_projects);
+            if clear_projects {
+                memberships.retain(|membership| membership.user_id.as_str() != id);
+            } else {
+                for project_id in add_project_ids {
+                    if memberships.iter().any(|membership| {
+                        membership.user_id.as_str() == id && membership.project_id == project_id
+                    }) {
+                        continue;
+                    }
+                    let membership_id = memberships.len() as i64 + 1;
+                    memberships.push(UserProject {
+                        id: ID::from(membership_id.to_string()),
+                        created_at: epoch(),
+                        updated_at: epoch(),
+                        user_id: updated.id.clone(),
+                        project_id,
+                        is_owner: false,
+                        scopes: None,
+                    });
+                }
+                memberships.retain(|membership| {
+                    membership.user_id.as_str() != id
+                        || !remove_project_ids.contains(&membership.project_id)
+                });
+            }
+            Ok(updated)
         }
 
         async fn update_user_status(
@@ -949,7 +1218,30 @@ mod tests {
     fn schema_with(store: &InMemoryUserService) -> AdminSchema {
         let query: Arc<dyn UserQueryServices> = Arc::new(store.clone());
         let mutation: Arc<dyn UserMutationServices> = Arc::new(store.clone());
-        admin_schema_builder().data(query).data(mutation).finish()
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(conduit_auth::Principal::system());
+        admin_schema_builder()
+            .data(query)
+            .data(mutation)
+            .data(context)
+            .finish()
+    }
+
+    fn schema_with_role_query(store: &InMemoryUserService, role: crate::role::Role) -> AdminSchema {
+        let query: Arc<dyn UserQueryServices> = Arc::new(store.clone());
+        let mutation: Arc<dyn UserMutationServices> = Arc::new(store.clone());
+        let role_query: Arc<dyn crate::role::RoleQueryServices> =
+            Arc::new(FixedRoleQueryService { role });
+        admin_schema_builder()
+            .data(query)
+            .data(mutation)
+            .data(role_query)
+            .data({
+                let mut context = conduit_auth::RequestContext::new();
+                let _ = context.set_principal(conduit_auth::Principal::system());
+                context
+            })
+            .finish()
     }
 
     fn bare_schema() -> AdminSchema {
@@ -966,6 +1258,35 @@ mod tests {
         let mut rc = conduit_auth::request_context::RequestContext::new();
         let _ = rc.set_principal(principal);
         rc
+    }
+
+    fn project_ctx(project_id: &str) -> conduit_auth::request_context::RequestContext {
+        let principal = conduit_auth::Principal::user("actor")
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::WRITE_USERS,
+            ))
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::READ_USERS,
+            ));
+        let mut rc = conduit_auth::request_context::RequestContext::new();
+        let _ = rc.set_principal(principal);
+        let _ = rc.set_project_id(project_id);
+        rc
+    }
+
+    fn project_owner_ctx(project_id: &str) -> conduit_auth::request_context::RequestContext {
+        let principal = conduit_auth::Principal::user("project-owner").with_scope(
+            conduit_auth::scopes::Scope::project_membership(
+                project_id,
+                conduit_auth::scopes::slug::WILDCARD,
+            ),
+        );
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(principal);
+        let _ = context.set_project_id(project_id);
+        context
     }
 
     // -----------------------------------------------------------------
@@ -1028,6 +1349,38 @@ mod tests {
             resp.errors
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_id_grant_cannot_bypass_the_callers_scope_ceiling() {
+        let store = InMemoryUserService::default();
+        let schema = schema_with_role_query(
+            &store,
+            crate::role::Role {
+                id: ID::from("9"),
+                created_at: epoch(),
+                updated_at: epoch(),
+                name: "Privileged".to_owned(),
+                level: crate::role::RoleLevel::System,
+                project_id: None,
+                scopes: Some(vec!["write_settings".to_owned()]),
+            },
+        );
+        let mutation = r#"mutation {
+            createUser(input: {
+                email: "role-target@example.com", password: "secret", roleIDs: ["9"]
+            }) { id }
+        }"#;
+        let response = schema
+            .execute(
+                async_graphql::Request::new(mutation)
+                    .data(non_owner_ctx(&[conduit_auth::scopes::slug::WRITE_USERS])),
+            )
+            .await;
+
+        assert_eq!(response.errors.len(), 1);
+        assert!(response.errors[0].message.contains("write_settings"));
+        assert!(lock(&store.users).is_empty());
     }
 
     /// No principal in context (crate's bare-schema tests) → guard is a no-op,
@@ -1575,5 +1928,134 @@ mod tests {
             msg.contains("user service is not available"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn project_scoped_users_only_lists_authorized_project_members() -> Result<(), TestError> {
+        let store = InMemoryUserService::default();
+        lock(&store.users).extend([
+            sample_user(1, "project-a@example.com"),
+            sample_user(2, "project-b@example.com"),
+        ]);
+        lock(&store.user_projects).extend([
+            UserProject {
+                id: "1".into(),
+                created_at: epoch(),
+                updated_at: epoch(),
+                user_id: "1".into(),
+                project_id: "A".into(),
+                is_owner: false,
+                scopes: None,
+            },
+            UserProject {
+                id: "2".into(),
+                created_at: epoch(),
+                updated_at: epoch(),
+                user_id: "2".into(),
+                project_id: "B".into(),
+                is_owner: false,
+                scopes: None,
+            },
+        ]);
+        let response = schema_with(&store)
+            .execute(
+                async_graphql::Request::new("{ users { totalCount edges { node { email } } } }")
+                    .data(project_ctx("A")),
+            )
+            .await;
+
+        assert!(response.errors.is_empty(), "errors: {:?}", response.errors);
+        let data = response.data.into_json()?;
+        assert_eq!(data["users"]["totalCount"], 1);
+        assert_eq!(
+            data["users"]["edges"][0]["node"]["email"],
+            "project-a@example.com"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_scoped_permission_rejects_global_user_mutations_and_project_b_membership() {
+        let store = InMemoryUserService::default();
+        lock(&store.users).push(sample_user(1, "target@example.com"));
+        let schema = schema_with(&store);
+
+        for mutation in [
+            r#"mutation { updateUser(id: "1", input: { firstName: "changed" }) { id } }"#,
+            r#"mutation { deleteUser(id: "1") }"#,
+            r#"mutation { addUserToProject(input: { projectId: "B", userId: "1" }) { id } }"#,
+        ] {
+            let response = schema
+                .execute(async_graphql::Request::new(mutation).data(project_ctx("A")))
+                .await;
+            assert!(
+                !response.errors.is_empty(),
+                "mutation unexpectedly succeeded"
+            );
+            assert!(
+                response.errors[0].message.contains("permission denied"),
+                "unexpected error: {}",
+                response.errors[0].message
+            );
+        }
+        assert_eq!(lock(&store.users)[0].first_name, "");
+        assert!(lock(&store.user_projects).is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_selected_project_owner_can_promote_another_project_member() {
+        let store = InMemoryUserService::default();
+        lock(&store.users).push(sample_user(1, "target@example.com"));
+        let schema = schema_with(&store);
+        let mutation = r#"mutation {
+            addUserToProject(input: { projectId: "A", userId: "1", isOwner: true }) { id }
+        }"#;
+
+        let denied = schema
+            .execute(async_graphql::Request::new(mutation).data(project_ctx("A")))
+            .await;
+        assert_eq!(denied.errors.len(), 1);
+        assert!(denied.errors[0].message.contains("owner"));
+
+        let allowed = schema
+            .execute(async_graphql::Request::new(mutation).data(project_owner_ctx("A")))
+            .await;
+        assert!(allowed.errors.is_empty(), "errors: {:?}", allowed.errors);
+        assert!(lock(&store.user_projects)[0].is_owner);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_user_consume_all_previously_ignored_fields() {
+        let store = InMemoryUserService::default();
+        lock(&store.users).push(sample_user(1, "target@example.com"));
+        let schema = schema_with(&store);
+
+        let created = schema
+            .execute(
+                r#"mutation { createUser(input: {
+                    email: "new@example.com", password: "secret",
+                    status: deactivated, preferLanguage: "zh-CN",
+                    avatar: "https://example.test/avatar.png", projectIDs: ["A"]
+                }) { status preferLanguage avatar } }"#,
+            )
+            .await;
+        assert!(created.errors.is_empty(), "errors: {:?}", created.errors);
+        let created_json = created.data.into_json().expect("JSON response");
+        assert_eq!(created_json["createUser"]["status"], "deactivated");
+        assert_eq!(created_json["createUser"]["preferLanguage"], "zh-CN");
+        assert_eq!(lock(&store.user_projects).len(), 1);
+
+        let updated = schema
+            .execute(
+                r#"mutation { updateUser(id: "1", input: {
+                    status: deactivated, preferLanguage: "fr",
+                    addProjectIDs: ["B"]
+                }) { status preferLanguage } }"#,
+            )
+            .await;
+        assert!(updated.errors.is_empty(), "errors: {:?}", updated.errors);
+        assert!(lock(&store.user_projects).iter().any(|membership| {
+            membership.user_id.as_str() == "1" && membership.project_id.as_str() == "B"
+        }));
     }
 }

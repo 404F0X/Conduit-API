@@ -117,6 +117,21 @@ pub trait NodeResolver: Send + Sync {
     /// - `Err(NodeError::UnknownType)` when the type string is not in the
     ///   dispatch table — matching Go's `"unknown node type: %s"` error.
     async fn resolve_node(&self, typ: &str, id: i64) -> Result<Option<Node>, NodeError>;
+
+    /// Request-aware variant used by the GraphQL Relay entry points. Hosts
+    /// that expose project-owned node types override this to enforce the
+    /// caller's selected project before returning a node.
+    async fn resolve_node_with_access(
+        &self,
+        typ: &str,
+        id: i64,
+        access: &crate::policy::AdminAccessScope,
+    ) -> Result<Option<Node>, NodeError> {
+        match access {
+            crate::policy::AdminAccessScope::Global => self.resolve_node(typ, id).await,
+            crate::policy::AdminAccessScope::Project(_) => Ok(None),
+        }
+    }
 }
 
 /// Error surface for [`NodeResolver`].
@@ -145,8 +160,14 @@ pub(crate) fn node_resolver(ctx: &Context<'_>) -> Result<Arc<dyn NodeResolver>, 
 
 /// Top-level dispatch used by both `node` and `nodes` resolvers. Mirrors the
 /// Go sequence (ent.resolvers.go:281-286): type lookup → service call.
-async fn dispatch(resolver: &dyn NodeResolver, guid: &Guid) -> Result<Option<Node>, NodeError> {
-    resolver.resolve_node(&guid.typ, guid.id).await
+async fn dispatch(
+    resolver: &dyn NodeResolver,
+    guid: &Guid,
+    access: &crate::policy::AdminAccessScope,
+) -> Result<Option<Node>, NodeError> {
+    resolver
+        .resolve_node_with_access(&guid.typ, guid.id, access)
+        .await
 }
 
 /// Public entry-point used by `QueryRoot::node`. Parses the GraphQL `ID`
@@ -157,9 +178,36 @@ async fn dispatch(resolver: &dyn NodeResolver, guid: &Guid) -> Result<Option<Nod
 pub(crate) async fn resolve_single(ctx: &Context<'_>, id: &ID) -> Result<Option<Node>, String> {
     let resolver = node_resolver(ctx)?;
     let guid = parse_guid(id.as_str()).map_err(|err| err.to_string())?;
-    dispatch(resolver.as_ref(), &guid)
+    let access = match guid.typ.as_str() {
+        "Request" | "UsageLog" | "Thread" | "Trace" => {
+            crate::request_usage::request_read_access_scope(ctx)?
+        }
+        node_type => node_read_access_scope(ctx, node_type)?,
+    };
+    dispatch(resolver.as_ref(), &guid, &access)
         .await
         .map_err(|err| err.to_string())
+}
+
+fn node_read_access_scope(
+    ctx: &Context<'_>,
+    node_type: &str,
+) -> Result<crate::policy::AdminAccessScope, String> {
+    use conduit_auth::scopes::slug;
+
+    let scope = match node_type {
+        "Project" => slug::READ_PROJECTS,
+        "Role" => slug::READ_ROLES,
+        "Model" | "Channel" | "PromptProtectionRule" => slug::READ_CHANNELS,
+        "APIKey" | "APIKeyProfileTemplate" => slug::READ_API_KEYS,
+        "User" | "UserProject" | "UserRole" => slug::READ_USERS,
+        "Prompt" => slug::READ_PROMPTS,
+        other => return Err(NodeError::UnknownType(other.to_owned()).to_string()),
+    };
+    let request = crate::policy::request_context(ctx)
+        .ok_or_else(|| "authz: request carries no authenticated principal".to_owned())?;
+    crate::policy::AdminAccessScope::from_request_context(request, scope)
+        .map_err(|error| error.to_string())
 }
 
 // ===========================================================================
@@ -240,7 +288,19 @@ mod tests {
 
     fn schema_with(resolver: &InMemoryNodeResolver) -> AdminSchema {
         let wired: Arc<dyn NodeResolver> = Arc::new(resolver.clone());
-        admin_schema_builder().data(wired).finish()
+        admin_schema_builder()
+            .data(wired)
+            .data(read_channels_context())
+            .finish()
+    }
+
+    fn read_channels_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(
+            conduit_auth::Principal::user("node-test")
+                .with_scope(conduit_auth::scopes::slug::READ_CHANNELS),
+        );
+        context
     }
 
     fn bare_schema() -> AdminSchema {
@@ -342,6 +402,26 @@ mod tests {
         let data = resp.data.into_json()?;
         assert!(data["node"].is_null());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_rejects_authenticated_callers_without_entity_read_scope() {
+        let resolver = InMemoryNodeResolver::default();
+        lock(&resolver.channels).push(sample_channel(7, "prod"));
+        let wired: Arc<dyn NodeResolver> = Arc::new(resolver);
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(conduit_auth::Principal::user("unprivileged"));
+        let schema = admin_schema_builder().data(wired).data(context).finish();
+
+        let response = schema
+            .execute(r#"query { node(id: "gid://conduit/Channel/7") { __typename } }"#)
+            .await;
+        assert_eq!(response.errors.len(), 1);
+        let message = &response.errors[0].message;
+        assert!(
+            message.contains("does not have required scope read_channels"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]

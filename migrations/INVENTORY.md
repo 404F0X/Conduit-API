@@ -34,6 +34,10 @@ deployments.
   snapshots, accounting-rate version, and request correlation.
 - `000032`: reviewable provider-price drafts between immutable upstream
   observations and formal procurement-price heads/history.
+- `000033`: immutable credit-redemption batches, digest-only one-time codes,
+  redemption receipts, and transaction-local audit history.
+- `000034`: bounded per-code redemption counts with user-scoped idempotency;
+  existing codes retain a one-redemption limit.
 
 Numeric gaps are historical and must not be filled by renaming an already
 released migration. New migrations use the next unused monotonically increasing

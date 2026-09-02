@@ -120,16 +120,26 @@ pub struct APIKeyProfileTemplate {
 #[ComplexObject]
 impl APIKeyProfileTemplate {
     async fn project(&self, ctx: &Context<'_>) -> Result<crate::project::Project, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_PROJECTS)
+            .map_err(|error| error.to_string())?;
         let services = crate::project::project_query_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         let connection = services
-            .projects(crate::project::ProjectConnectionArgs {
-                first: Some(1),
-                where_filter: Some(crate::project::ProjectWhereInput {
-                    id: Some(self.project_id.clone()),
+            .projects_with_access(
+                &access,
+                crate::project::ProjectConnectionArgs {
+                    first: Some(1),
+                    where_filter: Some(crate::project::ProjectWhereInput {
+                        id: Some(self.project_id.clone()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
 
@@ -353,7 +363,7 @@ pub enum APIKeyProfileTemplateOrderTerm {
 }
 
 /// The resolver-lowered ordering selection handed to
-/// [`ProfileTemplateQueryServices::api_key_profile_templates`].
+/// [`ProfileTemplateQueryServices::api_key_profile_templates_with_access`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct APIKeyProfileTemplateOrderSelection {
     pub direction: OrderDirection,
@@ -407,6 +417,8 @@ pub enum ProfileTemplateServiceError {
     TemplateProfileMissing,
     #[error("ent: apikeyprofiletemplate not found")]
     NotFound,
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("failed to create template: {0}")]
     Create(String),
     #[error("failed to update template: {0}")]
@@ -436,8 +448,9 @@ pub struct APIKeyProfileTemplateConnectionArgs {
 /// `r.client.APIKeyProfileTemplate.Query().Paginate(...)`).
 #[async_trait::async_trait]
 pub trait ProfileTemplateQueryServices: Send + Sync {
-    async fn api_key_profile_templates(
+    async fn api_key_profile_templates_with_access(
         &self,
+        access: &crate::policy::AdminAccessScope,
         args: APIKeyProfileTemplateConnectionArgs,
     ) -> Result<APIKeyProfileTemplateConnection, ProfileTemplateServiceError>;
 }
@@ -452,8 +465,9 @@ pub trait ProfileTemplateMutationServices: Send + Sync {
     /// (`biz/api_key_profile_template.go:34`): force `profile.Name = input.Name`
     /// → create with `SetInput(input).SetProfile(profile)` → on
     /// `ent.IsConstraintError` surface the friendly duplicate-name error.
-    async fn create_api_key_profile_template(
+    async fn create_api_key_profile_template_with_access(
         &self,
+        access: &crate::policy::AdminAccessScope,
         input: CreateAPIKeyProfileTemplateInput,
         profile: APIKeyProfileInput,
     ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError>;
@@ -463,8 +477,9 @@ pub trait ProfileTemplateMutationServices: Send + Sync {
     /// SetInput(input); if profile supplied, reuse existing template name when
     /// input.Name is nil, force `profile.Name` accordingly, SetProfile; on
     /// constraint error surface duplicate-name.
-    async fn update_api_key_profile_template(
+    async fn update_api_key_profile_template_with_access(
         &self,
+        access: &crate::policy::AdminAccessScope,
         id: &str,
         input: UpdateAPIKeyProfileTemplateInput,
         profile: Option<APIKeyProfileInput>,
@@ -473,8 +488,9 @@ pub trait ProfileTemplateMutationServices: Send + Sync {
     /// Mirrors `APIKeyProfileTemplateService.DeleteTemplate`
     /// (`biz/api_key_profile_template.go:156`): RunInTransaction → get then
     /// DeleteOneID → return the pre-delete snapshot.
-    async fn delete_api_key_profile_template(
+    async fn delete_api_key_profile_template_with_access(
         &self,
+        access: &crate::policy::AdminAccessScope,
         id: &str,
     ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError>;
 
@@ -482,8 +498,9 @@ pub trait ProfileTemplateMutationServices: Send + Sync {
     /// (`biz/api_key_profile_template.go:181`): RunInTransaction → get
     /// template + apiKey → cross-project guard → clone template.Profile →
     /// name-conflict-resolve → append to apiKey.Profiles → save.
-    async fn load_api_key_profile_template(
+    async fn load_api_key_profile_template_with_access(
         &self,
+        access: &crate::policy::AdminAccessScope,
         input: LoadApiKeyProfileTemplateInput,
     ) -> Result<APIKey, ProfileTemplateServiceError>;
 }
@@ -568,13 +585,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProfileTemplateQueryServices for InMemoryProfileTemplateService {
-        async fn api_key_profile_templates(
+        async fn api_key_profile_templates_with_access(
             &self,
+            access: &crate::policy::AdminAccessScope,
             args: APIKeyProfileTemplateConnectionArgs,
         ) -> Result<APIKeyProfileTemplateConnection, ProfileTemplateServiceError> {
             lock(&self.captured_query_args).push(args.clone());
 
-            let mut nodes: Vec<APIKeyProfileTemplate> = lock(&self.templates).clone();
+            let mut nodes: Vec<APIKeyProfileTemplate> = lock(&self.templates)
+                .iter()
+                .filter(|template| access.allows_project(template.project_id.as_str()))
+                .cloned()
+                .collect();
             if let Some(selection) = &args.order_by {
                 nodes.sort_by(|a, b| {
                     let ordering = match selection.term {
@@ -622,11 +644,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProfileTemplateMutationServices for InMemoryProfileTemplateService {
-        async fn create_api_key_profile_template(
+        async fn create_api_key_profile_template_with_access(
             &self,
+            access: &crate::policy::AdminAccessScope,
             input: CreateAPIKeyProfileTemplateInput,
             mut profile: APIKeyProfileInput,
         ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError> {
+            if !access.allows_project(input.project_id.as_str()) {
+                return Err(ProfileTemplateServiceError::PermissionDenied(
+                    "cannot create a template outside the authorized project".to_owned(),
+                ));
+            }
             let mut guard = lock(&self.templates);
             // biz/api_key_profile_template.go:48-52 — unique (project_id, name)
             // constraint surfaced as DuplicateNameError.
@@ -655,8 +683,9 @@ mod tests {
             Ok(created)
         }
 
-        async fn update_api_key_profile_template(
+        async fn update_api_key_profile_template_with_access(
             &self,
+            access: &crate::policy::AdminAccessScope,
             id: &str,
             input: UpdateAPIKeyProfileTemplateInput,
             profile: Option<APIKeyProfileInput>,
@@ -664,7 +693,7 @@ mod tests {
             let mut guard = lock(&self.templates);
             let idx = guard
                 .iter()
-                .position(|t| t.id.as_str() == id)
+                .position(|t| t.id.as_str() == id && access.allows_project(t.project_id.as_str()))
                 .ok_or_else(|| {
                     ProfileTemplateServiceError::Update(
                         ProfileTemplateServiceError::NotFound.to_string(),
@@ -701,14 +730,15 @@ mod tests {
             Ok(template.clone())
         }
 
-        async fn delete_api_key_profile_template(
+        async fn delete_api_key_profile_template_with_access(
             &self,
+            access: &crate::policy::AdminAccessScope,
             id: &str,
         ) -> Result<APIKeyProfileTemplate, ProfileTemplateServiceError> {
             let mut guard = lock(&self.templates);
             let idx = guard
                 .iter()
-                .position(|t| t.id.as_str() == id)
+                .position(|t| t.id.as_str() == id && access.allows_project(t.project_id.as_str()))
                 .ok_or_else(|| {
                     ProfileTemplateServiceError::Delete(
                         ProfileTemplateServiceError::NotFound.to_string(),
@@ -717,8 +747,9 @@ mod tests {
             Ok(guard.remove(idx))
         }
 
-        async fn load_api_key_profile_template(
+        async fn load_api_key_profile_template_with_access(
             &self,
+            access: &crate::policy::AdminAccessScope,
             input: LoadApiKeyProfileTemplateInput,
         ) -> Result<APIKey, ProfileTemplateServiceError> {
             // biz/api_key_profile_template.go:181-233 — load + cross-project
@@ -726,7 +757,7 @@ mod tests {
             let templates = lock(&self.templates).clone();
             let template = templates
                 .iter()
-                .find(|t| t.id == input.template_id)
+                .find(|t| t.id == input.template_id && access.allows_project(t.project_id.as_str()))
                 .ok_or_else(|| {
                     ProfileTemplateServiceError::Load(
                         ProfileTemplateServiceError::NotFound.to_string(),
@@ -736,7 +767,7 @@ mod tests {
             let mut keys = lock(&self.api_keys);
             let api_key = keys
                 .iter_mut()
-                .find(|k| k.id == input.api_key_id)
+                .find(|k| k.id == input.api_key_id && access.allows_project(k.project_id.as_str()))
                 .ok_or_else(|| {
                     ProfileTemplateServiceError::Load("ent: apikey not found".to_string())
                 })?;
@@ -860,7 +891,39 @@ mod tests {
     fn schema_with(store: &InMemoryProfileTemplateService) -> AdminSchema {
         let query: Arc<dyn ProfileTemplateQueryServices> = Arc::new(store.clone());
         let mutation: Arc<dyn ProfileTemplateMutationServices> = Arc::new(store.clone());
-        admin_schema_builder().data(query).data(mutation).finish()
+        let mut request = conduit_auth::RequestContext::new();
+        let _ = request.set_principal(conduit_auth::Principal::system());
+        let _ = request.set_project_id("1");
+        admin_schema_builder()
+            .data(query)
+            .data(mutation)
+            .data(request)
+            .finish()
+    }
+
+    fn schema_with_project(
+        store: &InMemoryProfileTemplateService,
+        project_id: &str,
+    ) -> AdminSchema {
+        let query: Arc<dyn ProfileTemplateQueryServices> = Arc::new(store.clone());
+        let mutation: Arc<dyn ProfileTemplateMutationServices> = Arc::new(store.clone());
+        let principal = conduit_auth::Principal::user("profile-template-test-actor")
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::READ_API_KEYS,
+            ))
+            .with_scope(conduit_auth::scopes::Scope::project_role(
+                project_id,
+                conduit_auth::scopes::slug::WRITE_API_KEYS,
+            ));
+        let mut request = conduit_auth::RequestContext::new();
+        let _ = request.set_principal(principal);
+        let _ = request.set_project_id(project_id);
+        admin_schema_builder()
+            .data(query)
+            .data(mutation)
+            .data(request)
+            .finish()
     }
 
     fn bare_schema() -> AdminSchema {
@@ -1424,6 +1487,85 @@ mod tests {
     // ---------------------------------------------------------------------
     // Resolver: apiKeyProfileTemplates connection query
     // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn project_scope_hides_and_protects_foreign_templates_and_keys() -> Result<(), TestError>
+    {
+        let store = InMemoryProfileTemplateService::default();
+        lock(&store.templates).extend([
+            sample_template(1, "project-a", "1"),
+            sample_template(2, "project-b", "2"),
+        ]);
+        lock(&store.api_keys).extend([
+            sample_api_key(10, "key-a", "1"),
+            sample_api_key(20, "key-b", "2"),
+        ]);
+        let schema = schema_with_project(&store, "1");
+
+        let query = schema
+            .execute(
+                r#"{
+                    apiKeyProfileTemplates {
+                        totalCount
+                        edges { node { id name projectID } }
+                    }
+                }"#,
+            )
+            .await;
+        assert!(query.errors.is_empty(), "errors: {:?}", query.errors);
+        let query_data = query.data.into_json()?;
+        assert_eq!(query_data["apiKeyProfileTemplates"]["totalCount"], 1);
+        assert_eq!(
+            query_data["apiKeyProfileTemplates"]["edges"][0]["node"]["name"],
+            "project-a"
+        );
+
+        let create = schema
+            .execute(
+                r#"mutation {
+                    createApiKeyProfileTemplate(
+                        input: { name: "cross-create", projectID: "2" },
+                        profile: { name: "ignored" }
+                    ) { id }
+                }"#,
+            )
+            .await;
+        assert_eq!(create.errors.len(), 1);
+        assert!(format!("{}", create.errors[0]).contains("permission denied"));
+
+        let update = schema
+            .execute(
+                r#"mutation {
+                    updateApiKeyProfileTemplate(id: "2", input: { name: "changed" }) { id }
+                }"#,
+            )
+            .await;
+        assert_eq!(update.errors.len(), 1);
+        assert!(format!("{}", update.errors[0]).contains("ent: apikeyprofiletemplate not found"));
+
+        let delete = schema
+            .execute(r#"mutation { deleteApiKeyProfileTemplate(id: "2") { id } }"#)
+            .await;
+        assert_eq!(delete.errors.len(), 1);
+        assert!(format!("{}", delete.errors[0]).contains("ent: apikeyprofiletemplate not found"));
+
+        let load = schema
+            .execute(
+                r#"mutation {
+                    loadApiKeyProfileTemplate(input: { templateID: "1", apiKeyID: "20" }) { id }
+                }"#,
+            )
+            .await;
+        assert_eq!(load.errors.len(), 1);
+        assert!(format!("{}", load.errors[0]).contains("ent: apikey not found"));
+
+        let templates = lock(&store.templates);
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[1].name, "project-b");
+        drop(templates);
+        assert!(lock(&store.api_keys)[1].profiles.is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn templates_query_returns_connection_with_total_count() -> Result<(), TestError> {

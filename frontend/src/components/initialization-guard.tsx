@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useState } from 'react';
 import { useRouter } from '@tanstack/react-router';
 import { useAuthStore } from '@/stores/authStore';
+import { withoutBasePath } from '@/lib/base-path';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useSystemStatus } from '@/features/auth/data/initialization';
 
@@ -30,7 +31,7 @@ export function InitializationGuard({ children }: InitializationGuardProps) {
     // Only redirect if we have data and system is not initialized
     if (systemStatus && !systemStatus.isInitialized) {
       // Check if we're not already on the initialization page
-      const currentPath = window.location.pathname;
+      const currentPath = withoutBasePath(window.location.pathname);
       if (currentPath !== '/initialization') {
         setIsNavigating(true);
         router.navigate({ to: '/initialization' }).finally(() => {
@@ -66,7 +67,7 @@ export function InitializationGuard({ children }: InitializationGuardProps) {
 
   // If system is not initialized and we're not on initialization page, don't render children
   // But allow navigation to complete naturally
-  if ((systemStatus && !systemStatus.isInitialized && window.location.pathname !== '/initialization') || isNavigating) {
+  if ((systemStatus && !systemStatus.isInitialized && withoutBasePath(window.location.pathname) !== '/initialization') || isNavigating) {
     // Don't return null immediately - let the navigation complete
     // The useEffect will handle the redirect
     return (

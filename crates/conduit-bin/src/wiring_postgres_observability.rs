@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use conduit_admin_graphql::channel::{Node, OrderDirection};
 use conduit_admin_graphql::node::{NodeError, NodeResolver};
 use conduit_admin_graphql::pagination::{connection_from_offset_page, decode_offset_cursor};
+use conduit_admin_graphql::policy::AdminAccessScope;
 use conduit_admin_graphql::scalars::{CursorScalar, TimeScalar};
 use conduit_admin_graphql::threads_ext::{
     ConnectionOrderSelection, ConnectionOrderTerm, Thread, ThreadConnection, ThreadConnectionArgs,
@@ -152,10 +153,15 @@ impl ThreadQueryServices for PostgresObservabilityServices {
         &self,
         args: ThreadConnectionArgs,
     ) -> Result<ThreadConnection, ThreadTraceError> {
-        let mut nodes: Vec<Thread> = self
-            .thread_repo
-            .list_all()
-            .await
+        let rows = match &args.access {
+            AdminAccessScope::Global => self.thread_repo.list_all().await,
+            AdminAccessScope::Project(project_id) => {
+                self.thread_repo
+                    .list_by_project(&database_id(project_id, "Project"))
+                    .await
+            }
+        };
+        let mut nodes: Vec<Thread> = rows
             .map_err(|error| ThreadTraceError::QueryThreads(error.to_string()))?
             .into_iter()
             .map(thread_to_gql)
@@ -205,10 +211,15 @@ impl ThreadQueryServices for PostgresObservabilityServices {
 #[async_trait]
 impl TraceQueryServices for PostgresObservabilityServices {
     async fn traces(&self, args: TraceConnectionArgs) -> Result<TraceConnection, ThreadTraceError> {
-        let mut nodes: Vec<Trace> = self
-            .trace_repo
-            .list_all()
-            .await
+        let rows = match &args.access {
+            AdminAccessScope::Global => self.trace_repo.list_all().await,
+            AdminAccessScope::Project(project_id) => {
+                self.trace_repo
+                    .list_by_project(&database_id(project_id, "Project"))
+                    .await
+            }
+        };
+        let mut nodes: Vec<Trace> = rows
             .map_err(|error| ThreadTraceError::QueryTraces(error.to_string()))?
             .into_iter()
             .map(trace_to_gql)
@@ -400,6 +411,215 @@ impl NodeResolver for PostgresObservabilityServices {
             other => Err(NodeError::UnknownType(other.to_owned())),
         }
     }
+
+    async fn resolve_node_with_access(
+        &self,
+        node_type: &str,
+        id: i64,
+        access: &AdminAccessScope,
+    ) -> Result<Option<Node>, NodeError> {
+        if matches!(access, AdminAccessScope::Global) {
+            return self.resolve_node(node_type, id).await;
+        }
+
+        let context = Self::trusted_context();
+        let database_id = id.to_string();
+        match node_type {
+            "Project" => {
+                if !access.allows_project(&database_id) {
+                    return Ok(None);
+                }
+                self.project_repo
+                    .find_project(&context, &database_id)
+                    .await
+                    .map(|row| {
+                        row.map(crate::wiring_postgres_project_role::project_row_to_gql)
+                            .map(Node::Project)
+                    })
+                    .map_err(Self::load_error)
+            }
+            "Role" => self
+                .role_repo
+                .find_role(&context, &database_id)
+                .await
+                .map(|row| {
+                    row.filter(|row| {
+                        row.level == "project" && access.allows_project(&row.project_id)
+                    })
+                    .map(crate::wiring_postgres_project_role::role_row_to_gql)
+                    .map(Node::Role)
+                })
+                .map_err(Self::load_error),
+            // Models, channels and prompt-protection rules are global
+            // entities. Their per-project visibility is the read-scope check
+            // performed by `node_read_access_scope`, not a row project key.
+            "Model" | "Channel" | "PromptProtectionRule" => self.resolve_node(node_type, id).await,
+            // APIKey nodes are resolved through the dedicated API-key access
+            // policy in QueryRoot::node; fail closed if this generic seam is
+            // ever called directly.
+            "APIKey" => Ok(None),
+            "APIKeyProfileTemplate" => self
+                .profile_template_repo
+                .find_profile_template_by_id_unchecked(&context, &database_id)
+                .await
+                .map(|row| {
+                    row.filter(|row| access.allows_project(&row.project_id))
+                        .map(crate::wiring_profile_template::template_row_to_gql)
+                        .map(Node::APIKeyProfileTemplate)
+                })
+                .map_err(Self::load_error),
+            "User" => {
+                let Some(project_id) = access.project_id() else {
+                    return Ok(None);
+                };
+                let member = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM user_projects \
+                     WHERE user_id = $1 AND project_id = $2)",
+                )
+                .bind(id)
+                .bind(
+                    database_id_from_access(project_id)
+                        .map_err(|error| NodeError::Load(error.to_owned()))?,
+                )
+                .fetch_one(&self.pool)
+                .await
+                .map_err(Self::load_error)?;
+                if !member {
+                    return Ok(None);
+                }
+                self.user_repo
+                    .find_user_by_id(&context, &database_id)
+                    .await
+                    .map(|row| {
+                        row.map(crate::wiring_postgres_user::user_to_gql)
+                            .map(Node::User)
+                    })
+                    .map_err(Self::load_error)
+            }
+            "UserProject" => {
+                let Some(project_id) = access.project_id() else {
+                    return Ok(None);
+                };
+                sqlx::query_as::<_, conduit_db::UserProjectRow>(
+                    "SELECT CAST(id AS TEXT) AS id, CAST(user_id AS TEXT) AS user_id, \
+                     CAST(project_id AS TEXT) AS project_id, is_owner, scopes, \
+                     created_at, updated_at FROM user_projects \
+                     WHERE id = $1 AND project_id = $2",
+                )
+                .bind(id)
+                .bind(
+                    database_id_from_access(project_id)
+                        .map_err(|error| NodeError::Load(error.to_owned()))?,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map(|row| {
+                    row.map(crate::wiring_postgres_user::user_project_to_gql)
+                        .map(Node::UserProject)
+                })
+                .map_err(Self::load_error)
+            }
+            "UserRole" => {
+                let Some(project_id) = access.project_id() else {
+                    return Ok(None);
+                };
+                sqlx::query_as::<_, conduit_db::UserRoleRow>(
+                    "SELECT CAST(ur.id AS TEXT) AS id, \
+                     CAST(ur.user_id AS TEXT) AS user_id, \
+                     CAST(ur.role_id AS TEXT) AS role_id, \
+                     ur.created_at, ur.updated_at FROM user_roles ur \
+                     JOIN roles r ON r.id = ur.role_id AND r.deleted_at = 0 \
+                     JOIN user_projects up ON up.user_id = ur.user_id \
+                       AND up.project_id = r.project_id \
+                     WHERE ur.id = $1 AND r.level = 'project' AND r.project_id = $2",
+                )
+                .bind(id)
+                .bind(
+                    database_id_from_access(project_id)
+                        .map_err(|error| NodeError::Load(error.to_owned()))?,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map(|row| {
+                    row.map(crate::wiring_postgres_user::user_role_to_gql)
+                        .map(Node::UserRole)
+                })
+                .map_err(Self::load_error)
+            }
+            "Prompt" => self
+                .prompt_repo
+                .find_by_row_id(id)
+                .await
+                .map(|row| {
+                    row.filter(|row| access.allows_project(&row.project_id))
+                        .map(crate::wiring_prompt::prompt_row_to_gql)
+                        .map(Node::Prompt)
+                })
+                .map_err(Self::load_error),
+            "Request" => {
+                let mut row = self
+                    .request_repo
+                    .find_request_by_id(&context, &database_id)
+                    .await
+                    .map_err(Self::load_error)?
+                    .filter(|row| access.allows_project(&row.project_id));
+                if let Some(row) = row.as_mut() {
+                    crate::wiring_request_content::hydrate_request_artifacts(
+                        &self.data_storage_repo,
+                        row,
+                    )
+                    .await;
+                }
+                Ok(row
+                    .map(crate::wiring_requests::request_row_to_gql)
+                    .map(Node::Request))
+            }
+            "UsageLog" => self
+                .usage_repo
+                .find_by_id(id)
+                .await
+                .map(|row| {
+                    row.filter(|row| access.allows_project(&row.project_id))
+                        .map(crate::wiring_requests::usage_log_row_to_gql)
+                        .map(Node::UsageLog)
+                })
+                .map_err(Self::load_error),
+            "Thread" => self
+                .thread_repo
+                .find_by_row_id(id)
+                .await
+                .map(|row| {
+                    row.filter(|row| access.allows_project(&row.project_id))
+                        .map(thread_to_gql)
+                        .map(Node::Thread)
+                })
+                .map_err(Self::load_error),
+            "Trace" => self
+                .trace_repo
+                .find_by_row_id(id)
+                .await
+                .map(|row| {
+                    row.filter(|row| access.allows_project(&row.project_id))
+                        .map(trace_to_gql)
+                        .map(Node::Trace)
+                })
+                .map_err(Self::load_error),
+            other => Err(NodeError::UnknownType(other.to_owned())),
+        }
+    }
+}
+
+fn database_id_from_access(project_id: &str) -> Result<i64, &'static str> {
+    database_id(project_id, "Project")
+        .parse::<i64>()
+        .map_err(|_| "authorized project ID is not a valid integer")
+}
+
+fn database_id(value: &str, expected_type: &str) -> String {
+    conduit_admin_graphql::node::parse_guid(value)
+        .ok()
+        .filter(|guid| guid.typ == expected_type)
+        .map_or_else(|| value.to_owned(), |guid| guid.id.to_string())
 }
 
 #[cfg(test)]
@@ -492,10 +712,16 @@ mod tests {
 
         let (thread_query, trace_query, node_resolver) =
             build_postgres_observability_services(pool.clone());
+        let mut graphql_context = conduit_auth::RequestContext::new();
+        let _ = graphql_context.set_principal(
+            conduit_auth::Principal::user("observability-test")
+                .with_scope(conduit_auth::scopes::slug::READ_REQUESTS),
+        );
         let schema = conduit_admin_graphql::admin_schema_builder()
             .data(thread_query)
             .data(trace_query)
             .data(node_resolver)
+            .data(graphql_context)
             .finish();
         let response = schema
             .execute(format!(
@@ -531,6 +757,23 @@ mod tests {
             resolver.resolve_node("Prompt", prompt_id).await?,
             Some(Node::Prompt(_))
         ));
+        let prompt_access = AdminAccessScope::Project(edge_seed.to_string());
+        assert!(matches!(
+            resolver
+                .resolve_node_with_access("Prompt", prompt_id, &prompt_access)
+                .await?,
+            Some(Node::Prompt(_))
+        ));
+        assert!(
+            resolver
+                .resolve_node_with_access(
+                    "Prompt",
+                    prompt_id,
+                    &AdminAccessScope::Project(edge_seed.saturating_add(1).to_string()),
+                )
+                .await?
+                .is_none()
+        );
         assert!(matches!(
             resolver
                 .resolve_node("PromptProtectionRule", prompt_rule_id)

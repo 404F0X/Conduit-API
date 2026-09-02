@@ -15,6 +15,9 @@ export interface InitializeSystemInput {
   ownerLastName: string;
   brandName: string;
   preferLanguage?: string;
+  accountingCurrencyCode: string;
+  creditDisplayName: string;
+  creditsPerAccountingUnit: string;
 }
 
 export interface InitializeSystemPayload {

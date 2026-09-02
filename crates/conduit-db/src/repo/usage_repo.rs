@@ -87,9 +87,18 @@ pub struct CreateUsageLogInput {
 /// Dashboard list filter. Every field is optional; `None` means "no filter".
 /// `project_id` is **required** (dashboard is project-scoped). Date range is
 /// inclusive on both bounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageListOrderField {
+    Id,
+    #[default]
+    CreatedAt,
+    UpdatedAt,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UsageListQuery {
     pub project_id: String,
+    pub id: Option<String>,
     pub api_key_id: Option<String>,
     pub channel_id: Option<String>,
     pub model_id: Option<String>,
@@ -99,6 +108,8 @@ pub struct UsageListQuery {
     pub end_at: Option<String>,
     pub limit: u32,
     pub offset: u32,
+    pub order_field: UsageListOrderField,
+    pub descending: bool,
 }
 
 impl UsageListQuery {
@@ -177,7 +188,12 @@ fn row_from_input(input: &CreateUsageLogInput) -> UsageLogRow {
 
 /// Apply the `UsageListQuery` filter to a row. `project_id` is always enforced.
 fn matches_query(row: &UsageLogRow, query: &UsageListQuery) -> bool {
-    if row.project_id != query.project_id {
+    if !query.project_id.is_empty() && row.project_id != query.project_id {
+        return false;
+    }
+    if let Some(v) = &query.id
+        && row.id != *v
+    {
         return false;
     }
     if let Some(v) = &query.api_key_id
@@ -264,9 +280,21 @@ fn sort_and_paginate(
     query: &UsageListQuery,
 ) -> RepoResult<UsageListResult> {
     rows.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
+        let id_ordering = || match (a.id.parse::<i64>(), b.id.parse::<i64>()) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => a.id.cmp(&b.id),
+        };
+        let ordering = match query.order_field {
+            UsageListOrderField::Id => id_ordering(),
+            UsageListOrderField::CreatedAt => a.created_at.cmp(&b.created_at),
+            UsageListOrderField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+        }
+        .then_with(id_ordering);
+        if query.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
     });
 
     let limit = query.limit as usize;
@@ -336,6 +364,36 @@ pub trait UsageRepo: Send + Sync {
         ctx: &RequestContext,
         query: &UsageListQuery,
     ) -> RepoResult<UsageListResult>;
+
+    async fn count_usage_unchecked(
+        &self,
+        ctx: &RequestContext,
+        query: &UsageListQuery,
+    ) -> RepoResult<u64> {
+        let mut page_query = query.clone();
+        page_query.limit = 1_000;
+        page_query.offset = 0;
+        let mut total = 0_u64;
+        loop {
+            let page = self.list_usage_unchecked(ctx, &page_query).await?;
+            let fetched = u32::try_from(page.rows.len()).unwrap_or(u32::MAX);
+            total = total.saturating_add(u64::from(fetched));
+            if !page.has_more || fetched == 0 {
+                break;
+            }
+            let next_offset = page_query.offset.saturating_add(fetched);
+            if next_offset == page_query.offset {
+                break;
+            }
+            page_query.offset = next_offset;
+        }
+        Ok(total)
+    }
+
+    async fn count_usage(&self, ctx: &RequestContext, query: &UsageListQuery) -> RepoResult<u64> {
+        guard_project_access(ctx, &query.project_id, ProjectAccess::Read)?;
+        self.count_usage_unchecked(ctx, query).await
+    }
 
     async fn list_usage(
         &self,
@@ -450,6 +508,21 @@ impl UsageRepo for InMemoryUsageRepo {
             .cloned()
             .collect();
         sort_and_paginate(&mut matched, query)
+    }
+
+    async fn count_usage_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        query: &UsageListQuery,
+    ) -> RepoResult<u64> {
+        let guard = self
+            .rows
+            .lock()
+            .map_err(|_| RepoError::LockPoisoned("usage repo"))?;
+        Ok(guard
+            .values()
+            .filter(|row| matches_query(row, query))
+            .count() as u64)
     }
 }
 

@@ -203,6 +203,7 @@ async fn first_trace_request(
     let services = crate::request_usage::request_query_services(ctx)?;
     let conn = services
         .requests(crate::request_usage::RequestConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             first: Some(1),
             order_by: Some(crate::request_usage::RequestOrderSelection {
                 direction: crate::request_usage::OrderDirection::Asc,
@@ -232,6 +233,7 @@ async fn trace_requests(
     let services = crate::request_usage::request_query_services(ctx)?;
     let conn = services
         .requests(crate::request_usage::RequestConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             order_by: Some(crate::request_usage::RequestOrderSelection {
                 direction: crate::request_usage::OrderDirection::Asc,
                 term: crate::request_usage::RequestOrderTerm::Id,
@@ -262,6 +264,7 @@ async fn usage_metadata_for_requests(
     for request in requests {
         let conn = services
             .usage_logs(crate::request_usage::UsageLogConnectionArgs {
+                access: crate::request_usage::request_read_access_scope(ctx)?,
                 where_filter: Some(crate::request_usage::UsageLogWhereInput {
                     request_id: Some(request.id.clone()),
                     ..Default::default()
@@ -312,16 +315,26 @@ fn first_text_from_response(body: &serde_json::Value) -> Option<String> {
 #[ComplexObject]
 impl Thread {
     async fn project(&self, ctx: &Context<'_>) -> Result<crate::project::Project, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_PROJECTS)
+            .map_err(|error| error.to_string())?;
         let services = crate::project::project_query_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         let conn = services
-            .projects(crate::project::ProjectConnectionArgs {
-                first: Some(1),
-                where_filter: Some(crate::project::ProjectWhereInput {
-                    id: Some(self.project_id.clone()),
+            .projects_with_access(
+                &access,
+                crate::project::ProjectConnectionArgs {
+                    first: Some(1),
+                    where_filter: Some(crate::project::ProjectWhereInput {
+                        id: Some(self.project_id.clone()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
         conn.edges
@@ -347,6 +360,7 @@ impl Thread {
         let services = trace_query_services(ctx)?;
         services
             .traces(TraceConnectionArgs {
+                access: crate::request_usage::request_read_access_scope(ctx)?,
                 after: after.map(|cursor| cursor.0),
                 first,
                 before: before.map(|cursor| cursor.0),
@@ -408,16 +422,26 @@ impl Thread {
 #[ComplexObject]
 impl Trace {
     async fn project(&self, ctx: &Context<'_>) -> Result<crate::project::Project, String> {
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_PROJECTS)
+            .map_err(|error| error.to_string())?;
         let services = crate::project::project_query_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_PROJECTS,
+        )
+        .map_err(|error| error.to_string())?;
         let conn = services
-            .projects(crate::project::ProjectConnectionArgs {
-                first: Some(1),
-                where_filter: Some(crate::project::ProjectWhereInput {
-                    id: Some(self.project_id.clone()),
+            .projects_with_access(
+                &access,
+                crate::project::ProjectConnectionArgs {
+                    first: Some(1),
+                    where_filter: Some(crate::project::ProjectWhereInput {
+                        id: Some(self.project_id.clone()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
         conn.edges
@@ -436,6 +460,7 @@ impl Trace {
         let services = thread_query_services(ctx)?;
         let conn = services
             .threads(ThreadConnectionArgs {
+                access: crate::request_usage::request_read_access_scope(ctx)?,
                 first: Some(1),
                 where_filter: Some(ThreadWhereInput {
                     id: Some(id),
@@ -468,6 +493,7 @@ impl Trace {
         let services = crate::request_usage::request_query_services(ctx)?;
         services
             .requests(crate::request_usage::RequestConnectionArgs {
+                access: crate::request_usage::request_read_access_scope(ctx)?,
                 after: after.map(|cursor| cursor.0),
                 first,
                 before: before.map(|cursor| cursor.0),
@@ -825,6 +851,7 @@ pub enum ThreadTraceError {
 /// GraphQL layer verbatim (Go hands them straight to ent's `Paginate`).
 #[derive(Debug, Clone, Default)]
 pub struct ThreadConnectionArgs {
+    pub access: crate::policy::AdminAccessScope,
     pub after: Option<String>,
     pub first: Option<i32>,
     pub before: Option<String>,
@@ -836,6 +863,7 @@ pub struct ThreadConnectionArgs {
 /// Arguments for the `traces` connection query.
 #[derive(Debug, Clone, Default)]
 pub struct TraceConnectionArgs {
+    pub access: crate::policy::AdminAccessScope,
     pub after: Option<String>,
     pub first: Option<i32>,
     pub before: Option<String>,
@@ -1117,7 +1145,20 @@ mod tests {
     fn schema_with(store: &InMemoryThreadTraceService) -> AdminSchema {
         let thread: Arc<dyn ThreadQueryServices> = Arc::new(store.clone());
         let trace: Arc<dyn TraceQueryServices> = Arc::new(store.clone());
-        admin_schema_builder().data(thread).data(trace).finish()
+        admin_schema_builder()
+            .data(thread)
+            .data(trace)
+            .data(read_requests_context())
+            .finish()
+    }
+
+    fn read_requests_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(
+            conduit_auth::Principal::user("thread-trace-test")
+                .with_scope(conduit_auth::scopes::slug::READ_REQUESTS),
+        );
+        context
     }
 
     fn bare_schema() -> AdminSchema {

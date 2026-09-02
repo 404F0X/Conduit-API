@@ -427,7 +427,7 @@ pub trait Executor: Send + Sync {
         &self,
         request: &HttpRequest,
         cancel: CancelToken,
-    ) -> Result<tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>>, ConduitError> {
+    ) -> Result<LiveUpstreamResponse, ConduitError> {
         let _ = cancel;
         // Buffered fallback: materialize the whole stream, then replay it
         // through the channel. Real executors (`UpstreamExecutor`) override this
@@ -441,8 +441,25 @@ pub trait Executor: Send + Sync {
                 }
             }
         });
-        Ok(rx)
+        Ok(LiveUpstreamResponse {
+            content_type: None,
+            events: rx,
+        })
     }
+}
+
+/// Eager upstream response metadata plus its incremental body/event stream.
+///
+/// The response headers are available as soon as the provider accepts the
+/// request, before any body bytes arrive. Keeping `content_type` beside the
+/// receiver lets binary speech preserve the provider's exact media type while
+/// still forwarding the body chunk-by-chunk; the HTTP layer never has to read
+/// ahead or buffer a first chunk just to choose its response headers.
+pub struct LiveUpstreamResponse {
+    /// Provider `Content-Type`, if it was a valid visible header value.
+    pub content_type: Option<String>,
+    /// Incremental provider events (`binary` is populated for raw audio).
+    pub events: tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>>,
 }
 
 /// Predicate mirroring Go `ChannelRetryable.CanRetry`: given the error from a
@@ -583,6 +600,33 @@ pub type StreamMode = ExecutionMode;
 /// transformer may have flipped it.
 pub const fn decide_stream_mode(user_stream: bool, provider_needs_stream: bool) -> StreamMode {
     ExecutionMode::resolve(user_stream, provider_needs_stream)
+}
+
+fn execution_mode_for_request(
+    user_wants_stream: bool,
+    effective_wants_stream: bool,
+    client_api_format: ApiFormat,
+    raw_inbound: &HttpRequest,
+) -> ExecutionMode {
+    // This routing marker belongs to the client-side request. Outbound
+    // transformers intentionally construct a fresh `HttpRequest` and are not
+    // required to copy internal metadata, so inspecting the transformed
+    // request here would silently miss the production marker.
+    let binary_speech = is_binary_speech_request(client_api_format, raw_inbound);
+    if binary_speech {
+        ExecutionMode::NonStream
+    } else {
+        ExecutionMode::resolve(user_wants_stream, effective_wants_stream)
+    }
+}
+
+fn is_binary_speech_request(client_api_format: ApiFormat, raw_inbound: &HttpRequest) -> bool {
+    raw_inbound
+        .metadata
+        .get("audio_stream_mode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("binary"))
+        && client_api_format == ApiFormat::OpenAiAudioSpeech
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,12 +1521,27 @@ impl Pipeline {
             }
         };
 
-        // Force `stream:true` on the outgoing JSON body (Go `effectiveWantStream`):
+        let binary_speech = is_binary_speech_request(client_api_format, raw_inbound);
+        if binary_speech {
+            // `merge_inbound` deliberately does not copy arbitrary metadata to
+            // provider requests. Carry only this handler-authenticated routing
+            // decision so the executor selects raw bytes instead of its SSE
+            // parser; never infer the mode from a provider response body.
+            http_req.metadata.insert(
+                "audio_stream_mode".to_string(),
+                serde_json::Value::String("binary".to_string()),
+            );
+        }
+
+        // Force `stream:true` on SSE JSON bodies (Go `effectiveWantStream`):
         // the outbound transformer already reflects `attempt_request.stream`, but
         // stamping defensively guarantees the provider streams. Re-applied after
         // the override middlewares so a channel override cannot accidentally
-        // clear it.
-        if let Some(body) = http_req.json_body.as_mut()
+        // clear it. Binary speech is selected by `stream_format=audio`; adding
+        // a non-standard `stream:true` field can make strict TTS providers
+        // reject an otherwise valid request, so preserve that body verbatim.
+        if !binary_speech
+            && let Some(body) = http_req.json_body.as_mut()
             && let Some(map) = body.as_object_mut()
         {
             map.insert("stream".to_string(), serde_json::Value::Bool(true));
@@ -1491,8 +1550,8 @@ impl Pipeline {
 
         // S13 — hand the executor the per-attempt cancel token so it can abort
         // the upstream provider call on client disconnect.
-        let raw_upstream_rx = match self.executor.execute_stream_live(&http_req, cancel).await {
-            Ok(receiver) => receiver,
+        let raw_upstream = match self.executor.execute_stream_live(&http_req, cancel).await {
+            Ok(response) => response,
             Err(err) => {
                 self.observe_attempt(
                     target,
@@ -1512,6 +1571,8 @@ impl Pipeline {
                 ));
             }
         };
+        let response_content_type = raw_upstream.content_type;
+        let raw_upstream_rx = raw_upstream.events;
 
         // Transform stage (mirrors the buffered `finish_stream_events`): raw
         // provider events → `outbound.transform_stream` → unified `LlmResponse`
@@ -1546,6 +1607,7 @@ impl Pipeline {
 
         Ok(LiveStreamAttempt {
             upstream_rx,
+            content_type: response_content_type,
             channel_id,
             sequence: 1,
             model_index: 0,
@@ -1699,7 +1761,17 @@ impl Pipeline {
             .and_then(|body| body.get("stream"))
             .and_then(|v| v.as_bool())
             .unwrap_or(user_wants_stream);
-        let mode = ExecutionMode::resolve(user_wants_stream, effective_wants_stream);
+        // `stream_format=audio` is a byte stream, not SSE.  The HTTP layer
+        // stamps this trusted routing decision before dispatch.  Execute it
+        // through `Executor::execute`, whose content-type decoder preserves
+        // raw bytes, instead of feeding a successful audio/mpeg response into
+        // the SSE-only live/parser path.
+        let mode = execution_mode_for_request(
+            user_wants_stream,
+            effective_wants_stream,
+            client_api_format,
+            raw_inbound,
+        );
         ctx.record_order(format!("execute:{mode:?}"));
 
         // S12 — per-attempt timeout knobs from the retry policy (Go
@@ -2078,13 +2150,7 @@ impl Pipeline {
         let raw_event_count = raw_events.len();
         let terminal_events: Vec<StreamEvent> = raw_events
             .iter()
-            .filter(|event| {
-                event.done
-                    || event
-                        .data
-                        .as_deref()
-                        .is_some_and(|data| data.trim() == "[DONE]")
-            })
+            .filter(|event| is_client_stream_terminal(event))
             .cloned()
             .collect();
 
@@ -2131,14 +2197,8 @@ impl Pipeline {
 
         let mut events: Vec<StreamEvent> = stream.collect();
         for terminal in terminal_events {
-            let already_present = events.len() >= raw_event_count
-                || events.iter().any(|event| {
-                    event.done
-                        || event
-                            .data
-                            .as_deref()
-                            .is_some_and(|data| data.trim() == "[DONE]")
-                });
+            let already_present =
+                events.len() >= raw_event_count || events.iter().any(is_client_stream_terminal);
             if !already_present {
                 events.push(terminal);
             }
@@ -2356,14 +2416,6 @@ fn transform_live_stream(
     let terminal_slot: Arc<std::sync::Mutex<Option<StreamEvent>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    fn is_terminal(event: &StreamEvent) -> bool {
-        event.done
-            || event
-                .data
-                .as_deref()
-                .is_some_and(|data| data.trim() == "[DONE]")
-    }
-
     // A synchronous iterator over the async upstream. `blocking_recv` is legal
     // here because the whole closure runs inside `spawn_blocking`.
     struct BlockingRecvIter {
@@ -2378,7 +2430,7 @@ fn transform_live_stream(
                 Some(Ok(event)) => {
                     // Stash a copy of any terminal sentinel so it can be
                     // re-emitted if the transform chain drops it.
-                    if is_terminal(&event)
+                    if is_client_stream_terminal(&event)
                         && let Ok(mut slot) = self.terminal_slot.lock()
                     {
                         *slot = Some(event.clone());
@@ -2428,7 +2480,18 @@ fn transform_live_stream(
 
         let mut terminal_survived = false;
         for frame in client_iter {
-            if is_terminal(&frame) {
+            if is_client_stream_terminal(&frame) {
+                // The synchronous transformer reaches EOF only after the raw
+                // iterator has observed a queued upstream read error. A
+                // transformer may synthesize a missing-finish terminal at
+                // that point; suppress it when a concrete upstream error is
+                // waiting so the client receives the real error frame rather
+                // than a misleading terminal followed by an error.
+                let upstream_error_pending =
+                    err_slot.lock().map(|slot| slot.is_some()).unwrap_or(false);
+                if upstream_error_pending {
+                    continue;
+                }
                 terminal_survived = true;
             }
             // Client dropped the receiver → stop pulling (upstream cancel is
@@ -2444,7 +2507,9 @@ fn transform_live_stream(
         // `transform_stream` serde-parses events into `LlmResponse` and
         // discards the non-JSON `[DONE]` sentinel, so without this the client
         // never sees the stream terminator.
+        let upstream_error_pending = err_slot.lock().map(|slot| slot.is_some()).unwrap_or(false);
         if !terminal_survived
+            && !upstream_error_pending
             && let Ok(mut slot) = terminal_slot.lock()
             && let Some(terminal) = slot.take()
             && out_tx.blocking_send(Ok(terminal)).is_err()
@@ -2462,6 +2527,28 @@ fn transform_live_stream(
     });
 
     out_rx
+}
+
+fn is_client_stream_terminal(event: &StreamEvent) -> bool {
+    event.done
+        || event
+            .data
+            .as_deref()
+            .is_some_and(|data| data.trim() == "[DONE]")
+        || matches!(
+            event.event_type.as_deref(),
+            Some(
+                "response.completed"
+                    | "response.failed"
+                    | "response.incomplete"
+                    | "response.cancelled"
+                    | "response.canceled"
+                    | "message_stop"
+                    | "speech.audio.done"
+                    | "transcript.text.done"
+                    | "binary.done"
+            )
+        )
 }
 
 fn passthrough_live_stream(
@@ -2592,6 +2679,8 @@ pub struct LiveStreamAttempt {
     /// Incremental provider events (`Ok`) / mid-stream failure (`Err`); the
     /// sender closes when the upstream ends.
     pub upstream_rx: tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>>,
+    /// Provider response `Content-Type`, captured before body streaming begins.
+    pub content_type: Option<String>,
     /// Channel id this attempt targeted (Go `candidate.Channel.ID`).
     pub channel_id: String,
     /// 1-based attempt sequence (always 1 — the live path takes the first
@@ -3340,6 +3429,84 @@ mod tests {
         force_effective_stream: Option<bool>,
     }
 
+    /// Reproduces the production OpenAI-compatible outbound behavior relevant
+    /// to binary speech: it builds a fresh provider request and deliberately
+    /// does not copy the inbound request's internal metadata.
+    struct BinarySpeechOutbound;
+
+    impl OutboundTransformer for BinarySpeechOutbound {
+        fn name(&self) -> &'static str {
+            "openai-compat-outbound"
+        }
+
+        fn outbound_request(&self, request: &LlmRequest) -> TransformerResult<HttpRequest> {
+            Ok(HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/audio/speech".to_string(),
+                api_format: Some(ApiFormat::OpenAiAudioSpeech),
+                json_body: Some(json!({
+                    "model": request.model,
+                    "stream": request.stream,
+                })),
+                ..HttpRequest::default()
+            })
+        }
+
+        fn outbound_response(&self, response: HttpResponse) -> TransformerResult<HttpResponse> {
+            Ok(response)
+        }
+
+        fn outbound_stream_event(&self, event: StreamEvent) -> TransformerResult<StreamEvent> {
+            Ok(event)
+        }
+
+        fn outbound_error(&self, response: HttpResponse) -> TransformerResult<ConduitError> {
+            Ok(ConduitError::upstream("binary speech upstream failed")
+                .with_provider_status(response.status))
+        }
+    }
+
+    /// Minimal Chat Completions provider used to exercise a Responses client
+    /// across the real pipeline lifecycle. The default unified response and
+    /// stream methods deliberately do the Chat JSON decoding; the Responses
+    /// inbound must then own the client-facing shape.
+    struct CrossProtocolChatOutbound;
+
+    impl OutboundTransformer for CrossProtocolChatOutbound {
+        fn name(&self) -> &'static str {
+            "cross-protocol-chat-outbound"
+        }
+
+        fn outbound_request(&self, request: &LlmRequest) -> TransformerResult<HttpRequest> {
+            Ok(HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                api_format: Some(ApiFormat::OpenAiChatCompletions),
+                json_body: Some(json!({
+                    "model": request.model,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": request.stream,
+                })),
+                ..HttpRequest::default()
+            })
+        }
+
+        fn outbound_response(&self, response: HttpResponse) -> TransformerResult<HttpResponse> {
+            Ok(response)
+        }
+
+        fn outbound_stream_event(&self, event: StreamEvent) -> TransformerResult<StreamEvent> {
+            Ok(event)
+        }
+
+        fn outbound_error(&self, response: HttpResponse) -> TransformerResult<ConduitError> {
+            Ok(
+                ConduitError::upstream("chat upstream failed")
+                    .with_provider_status(response.status),
+            )
+        }
+    }
+
     impl OutboundTransformer for StubOutbound {
         fn name(&self) -> &'static str {
             "stub-outbound"
@@ -3589,6 +3756,242 @@ mod tests {
             ExecutionMode::resolve(false, false),
             ExecutionMode::NonStream
         );
+    }
+
+    #[test]
+    fn binary_speech_uses_non_stream_executor_even_when_client_requested_stream() {
+        let mut request = HttpRequest::default();
+        request.metadata.insert(
+            "audio_stream_mode".to_string(),
+            serde_json::Value::String("binary".to_string()),
+        );
+
+        assert_eq!(
+            execution_mode_for_request(true, true, ApiFormat::OpenAiAudioSpeech, &request),
+            ExecutionMode::NonStream
+        );
+        assert_eq!(
+            execution_mode_for_request(true, true, ApiFormat::OpenAiChatCompletions, &request),
+            ExecutionMode::Stream,
+            "the internal marker must not affect non-speech protocols"
+        );
+
+        request.metadata.insert(
+            "audio_stream_mode".to_string(),
+            serde_json::Value::String("sse".to_string()),
+        );
+        assert_eq!(
+            execution_mode_for_request(true, true, ApiFormat::OpenAiAudioSpeech, &request),
+            ExecutionMode::Stream
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_speech_production_path_uses_byte_preserving_executor()
+    -> Result<(), ConduitError> {
+        let mut headers = conduit_llm::model::HeaderMap::new();
+        headers.insert("content-type".to_string(), "audio/mpeg".to_string());
+        let executor: Arc<dyn Executor> =
+            Arc::new(StubExecutor::non_stream(vec![Ok(HttpResponse {
+                status: 200,
+                headers,
+                body: Some(vec![0x49, 0x44, 0x33, 0x04]),
+                ..HttpResponse::default()
+            })]));
+        let pipeline = Pipeline::new(
+            Arc::new(conduit_transformers::OpenAiSpeechInbound::new()),
+            Arc::new(BinarySpeechOutbound),
+            executor,
+        );
+        let mut raw = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/audio/speech".to_string(),
+            api_format: Some(ApiFormat::OpenAiAudioSpeech),
+            content_type: Some("application/json".to_string()),
+            json_body: Some(json!({
+                "model": "gpt-4o-mini-tts",
+                "input": "hello",
+                "voice": "alloy",
+                "stream_format": "audio",
+            })),
+            ..HttpRequest::default()
+        };
+        raw.metadata.insert(
+            "audio_stream_mode".to_string(),
+            serde_json::Value::String("binary".to_string()),
+        );
+        let mut ctx = PipelineContext::new();
+
+        let (response, attempts) = pipeline
+            .process(&mut ctx, raw.clone(), &raw, &pc(&["audio-provider"]))
+            .await?;
+
+        assert_eq!(response.body, Some(vec![0x49, 0x44, 0x33, 0x04]));
+        assert_eq!(
+            response.headers.get("content-type").map(String::as_str),
+            Some("audio/mpeg")
+        );
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].mode, ExecutionMode::NonStream);
+        assert!(ctx.order.iter().any(|step| step == "execute:NonStream"));
+        Ok(())
+    }
+
+    fn responses_to_chat_candidate() -> PipelineCandidate {
+        let mut candidate = PipelineCandidate::from("chat-provider");
+        candidate.api_format = ApiFormat::OpenAiChatCompletions.as_str().to_string();
+        candidate
+    }
+
+    fn responses_request(stream: bool) -> HttpRequest {
+        HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_format: Some(ApiFormat::OpenAiResponses),
+            content_type: Some("application/json".to_string()),
+            json_body: Some(json!({
+                "model": "gpt-test",
+                "input": "hello",
+                "stream": stream,
+            })),
+            ..HttpRequest::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_client_cross_protocol_non_stream_uses_canonical_transform()
+    -> Result<(), ConduitError> {
+        let provider_body = json!({
+            "id": "resp_cross_protocol",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "id": "msg_cross_protocol",
+                    "role": "assistant",
+                    "content": "hello"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 1},
+                "completion_tokens_details": {"reasoning_tokens": 1}
+            }
+        });
+        let executor: Arc<dyn Executor> =
+            Arc::new(StubExecutor::non_stream(vec![Ok(HttpResponse {
+                status: 200,
+                json_body: Some(provider_body),
+                ..HttpResponse::default()
+            })]));
+        let pipeline = Pipeline::new(
+            Arc::new(conduit_transformers::OpenAiResponsesInbound::new()),
+            Arc::new(CrossProtocolChatOutbound),
+            executor,
+        );
+        let raw = responses_request(false);
+        let mut ctx = PipelineContext::new();
+
+        let (response, _) = pipeline
+            .process(
+                &mut ctx,
+                raw.clone(),
+                &raw,
+                &[responses_to_chat_candidate()],
+            )
+            .await?;
+        let body = response
+            .json_body
+            .ok_or_else(|| ConduitError::internal("missing Responses client body"))?;
+
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["content"][0]["text"], "hello");
+        assert!(body.get("choices").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responses_client_cross_protocol_stream_ends_with_responses_terminal_only()
+    -> Result<(), ConduitError> {
+        let chunks = vec![
+            StreamEvent {
+                data: Some(
+                    json!({
+                        "id": "resp_stream",
+                        "object": "chat.completion.chunk",
+                        "created": 42,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "hel"}
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ..StreamEvent::default()
+            },
+            StreamEvent {
+                data: Some(
+                    json!({
+                        "id": "resp_stream",
+                        "object": "chat.completion.chunk",
+                        "created": 42,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": "lo"},
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string(),
+                ),
+                ..StreamEvent::default()
+            },
+            StreamEvent {
+                data: Some("[DONE]".to_string()),
+                done: true,
+                ..StreamEvent::default()
+            },
+        ];
+        let executor: Arc<dyn Executor> = Arc::new(StubExecutor::stream(vec![Ok(chunks)]));
+        let pipeline = Pipeline::new(
+            Arc::new(conduit_transformers::OpenAiResponsesInbound::new()),
+            Arc::new(CrossProtocolChatOutbound),
+            executor,
+        );
+        let raw = responses_request(true);
+        let mut ctx = PipelineContext::new();
+
+        let (response, _) = pipeline
+            .process(
+                &mut ctx,
+                raw.clone(),
+                &raw,
+                &[responses_to_chat_candidate()],
+            )
+            .await?;
+        let event_types = response
+            .stream
+            .iter()
+            .filter_map(|event| event.event_type.as_deref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(event_types.first().copied(), Some("response.created"));
+        assert_eq!(event_types.last().copied(), Some("response.completed"));
+        assert!(
+            response
+                .stream
+                .iter()
+                .all(|event| event.data.as_deref() != Some("[DONE]"))
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -7921,6 +8324,56 @@ mod tests {
         assert_eq!(error.message, "provider live failure");
         assert_eq!(error.provider_status, Some(529));
         assert!(rewritten.recv().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_responses_stream_prefers_real_error_over_synthetic_missing_finish_terminal()
+    -> Result<(), ConduitError> {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(StreamEvent {
+            data: Some(
+                json!({
+                    "id": "resp_interrupted",
+                    "object": "chat.completion.chunk",
+                    "created": 42,
+                    "model": "gpt-test",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "partial"}
+                    }]
+                })
+                .to_string(),
+            ),
+            ..StreamEvent::default()
+        }))
+        .await
+        .map_err(|_| ConduitError::internal("failed to seed partial stream chunk"))?;
+        tx.send(Err(ConduitError::upstream("provider body read failed")))
+            .await
+            .map_err(|_| ConduitError::internal("failed to seed stream error"))?;
+        drop(tx);
+
+        let mut client = transform_live_stream(
+            Arc::new(CrossProtocolChatOutbound),
+            Arc::new(conduit_transformers::OpenAiResponsesInbound::new()),
+            rx,
+        );
+        let mut saw_real_error = false;
+        while let Some(item) = client.recv().await {
+            match item {
+                Ok(event) => assert_ne!(
+                    event.event_type.as_deref(),
+                    Some("response.failed"),
+                    "a concrete upstream error must suppress the synthetic missing-finish terminal"
+                ),
+                Err(error) => {
+                    saw_real_error = true;
+                    assert_eq!(error.message, "provider body read failed");
+                }
+            }
+        }
+        assert!(saw_real_error);
         Ok(())
     }
 }

@@ -1343,8 +1343,12 @@ export function useCreateChannel() {
       const data = await graphqlRequest<{ createChannel: Channel }>(CREATE_CHANNEL_MUTATION, { input });
       return channelSchema.parse(data.createChannel);
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['channels'] });
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
+        queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
+      ]);
       toast.success(t('channels.messages.createSuccess'));
     },
     onError: (error) => {
@@ -1423,9 +1427,13 @@ export function useUpdateChannel() {
       const data = await graphqlRequest<{ updateChannel: Channel }>(UPDATE_CHANNEL_MUTATION, { id, input });
       return channelSchema.parse(data.updateChannel);
     },
-    onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ['channels'] });
-      queryClient.invalidateQueries({ queryKey: ['channel', data.id] });
+    onSuccess: async (data) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['channel', data.id] }),
+        queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
+        queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
+      ]);
       toast.success(t('channels.messages.updateSuccess'));
     },
     onError: (error) => {
@@ -1956,8 +1964,12 @@ export function useSyncChannelModels() {
         throw error;
       }
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['channels'] });
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
+        queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
+      ]);
       toast.success(t('channels.messages.syncModelsSuccess'));
     },
   });

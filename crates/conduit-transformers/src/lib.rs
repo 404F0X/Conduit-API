@@ -24,6 +24,7 @@ pub mod openai;
 pub mod openai_compatible;
 pub mod openai_legacy;
 pub mod openai_outbound;
+mod openai_responses_inbound;
 pub mod openai_responses_outbound;
 pub mod openai_stream;
 pub mod openrouter;

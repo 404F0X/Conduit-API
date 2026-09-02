@@ -124,7 +124,7 @@ fn boot_request_context() -> RequestContext {
 // `username,omitempty`, `password,omitempty`.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct WireProxyConfig {
     #[serde(rename = "type")]
@@ -179,7 +179,47 @@ fn proxy_from_wire(w: WireProxyConfig) -> GqlProxyConfig {
         proxy_type: proxy_type_from_wire(&w.proxy_type),
         url: non_empty(w.url),
         username: non_empty(w.username),
-        password: non_empty(w.password),
+        // Stored proxy credentials are write-only. Discard the wire value at
+        // the adapter boundary as defense in depth; ProxyConfig's GraphQL
+        // resolver independently guarantees that it can never be projected.
+        password: None,
+    }
+}
+
+/// Restore a write-only proxy password when an admin submits the unchanged
+/// redacted projection. Never carry a credential to a different endpoint.
+fn preserve_webhook_proxy_passwords(
+    incoming: &mut GqlWebhookNotifierConfig,
+    stored: &DomainWebhookNotifierConfig,
+) {
+    for target in &mut incoming.targets {
+        let Some(proxy) = target.proxy.as_mut() else {
+            continue;
+        };
+        if proxy
+            .password
+            .as_deref()
+            .is_some_and(|password| !password.is_empty())
+        {
+            continue;
+        }
+        let Some(stored_proxy) = stored
+            .targets
+            .iter()
+            .find(|stored_target| stored_target.name == target.name)
+            .and_then(|stored_target| stored_target.extra.get("proxy"))
+            .and_then(|value| serde_json::from_value::<WireProxyConfig>(value.clone()).ok())
+        else {
+            continue;
+        };
+        let same_identity = stored_proxy
+            .proxy_type
+            .eq_ignore_ascii_case(proxy_type_to_wire(proxy.proxy_type))
+            && stored_proxy.url == proxy.url.as_deref().unwrap_or_default()
+            && stored_proxy.username == proxy.username.as_deref().unwrap_or_default();
+        if same_identity && !stored_proxy.password.is_empty() {
+            proxy.password = Some(stored_proxy.password);
+        }
     }
 }
 
@@ -463,9 +503,15 @@ impl SystemSettingsExtServices for SystemSettingsExtAdapter {
     /// `UpdateWebhookNotifierConfig` (`system.resolvers.go:70`).
     async fn set_webhook_notifier_config(
         &self,
-        config: GqlWebhookNotifierConfig,
+        mut config: GqlWebhookNotifierConfig,
     ) -> Result<(), ExtErr> {
         let ctx = boot_request_context();
+        let stored = self
+            .system
+            .webhook_notifier_config(&ctx)
+            .await
+            .map_err(|err| ExtErr::UpdateWebhookConfig(err.to_string()))?;
+        preserve_webhook_proxy_passwords(&mut config, &stored);
         let domain = webhook_config_to_domain(config)
             .map_err(|err| ExtErr::UpdateWebhookConfig(err.to_string()))?;
         self.system
@@ -531,5 +577,81 @@ impl SystemSettingsExtServices for SystemSettingsExtAdapter {
             .complete_auto_disable_channel_onboarding(&ctx)
             .await
             .map_err(|err| ExtErr::CompleteAutoDisableOnboarding(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod proxy_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn webhook_proxy_password_is_discarded_on_read() {
+        let proxy = proxy_from_wire(WireProxyConfig {
+            proxy_type: "URL".to_owned(),
+            url: "http://proxy.example".to_owned(),
+            username: "operator".to_owned(),
+            password: "must-not-leak".to_owned(),
+        });
+
+        assert_eq!(proxy.url.as_deref(), Some("http://proxy.example"));
+        assert_eq!(proxy.username.as_deref(), Some("operator"));
+        assert_eq!(proxy.password, None);
+    }
+
+    #[test]
+    fn webhook_update_preserves_only_unchanged_proxy_password() {
+        let stored_proxy = serde_json::to_value(WireProxyConfig {
+            proxy_type: "URL".to_owned(),
+            url: "http://proxy.example".to_owned(),
+            username: "operator".to_owned(),
+            password: "stored-secret".to_owned(),
+        })
+        .expect("proxy serializes");
+        let stored = DomainWebhookNotifierConfig {
+            targets: vec![DomainWebhookTarget {
+                name: "alerts".to_owned(),
+                enabled: true,
+                url: "https://hooks.example/alerts".to_owned(),
+                timeout_ms: 1_000,
+                headers: Vec::new(),
+                body: String::new(),
+                extra: BTreeMap::from([("proxy".to_owned(), stored_proxy)]),
+            }],
+            ..DomainWebhookNotifierConfig::default()
+        };
+        let target = |proxy_url: &str| GqlWebhookTarget {
+            name: "alerts".to_owned(),
+            enabled: true,
+            url: "https://hooks.example/alerts".to_owned(),
+            proxy: Some(GqlProxyConfig {
+                proxy_type: GqlProxyType::Url,
+                url: Some(proxy_url.to_owned()),
+                username: Some("operator".to_owned()),
+                password: None,
+            }),
+            timeout_ms: 1_000,
+            headers: Vec::new(),
+            body: String::new(),
+        };
+        let mut unchanged = GqlWebhookNotifierConfig {
+            targets: vec![target("http://proxy.example")],
+            subscriptions: Vec::new(),
+        };
+        let mut changed = GqlWebhookNotifierConfig {
+            targets: vec![target("http://different-proxy.example")],
+            subscriptions: Vec::new(),
+        };
+
+        preserve_webhook_proxy_passwords(&mut unchanged, &stored);
+        preserve_webhook_proxy_passwords(&mut changed, &stored);
+
+        assert_eq!(
+            unchanged.targets[0]
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.password.as_deref()),
+            Some("stored-secret")
+        );
+        assert_eq!(changed.targets[0].proxy.as_ref().unwrap().password, None);
     }
 }

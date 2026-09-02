@@ -227,6 +227,7 @@ impl DataStorage {
             ..where_filter.unwrap_or_default()
         };
         let args = crate::request_execution::RequestExecutionConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -1585,9 +1586,17 @@ mod tests {
         let ds_arc: Arc<dyn DataStorageServices> = Arc::new(ds_fake);
         let exec_arc: Arc<dyn crate::request_execution::RequestExecutionQueryServices> =
             Arc::new(exec_fake.clone());
+        let mut request_context = conduit_auth::RequestContext::new();
+        request_context
+            .set_principal(conduit_auth::Principal::system())
+            .map_err(|error| error.to_string())?;
+        request_context
+            .set_project_id("41")
+            .map_err(|error| error.to_string())?;
         let schema = crate::admin_schema_builder()
             .data(ds_arc)
             .data(exec_arc)
+            .data(request_context)
             .finish();
 
         let resp = schema
@@ -1602,6 +1611,7 @@ mod tests {
             .clone()
             .ok_or("executions edge did not inject a where filter")?;
         assert_eq!(filter.data_storage_id, Some(ID::from("9")));
+        assert_eq!(captured[0].access, crate::policy::AdminAccessScope::Global);
         assert_eq!(captured[0].first, Some(3));
         Ok(())
     }

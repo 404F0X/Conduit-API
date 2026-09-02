@@ -538,6 +538,14 @@ pub trait CandidateProjector: Send + Sync {
     fn project(&self, resolved: &[ChannelModelsCandidate]) -> Vec<Candidate>;
 }
 
+/// Metadata key carrying the stable request-scoped billing idempotency key.
+///
+/// It is written before the asynchronous reservation call starts so a dropped
+/// admission future can still release a reservation that committed just before
+/// cancellation. Reservation implementations must use
+/// [`BillingAdmissionInput::request_key`] as their stable request identity.
+pub const BILLING_ADMISSION_REQUEST_KEY_METADATA: &str = "billing_admission_request_key";
+
 /// Persists request-execution state and usage logs (Go `RequestService` +
 /// `UsageLogService`). The orchestrator calls these on the success and error
 /// paths of the pipeline. Errors here are surfaced with the `Persist` stage tag
@@ -555,6 +563,10 @@ pub trait RequestRecorder: Send + Sync {
         input: &BillingAdmissionInput,
         api_key_limit: Option<u32>,
     ) -> Result<(), ConduitError> {
+        ctx.metadata.insert(
+            BILLING_ADMISSION_REQUEST_KEY_METADATA.to_owned(),
+            input.request_key.clone(),
+        );
         if let (Some(api_key_id), Some(limit)) = (
             input
                 .api_key_id
@@ -564,10 +576,17 @@ pub trait RequestRecorder: Send + Sync {
         ) {
             self.acquire_api_key_slot(ctx, api_key_id, limit)?;
         }
-        if let Err(error) = self.reserve_request(ctx, input).await {
-            self.release_api_key_slot(ctx);
-            return Err(error);
-        }
+
+        // `reserve_request` may await PostgreSQL after the in-memory
+        // concurrency slot has already been acquired. An outer timeout drops
+        // this future; ordinary control-flow cleanup would never run. The
+        // borrowed guard closes that cancellation window. On success,
+        // ownership moves to the request-level guard installed by the command
+        // flow before its next await point.
+        let mut cleanup =
+            BorrowedAdmissionGuard::new(self, ctx.clone(), "request admission interrupted");
+        self.reserve_request(ctx, input).await?;
+        cleanup.disarm();
         Ok(())
     }
 
@@ -583,6 +602,17 @@ pub trait RequestRecorder: Send + Sync {
     }
 
     fn release_api_key_slot(&self, _ctx: &OrchestratorContext) {}
+
+    /// Finalize an admitted request whose future was dropped before a normal
+    /// success/failure recorder callback could finish.
+    ///
+    /// This method is invoked from `Drop`: implementations must be
+    /// non-blocking, panic-free, and idempotent. Synchronous resources should
+    /// be released immediately; asynchronous durable cleanup may be delegated
+    /// to a supervised task and backed by expiry/reconciliation.
+    fn abandon_request(&self, ctx: &OrchestratorContext, _reason: &'static str) {
+        self.release_api_key_slot(ctx);
+    }
 
     /// Reserve the estimated maximum customer charge before any upstream
     /// attempt starts. Implementations that do not own a wallet keep the
@@ -668,6 +698,76 @@ pub trait RequestRecorder: Send + Sync {
         _chunks: &[conduit_llm::StreamEvent],
     ) -> Result<(), ConduitError> {
         Ok(())
+    }
+}
+
+/// Covers cancellation while `RequestRecorder::admit_request` is awaiting its
+/// durable reservation. This guard borrows the recorder because admission is a
+/// trait default method and therefore does not own the surrounding `Arc`.
+struct BorrowedAdmissionGuard<'a, R: RequestRecorder + ?Sized> {
+    recorder: &'a R,
+    ctx: OrchestratorContext,
+    reason: &'static str,
+    armed: bool,
+}
+
+impl<'a, R: RequestRecorder + ?Sized> BorrowedAdmissionGuard<'a, R> {
+    fn new(recorder: &'a R, ctx: OrchestratorContext, reason: &'static str) -> Self {
+        Self {
+            recorder,
+            ctx,
+            reason,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<R: RequestRecorder + ?Sized> Drop for BorrowedAdmissionGuard<'_, R> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.recorder.abandon_request(&self.ctx, self.reason);
+        }
+    }
+}
+
+/// Owns request admission after the reservation call completes. Because it
+/// owns both the recorder and a metadata snapshot, dropping any outer handler,
+/// timeout, or pipeline future still reaches the abandonment hook.
+struct RequestAdmissionGuard {
+    recorder: Arc<dyn RequestRecorder>,
+    ctx: OrchestratorContext,
+    reason: &'static str,
+    armed: bool,
+}
+
+impl RequestAdmissionGuard {
+    fn new(
+        recorder: Arc<dyn RequestRecorder>,
+        ctx: &OrchestratorContext,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            recorder,
+            ctx: ctx.clone(),
+            reason,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestAdmissionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.recorder.abandon_request(&self.ctx, self.reason);
+        }
     }
 }
 
@@ -1089,6 +1189,11 @@ impl CommandOrchestrator {
             .admit_request(ctx, &admission, api_key_limit)
             .await
             .map_err(|error| OrchestratorError::new(OrchestratorStage::Quota, error))?;
+        let mut admission_guard = RequestAdmissionGuard::new(
+            Arc::clone(&self.recorder),
+            ctx,
+            "buffered request future dropped before terminal recording",
+        );
 
         // ---- S03 Pipeline: inbound → attempt loop → outbound → execute ----
         // The pipeline owns retry/failover (RUST-P8-002); orchestrator re-checks
@@ -1210,14 +1315,15 @@ impl CommandOrchestrator {
                         record_err,
                     ));
                 }
+                admission_guard.disarm();
                 return Err(OrchestratorError::new(OrchestratorStage::Pipeline, err));
             }
         };
 
         // ---- S04 Persist: record execution + usage (Go persistRequestExecution) ----
         ctx.record_stage(OrchestratorStage::Persist);
-        if let Some(last_attempt) = attempts.last()
-            && let Err(record_err) = self
+        if let Some(last_attempt) = attempts.last() {
+            if let Err(record_err) = self
                 .recorder
                 .record_success(
                     ctx,
@@ -1227,11 +1333,13 @@ impl CommandOrchestrator {
                     &response,
                 )
                 .await
-        {
-            return Err(OrchestratorError::new(
-                OrchestratorStage::Persist,
-                record_err,
-            ));
+            {
+                return Err(OrchestratorError::new(
+                    OrchestratorStage::Persist,
+                    record_err,
+                ));
+            }
+            admission_guard.disarm();
         }
 
         Ok(response)
@@ -1760,6 +1868,11 @@ impl CommandOrchestrator {
             .admit_request(ctx, &admission, api_key_limit)
             .await
             .map_err(|error| OrchestratorError::new(OrchestratorStage::Quota, error))?;
+        let mut admission_guard = RequestAdmissionGuard::new(
+            Arc::clone(&self.recorder),
+            ctx,
+            "stream request future dropped before finalizer handoff",
+        );
 
         // ---- S03 Pipeline (live): inbound → outbound → execute_stream_live ----
         let mut pipeline_ctx = PipelineContext::new();
@@ -1811,9 +1924,11 @@ impl CommandOrchestrator {
                         record_error,
                     ));
                 }
+                admission_guard.disarm();
                 return Err(OrchestratorError::new(OrchestratorStage::Pipeline, error));
             }
         };
+        let response_content_type = live.content_type.clone();
 
         // The live pipeline owns the attempt-scoped channel/model metadata.
         // Copy the fields needed by the detached usage/cost recorder before
@@ -1914,11 +2029,16 @@ impl CommandOrchestrator {
         let run_ctx = ctx.clone();
         let finalizer_handle = tokio::spawn(async move {
             let _stream_cleanup = stream_cleanup;
-            forwarding.run(&run_ctx).await
+            let result = forwarding.run(&run_ctx).await;
+            if result.is_ok() {
+                admission_guard.disarm();
+            }
+            result
         });
 
         Ok(CommandStreamHandle {
             client_rx,
+            content_type: response_content_type,
             finalizer: finalizer_handle,
         })
     }
@@ -1937,6 +2057,10 @@ pub struct CommandStreamHandle {
     /// terminal event (e.g. `[DONE]`). Closes when the stream ends or the
     /// upstream is canceled.
     pub client_rx: tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>>,
+    /// Provider response `Content-Type`, available before the first body chunk.
+    /// Binary speech uses it for the Axum response header; SSE writers retain
+    /// their fixed protocol content type.
+    pub content_type: Option<String>,
     /// The persistence finalizer task (Go `OutboundPersistentStream.Close`):
     /// resolves to the [`StreamFinalPlan`] once the stream ends, having written
     /// the execution/request rows + chunks + usage.
@@ -5569,6 +5693,22 @@ mod tests {
         released: AtomicUsize,
     }
 
+    struct CancellationLifecycleRecorder {
+        acquired: AtomicUsize,
+        released: AtomicUsize,
+        block_reservation: bool,
+    }
+
+    impl CancellationLifecycleRecorder {
+        fn new(block_reservation: bool) -> Self {
+            Self {
+                acquired: AtomicUsize::new(0),
+                released: AtomicUsize::new(0),
+                block_reservation,
+            }
+        }
+    }
+
     #[async_trait]
     impl RequestRecorder for AdmissionLifecycleRecorder {
         fn acquire_api_key_slot(
@@ -5619,6 +5759,60 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl RequestRecorder for CancellationLifecycleRecorder {
+        fn acquire_api_key_slot(
+            &self,
+            ctx: &mut OrchestratorContext,
+            api_key_id: i64,
+            _limit: u32,
+        ) -> Result<(), ConduitError> {
+            self.acquired.fetch_add(1, Ordering::SeqCst);
+            ctx.metadata.insert(
+                "api_key_concurrency_slot".to_owned(),
+                api_key_id.to_string(),
+            );
+            Ok(())
+        }
+
+        fn release_api_key_slot(&self, _ctx: &OrchestratorContext) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn reserve_request(
+            &self,
+            _ctx: &mut OrchestratorContext,
+            _input: &BillingAdmissionInput,
+        ) -> Result<(), ConduitError> {
+            if self.block_reservation {
+                std::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn record_success(
+            &self,
+            _ctx: &OrchestratorContext,
+            _request_id: &str,
+            _project_id: &str,
+            _attempt: &PipelineAttempt,
+            _response: &HttpResponse,
+        ) -> Result<(), ConduitError> {
+            Ok(())
+        }
+
+        async fn record_failure(
+            &self,
+            _ctx: &OrchestratorContext,
+            _request_id: &str,
+            _project_id: &str,
+            _error: &ConduitError,
+        ) -> Result<(), ConduitError> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn failed_wallet_reservation_releases_api_key_concurrency_slot() {
         let recorder = AdmissionLifecycleRecorder::default();
@@ -5640,6 +5834,73 @@ mod tests {
         assert_eq!(error.error_type(), "quota_exhausted");
         assert_eq!(recorder.acquired.load(Ordering::SeqCst), 1);
         assert_eq!(recorder.released.load(Ordering::SeqCst), 1);
+    }
+
+    fn billing_admission(request_key: &str) -> BillingAdmissionInput {
+        BillingAdmissionInput {
+            request_key: request_key.to_owned(),
+            project_id: "project-1".to_owned(),
+            api_key_id: Some("7".to_owned()),
+            public_model: "gpt-5".to_owned(),
+            estimated_input_tokens: 1,
+            max_output_tokens: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_while_reserving_releases_acquired_admission() {
+        let recorder = CancellationLifecycleRecorder::new(true);
+        let mut ctx = OrchestratorContext::new();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            recorder.admit_request(&mut ctx, &billing_admission("request-reserve"), Some(1)),
+        )
+        .await;
+
+        assert!(result.is_err(), "reservation future must be canceled");
+        assert_eq!(recorder.acquired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            recorder.released.load(Ordering::SeqCst),
+            1,
+            "the borrowed admission guard must release on future Drop"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(BILLING_ADMISSION_REQUEST_KEY_METADATA)
+                .map(String::as_str),
+            Some("request-reserve")
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_after_admission_releases_request_guard() {
+        let concrete = Arc::new(CancellationLifecycleRecorder::new(false));
+        let recorder: Arc<dyn RequestRecorder> = concrete.clone();
+
+        let admitted_then_stalled = async move {
+            let mut ctx = OrchestratorContext::new();
+            recorder
+                .admit_request(&mut ctx, &billing_admission("request-pipeline"), Some(1))
+                .await?;
+            let _guard = RequestAdmissionGuard::new(
+                Arc::clone(&recorder),
+                &ctx,
+                "test pipeline cancellation",
+            );
+            std::future::pending::<Result<(), ConduitError>>().await
+        };
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), admitted_then_stalled).await;
+
+        assert!(result.is_err(), "request future must be canceled");
+        assert_eq!(concrete.acquired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            concrete.released.load(Ordering::SeqCst),
+            1,
+            "the request admission guard must release on outer timeout"
+        );
     }
 
     #[test]

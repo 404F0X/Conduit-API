@@ -27,7 +27,7 @@ jobs:
 
   test-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     services:
       postgres:
         image: postgres:17-bookworm@sha256:051f7b7b3abdd564d5d1bd1e8c4b9c1b6e77087d1dd22020ede611c096a272e0
@@ -47,6 +47,8 @@ jobs:
       CONDUIT_DB_DIALECT: postgres
       CONDUIT_DB_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
       CONDUIT_TEST_POSTGRES_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_test
+      CONDUIT_E2E_POSTGRES_DSN: postgresql://conduit:conduit-ci-only-password@127.0.0.1:5432/conduit_e2e_ci
+      CONDUIT_E2E_BACKEND_TIMEOUT_MS: "600000"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -94,6 +96,21 @@ jobs:
         working-directory: frontend
         run: pnpm build
 
+      - name: Verify frontend legal notices
+        working-directory: frontend
+        shell: bash
+        run: |
+          test -r dist/licenses/LICENSE
+          test -r dist/licenses/NOTICE
+          test -r dist/licenses/LICENSING.md
+          test -r dist/licenses/LICENSES/LGPL-3.0-only.txt
+          test -r dist/licenses/frontend/NOTICE
+          test -s dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          grep --fixed-strings --quiet '## react - ' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          grep --fixed-strings --quiet '## @lobehub/icons - ' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          ! grep --fixed-strings --quiet '@splinetool/runtime' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          ! grep --fixed-strings --quiet '@splinetool/runtime' pnpm-lock.yaml
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
@@ -102,6 +119,9 @@ jobs:
 
       - name: Check configuration schema drift
         run: bash scripts/generate_config_schema.sh --check
+
+      - name: Check Rust security invariants
+        run: node scripts/rust/security-static-check.mjs && node scripts/rust/security-static-check.mjs --self-test
 
       - name: Test Rust workspace
         run: cargo test --locked --workspace --all-targets
@@ -117,6 +137,14 @@ jobs:
 
       - name: Audit Rust dependencies
         run: cargo audit
+
+      - name: Install Playwright Chromium
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run isolated browser E2E
+        working-directory: frontend
+        run: pnpm test:e2e -- --reporter=line
 
       - name: Validate Compose model
         run: docker compose -f compose.yml config --quiet
@@ -175,7 +203,10 @@ jobs:
           test "$(docker compose -f compose.yml exec --no-TTY conduit-api id -u)" = "10001"
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSE
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/NOTICE
-          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/third-party/LGPL-3.0-only.txt
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSING.md
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSES/LGPL-3.0-only.txt
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/frontend/NOTICE
+          docker compose -f compose.yml exec --no-TTY conduit-api test -s /app/licenses/frontend/THIRD_PARTY_LICENSES.md
 
       - name: Verify restart health
         shell: bash

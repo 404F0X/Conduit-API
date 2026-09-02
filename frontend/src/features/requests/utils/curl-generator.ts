@@ -1,3 +1,4 @@
+import { withBasePath } from '@/lib/base-path';
 import { CHANNEL_CONFIGS } from '@/features/channels/data/config_channels';
 import { ApiFormat } from '@/features/channels/data/schema';
 
@@ -77,7 +78,7 @@ function resolveExecutionURL(options: CurlGeneratorOptions, apiFormat?: ApiForma
     return `${cleanBaseUrl}${combinedPath}`;
   }
 
-  return `${typeof window !== 'undefined' ? window.location.origin : ''}${apiPath}`;
+  return `${typeof window !== 'undefined' ? window.location.origin : ''}${withBasePath(apiPath)}`;
 }
 
 export function generateCurlCommand(options: CurlGeneratorOptions): string {

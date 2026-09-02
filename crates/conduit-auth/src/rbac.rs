@@ -398,35 +398,54 @@ mod tests {
     -> Result<(), crate::request_context::ContextConflictError> {
         let direct = context_with(
             Principal::user("user-1")
-                .with_scope(Scope::project("project-1", slug::READ_PROJECTS))
+                .with_scope(Scope::project("project-1", slug::READ_USERS))
                 .with_scope(slug::SYSTEM_ADMIN)
-                .with_scope(Scope::project_membership("project-1", slug::READ_PROJECTS))
-                .with_scope(Scope::project_role("project-1", slug::READ_PROJECTS)),
+                .with_scope(Scope::project_membership("project-1", slug::READ_USERS))
+                .with_scope(Scope::project_role("project-1", slug::READ_USERS)),
             Some("project-1"),
         )?;
         let membership = context_with(
             Principal::user("user-1")
-                .with_scope(Scope::project_membership("project-1", slug::READ_PROJECTS)),
+                .with_scope(Scope::project_membership("project-1", slug::READ_USERS)),
             Some("project-1"),
         )?;
         let project_role = context_with(
             Principal::user("user-1")
-                .with_scope(Scope::project_role("project-1", slug::READ_PROJECTS)),
+                .with_scope(Scope::project_role("project-1", slug::READ_USERS)),
             Some("project-1"),
         )?;
 
         assert_eq!(
-            has_project_scope(&direct, slug::READ_PROJECTS).source(),
+            has_project_scope(&direct, slug::READ_USERS).source(),
             Some(PermissionSource::DirectScope)
         );
         assert_eq!(
-            has_project_scope(&membership, slug::READ_PROJECTS).source(),
+            has_project_scope(&membership, slug::READ_USERS).source(),
             Some(PermissionSource::ProjectMembershipScope)
         );
         assert_eq!(
-            has_project_scope(&project_role, slug::READ_PROJECTS).source(),
+            has_project_scope(&project_role, slug::READ_USERS).source(),
             Some(PermissionSource::ProjectRoleScope)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn project_owner_wildcard_cannot_grant_system_only_scope()
+    -> Result<(), crate::request_context::ContextConflictError> {
+        let ctx = context_with(
+            Principal::user("project-owner")
+                .with_scope(Scope::project_membership("project-1", slug::WILDCARD)),
+            Some("project-1"),
+        )?;
+
+        assert_eq!(
+            has_project_scope(&ctx, slug::WILDCARD).source(),
+            Some(PermissionSource::ProjectMembershipScope)
+        );
+        assert!(has_project_scope(&ctx, slug::WRITE_API_KEYS).is_allowed());
+        assert!(!has_project_scope(&ctx, slug::GRANT_CREDIT).is_allowed());
+        assert!(!has_project_scope(&ctx, slug::WRITE_SETTINGS).is_allowed());
         Ok(())
     }
 
@@ -537,23 +556,23 @@ mod tests {
     -> Result<(), crate::request_context::ContextConflictError> {
         let same_project = context_with(
             Principal::user("user-1")
-                .with_scope(Scope::project_membership("project-1", slug::READ_PROJECTS)),
+                .with_scope(Scope::project_membership("project-1", slug::READ_USERS)),
             Some("project-1"),
         )?;
         let other_project = context_with(
             Principal::user("user-1")
-                .with_scope(Scope::project_membership("project-1", slug::READ_PROJECTS)),
+                .with_scope(Scope::project_membership("project-1", slug::READ_USERS)),
             Some("project-2"),
         )?;
 
-        let allow = has_project_scope(&same_project, slug::READ_PROJECTS);
+        let allow = has_project_scope(&same_project, slug::READ_USERS);
         assert!(allow.is_allowed());
         assert_eq!(
             allow.source(),
             Some(PermissionSource::ProjectMembershipScope)
         );
 
-        let deny = has_project_scope(&other_project, slug::READ_PROJECTS);
+        let deny = has_project_scope(&other_project, slug::READ_USERS);
         assert!(!deny.is_allowed());
         Ok(())
     }

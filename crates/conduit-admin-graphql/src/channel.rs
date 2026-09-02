@@ -353,13 +353,24 @@ pub struct OverrideOperation {
 
 /// `type ProxyConfig` — snapshot lines 83-88.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+#[graphql(complex)]
 pub struct ProxyConfig {
     // `type` is a Rust keyword; GraphQL name pinned explicitly.
     #[graphql(name = "type")]
     pub proxy_type: ProxyType,
     pub url: Option<String>,
     pub username: Option<String>,
+    #[graphql(skip)]
     pub password: Option<String>,
+}
+
+#[ComplexObject]
+impl ProxyConfig {
+    /// Proxy credentials are write-only. Keep the Rust field for persistence
+    /// conversions, but never serialize the stored secret into GraphQL.
+    async fn password(&self) -> Option<String> {
+        self.password.as_ref().map(|_| String::new())
+    }
 }
 
 /// `type TransformOptions` — snapshot lines 60-64 (all fields non-null).
@@ -884,6 +895,7 @@ impl Channel {
             ..where_filter.unwrap_or_default()
         };
         let args = crate::request_usage::RequestConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -915,6 +927,7 @@ impl Channel {
             ..where_filter.unwrap_or_default()
         };
         let args = crate::request_usage::UsageLogConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -956,6 +969,7 @@ impl Channel {
             ..where_filter.unwrap_or_default()
         };
         let args = crate::request_execution::RequestExecutionConnectionArgs {
+            access: crate::request_usage::request_read_access_scope(ctx)?,
             after: after.map(|cursor| cursor.0),
             first,
             before: before.map(|cursor| cursor.0),
@@ -3606,7 +3620,17 @@ mod tests {
             .data(mutation)
             .data(req)
             .data(usage)
+            .data(read_requests_context())
             .finish()
+    }
+
+    fn read_requests_context() -> conduit_auth::RequestContext {
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(
+            conduit_auth::Principal::user("channel-edge-test")
+                .with_scope(conduit_auth::scopes::slug::READ_REQUESTS),
+        );
+        context
     }
 
     #[tokio::test]
@@ -3751,12 +3775,16 @@ mod tests {
             Arc::new(usage_logs.clone());
         let exec: Arc<dyn crate::request_execution::RequestExecutionQueryServices> =
             Arc::new(execs.clone());
+        let mut request_context = conduit_auth::RequestContext::new();
+        request_context.set_principal(conduit_auth::Principal::system())?;
+        request_context.set_project_id("41")?;
         let schema = admin_schema_builder()
             .data(query)
             .data(mutation)
             .data(req)
             .data(usage)
             .data(exec)
+            .data(request_context)
             .finish();
 
         let resp = schema
@@ -3777,6 +3805,7 @@ mod tests {
         // ent's edge resolver filters on `channelID = obj.id`; the Rust port
         // mirrors that by overriding the `channel_id` slot with the parent id.
         assert_eq!(filter.channel_id, Some(ID::from("33")));
+        assert_eq!(captured[0].access, crate::policy::AdminAccessScope::Global);
         assert_eq!(captured[0].first, Some(2));
         Ok(())
     }

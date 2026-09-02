@@ -320,16 +320,26 @@ impl APIKey {
             return Ok(None);
         };
 
+        crate::policy::authorize_current(ctx, conduit_auth::scopes::slug::READ_USERS)
+            .map_err(|error| error.to_string())?;
         let services = crate::user::user_query_services(ctx)?;
+        let access = crate::policy::AdminAccessScope::from_graphql_context(
+            ctx,
+            conduit_auth::scopes::slug::READ_USERS,
+        )
+        .map_err(|error| error.to_string())?;
         let connection = services
-            .users(crate::user::UserConnectionArgs {
-                first: Some(1),
-                where_filter: Some(crate::user::UserWhereInput {
-                    id: Some(user_id),
+            .users_with_access(
+                &access,
+                crate::user::UserConnectionArgs {
+                    first: Some(1),
+                    where_filter: Some(crate::user::UserWhereInput {
+                        id: Some(user_id),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })
+                },
+            )
             .await
             .map_err(|err| err.to_string())?;
 
@@ -994,6 +1004,14 @@ mod tests {
                 page_info: PageInfo::empty(false, false),
                 total_count,
             })
+        }
+
+        async fn users_with_access(
+            &self,
+            _access: &crate::policy::AdminAccessScope,
+            args: UserConnectionArgs,
+        ) -> Result<UserConnection, UserServiceError> {
+            self.users(args).await
         }
 
         async fn roles_for_user(
@@ -1774,6 +1792,107 @@ mod tests {
         assert_eq!(data["createAPIKey"]["user"]["id"], "7");
         assert_eq!(data["createAPIKey"]["user"]["firstName"], "Admin");
         assert_eq!(data["createAPIKey"]["user"]["lastName"], "User");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_user_edge_requires_read_users_in_selected_project() -> Result<(), TestError> {
+        let store = InMemoryApiKeyService::default();
+        let mut key = sample_apikey(1, "scoped", APIKeyType::User);
+        key.user_id = Some(ID::from("7"));
+        lock(&store.api_keys).push(key);
+        lock(&store.users).push(User {
+            id: ID::from("7"),
+            created_at: epoch(),
+            updated_at: epoch(),
+            email: "must-not-leak@example.com".to_owned(),
+            status: UserStatus::Activated,
+            prefer_language: "en".to_owned(),
+            first_name: "Private".to_owned(),
+            last_name: "User".to_owned(),
+            avatar: None,
+            is_owner: false,
+            scopes: None,
+        });
+        let query: Arc<dyn ApiKeyQueryServices> = Arc::new(store.clone());
+        let users: Arc<dyn UserQueryServices> = Arc::new(store);
+        let mut context = conduit_auth::RequestContext::new();
+        context.set_principal(
+            conduit_auth::Principal::user("project-api-key-reader").with_scope(
+                conduit_auth::scopes::Scope::project(
+                    "1",
+                    conduit_auth::scopes::slug::READ_API_KEYS,
+                ),
+            ),
+        )?;
+        context.set_project_id("1")?;
+        let schema = admin_schema_builder()
+            .data(query)
+            .data(users)
+            .data(context)
+            .finish();
+
+        let response = schema
+            .execute("{ apiKeys { edges { node { user { email } } } } }")
+            .await;
+
+        assert_eq!(response.errors.len(), 1);
+        assert!(response.errors[0].message.contains("read_users"));
+        assert!(
+            !response
+                .data
+                .to_string()
+                .contains("must-not-leak@example.com")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_user_edge_accepts_project_read_users_scope() -> Result<(), TestError> {
+        let store = InMemoryApiKeyService::default();
+        let mut key = sample_apikey(1, "scoped", APIKeyType::User);
+        key.user_id = Some(ID::from("7"));
+        lock(&store.api_keys).push(key);
+        lock(&store.users).push(User {
+            id: ID::from("7"),
+            created_at: epoch(),
+            updated_at: epoch(),
+            email: "visible@example.com".to_owned(),
+            status: UserStatus::Activated,
+            prefer_language: "en".to_owned(),
+            first_name: "Visible".to_owned(),
+            last_name: "User".to_owned(),
+            avatar: None,
+            is_owner: false,
+            scopes: None,
+        });
+        let query: Arc<dyn ApiKeyQueryServices> = Arc::new(store.clone());
+        let users: Arc<dyn UserQueryServices> = Arc::new(store);
+        let mut context = conduit_auth::RequestContext::new();
+        context.set_principal(
+            conduit_auth::Principal::user("project-reader")
+                .with_scope(conduit_auth::scopes::Scope::project(
+                    "1",
+                    conduit_auth::scopes::slug::READ_API_KEYS,
+                ))
+                .with_scope(conduit_auth::scopes::Scope::project(
+                    "1",
+                    conduit_auth::scopes::slug::READ_USERS,
+                )),
+        )?;
+        context.set_project_id("1")?;
+        let schema = admin_schema_builder()
+            .data(query)
+            .data(users)
+            .data(context)
+            .finish();
+
+        let response = schema
+            .execute("{ apiKeys { edges { node { user { email } } } } }")
+            .await;
+
+        assert!(response.errors.is_empty(), "errors: {:?}", response.errors);
+        assert!(response.data.to_string().contains("visible@example.com"));
         Ok(())
     }
 

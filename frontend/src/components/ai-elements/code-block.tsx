@@ -1,11 +1,12 @@
 'use client';
 
-import { type ComponentProps, createContext, type HTMLAttributes, useContext, useEffect, useRef, useState } from 'react';
+import { type ComponentProps, createContext, type HTMLAttributes, useContext, useEffect, useState } from 'react';
 import type { Element } from 'hast';
 import { CheckIcon, CopyIcon } from 'lucide-react';
 import { type BundledLanguage, codeToHtml, type ShikiTransformer } from 'shiki';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
+import { createHighlightState, settleHighlightWhileActive } from './highlight-lifecycle';
 
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
@@ -53,22 +54,11 @@ export async function highlightCode(code: string, language: BundledLanguage, sho
 }
 
 export const CodeBlock = ({ code, language, showLineNumbers = false, className, children, ...props }: CodeBlockProps) => {
-  const [html, setHtml] = useState<string>('');
-  const [darkHtml, setDarkHtml] = useState<string>('');
-  const mounted = useRef(false);
+  const [highlight, setHighlight] = useState(() => createHighlightState());
 
   useEffect(() => {
-    highlightCode(code, language, showLineNumbers).then(([light, dark]) => {
-      if (!mounted.current) {
-        setHtml(light);
-        setDarkHtml(dark);
-        mounted.current = true;
-      }
-    });
-
-    return () => {
-      mounted.current = false;
-    };
+    setHighlight(createHighlightState());
+    return settleHighlightWhileActive(highlightCode(code, language, showLineNumbers), setHighlight);
   }, [code, language, showLineNumbers]);
 
   return (
@@ -78,12 +68,12 @@ export const CodeBlock = ({ code, language, showLineNumbers = false, className, 
           <div
             className='[&>pre]:bg-background! [&>pre]:text-foreground! overflow-hidden dark:hidden [&_code]:font-mono [&_code]:text-sm [&>pre]:m-0 [&>pre]:p-4 [&>pre]:text-sm'
             // biome-ignore lint/security/noDangerouslySetInnerHtml: "this is needed."
-            dangerouslySetInnerHTML={{ __html: html }}
+            dangerouslySetInnerHTML={{ __html: highlight.light }}
           />
           <div
             className='[&>pre]:bg-background! [&>pre]:text-foreground! hidden overflow-hidden dark:block [&_code]:font-mono [&_code]:text-sm [&>pre]:m-0 [&>pre]:p-4 [&>pre]:text-sm'
             // biome-ignore lint/security/noDangerouslySetInnerHtml: "this is needed."
-            dangerouslySetInnerHTML={{ __html: darkHtml }}
+            dangerouslySetInnerHTML={{ __html: highlight.dark }}
           />
           {children && <div className='absolute top-2 right-2 flex items-center gap-2'>{children}</div>}
         </div>

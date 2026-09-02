@@ -133,8 +133,7 @@ test.describe('Admin API Keys Management', () => {
     const addProfileButton = profilesDialog.getByRole('button', { name: /新增配置|Add Profile/i })
     await expect(addProfileButton).toBeVisible()
 
-    // Add first profile card (UI starts empty)
-    await addProfileButton.click()
+    // New API keys already contain the default profile created by the backend.
     const profileInputs = profilesDialog.locator(profileInputSelector)
     await expect(profileInputs).toHaveCount(1)
 
@@ -227,9 +226,9 @@ test.describe('Admin API Keys Management', () => {
     const addProfileButton = profilesDialog.getByRole('button', { name: /新增配置|Add Profile/i })
     await expect(addProfileButton).toBeVisible()
 
-    // Add first profile and set its name to "Default" for baseline comparison
-    await addProfileButton.click()
+    // Use the default profile created with the API key as the baseline.
     const profileInputs = profilesDialog.locator(profileInputSelector)
+    await expect(profileInputs).toHaveCount(1)
     const firstProfileInput = profileInputs.first()
     await expect(firstProfileInput).toBeVisible()
     await firstProfileInput.clear()

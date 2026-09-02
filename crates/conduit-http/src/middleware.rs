@@ -222,27 +222,16 @@ impl AuthRequestContextExtension {
 /// P-22: whether the JWT-authenticated caller may read request rows
 /// (prompt/response content + previews).
 ///
-/// Mirrors Go's `Request` ent policy owner + `UserReadScopeRule(read_requests)`
-/// branches: an owner, or a user holding the system `read_requests` scope, may
-/// read any project's requests (system-scoped admins are project-agnostic in
-/// Go). A caller with no auth context, or without owner/`read_requests`, is
-/// denied.
-///
-/// **Deliberate divergence (stricter than Go, user-approved)**: Go additionally
-/// admits a *project member* who holds `read_requests` only within that project
-/// (`UserProjectScopeReadRule`). The Rust principal does not yet carry per-
-/// project membership scopes, so that branch is dropped — we fail safe (deny)
-/// rather than admit. Effect: a non-owner who only has `read_requests` as a
-/// project-scoped grant is denied here; closing the IDOR takes priority over
-/// that narrower capability until membership is plumbed onto the principal.
+/// Mirrors Go's `Request` ent policy branches: global `read_requests` grants
+/// cross-project access, while a project membership/role grant is accepted only
+/// for the project selected in the authenticated request context.
 pub fn caller_can_read_requests(auth: Option<&AuthRequestContextExtension>) -> bool {
-    let Some(principal) = auth.and_then(|ext| ext.context().principal.as_ref()) else {
+    let Some(context) = auth.map(AuthRequestContextExtension::context) else {
         return false;
     };
-    principal.is_owner
-        || principal
-            .scopes
-            .contains(conduit_auth::scopes::slug::READ_REQUESTS)
+    conduit_auth::rbac::has_scope(context, conduit_auth::scopes::slug::READ_REQUESTS).is_allowed()
+        || conduit_auth::rbac::has_project_scope(context, conduit_auth::scopes::slug::READ_REQUESTS)
+            .is_allowed()
 }
 
 /// 把已构造的 `RequestContext` 注入到请求扩展中。
@@ -742,7 +731,7 @@ fn blocked_entry_matches(client: IpAddr, configured: &str) -> bool {
 
     let Some((network, prefix_len)) = configured.split_once('/') else {
         return match configured.parse::<IpAddr>() {
-            Ok(blocked) => blocked == client,
+            Ok(blocked) => canonical_ip(blocked) == canonical_ip(client),
             Err(error) => {
                 tracing::warn!(blocked_ip = configured, %error, "failed to parse blocked IP");
                 false
@@ -771,6 +760,17 @@ fn blocked_entry_matches(client: IpAddr, configured: &str) -> bool {
             };
             (u32::from(client) & mask) == (u32::from(network) & mask)
         }
+        (IpAddr::V6(client), IpAddr::V4(network)) if prefix_len <= 32 => {
+            let Some(client) = client.to_ipv4_mapped() else {
+                return false;
+            };
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            (u32::from(client) & mask) == (u32::from(network) & mask)
+        }
         (IpAddr::V6(client), IpAddr::V6(network)) if prefix_len <= 128 => {
             let mask = if prefix_len == 0 {
                 0
@@ -783,6 +783,16 @@ fn blocked_entry_matches(client: IpAddr, configured: &str) -> bool {
             tracing::warn!(blocked_ip = configured, "failed to parse blocked IP prefix");
             false
         }
+    }
+}
+
+/// Treat an IPv4-mapped IPv6 address as its canonical IPv4 identity. Socket
+/// peers and forwarding proxies may represent the same client either way, so
+/// exact blocklist and trusted-proxy checks must not distinguish the forms.
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        IpAddr::V4(ip) => IpAddr::V4(ip),
     }
 }
 
@@ -2199,6 +2209,50 @@ mod tests {
 
     use super::*;
 
+    fn request_reader(
+        scopes: impl IntoIterator<Item = String>,
+        project_id: Option<&str>,
+    ) -> AuthRequestContextExtension {
+        let mut principal = conduit_auth::Principal::user("request-reader");
+        for scope in scopes {
+            principal = principal.with_scope(scope);
+        }
+        let mut context = conduit_auth::RequestContext::new();
+        let _ = context.set_principal(principal);
+        if let Some(project_id) = project_id {
+            let _ = context.set_project_id(project_id);
+        }
+        AuthRequestContextExtension::new(context)
+    }
+
+    #[test]
+    fn request_read_authorization_accepts_global_and_same_project_grants_only() {
+        let global = request_reader([conduit_auth::scopes::slug::READ_REQUESTS.to_owned()], None);
+        assert!(caller_can_read_requests(Some(&global)));
+
+        for project_scope in [
+            conduit_auth::scopes::Scope::project_membership(
+                "7",
+                conduit_auth::scopes::slug::READ_REQUESTS,
+            )
+            .to_string(),
+            conduit_auth::scopes::Scope::project_role(
+                "7",
+                conduit_auth::scopes::slug::READ_REQUESTS,
+            )
+            .to_string(),
+        ] {
+            let same_project = request_reader([project_scope.clone()], Some("7"));
+            assert!(caller_can_read_requests(Some(&same_project)));
+            let other_project = request_reader([project_scope], Some("8"));
+            assert!(!caller_can_read_requests(Some(&other_project)));
+        }
+
+        let no_scope = request_reader(Vec::new(), Some("7"));
+        assert!(!caller_can_read_requests(Some(&no_scope)));
+        assert!(!caller_can_read_requests(None));
+    }
+
     #[test]
     fn middleware_order_vector_matches_expected_stack() {
         let mut recorder = MiddlewareOrderRecorder::default();
@@ -2240,6 +2294,14 @@ mod tests {
         let blocked = vec!["10.42.0.0/16".to_string()];
 
         assert!(is_blocked_ip(&candidates, &blocked));
+    }
+
+    #[test]
+    fn dynamic_ip_blocklist_canonicalizes_ipv4_mapped_ipv6() {
+        let candidates = vec!["::ffff:203.0.113.8".to_string()];
+
+        assert!(is_blocked_ip(&candidates, &["203.0.113.8".to_string()]));
+        assert!(is_blocked_ip(&candidates, &["203.0.113.0/24".to_string()]));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use sqlx::Connection as _;
 use thiserror::Error;
 
 /// Runtime migration dialect.
@@ -144,8 +145,21 @@ pub const ROUTE_AFFINITIES_SCHEMA_VERSION: &str = "000029";
 pub const PROVIDER_PRICE_ACCOUNTING_SCHEMA_VERSION: &str = "000030";
 pub const PRICING_CHANGE_AUDITS_SCHEMA_VERSION: &str = "000031";
 pub const CHANGE_SETS_SCHEMA_VERSION: &str = "000032";
-pub const LATEST_SCHEMA_VERSION: &str = CHANGE_SETS_SCHEMA_VERSION;
+pub const CREDIT_REDEMPTIONS_SCHEMA_VERSION: &str = "000033";
+pub const CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION: &str = "000034";
+pub const LATEST_SCHEMA_VERSION: &str = CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION;
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
+
+// Keep this stable across releases: an instance running an older binary must
+// contend on the same lock while a newer instance is applying migrations.
+const POSTGRES_MIGRATION_LOCK_KEY: i64 = 0x4158_4F4E_4855_4221;
+const POSTGRES_MIGRATION_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock($1)";
+const CREATE_TRACKING_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (\
+        version TEXT PRIMARY KEY, \
+        applied_at TEXT NOT NULL \
+     )";
+const MIGRATION_APPLIED_SQL: &str =
+    "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationOutcome {
@@ -168,6 +182,12 @@ pub enum MigrationRunnerError {
 struct EmbeddedMigration {
     version: &'static str,
     sql: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedMigration {
+    version: &'static str,
+    statements: Vec<String>,
 }
 
 const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
@@ -299,6 +319,14 @@ const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
         version: CHANGE_SETS_SCHEMA_VERSION,
         sql: include_str!("../../../migrations/postgres/000032_change_sets.sql"),
     },
+    EmbeddedMigration {
+        version: CREDIT_REDEMPTIONS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000033_credit_redemptions.sql"),
+    },
+    EmbeddedMigration {
+        version: CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000034_credit_redemption_limits.sql"),
+    },
 ];
 
 pub(crate) fn required_postgres_schema_versions() -> impl Iterator<Item = &'static str> {
@@ -327,6 +355,11 @@ pub fn select_dialect_entrypoint(dialect: Dialect) -> &'static str {
 }
 
 /// Apply every missing embedded PostgreSQL migration in version order.
+///
+/// The runner owns its transaction so direct callers receive the same safety
+/// guarantees as the pool bootstrap path. The transaction-scoped advisory
+/// lock is acquired before the tracking table is created or inspected. This
+/// serializes first boot as well as upgrades across application instances.
 pub async fn run_migrations_postgres(
     conn: &mut sqlx::PgConnection,
     disable_auto_migration: bool,
@@ -335,56 +368,8 @@ pub async fn run_migrations_postgres(
         return Ok(MigrationOutcome::Disabled);
     }
 
-    let create_tracking_table = format!(
-        "CREATE TABLE IF NOT EXISTS {table} (\
-            version TEXT PRIMARY KEY, \
-            applied_at TEXT NOT NULL \
-         )",
-        table = SCHEMA_MIGRATIONS_TABLE,
-    );
-    sqlx::query(&create_tracking_table)
-        .execute(&mut *conn)
-        .await?;
-
     let migrations = migrations_for_dialect(Dialect::Postgres);
-    let mut plan = MigrationPlan::new(Dialect::Postgres);
-    for migration in &migrations {
-        plan.push_step(MigrationStep::new(
-            migration.version,
-            Dialect::Postgres,
-            migration.sql,
-        ));
-    }
-    validate_plan_non_destructive(&plan)?;
-
-    let mut last_applied = None;
-    for migration in migrations {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM schema_migrations WHERE version = $1",
-        )
-        .bind(migration.version)
-        .fetch_one(&mut *conn)
-        .await?;
-        if count > 0 {
-            continue;
-        }
-
-        for statement in split_ddl_statements(migration.sql) {
-            if let Err(error) = sqlx::raw_sql(&statement).execute(&mut *conn).await {
-                if is_object_exists_error(&error) {
-                    continue;
-                }
-                return Err(error.into());
-            }
-        }
-
-        sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)")
-            .bind(migration.version)
-            .bind(rfc3339_utc_now())
-            .execute(&mut *conn)
-            .await?;
-        last_applied = Some(migration.version);
-    }
+    let last_applied = run_postgres_migration_catalog(conn, &migrations).await?;
 
     Ok(match last_applied {
         Some(version) => MigrationOutcome::Applied { version },
@@ -394,11 +379,81 @@ pub async fn run_migrations_postgres(
     })
 }
 
-fn is_object_exists_error(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|database_error| database_error.code())
-        .is_some_and(|code| matches!(code.as_ref(), "42P07" | "42710" | "42P06" | "42P16"))
+fn prepare_postgres_migration_catalog(
+    migrations: &[EmbeddedMigration],
+) -> MigrationPlanResult<Vec<PreparedMigration>> {
+    let mut plan = MigrationPlan::new(Dialect::Postgres);
+    for migration in migrations {
+        plan.push_step(MigrationStep::new(
+            migration.version,
+            Dialect::Postgres,
+            migration.sql,
+        ));
+    }
+    validate_plan_non_destructive(&plan)?;
+
+    Ok(migrations
+        .iter()
+        .map(|migration| PreparedMigration {
+            version: migration.version,
+            statements: split_ddl_statements(migration.sql),
+        })
+        .collect())
+}
+
+async fn run_postgres_migration_catalog(
+    conn: &mut sqlx::PgConnection,
+    migrations: &[EmbeddedMigration],
+) -> Result<Option<&'static str>, MigrationRunnerError> {
+    let migrations = prepare_postgres_migration_catalog(migrations)?;
+    let mut transaction = conn.begin().await?;
+    let result: Result<Option<&'static str>, MigrationRunnerError> = async {
+        sqlx::query(POSTGRES_MIGRATION_LOCK_SQL)
+            .bind(POSTGRES_MIGRATION_LOCK_KEY)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(CREATE_TRACKING_TABLE_SQL)
+            .execute(&mut *transaction)
+            .await?;
+
+        let mut last_applied = None;
+        for migration in migrations {
+            let already_applied = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)",
+            )
+            .bind(migration.version)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if already_applied {
+                continue;
+            }
+
+            for statement in &migration.statements {
+                sqlx::raw_sql(statement).execute(&mut *transaction).await?;
+            }
+
+            sqlx::query(MIGRATION_APPLIED_SQL)
+                .bind(migration.version)
+                .bind(rfc3339_utc_now())
+                .execute(&mut *transaction)
+                .await?;
+            last_applied = Some(migration.version);
+        }
+
+        Ok(last_applied)
+    }
+    .await;
+
+    match result {
+        Ok(last_applied) => {
+            transaction.commit().await?;
+            Ok(last_applied)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
 }
 
 /// Split a multi-statement PostgreSQL payload while preserving dollar-quoted
@@ -619,13 +674,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_latest_pricing_review_migrations() -> Result<(), &'static str> {
+    fn catalog_includes_latest_pricing_and_credit_redemption_migrations() -> Result<(), &'static str>
+    {
         let migrations = migrations_for_dialect(Dialect::Postgres);
         assert_eq!(
             migrations.last().map(|migration| migration.version),
             Some(LATEST_SCHEMA_VERSION)
         );
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 31);
         assert!(
             migrations
                 .iter()
@@ -656,6 +712,31 @@ mod tests {
         assert!(change_sets.contains("change_set_events_append_only"));
         assert!(change_sets.contains("change_sets_activity"));
         assert!(change_sets.contains("status, updated_at DESC, id DESC"));
+
+        let redemptions = migration_sql(&migrations, CREDIT_REDEMPTIONS_SCHEMA_VERSION)?;
+        assert!(redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_batches"));
+        assert!(redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_codes"));
+        assert!(redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_receipts"));
+        assert!(
+            redemptions.contains("CREATE TABLE IF NOT EXISTS credit_redemption_transaction_audits")
+        );
+        assert!(redemptions.contains("code_digest ~ '^sha256:[0-9a-f]{64}$'"));
+        assert!(redemptions.contains("quantity BETWEEN 1 AND 1000"));
+        assert!(redemptions.contains("credit_redemption_batches_append_only"));
+        assert!(redemptions.contains("credit_redemption_codes_state_machine"));
+        assert!(redemptions.contains("credit_redemption_receipts_append_only"));
+        assert!(redemptions.contains("credit_redemption_transaction_audits_append_only"));
+
+        let redemption_limits =
+            migration_sql(&migrations, CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION)?;
+        assert!(
+            redemption_limits.contains("ADD COLUMN max_redemptions INTEGER NOT NULL DEFAULT 1")
+        );
+        assert!(redemption_limits.contains("max_redemptions BETWEEN 1 AND 100000"));
+        assert!(
+            redemption_limits.contains("DROP CONSTRAINT credit_redemption_receipts_code_id_key")
+        );
+        assert!(redemption_limits.contains("UNIQUE (code_id, user_id)"));
         assert!(accounting.contains("customer_charge_events_station_credit_currency"));
         assert!(accounting.contains("project_commercial_profiles_station_credit_currency"));
         assert!(accounting.contains("channel_model_prices_currency_code_iso"));
@@ -790,5 +871,124 @@ mod tests {
         assert_eq!(statements.len(), 2);
         assert!(statements[0].contains("RETURN NEW;"));
         assert!(statements[1].starts_with("CREATE INDEX"));
+    }
+
+    #[test]
+    fn prepared_catalog_keeps_redemption_limit_ddl_in_one_migration_unit() -> MigrationPlanResult<()>
+    {
+        let prepared = prepare_postgres_migration_catalog(EMBEDDED_MIGRATIONS)?;
+        assert_eq!(prepared.len(), EMBEDDED_MIGRATIONS.len());
+        assert_eq!(
+            prepared.last().map(|migration| migration.version),
+            Some(CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION)
+        );
+
+        let redemption_limits = prepared
+            .last()
+            .expect("the embedded catalog always contains a latest migration");
+        assert_eq!(redemption_limits.statements.len(), 3);
+        assert!(redemption_limits.statements[0].contains("ADD COLUMN max_redemptions"));
+        assert!(redemption_limits.statements[1].contains("DROP CONSTRAINT"));
+        assert!(redemption_limits.statements[2].contains("UNIQUE (code_id, user_id)"));
+        assert_eq!(
+            POSTGRES_MIGRATION_LOCK_SQL,
+            "SELECT pg_advisory_xact_lock($1)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_ddl_and_tracking_when_test_dsn_is_provided()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let database = crate::postgres_test_support::IsolatedPostgres::new_unmigrated(&dsn).await?;
+        let failing_catalog = [EmbeddedMigration {
+            version: "test_atomic_failure",
+            sql: "CREATE TABLE migration_atomicity_probe (id BIGINT PRIMARY KEY);\n\
+                  SELECT conduit_missing_migration_function();",
+        }];
+
+        let mut connection = database.pool.acquire().await?;
+        let result = run_postgres_migration_catalog(&mut connection, &failing_catalog).await;
+        assert!(matches!(result, Err(MigrationRunnerError::Database(_))));
+        drop(connection);
+
+        let probe_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('migration_atomicity_probe') IS NOT NULL")
+                .fetch_one(&database.pool)
+                .await?;
+        let tracking_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('schema_migrations') IS NOT NULL")
+                .fetch_one(&database.pool)
+                .await?;
+        assert!(!probe_exists, "DDL before the error must be rolled back");
+        assert!(
+            !tracking_exists,
+            "tracking-table creation must share the failed transaction"
+        );
+
+        let retry_catalog = [EmbeddedMigration {
+            version: "test_atomic_failure",
+            sql: "CREATE TABLE migration_atomicity_probe (id BIGINT PRIMARY KEY);",
+        }];
+        let mut connection = database.pool.acquire().await?;
+        assert_eq!(
+            run_postgres_migration_catalog(&mut connection, &retry_catalog).await?,
+            Some("test_atomic_failure")
+        );
+        drop(connection);
+        let recorded: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)")
+                .bind("test_atomic_failure")
+                .fetch_one(&database.pool)
+                .await?;
+        assert!(recorded, "a clean retry must record its version");
+
+        database.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_fresh_runners_are_serialized_when_test_dsn_is_provided()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let database = crate::postgres_test_support::IsolatedPostgres::new_unmigrated(&dsn).await?;
+
+        let (left, right) = tokio::join!(
+            crate::connection::migrate_postgres(&database.pool),
+            crate::connection::migrate_postgres(&database.pool)
+        );
+        let left = left?;
+        let right = right?;
+        assert!(matches!(
+            (left, right),
+            (
+                MigrationOutcome::Applied {
+                    version: LATEST_SCHEMA_VERSION
+                },
+                MigrationOutcome::AlreadyApplied {
+                    version: LATEST_SCHEMA_VERSION
+                }
+            ) | (
+                MigrationOutcome::AlreadyApplied {
+                    version: LATEST_SCHEMA_VERSION
+                },
+                MigrationOutcome::Applied {
+                    version: LATEST_SCHEMA_VERSION
+                }
+            )
+        ));
+
+        let recorded_versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(recorded_versions as usize, EMBEDDED_MIGRATIONS.len());
+
+        database.cleanup().await?;
+        Ok(())
     }
 }
