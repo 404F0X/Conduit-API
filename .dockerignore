@@ -6,6 +6,7 @@
 !Dockerfile
 !LICENSE
 !NOTICE
+!LICENSING.md
 
 !crates
 !crates/**

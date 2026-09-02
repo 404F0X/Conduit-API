@@ -165,7 +165,12 @@ mod tests {
             ),
             (
                 "ApiAuthConfig",
-                &["jwt_secret", "session_ttl", "bcrypt_cost"][..],
+                &[
+                    "jwt_secret",
+                    "session_ttl",
+                    "bcrypt_cost",
+                    "allow_password_signup",
+                ][..],
             ),
             (
                 "RetryConfig",

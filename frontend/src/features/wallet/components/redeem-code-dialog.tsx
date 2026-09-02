@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { IconRefresh, IconTicket } from '@tabler/icons-react';
+import { isAuthError } from '@/gql/graphql';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -50,8 +51,13 @@ export function RedeemCodeDialog({
       setShowRequired(false);
       redeem.reset();
       onOpenChange(false);
-    } catch {
-      toast.error(t('wallet.redeem.errors.generic'));
+    } catch (error) {
+      // graphqlRequest already shows the single session-expired notification
+      // and starts the sign-in redirect. Do not mislabel an authentication
+      // failure as an invalid or unavailable redemption code.
+      if (!isAuthError(error)) {
+        toast.error(t('wallet.redeem.errors.generic'));
+      }
     }
   };
 

@@ -412,10 +412,24 @@ fn generated_id(prefix: &str) -> String {
 }
 
 #[derive(Debug, Default)]
-struct TextStreamItem {
+struct TextStreamPart {
+    content_index: u64,
+    text: String,
+}
+
+#[derive(Debug, Default)]
+struct RefusalStreamPart {
+    content_index: u64,
+    refusal: String,
+}
+
+#[derive(Debug, Default)]
+struct MessageStreamItem {
     id: String,
     output_index: u64,
-    text: String,
+    next_content_index: u64,
+    text: Option<TextStreamPart>,
+    refusal: Option<RefusalStreamPart>,
 }
 
 #[derive(Debug, Default)]
@@ -446,7 +460,7 @@ struct ResponsesClientStream {
     usage: Option<Usage>,
     error: Option<ResponseError>,
     finish_reason: Option<String>,
-    text: Option<TextStreamItem>,
+    message: Option<MessageStreamItem>,
     reasoning: Option<ReasoningStreamItem>,
     tools: BTreeMap<i64, ToolStreamItem>,
     next_output_index: u64,
@@ -467,7 +481,7 @@ impl ResponsesClientStream {
             usage: None,
             error: None,
             finish_reason: None,
-            text: None,
+            message: None,
             reasoning: None,
             tools: BTreeMap::new(),
             next_output_index: 0,
@@ -527,39 +541,55 @@ impl ResponsesClientStream {
     }
 
     fn consume_message(&mut self, message: LlmMessage) {
-        if let Some(reasoning_delta) = message.reasoning_content {
+        let LlmMessage {
+            id,
+            content,
+            refusal,
+            reasoning_content,
+            reasoning_signature,
+            tool_calls,
+            ..
+        } = message;
+        if let Some(reasoning_delta) = reasoning_content {
             self.push_reasoning_delta(&reasoning_delta);
         }
-        if let Some(signature) = message.reasoning_signature {
+        if let Some(signature) = reasoning_signature {
             self.ensure_reasoning();
             if let Some(reasoning) = &mut self.reasoning {
                 reasoning.encrypted_content = Some(signature);
             }
         }
-        if let Some(content) = message.content {
-            for delta in content_texts(&content) {
-                self.push_text_delta(&delta, message.id.as_deref());
+        if let Some(content) = content {
+            for delta in content_stream_deltas(&content) {
+                match delta {
+                    ContentStreamDelta::OutputText(delta) => {
+                        self.push_text_delta(&delta, id.as_deref());
+                    }
+                    ContentStreamDelta::Refusal(delta) => {
+                        self.push_refusal_delta(&delta, id.as_deref());
+                    }
+                }
             }
         }
-        if let Some(refusal) = message.refusal {
-            self.push_text_delta(&refusal, message.id.as_deref());
+        if let Some(refusal) = refusal {
+            self.push_refusal_delta(&refusal, id.as_deref());
         }
-        for tool_call in message.tool_calls {
+        for tool_call in tool_calls {
             self.push_tool_delta(tool_call);
         }
     }
 
-    fn ensure_text(&mut self, message_id: Option<&str>) {
-        if self.text.is_some() {
+    fn ensure_message(&mut self, message_id: Option<&str>) {
+        if self.message.is_some() {
             return;
         }
-        let item = TextStreamItem {
+        let item = MessageStreamItem {
             id: message_id
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| generated_id("msg")),
             output_index: self.take_output_index(),
-            text: String::new(),
+            ..MessageStreamItem::default()
         };
         self.push_event(
             "response.output_item.added",
@@ -574,12 +604,31 @@ impl ResponsesClientStream {
                 }
             }),
         );
+        self.message = Some(item);
+    }
+
+    fn ensure_text(&mut self, message_id: Option<&str>) {
+        self.ensure_message(message_id);
+        let Some(message) = self.message.as_mut() else {
+            return;
+        };
+        if message.text.is_some() {
+            return;
+        }
+        let content_index = message.next_content_index;
+        message.next_content_index = message.next_content_index.saturating_add(1);
+        message.text = Some(TextStreamPart {
+            content_index,
+            text: String::new(),
+        });
+        let id = message.id.clone();
+        let output_index = message.output_index;
         self.push_event(
             "response.content_part.added",
             json!({
-                "item_id": item.id,
-                "output_index": item.output_index,
-                "content_index": 0,
+                "item_id": id,
+                "output_index": output_index,
+                "content_index": content_index,
                 "part": {
                     "type": "output_text",
                     "text": "",
@@ -588,25 +637,81 @@ impl ResponsesClientStream {
                 }
             }),
         );
-        self.text = Some(item);
     }
 
     fn push_text_delta(&mut self, delta: &str, message_id: Option<&str>) {
         self.ensure_text(message_id);
-        let Some(text) = &mut self.text else {
+        let Some(message) = &mut self.message else {
+            return;
+        };
+        let Some(text) = &mut message.text else {
             return;
         };
         text.text.push_str(delta);
-        let id = text.id.clone();
-        let output_index = text.output_index;
+        let id = message.id.clone();
+        let output_index = message.output_index;
+        let content_index = text.content_index;
         self.push_event(
             "response.output_text.delta",
             json!({
                 "item_id": id,
                 "output_index": output_index,
-                "content_index": 0,
+                "content_index": content_index,
                 "delta": delta,
                 "logprobs": [],
+            }),
+        );
+    }
+
+    fn ensure_refusal(&mut self, message_id: Option<&str>) {
+        self.ensure_message(message_id);
+        let Some(message) = self.message.as_mut() else {
+            return;
+        };
+        if message.refusal.is_some() {
+            return;
+        }
+        let content_index = message.next_content_index;
+        message.next_content_index = message.next_content_index.saturating_add(1);
+        message.refusal = Some(RefusalStreamPart {
+            content_index,
+            refusal: String::new(),
+        });
+        let id = message.id.clone();
+        let output_index = message.output_index;
+        self.push_event(
+            "response.content_part.added",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": {
+                    "type": "refusal",
+                    "refusal": "",
+                }
+            }),
+        );
+    }
+
+    fn push_refusal_delta(&mut self, delta: &str, message_id: Option<&str>) {
+        self.ensure_refusal(message_id);
+        let Some(message) = &mut self.message else {
+            return;
+        };
+        let Some(refusal) = &mut message.refusal else {
+            return;
+        };
+        refusal.refusal.push_str(delta);
+        let id = message.id.clone();
+        let output_index = message.output_index;
+        let content_index = refusal.content_index;
+        self.push_event(
+            "response.refusal.delta",
+            json!({
+                "item_id": id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": delta,
             }),
         );
     }
@@ -817,44 +922,83 @@ impl ResponsesClientStream {
             completed.insert(reasoning.output_index, item);
         }
 
-        if let Some(text) = self.text.take() {
-            self.push_event(
-                "response.output_text.done",
-                json!({
-                    "item_id": text.id,
-                    "output_index": text.output_index,
-                    "content_index": 0,
+        if let Some(message) = self.message.take() {
+            let MessageStreamItem {
+                id,
+                output_index,
+                text,
+                refusal,
+                ..
+            } = message;
+            let mut content = BTreeMap::<u64, Value>::new();
+
+            if let Some(text) = text {
+                self.push_event(
+                    "response.output_text.done",
+                    json!({
+                        "item_id": id,
+                        "output_index": output_index,
+                        "content_index": text.content_index,
+                        "text": text.text,
+                        "logprobs": [],
+                    }),
+                );
+                let part = json!({
+                    "type": "output_text",
                     "text": text.text,
+                    "annotations": [],
                     "logprobs": [],
-                }),
-            );
-            let part = json!({
-                "type": "output_text",
-                "text": text.text,
-                "annotations": [],
-                "logprobs": [],
-            });
-            self.push_event(
-                "response.content_part.done",
-                json!({
-                    "item_id": text.id,
-                    "output_index": text.output_index,
-                    "content_index": 0,
-                    "part": part,
-                }),
-            );
+                });
+                self.push_event(
+                    "response.content_part.done",
+                    json!({
+                        "item_id": id,
+                        "output_index": output_index,
+                        "content_index": text.content_index,
+                        "part": part,
+                    }),
+                );
+                content.insert(text.content_index, part);
+            }
+
+            if let Some(refusal) = refusal {
+                self.push_event(
+                    "response.refusal.done",
+                    json!({
+                        "item_id": id,
+                        "output_index": output_index,
+                        "content_index": refusal.content_index,
+                        "refusal": refusal.refusal,
+                    }),
+                );
+                let part = json!({
+                    "type": "refusal",
+                    "refusal": refusal.refusal,
+                });
+                self.push_event(
+                    "response.content_part.done",
+                    json!({
+                        "item_id": id,
+                        "output_index": output_index,
+                        "content_index": refusal.content_index,
+                        "part": part,
+                    }),
+                );
+                content.insert(refusal.content_index, part);
+            }
+
             let item = json!({
-                "id": text.id,
+                "id": id,
                 "type": "message",
                 "status": item_status,
                 "role": "assistant",
-                "content": [part],
+                "content": content.into_values().collect::<Vec<_>>(),
             });
             self.push_event(
                 "response.output_item.done",
-                json!({"output_index": text.output_index, "item": item}),
+                json!({"output_index": output_index, "item": item}),
             );
-            completed.insert(text.output_index, item);
+            completed.insert(output_index, item);
         }
 
         let tools = std::mem::take(&mut self.tools);
@@ -962,11 +1106,30 @@ impl Iterator for ResponsesClientStream {
     }
 }
 
-fn content_texts(content: &MessageContent) -> Vec<String> {
+enum ContentStreamDelta {
+    OutputText(String),
+    Refusal(String),
+}
+
+fn content_stream_deltas(content: &MessageContent) -> Vec<ContentStreamDelta> {
     match content {
-        MessageContent::Text(text) => vec![text.clone()],
-        MessageContent::Parts(parts) => parts.iter().filter_map(|part| part.text.clone()).collect(),
-        MessageContent::Json(value) => json_content_text(value).into_iter().collect(),
+        MessageContent::Text(text) => vec![ContentStreamDelta::OutputText(text.clone())],
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.text.clone().map(|text| {
+                    if part.part_type == "refusal" {
+                        ContentStreamDelta::Refusal(text)
+                    } else {
+                        ContentStreamDelta::OutputText(text)
+                    }
+                })
+            })
+            .collect(),
+        MessageContent::Json(value) => json_content_text(value)
+            .map(ContentStreamDelta::OutputText)
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -1013,7 +1176,7 @@ fn incomplete_reason_from_finish(finish_reason: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use conduit_llm::{Choice, RequestType, TokenDetails};
+    use conduit_llm::{Choice, ContentPart, RequestType, TokenDetails};
 
     use super::*;
 
@@ -1158,6 +1321,74 @@ mod tests {
             "hello"
         );
         assert_eq!(completed["response"]["usage"]["total_tokens"], 3);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_protocol_stream_preserves_refusal_events_and_content_type() -> TransformerResult<()> {
+        let chunks = vec![
+            LlmResponse {
+                id: "resp_refusal".to_string(),
+                created: 42,
+                model: "gpt-test".to_string(),
+                choices: vec![Choice {
+                    delta: Some(LlmMessage {
+                        id: Some("msg_refusal".to_string()),
+                        role: Some("assistant".to_string()),
+                        content: Some(MessageContent::Parts(vec![ContentPart {
+                            part_type: "refusal".to_string(),
+                            text: Some("I cannot".to_string()),
+                            ..ContentPart::default()
+                        }])),
+                        ..LlmMessage::default()
+                    }),
+                    ..Choice::default()
+                }],
+                ..LlmResponse::default()
+            },
+            LlmResponse {
+                id: "resp_refusal".to_string(),
+                created: 42,
+                model: "gpt-test".to_string(),
+                choices: vec![Choice {
+                    delta: Some(LlmMessage {
+                        refusal: Some(" assist with that".to_string()),
+                        ..LlmMessage::default()
+                    }),
+                    finish_reason: Some("stop".to_string()),
+                    ..Choice::default()
+                }],
+                ..LlmResponse::default()
+            },
+        ];
+
+        let events: Vec<_> = transform_stream(Box::new(chunks.into_iter()), false)?.collect();
+        let event_types = events
+            .iter()
+            .filter_map(|event| event.event_type.as_deref())
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"response.refusal.delta"));
+        assert!(event_types.contains(&"response.refusal.done"));
+        assert!(!event_types.contains(&"response.output_text.delta"));
+
+        let refusal_done = events
+            .iter()
+            .find(|event| event.event_type.as_deref() == Some("response.refusal.done"))
+            .and_then(|event| event.json_data.as_ref())
+            .ok_or_else(|| ConduitError::internal("missing refusal done event"))?;
+        assert_eq!(refusal_done["refusal"], "I cannot assist with that");
+
+        let completed = events
+            .last()
+            .and_then(|event| event.json_data.as_ref())
+            .ok_or_else(|| ConduitError::internal("missing completed event"))?;
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0],
+            json!({
+                "type": "refusal",
+                "refusal": "I cannot assist with that",
+            })
+        );
         Ok(())
     }
 

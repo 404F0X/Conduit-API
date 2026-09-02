@@ -407,9 +407,9 @@ fn proxy_value_to_gql(v: Value) -> Option<ProxyConfig> {
 
 fn proxy_type_from_str(s: &str) -> ProxyType {
     match s {
-        "ENVIRONMENT" => ProxyType::Environment,
-        "URL" => ProxyType::Url,
-        // `DISABLED` and any unexpected value → the Go default.
+        "ENVIRONMENT" | "environment" => ProxyType::Environment,
+        "URL" | "url" => ProxyType::Url,
+        // `DISABLED`/`disabled` and any unexpected value → the Go default.
         _ => ProxyType::Disabled,
     }
 }
@@ -1089,5 +1089,28 @@ mod security_tests {
         assert_eq!(proxy.url.as_deref(), Some("http://proxy.internal"));
         assert_eq!(proxy.username.as_deref(), Some("proxy-user"));
         assert_eq!(proxy.password.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn channel_proxy_projection_accepts_canonical_and_legacy_type_casing() {
+        for (stored_type, expected) in [
+            ("url", ProxyType::Url),
+            ("URL", ProxyType::Url),
+            ("environment", ProxyType::Environment),
+            ("ENVIRONMENT", ProxyType::Environment),
+            ("disabled", ProxyType::Disabled),
+            ("DISABLED", ProxyType::Disabled),
+        ] {
+            let proxy = proxy_value_to_gql(serde_json::json!({
+                "type": stored_type,
+                "url": "http://proxy.internal",
+                "username": "proxy-user",
+                "password": "stored-secret"
+            }))
+            .expect("proxy");
+
+            assert_eq!(proxy.proxy_type, expected, "stored type: {stored_type}");
+            assert_eq!(proxy.password.as_deref(), Some(""));
+        }
     }
 }

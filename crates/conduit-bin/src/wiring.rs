@@ -575,7 +575,6 @@ async fn build_postgres_core_services(
     let signup = Arc::new(crate::wiring_postgres_auth::PgSignupService::new(
         pool.clone(),
         config.api_auth.bcrypt_cost,
-        signin.clone(),
     ));
     let model = Arc::new(DbModelService::new_with_repo(
         Arc::new(conduit_db::PgModelRepo::new(pool.clone())),

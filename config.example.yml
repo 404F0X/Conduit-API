@@ -135,6 +135,8 @@ api_auth:
   jwt_secret:
   session_ttl: 24h
   bcrypt_cost: 12
+  # Public password registration is disabled unless explicitly opted in.
+  allow_password_signup: false
 
 retry:
   enabled: true

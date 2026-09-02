@@ -132,17 +132,8 @@ pub async fn migrate_postgres_with_flag(
         return Ok(MigrationOutcome::Disabled);
     }
 
-    // Serialize the complete catalog across application instances and keep a
-    // failed migration atomic.
-    const MIGRATION_LOCK_KEY: i64 = 0x4158_4F4E_4855_4221; // "CONDUIT!"
-    let mut transaction = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(MIGRATION_LOCK_KEY)
-        .execute(&mut *transaction)
-        .await?;
-    let outcome = run_migrations_postgres(&mut transaction, false).await?;
-    transaction.commit().await?;
-    Ok(outcome)
+    let mut connection = pool.acquire().await?;
+    run_migrations_postgres(&mut connection, false).await
 }
 
 async fn verify_postgres_schema_current(pool: &PgPool) -> Result<(), MigrationRunnerError> {

@@ -4,14 +4,13 @@ use async_trait::async_trait;
 use conduit_auth::Scope;
 use conduit_auth::encode_password_bcrypt_hex;
 use conduit_core::objects::apikey::{APIKeyProfile, APIKeyProfiles};
+use conduit_core::objects::user::{RoleInfo, UserInfo, UserProjectInfo};
 use conduit_db::PgApiKeyRepo;
 use conduit_db::pg_quota_admission::{
     PgQuotaAdmission, PgQuotaAdmissionOutcome, admit_postgres_request,
 };
 use conduit_db::repo::{ApiKeyRepo, RepoError, RequestContext};
-use conduit_http::auth_handlers::{
-    AuthenticatedUser, SignUpRequest, SigninService, SignupError, SignupService,
-};
+use conduit_http::auth_handlers::{AuthenticatedUser, SignUpRequest, SignupError, SignupService};
 use conduit_http::middleware::api_key_auth::{
     ApiKeyValidationError, ApiKeyValidationService, ValidatedApiKeyMetadata,
 };
@@ -25,6 +24,7 @@ use rust_decimal::prelude::FromPrimitive;
 use sqlx::PgPool;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 pub(crate) struct PgApiKeyValidationService {
     auth: Arc<AuthService>,
@@ -503,17 +503,42 @@ impl AuthApiKeyRepo for PgAuthApiKeyRepo {
 pub(crate) struct PgSignupService {
     pool: PgPool,
     bcrypt_cost: u32,
-    signin: Arc<dyn SigninService>,
+    signup_slots: Arc<Semaphore>,
 }
 
 impl PgSignupService {
-    pub(crate) fn new(pool: PgPool, bcrypt_cost: u32, signin: Arc<dyn SigninService>) -> Self {
+    const MAX_CONCURRENT_SIGNUPS: usize = 2;
+
+    pub(crate) fn new(pool: PgPool, bcrypt_cost: u32) -> Self {
         Self {
             pool,
             bcrypt_cost,
-            signin,
+            signup_slots: Arc::new(Semaphore::new(Self::MAX_CONCURRENT_SIGNUPS)),
         }
     }
+}
+
+async fn run_bounded_signup_hash<F>(
+    signup_slots: Arc<Semaphore>,
+    hash_password: F,
+) -> Result<String, SignupError>
+where
+    F: FnOnce() -> Result<String, conduit_auth::PasswordError> + Send + 'static,
+{
+    let signup_slot = signup_slots
+        .try_acquire_owned()
+        .map_err(|_| SignupError::RateLimited)?;
+
+    tokio::task::spawn_blocking(move || {
+        // `spawn_blocking` work cannot be aborted after it starts. Keep the
+        // permit inside that work so cancelling the request future cannot
+        // release a slot while bcrypt is still consuming a worker thread.
+        let _signup_slot = signup_slot;
+        hash_password()
+    })
+    .await
+    .map_err(|error| SignupError::Internal(format!("password worker failed: {error}")))?
+    .map_err(|error| SignupError::Internal(error.to_string()))
 }
 
 #[async_trait]
@@ -523,17 +548,16 @@ impl SignupService for PgSignupService {
         request: SignUpRequest,
     ) -> Result<AuthenticatedUser, SignupError> {
         let email = request.email.trim().to_lowercase();
-        let password = encode_password_bcrypt_hex(&request.password, self.bcrypt_cost)
-            .map_err(|e| SignupError::Internal(e.to_string()))?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| SignupError::Internal(e.to_string()))?;
+        let first_name = request.first_name.trim().to_owned();
+        let last_name = request.last_name.trim().to_owned();
+
+        // Reject pre-bootstrap traffic before reserving a bcrypt worker. The
+        // previous order allowed an unauthenticated request to burn a full
+        // password hash even though signup could never succeed.
         let initialized = sqlx::query_scalar::<_, String>(
             "SELECT value FROM systems WHERE key='system_initialized' AND deleted_at=0",
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| SignupError::Internal(e.to_string()))?;
         if !initialized
@@ -543,8 +567,23 @@ impl SignupService for PgSignupService {
         {
             return Err(SignupError::SystemNotInitialized);
         }
+
+        // Bound the CPU-heavy public path per process and fail fast instead of
+        // allowing Tokio's blocking pool to grow an unbounded bcrypt backlog.
+        let bcrypt_cost = self.bcrypt_cost;
+        let raw_password = request.password;
+        let password = run_bounded_signup_hash(self.signup_slots.clone(), move || {
+            encode_password_bcrypt_hex(&raw_password, bcrypt_cost)
+        })
+        .await?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SignupError::Internal(e.to_string()))?;
         let user_id=sqlx::query_scalar::<_,i64>("INSERT INTO users(email,status,prefer_language,password,first_name,last_name,is_owner,scopes) VALUES($1,'activated','en',$2,$3,$4,FALSE,'[]'::jsonb) RETURNING id")
-            .bind(&email).bind(password).bind(request.first_name.trim()).bind(request.last_name.trim()).fetch_one(&mut *tx).await.map_err(|e|if e.as_database_error().and_then(|e|e.code()).is_some_and(|v|v=="23505"){SignupError::EmailTaken}else{SignupError::Internal(e.to_string())})?;
+            .bind(&email).bind(password).bind(&first_name).bind(&last_name).fetch_one(&mut *tx).await.map_err(|e|if e.as_database_error().and_then(|e|e.code()).is_some_and(|v|v=="23505"){SignupError::EmailTaken}else{SignupError::Internal(e.to_string())})?;
         let project_id=sqlx::query_scalar::<_,i64>("INSERT INTO projects(name,description,status,profiles) VALUES($1,'Private workspace created during signup','active','{}'::jsonb) RETURNING id")
             .bind(format!("Personal Workspace #{user_id}")).fetch_one(&mut *tx).await.map_err(|e|SignupError::Internal(e.to_string()))?;
         sqlx::query("INSERT INTO project_commercial_profiles(project_id,account_type,billing_currency,status,created_at,updated_at) VALUES($1,'personal','STATION_CREDIT','active',now(),now())")
@@ -567,10 +606,27 @@ impl SignupService for PgSignupService {
         tx.commit()
             .await
             .map_err(|e| SignupError::Internal(e.to_string()))?;
-        self.signin
-            .authenticate_user(&email, &request.password)
-            .await
-            .map_err(|e| SignupError::Internal(format!("new user authentication failed: {e:?}")))
+        Ok(AuthenticatedUser {
+            id: user_id,
+            info: UserInfo {
+                id: user_id.to_string(),
+                email,
+                first_name,
+                last_name,
+                is_owner: false,
+                prefer_language: "en".to_owned(),
+                projects: vec![UserProjectInfo {
+                    project_id: project_id.to_string(),
+                    is_owner: true,
+                    roles: vec![RoleInfo {
+                        name: "Owner".to_owned(),
+                    }],
+                    ..UserProjectInfo::default()
+                }],
+                has_password: true,
+                ..UserInfo::default()
+            },
+        })
     }
 }
 
@@ -595,6 +651,47 @@ mod tests {
             parse_validated_profiles("test-key", &json!({})),
             Ok(APIKeyProfiles::default())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signup_slot_survives_caller_cancellation_until_blocking_work_finishes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let signup_slots = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_slots = signup_slots.clone();
+
+        let request = tokio::spawn(run_bounded_signup_hash(worker_slots, move || {
+            let _ = started_tx.send(());
+            // Model a bcrypt call that has already entered blocking work.
+            let _ = release_rx.recv();
+            Ok("encoded-password".to_owned())
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx).await??;
+
+        request.abort();
+        let request_was_cancelled = request.await.is_err_and(|error| error.is_cancelled());
+        let permits_while_hashing = signup_slots.available_permits();
+        let second_request_was_limited = match signup_slots.clone().try_acquire_owned() {
+            Ok(unexpected_permit) => {
+                drop(unexpected_permit);
+                false
+            }
+            Err(_) => true,
+        };
+
+        release_tx.send(())?;
+        let returned_permit = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            signup_slots.clone().acquire_owned(),
+        )
+        .await??;
+
+        assert!(request_was_cancelled);
+        assert_eq!(permits_while_hashing, 0);
+        assert!(second_request_was_limited);
+        drop(returned_permit);
+        Ok(())
     }
 
     #[tokio::test]
@@ -628,6 +725,59 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(key.project_status, AuthProjectStatus::Active);
+        isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signup_checks_initialization_before_bcrypt_when_dsn_is_provided()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let isolated = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let service = PgSignupService::new(isolated.pool.clone(), u32::MAX);
+
+        let result = service
+            .register_user(SignUpRequest {
+                email: "new@example.com".to_owned(),
+                password: "Password123!".to_owned(),
+                ..SignUpRequest::default()
+            })
+            .await;
+
+        assert!(matches!(result, Err(SignupError::SystemNotInitialized)));
+        isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saturated_signup_limiter_fails_before_bcrypt_when_dsn_is_provided()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let isolated = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        sqlx::query(
+            "INSERT INTO systems(key,value) VALUES('system_initialized','true') \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value,deleted_at=0",
+        )
+        .execute(&isolated.pool)
+        .await?;
+        let service = PgSignupService::new(isolated.pool.clone(), u32::MAX);
+        let first_slot = service.signup_slots.clone().acquire_owned().await?;
+        let second_slot = service.signup_slots.clone().acquire_owned().await?;
+
+        let result = service
+            .register_user(SignUpRequest {
+                email: "new@example.com".to_owned(),
+                password: "Password123!".to_owned(),
+                ..SignUpRequest::default()
+            })
+            .await;
+
+        assert!(matches!(result, Err(SignupError::RateLimited)));
+        drop((first_slot, second_slot));
         isolated.cleanup().await?;
         Ok(())
     }

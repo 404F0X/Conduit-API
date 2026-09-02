@@ -174,6 +174,10 @@ pub fn env_entries(config: &AppConfig) -> Vec<EnvEntry> {
             "CONDUIT_API_AUTH_JWT_SECRET",
             option_string(&config.api_auth.jwt_secret),
         ),
+        EnvEntry::new(
+            "CONDUIT_API_AUTH_ALLOW_PASSWORD_SIGNUP",
+            config.api_auth.allow_password_signup.to_string(),
+        ),
     ]
 }
 
@@ -309,6 +313,7 @@ mod tests {
         assert!(text.contains("CONDUIT_CACHE_ROUTE_AFFINITY_ENABLED=true"));
         assert!(text.contains("CONDUIT_CACHE_ROUTE_AFFINITY_PROMPT_CACHE_TTL=1h"));
         assert!(text.contains("CONDUIT_CACHE_REDIS_ADDR=127.0.0.1:6379"));
+        assert!(text.contains("CONDUIT_API_AUTH_ALLOW_PASSWORD_SIGNUP=false"));
     }
 
     #[test]

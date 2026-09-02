@@ -670,11 +670,10 @@ mod resolver_guard_tests {
         // Mirrors Go `userHasProjectScope`: a user with a project-membership
         // scope is allowed only when the request project matches.
         let principal = Principal::user("user-1")
-            .with_scope(Scope::project_membership("project-1", slug::READ_PROJECTS));
+            .with_scope(Scope::project_membership("project-1", slug::READ_USERS));
 
-        let same_project = authorize_project_resolver(&principal, "project-1", slug::READ_PROJECTS);
-        let other_project =
-            authorize_project_resolver(&principal, "project-2", slug::READ_PROJECTS);
+        let same_project = authorize_project_resolver(&principal, "project-1", slug::READ_USERS);
+        let other_project = authorize_project_resolver(&principal, "project-2", slug::READ_USERS);
 
         assert!(same_project.is_ok());
         assert!(other_project.is_err());
@@ -717,14 +716,14 @@ mod resolver_guard_tests {
         // the principal. So we attach a `RequestContext` carrying both the
         // principal and the project id, exactly as a real resolver would.
         let principal = Principal::user("user-1")
-            .with_scope(Scope::project_membership("project-1", slug::READ_PROJECTS));
+            .with_scope(Scope::project_membership("project-1", slug::READ_USERS));
         let mut request_ctx = RequestContext::new();
         let _ = request_ctx.set_principal(principal.clone());
         let _ = request_ctx.set_project_id("project-1");
         let guard = ResolverGuard::new(principal).with_request_context(request_ctx);
 
-        let project_intent = ResolverIntent::project("projects", slug::READ_PROJECTS);
-        let global_intent = ResolverIntent::global("projects", slug::READ_PROJECTS);
+        let project_intent = ResolverIntent::project("users", slug::READ_USERS);
+        let global_intent = ResolverIntent::global("users", slug::READ_USERS);
 
         assert!(
             guard.authorize(&project_intent).is_ok(),

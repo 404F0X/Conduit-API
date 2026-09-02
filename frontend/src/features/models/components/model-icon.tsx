@@ -7,10 +7,10 @@ type ModelIconModule = { default: ModelIconComponent };
 // Loading the package namespace pulls the entire icon catalog and its UI peer
 // dependencies into one route chunk. Keep each icon behind its own import so a
 // page only downloads the icons it actually renders.
-const modelIconModules = import.meta.glob<ModelIconModule>('../../../../node_modules/@lobehub/icons/es/*/index.js');
+const modelIconModules = import.meta.glob<ModelIconModule>('../../../../node_modules/@lobehub/icons/es/*/components/Mono.js');
 const modelIconImporters = new Map(
   Object.entries(modelIconModules).flatMap(([modulePath, importer]) => {
-    const iconName = modulePath.match(/\/es\/([^/]+)\/index\.js$/)?.[1];
+    const iconName = modulePath.match(/\/es\/([^/]+)\/components\/Mono\.js$/)?.[1];
     return iconName ? ([[iconName, importer]] as const) : [];
   })
 );

@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react';
 import { IconBan, IconChevronLeft, IconChevronRight, IconCopy, IconPlus, IconRefresh, IconTicket } from '@tabler/icons-react';
+import { isAuthError } from '@/gql/graphql';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -58,8 +59,10 @@ export function RedemptionCodeSection({
     try {
       await revoke.mutateAsync(id);
       toast.success(t('billing.redemption.admin.revokeSuccess'));
-    } catch {
-      toast.error(t('billing.redemption.admin.revokeError'));
+    } catch (error) {
+      if (!isAuthError(error)) {
+        toast.error(t('billing.redemption.admin.revokeError'));
+      }
     }
   };
 
@@ -255,8 +258,10 @@ function CreateRedemptionCodesDialog({
       setCreated(result);
       create.reset();
       toast.success(t('billing.redemption.admin.createSuccess', { count: result.quantity }));
-    } catch {
-      toast.error(t('billing.redemption.admin.createError'));
+    } catch (error) {
+      if (!isAuthError(error)) {
+        toast.error(t('billing.redemption.admin.createError'));
+      }
     }
   };
 

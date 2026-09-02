@@ -48,7 +48,7 @@ use async_graphql::extensions::{
 };
 use async_graphql::{ServerError, ServerResult, Value};
 use conduit_auth::request_context::RequestContext;
-use conduit_auth::scopes::slug;
+use conduit_auth::scopes::{slug, supports_project_role};
 use std::sync::Arc;
 
 use crate::policy::{authorize_project_resolver, authorize_resolver};
@@ -321,7 +321,9 @@ fn enforce_field(ctx: &ExtensionContext<'_>, field: &str) -> Result<(), String> 
             let Some(principal) = principal else {
                 return Err(NO_PRINCIPAL.to_string());
             };
-            if let Some(project_id) = request_context.and_then(|rc| rc.project_id.as_deref()) {
+            if supports_project_role(scope)
+                && let Some(project_id) = request_context.and_then(|rc| rc.project_id.as_deref())
+            {
                 authorize_project_resolver(principal, project_id, scope)
                     .map_err(|err| err.to_string())
             } else {
@@ -703,6 +705,45 @@ mod tests {
         assert!(
             !denied.errors.is_empty(),
             "a project role scope must not cross project boundaries"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_owner_wildcard_cannot_authorize_global_mutations() {
+        let principal = Principal::user("project-owner").with_scope(
+            conduit_auth::Scope::project_membership("project-1", slug::WILDCARD),
+        );
+
+        for query in [
+            "{ grantProjectCredit }",
+            "{ updateSubscriptionPlan }",
+            "{ updateSystemGeneralSettings }",
+        ] {
+            let response = run_for_project(query, principal.clone(), "project-1").await;
+            assert!(
+                !response.errors.is_empty(),
+                "project ownership must not authorize global operation {query}"
+            );
+        }
+
+        let project_response = run_for_project("{ requests }", principal, "project-1").await;
+        assert!(
+            project_response.errors.is_empty(),
+            "project ownership must retain project-scoped access: {:?}",
+            project_response.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn system_role_scope_remains_valid_when_project_header_is_present() {
+        let principal = Principal::user("credit-operator")
+            .with_scope(conduit_auth::Scope::system_role(slug::GRANT_CREDIT));
+
+        let response = run_for_project("{ grantProjectCredit }", principal, "project-1").await;
+        assert!(
+            response.errors.is_empty(),
+            "system role must authorize global operation despite project header: {:?}",
+            response.errors
         );
     }
 

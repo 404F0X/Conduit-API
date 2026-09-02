@@ -136,6 +136,10 @@ export function useCreateCreditRedemptionCodes() {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['billing', 'redemption-codes'] }).catch(() => undefined);
     },
+    // The dialog owns the operation-specific error message. Supplying a local
+    // handler replaces the QueryClient default and prevents a second generic
+    // mutation toast for the same failure.
+    onError: () => undefined,
     // Generated plaintext codes must disappear as soon as their observer is gone.
     gcTime: 0,
   });
@@ -151,6 +155,9 @@ export function useRevokeCreditRedemptionCode() {
     onSuccess: () => {
       void client.invalidateQueries({ queryKey: ['billing', 'redemption-codes'] }).catch(() => undefined);
     },
+    // The table action renders its own revoke error; suppress the global
+    // mutation handler so one rejection produces one notification.
+    onError: () => undefined,
   });
 }
 

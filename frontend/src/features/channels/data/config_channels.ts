@@ -30,7 +30,7 @@ import {
   Ollama,
   AiHubMix,
   OpenCode,
-} from '@lobehub/icons';
+} from '@/lib/lobe-icons';
 import { AtlasCloudIcon } from '../components/atlas-cloud-icon';
 import { EvolinkIcon } from '../components/evolink-icon';
 import { NanoGPTIcon } from '../components/nanogpt-icon';

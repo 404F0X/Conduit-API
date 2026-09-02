@@ -5,6 +5,11 @@
     "ApiAuthConfig": {
       "additionalProperties": false,
       "properties": {
+        "allow_password_signup": {
+          "default": false,
+          "description": "Allow unauthenticated email/password self-registration.\n\nThis is deliberately opt-in because every enabled deployment exposes an account-creation and password-hashing endpoint to the public network.",
+          "type": "boolean"
+        },
         "bcrypt_cost": {
           "default": 12,
           "format": "uint32",
@@ -911,6 +916,7 @@
         }
       ],
       "default": {
+        "allow_password_signup": false,
         "bcrypt_cost": 12,
         "jwt_secret": null,
         "session_ttl": "1d"

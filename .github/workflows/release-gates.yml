@@ -96,6 +96,21 @@ jobs:
         working-directory: frontend
         run: pnpm build
 
+      - name: Verify frontend legal notices
+        working-directory: frontend
+        shell: bash
+        run: |
+          test -r dist/licenses/LICENSE
+          test -r dist/licenses/NOTICE
+          test -r dist/licenses/LICENSING.md
+          test -r dist/licenses/LICENSES/LGPL-3.0-only.txt
+          test -r dist/licenses/frontend/NOTICE
+          test -s dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          grep --fixed-strings --quiet '## react - ' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          grep --fixed-strings --quiet '## @lobehub/icons - ' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          ! grep --fixed-strings --quiet '@splinetool/runtime' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
+          ! grep --fixed-strings --quiet '@splinetool/runtime' pnpm-lock.yaml
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
@@ -188,7 +203,10 @@ jobs:
           test "$(docker compose -f compose.yml exec --no-TTY conduit-api id -u)" = "10001"
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSE
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/NOTICE
-          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/third-party/LGPL-3.0-only.txt
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSING.md
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSES/LGPL-3.0-only.txt
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/frontend/NOTICE
+          docker compose -f compose.yml exec --no-TTY conduit-api test -s /app/licenses/frontend/THIRD_PARTY_LICENSES.md
 
       - name: Verify restart health
         shell: bash

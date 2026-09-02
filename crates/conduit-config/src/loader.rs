@@ -445,6 +445,11 @@ fn apply_env_overrides(
         "CONDUIT_API_AUTH_BCRYPT_COST",
         &mut config.api_auth.bcrypt_cost,
     )?;
+    set_bool(
+        env_lookup,
+        "CONDUIT_API_AUTH_ALLOW_PASSWORD_SIGNUP",
+        &mut config.api_auth.allow_password_signup,
+    )?;
 
     set_bool(
         env_lookup,
@@ -736,6 +741,19 @@ server:
             |key: &str| (key == "CONDUIT_SERVER_DISABLE_SSL_VERIFY").then(|| "true".to_string());
         let config = load_from_optional_path_with_env(None, &CliOverrides::default(), &env)?;
         assert!(config.server.disable_ssl_verify);
+        Ok(())
+    }
+
+    #[test]
+    fn password_signup_is_opt_in_via_environment() -> Result<(), Box<dyn std::error::Error>> {
+        let default = load_from_optional_path_with_env(None, &CliOverrides::default(), &|_| None)?;
+        assert!(!default.api_auth.allow_password_signup);
+
+        let env = |key: &str| {
+            (key == "CONDUIT_API_AUTH_ALLOW_PASSWORD_SIGNUP").then(|| "true".to_string())
+        };
+        let enabled = load_from_optional_path_with_env(None, &CliOverrides::default(), &env)?;
+        assert!(enabled.api_auth.allow_password_signup);
         Ok(())
     }
 

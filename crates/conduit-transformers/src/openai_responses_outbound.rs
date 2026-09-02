@@ -903,6 +903,7 @@ fn build_text_options(response_format: &Value) -> TransformerResult<Value> {
 /// (responses/outbound_convert.go:604-766), handling:
 ///
 /// * `output_text` → message content
+/// * `refusal` → typed refusal content part
 /// * `function_call` → tool_calls
 /// * `custom_tool_call` → tool_calls with `responses_custom_tool` type
 /// * `reasoning` → reasoning_content/reasoning_signature
@@ -1168,6 +1169,17 @@ fn convert_output_to_message(
                                             }
                                         }
                                     }
+                                }
+                            }
+                            "refusal" => {
+                                if let Some(refusal) =
+                                    content_item.get("refusal").and_then(Value::as_str)
+                                {
+                                    content_parts.push(ContentPart {
+                                        part_type: "refusal".to_string(),
+                                        text: Some(refusal.to_string()),
+                                        ..Default::default()
+                                    });
                                 }
                             }
                             "input_image" => {
@@ -2032,6 +2044,24 @@ impl ResponsesStreamIter {
                 });
                 Ok(vec![chunk])
             }
+            "response.refusal.delta" => {
+                let delta = value.get("delta").and_then(Value::as_str).unwrap_or("");
+                let mut chunk = self.base_chunk();
+                chunk.choices.push(Choice {
+                    index: 0,
+                    delta: Some(LlmMessage {
+                        content: Some(MessageContent::Parts(vec![ContentPart {
+                            part_type: "refusal".to_string(),
+                            text: Some(delta.to_string()),
+                            ..Default::default()
+                        }])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                Ok(vec![chunk])
+            }
+            "response.refusal.done" => Ok(Vec::new()),
             "response.reasoning_summary_text.delta" => {
                 let delta = value.get("delta").and_then(Value::as_str).unwrap_or("");
                 let mut chunk = self.base_chunk();
@@ -2855,6 +2885,61 @@ mod tests {
     }
 
     #[test]
+    fn non_stream_refusal_round_trips_as_typed_content() -> TransformerResult<()> {
+        let outbound = OpenAiResponsesOutbound::new("", "")?;
+        let unified = OutboundTransformer::transform_response(
+            &outbound,
+            HttpResponse {
+                status: 200,
+                json_body: Some(json!({
+                    "id": "resp_refusal",
+                    "object": "response",
+                    "created_at": 1700000000,
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_refusal",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "refusal",
+                            "refusal": "I cannot assist with that."
+                        }]
+                    }]
+                })),
+                ..HttpResponse::default()
+            },
+        )?;
+
+        let content = unified.choices[0]
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref())
+            .ok_or_else(|| ConduitError::internal("missing unified refusal content"))?;
+        let MessageContent::Parts(parts) = content else {
+            return Err(ConduitError::internal(
+                "refusal must remain a typed content part",
+            ));
+        };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].part_type, "refusal");
+        assert_eq!(parts[0].text.as_deref(), Some("I cannot assist with that."));
+
+        let client_response = crate::openai_responses_inbound::transform_response(unified, false)?;
+        let client_body = client_response
+            .json_body
+            .ok_or_else(|| ConduitError::internal("missing client Responses body"))?;
+        assert_eq!(
+            client_body["output"][0]["content"][0],
+            json!({
+                "type": "refusal",
+                "refusal": "I cannot assist with that.",
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_responses_outbound_compact_request() -> TransformerResult<()> {
         // Verify that the struct dispatches compact requests correctly.
         let outbound = OpenAiResponsesOutbound::new("https://api.openai.com", "test-api-key")?;
@@ -3127,6 +3212,138 @@ mod tests {
         assert_eq!(
             chunks[5].usage.as_ref().map(|usage| usage.total_tokens),
             Some(6)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stream_refusal_round_trip_preserves_deltas_without_done_duplication() -> TransformerResult<()>
+    {
+        fn sse(value: Value) -> StreamEvent {
+            StreamEvent {
+                data: Some(value.to_string()),
+                ..StreamEvent::default()
+            }
+        }
+
+        let outbound = OpenAiResponsesOutbound::new("", "")?;
+        let upstream_events = vec![
+            sse(json!({
+                "type": "response.created",
+                "response": {
+                    "id": "resp_refusal_stream",
+                    "model": "gpt-test",
+                    "created_at": 1700000001
+                }
+            })),
+            sse(json!({
+                "type": "response.refusal.delta",
+                "item_id": "msg_refusal_stream",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "I cannot"
+            })),
+            sse(json!({
+                "type": "response.refusal.delta",
+                "item_id": "msg_refusal_stream",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": " assist with that."
+            })),
+            sse(json!({
+                "type": "response.refusal.done",
+                "item_id": "msg_refusal_stream",
+                "output_index": 0,
+                "content_index": 0,
+                "refusal": "I cannot assist with that."
+            })),
+            sse(json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_refusal_stream",
+                    "model": "gpt-test",
+                    "created_at": 1700000001,
+                    "status": "completed"
+                }
+            })),
+        ];
+
+        let unified_chunks: Vec<_> = OutboundTransformer::transform_stream(
+            &outbound,
+            Box::new(upstream_events.into_iter()),
+        )?
+        .collect();
+        assert_eq!(unified_chunks.len(), 4);
+
+        let refusal_deltas = unified_chunks
+            .iter()
+            .filter_map(|chunk| chunk.choices.first())
+            .filter_map(|choice| choice.delta.as_ref())
+            .filter_map(|message| message.content.as_ref())
+            .filter_map(|content| match content {
+                MessageContent::Parts(parts) if parts.len() == 1 => Some(&parts[0]),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(refusal_deltas.len(), 2);
+        assert!(
+            refusal_deltas
+                .iter()
+                .all(|part| part.part_type == "refusal")
+        );
+        assert_eq!(
+            refusal_deltas
+                .iter()
+                .filter_map(|part| part.text.as_deref())
+                .collect::<String>(),
+            "I cannot assist with that."
+        );
+
+        let client_events: Vec<_> = crate::openai_responses_inbound::transform_stream(
+            Box::new(unified_chunks.into_iter()),
+            false,
+        )?
+        .collect();
+        let refusal_delta_events = client_events
+            .iter()
+            .filter(|event| event.event_type.as_deref() == Some("response.refusal.delta"))
+            .collect::<Vec<_>>();
+        assert_eq!(refusal_delta_events.len(), 2);
+        assert_eq!(
+            refusal_delta_events
+                .iter()
+                .filter_map(|event| event.json_data.as_ref())
+                .filter_map(|value| value.get("delta"))
+                .filter_map(Value::as_str)
+                .collect::<String>(),
+            "I cannot assist with that."
+        );
+
+        let refusal_done_events = client_events
+            .iter()
+            .filter(|event| event.event_type.as_deref() == Some("response.refusal.done"))
+            .collect::<Vec<_>>();
+        assert_eq!(refusal_done_events.len(), 1);
+        assert_eq!(
+            refusal_done_events[0]
+                .json_data
+                .as_ref()
+                .and_then(|value| value.get("refusal"))
+                .and_then(Value::as_str),
+            Some("I cannot assist with that.")
+        );
+
+        let completed = client_events
+            .iter()
+            .find(|event| event.event_type.as_deref() == Some("response.completed"))
+            .and_then(|event| event.json_data.as_ref())
+            .ok_or_else(|| ConduitError::internal("missing response.completed event"))?;
+        assert_eq!(
+            completed["response"]["output"][0]["content"][0],
+            json!({
+                "type": "refusal",
+                "refusal": "I cannot assist with that.",
+            })
         );
         Ok(())
     }

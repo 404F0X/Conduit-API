@@ -314,6 +314,18 @@ impl ChannelMutationServices for ChannelCrudAdapter {
         let db_id = channel_db_id(id).ok_or_else(|| {
             ChannelServiceError::Update(ChannelServiceError::NotFound.to_string())
         })?;
+        // The GraphQL projection deliberately redacts write-only secrets. Load
+        // the stored row before lowering a full settings update so an unchanged
+        // blank proxy password can be interpreted as "preserve", never
+        // "overwrite with empty".
+        let existing = self
+            .channel_repo
+            .find_channel(&ctx, &db_id)
+            .await
+            .map_err(|err| ChannelServiceError::Update(err.to_string()))?
+            .ok_or_else(|| {
+                ChannelServiceError::Update(ChannelServiceError::NotFound.to_string())
+            })?;
         let now = chrono::Utc::now().to_rfc3339();
         // Name (if any) retained for the duplicate-name error.
         let name = input.name.clone();
@@ -356,14 +368,6 @@ impl ChannelMutationServices for ChannelCrudAdapter {
             None
         };
         if let Some(credentials) = input.credentials.as_ref() {
-            let existing = self
-                .channel_repo
-                .find_channel(&ctx, &db_id)
-                .await
-                .map_err(|err| ChannelServiceError::Update(err.to_string()))?
-                .ok_or_else(|| {
-                    ChannelServiceError::Update(ChannelServiceError::NotFound.to_string())
-                })?;
             let channel_type = input
                 .channel_type
                 .map(channel_type_to_wire)
@@ -392,6 +396,10 @@ impl ChannelMutationServices for ChannelCrudAdapter {
         } else {
             None
         };
+        let mut settings = input.settings.map(settings_input_to_json);
+        if let Some(settings) = settings.as_mut() {
+            preserve_redacted_proxy_password(settings, &existing.settings);
+        }
 
         let repo_input = RepoUpdateChannelInput {
             channel_type: input
@@ -414,7 +422,7 @@ impl ChannelMutationServices for ChannelCrudAdapter {
             tags: input.tags,
             default_test_model: input.default_test_model,
             policies: input.policies.map(policies_input_to_json),
-            settings: input.settings.map(settings_input_to_json),
+            settings,
             endpoints: input
                 .endpoints
                 .map(|v| v.into_iter().map(endpoint_input_to_json).collect()),
@@ -799,6 +807,58 @@ fn proxy_input_to_json(p: ProxyConfigInput) -> Value {
         obj.insert("password".to_string(), Value::String(password));
     }
     Value::Object(obj)
+}
+
+/// A projected proxy password is intentionally blank. Treat that sentinel as
+/// "unchanged" only while the proxy identity is unchanged; carrying a stored
+/// password to a different URL or username could disclose it to another
+/// endpoint. A non-empty input always replaces the stored password.
+fn preserve_redacted_proxy_password(incoming_settings: &mut Value, stored_settings: &Value) {
+    let Some(incoming) = incoming_settings
+        .get_mut("proxy")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(stored) = stored_settings.get("proxy").and_then(Value::as_object) else {
+        return;
+    };
+    let incoming_password_is_blank = incoming
+        .get("password")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty);
+    let stored_password = stored
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty());
+    let same_type = incoming
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .eq_ignore_ascii_case(
+            stored
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+    let same_endpoint = ["url", "username"].into_iter().all(|key| {
+        incoming
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            == stored.get(key).and_then(Value::as_str).unwrap_or_default()
+    });
+
+    if incoming_password_is_blank
+        && same_type
+        && same_endpoint
+        && let Some(stored_password) = stored_password
+    {
+        incoming.insert(
+            "password".to_string(),
+            Value::String(stored_password.to_string()),
+        );
+    }
 }
 
 /// Lower a `ChannelCredentialsInput` into the `credentials` JSON column value.
@@ -1262,4 +1322,80 @@ fn i64_family(
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod proxy_secret_tests {
+    use super::*;
+
+    #[test]
+    fn blank_projected_password_preserves_unchanged_channel_proxy_secret() {
+        let stored = serde_json::json!({
+            "proxy": {
+                "type": "URL",
+                "url": "http://proxy.internal:8080",
+                "username": "conduit",
+                "password": "stored-secret"
+            }
+        });
+        let mut incoming = serde_json::json!({
+            "proxy": {
+                "type": "URL",
+                "url": "http://proxy.internal:8080",
+                "username": "conduit",
+                "password": ""
+            }
+        });
+
+        preserve_redacted_proxy_password(&mut incoming, &stored);
+
+        assert_eq!(incoming["proxy"]["password"], "stored-secret");
+    }
+
+    #[test]
+    fn proxy_type_casing_does_not_clear_a_legacy_stored_secret() {
+        let stored = serde_json::json!({
+            "proxy": {
+                "type": "url",
+                "url": "http://proxy.internal:8080",
+                "username": "conduit",
+                "password": "stored-secret"
+            }
+        });
+        let mut incoming = serde_json::json!({
+            "proxy": {
+                "type": "URL",
+                "url": "http://proxy.internal:8080",
+                "username": "conduit"
+            }
+        });
+
+        preserve_redacted_proxy_password(&mut incoming, &stored);
+
+        assert_eq!(incoming["proxy"]["password"], "stored-secret");
+    }
+
+    #[test]
+    fn blank_password_is_not_carried_to_a_different_proxy_identity() {
+        let stored = serde_json::json!({
+            "proxy": {
+                "type": "URL",
+                "url": "http://old-proxy.internal:8080",
+                "username": "conduit",
+                "password": "stored-secret"
+            }
+        });
+        let mut incoming = serde_json::json!({
+            "proxy": {
+                "type": "URL",
+                "url": "http://new-proxy.internal:8080",
+                "username": "conduit",
+                "password": ""
+            }
+        });
+
+        preserve_redacted_proxy_password(&mut incoming, &stored);
+
+        assert_eq!(incoming["proxy"]["password"], "");
+    }
 }

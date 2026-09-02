@@ -713,6 +713,11 @@ pub struct ApiAuthConfig {
     #[schemars(with = "String")]
     pub session_ttl: Duration,
     pub bcrypt_cost: u32,
+    /// Allow unauthenticated email/password self-registration.
+    ///
+    /// This is deliberately opt-in because every enabled deployment exposes
+    /// an account-creation and password-hashing endpoint to the public network.
+    pub allow_password_signup: bool,
 }
 
 impl Default for ApiAuthConfig {
@@ -721,6 +726,7 @@ impl Default for ApiAuthConfig {
             jwt_secret: None,
             session_ttl: Duration::from_secs(24 * 60 * 60),
             bcrypt_cost: 12,
+            allow_password_signup: false,
         }
     }
 }
@@ -997,6 +1003,7 @@ read_replica:
             Duration::from_secs(24 * 60 * 60)
         );
         assert_eq!(config.api_auth.bcrypt_cost, 12);
+        assert!(!config.api_auth.allow_password_signup);
     }
 
     #[test]

@@ -36,8 +36,32 @@ test('wallet redemption remains Project-bound and refreshes the wallet surface',
   assert.match(dataSource, /onError:\s*\(\)\s*=>\s*undefined/);
   assert.match(walletSource, /<RedeemCodeDialog/);
   assert.match(dialogSource, /wallet\.redeem\.errors\.generic/);
-  assert.match(dialogSource, /try\s*\{[\s\S]*await redeem\.mutateAsync\(normalizedCode\)[\s\S]*\}\s*catch\s*\{/);
+  assert.match(dialogSource, /try\s*\{[\s\S]*await redeem\.mutateAsync\(normalizedCode\)[\s\S]*\}\s*catch\s*\(error\)\s*\{/);
+  assert.match(dialogSource, /if \(!isAuthError\(error\)\)\s*\{[\s\S]*wallet\.redeem\.errors\.generic/);
   assert.doesNotMatch(dialogSource, /error\.message|REDEMPTION_CODE_(?:EXPIRED|REVOKED|ALREADY_REDEEMED)/);
+});
+
+test('admin redemption mutations delegate exactly one error toast to their components', () => {
+  const dataSource = readSource('features', 'billing', 'redemption-data.ts');
+  const adminSource = readSource('features', 'billing', 'components', 'redemption-code-section.tsx');
+  const createHook = dataSource.slice(
+    dataSource.indexOf('export function useCreateCreditRedemptionCodes'),
+    dataSource.indexOf('export function useRevokeCreditRedemptionCode')
+  );
+  const revokeHook = dataSource.slice(
+    dataSource.indexOf('export function useRevokeCreditRedemptionCode'),
+    dataSource.indexOf('export function useRedeemCreditCode')
+  );
+  const revokeHandler = adminSource.slice(
+    adminSource.indexOf('const revokeCode = async'),
+    adminSource.indexOf('\n  return (', adminSource.indexOf('const revokeCode = async'))
+  );
+  const createHandler = adminSource.slice(adminSource.indexOf('const submit = async'), adminSource.indexOf('const copyCodes = async'));
+
+  assert.match(createHook, /onError:\s*\(\)\s*=>\s*undefined/);
+  assert.match(revokeHook, /onError:\s*\(\)\s*=>\s*undefined/);
+  assert.match(revokeHandler, /catch\s*\(error\)\s*\{[\s\S]*if \(!isAuthError\(error\)\)[\s\S]*billing\.redemption\.admin\.revokeError/);
+  assert.match(createHandler, /catch\s*\(error\)\s*\{[\s\S]*if \(!isAuthError\(error\)\)[\s\S]*billing\.redemption\.admin\.createError/);
 });
 
 test('billing route guard matches the any-of scopes used by navigation', () => {

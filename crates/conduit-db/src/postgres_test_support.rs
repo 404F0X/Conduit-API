@@ -15,6 +15,12 @@ pub(crate) struct IsolatedPostgres {
 
 impl IsolatedPostgres {
     pub(crate) async fn new(dsn: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let database = Self::new_unmigrated(dsn).await?;
+        crate::connection::migrate_postgres_with_flag(&database.pool, false).await?;
+        Ok(database)
+    }
+
+    pub(crate) async fn new_unmigrated(dsn: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let admin_pool = PgPool::connect(dsn).await?;
         let schema = format!(
             "conduit_db_test_{}_{}",
@@ -37,7 +43,6 @@ impl IsolatedPostgres {
             })
             .connect(dsn)
             .await?;
-        crate::connection::migrate_postgres_with_flag(&pool, false).await?;
 
         Ok(Self {
             pool,
