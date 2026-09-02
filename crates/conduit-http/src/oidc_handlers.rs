@@ -198,15 +198,21 @@ pub struct ExchangeRequest {
 
 /// `h.getBaseURL(c)` (oidc.go:176-189), pure form:
 ///
-/// `oidc.redirect_base_url` wins over `server.public_url`. A configured,
-/// absolute HTTP(S) URL is mandatory so public OIDC endpoints never derive a
-/// security-sensitive callback URI from untrusted request headers.
+/// `oidc.redirect_base_url` wins over `server.public_url`. An explicit OIDC
+/// redirect base is already the final externally visible base. When falling
+/// back to `server.public_url`, append `server.base_path` so OIDC callbacks and
+/// browser redirects target the same mount point as the HTTP router.
+///
+/// A configured, absolute HTTP(S) URL is mandatory so public OIDC endpoints
+/// never derive a security-sensitive callback URI from untrusted request
+/// headers.
 pub fn resolve_base_url(
     redirect_base_url: Option<&str>,
     public_url: &str,
+    base_path: &str,
 ) -> Result<String, String> {
-    let configured = redirect_base_url
-        .filter(|value| !value.trim().is_empty())
+    let explicit_redirect_base = redirect_base_url.filter(|value| !value.trim().is_empty());
+    let configured = explicit_redirect_base
         .or_else(|| (!public_url.trim().is_empty()).then_some(public_url))
         .ok_or_else(|| "OIDC requires oidc.redirect_base_url or server.public_url".to_string())?;
     let parsed = url::Url::parse(configured.trim())
@@ -220,7 +226,18 @@ pub fn resolve_base_url(
     {
         return Err("OIDC canonical URL is invalid".to_string());
     }
-    Ok(parsed.as_str().trim_end_matches('/').to_string())
+
+    let mut canonical = parsed.as_str().trim_end_matches('/').to_string();
+    if explicit_redirect_base.is_none() {
+        crate::router::validate_base_path(base_path)
+            .map_err(|_| "OIDC canonical URL is invalid".to_string())?;
+        let base_path = base_path.trim_end_matches('/');
+        let configured_path = parsed.path().trim_end_matches('/');
+        if !base_path.is_empty() && base_path != "/" && !configured_path.ends_with(base_path) {
+            canonical.push_str(base_path);
+        }
+    }
+    Ok(canonical)
 }
 
 /// Go `url.QueryEscape` (used at oidc.go:161): unreserved bytes
@@ -662,6 +679,7 @@ fn request_base_url(state: &AppState) -> Result<String, String> {
     resolve_base_url(
         state.config().oidc.redirect_base_url.as_deref(),
         &state.config().server.public_url,
+        state.base_path(),
     )
 }
 
@@ -970,8 +988,17 @@ mod tests {
     }
 
     fn app_with_public_url(service: Arc<FakeOidcService>, public_url: &str) -> Router {
+        app_with_public_url_and_base_path(service, public_url, "")
+    }
+
+    fn app_with_public_url_and_base_path(
+        service: Arc<FakeOidcService>,
+        public_url: &str,
+        base_path: &str,
+    ) -> Router {
         let mut config = AppConfig::default();
         config.server.public_url = public_url.to_string();
+        config.server.base_path = base_path.to_string();
         // Wire the secret the admin JWT guard reads (routes.go:96 adminGroup)
         // so the guarded `/admin/oidc/link/{provider}` route can be reached
         // with a token minted by `mint_admin_jwt`.
@@ -1250,6 +1277,43 @@ mod tests {
         assert_eq!(
             seen(&service.seen_authorize).map(|(_, base)| base),
             Some("https://login.example.test/oidc".to_string())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_url_inherits_server_base_path_for_oidc_round_trip()
+    -> Result<(), Box<dyn StdError>> {
+        let service = Arc::new(FakeOidcService {
+            providers: vec![sample_provider()],
+            ..FakeOidcService::default()
+        });
+        let mut app = app_with_public_url_and_base_path(
+            service.clone(),
+            "https://gateway.example.test",
+            "/gateway",
+        );
+
+        let (status, _) = call_json(&mut app, get("/gateway/oauth/oidc/authorize/google")?).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen(&service.seen_authorize).map(|(_, base)| base),
+            Some("https://gateway.example.test/gateway".to_string())
+        );
+
+        let (status, headers, _) = call(
+            &mut app,
+            get("/gateway/oauth/oidc/callback/google?code=abc&state=xyz")?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FOUND);
+        assert_eq!(
+            location(&headers),
+            "https://gateway.example.test/gateway/oauth/oidc/idp-callback?code=exchange-code-1"
+        );
+        assert_eq!(
+            seen(&service.seen_callback).map(|(_, _, _, base)| base),
+            Some("https://gateway.example.test/gateway".to_string())
         );
         Ok(())
     }
@@ -1767,15 +1831,28 @@ mod tests {
     #[test]
     fn resolve_base_url_uses_redirect_then_public_url_without_header_fallback() {
         assert_eq!(
-            resolve_base_url(Some("https://login.example/"), "https://public.example").as_deref(),
+            resolve_base_url(
+                Some("https://login.example/"),
+                "https://public.example",
+                "/gateway",
+            )
+            .as_deref(),
             Ok("https://login.example")
         );
         assert_eq!(
-            resolve_base_url(None, "https://public.example/").as_deref(),
-            Ok("https://public.example")
+            resolve_base_url(None, "https://public.example/", "/gateway").as_deref(),
+            Ok("https://public.example/gateway")
         );
-        assert!(resolve_base_url(None, "").is_err());
-        assert!(resolve_base_url(Some("https://user:secret@example.test"), "").is_err());
+        assert_eq!(
+            resolve_base_url(None, "https://public.example/gateway/", "/gateway").as_deref(),
+            Ok("https://public.example/gateway")
+        );
+        assert_eq!(
+            resolve_base_url(None, "https://gateway", "/gateway").as_deref(),
+            Ok("https://gateway/gateway")
+        );
+        assert!(resolve_base_url(None, "", "").is_err());
+        assert!(resolve_base_url(Some("https://user:secret@example.test"), "", "").is_err());
     }
 
     /// Go url.QueryEscape golden values (oidc.go:161).
