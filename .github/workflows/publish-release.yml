@@ -66,13 +66,28 @@ jobs:
             exit 1
           fi
 
-          tag_object="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")"
-          remote_tag_object="$(
-            git ls-remote --refs origin "refs/tags/${GITHUB_REF_NAME}" |
-              awk 'NR == 1 { print $1 }'
+          remote_tag_refs="$(
+            git ls-remote origin \
+              "refs/tags/${GITHUB_REF_NAME}" \
+              "refs/tags/${GITHUB_REF_NAME}^{}"
           )"
-          if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${tag_object}" ]]; then
-            echo "release tag changed or disappeared while validation was running" >&2
+          tag_object="$(
+            awk -v ref="refs/tags/${GITHUB_REF_NAME}" \
+              '$2 == ref { print $1; exit }' <<<"${remote_tag_refs}"
+          )"
+          remote_source_sha="$(
+            awk -v ref="refs/tags/${GITHUB_REF_NAME}^{}" \
+              '$2 == ref { print $1; exit }' <<<"${remote_tag_refs}"
+          )"
+          if [[ -z "${tag_object}" ]]; then
+            echo "release tag disappeared while validation was running" >&2
+            exit 1
+          fi
+          if [[ -z "${remote_source_sha}" ]]; then
+            remote_source_sha="${tag_object}"
+          fi
+          if [[ "${remote_source_sha}" != "${source_sha}" ]]; then
+            echo "release tag does not resolve to the workflow source commit" >&2
             exit 1
           fi
 
@@ -367,7 +382,8 @@ jobs:
 
           remote_tag_object="$(
             git ls-remote --refs origin "refs/tags/${GITHUB_REF_NAME}" |
-              awk 'NR == 1 { print $1 }'
+              awk -v ref="refs/tags/${GITHUB_REF_NAME}" \
+                '$2 == ref { print $1; exit }'
           )"
           if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]]; then
             echo "release tag changed or disappeared before image publication" >&2
@@ -778,7 +794,8 @@ jobs:
           remote_tag_object="$(
             git ls-remote --refs "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
               "refs/tags/${GITHUB_REF_NAME}" |
-              awk 'NR == 1 { print $1 }'
+              awk -v ref="refs/tags/${GITHUB_REF_NAME}" \
+                '$2 == ref { print $1; exit }'
           )"
           if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]]; then
             echo "release tag changed or disappeared during the build" >&2

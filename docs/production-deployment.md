@@ -28,8 +28,8 @@ must exactly match the workspace version, and publication occurs only after the
 full CI and container smoke gates pass:
 
 ```sh
-export TAG='v0.1.0-alpha.1'
-export IMAGE='ghcr.io/404f0x/conduit-api:0.1.0-alpha.1'
+export TAG='v0.1.0-alpha.2'
+export IMAGE='ghcr.io/404f0x/conduit-api:0.1.0-alpha.2'
 docker pull "$IMAGE"
 cosign verify \
   --certificate-identity "https://github.com/404F0X/Conduit-API/.github/workflows/publish-release.yml@refs/tags/$TAG" \
