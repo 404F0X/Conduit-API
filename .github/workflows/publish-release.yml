@@ -177,7 +177,7 @@ jobs:
           package_dir="dist/${ARCHIVE_BASENAME}"
           mkdir -p "${package_dir}/frontend"
           install -m 0755 "target/${TARGET}/release/${EXECUTABLE}" "${package_dir}/${EXECUTABLE}"
-          cp config.example.yml LICENSE LICENSING.md NOTICE README.md RELINKING.md "${package_dir}/"
+          cp config.example.yml LICENSE LICENSING.md NOTICE README.md README_CN.md RELINKING.md "${package_dir}/"
           cp -R LICENSES "${package_dir}/LICENSES"
           cp frontend/NOTICE "${package_dir}/frontend/NOTICE"
           cp frontend/dist/licenses/frontend/THIRD_PARTY_LICENSES.md \
@@ -270,7 +270,7 @@ jobs:
           $frontendDir = Join-Path $packageDir 'frontend'
           New-Item -ItemType Directory -Path $frontendDir -Force | Out-Null
           Copy-Item "target/$env:TARGET/release/$env:EXECUTABLE" $packageDir
-          Copy-Item config.example.yml, LICENSE, LICENSING.md, NOTICE, README.md, RELINKING.md $packageDir
+          Copy-Item config.example.yml, LICENSE, LICENSING.md, NOTICE, README.md, README_CN.md, RELINKING.md $packageDir
           Copy-Item LICENSES (Join-Path $packageDir 'LICENSES') -Recurse
           Copy-Item frontend/NOTICE (Join-Path $frontendDir 'NOTICE')
           Copy-Item frontend/dist/licenses/frontend/THIRD_PARTY_LICENSES.md (Join-Path $frontendDir 'THIRD_PARTY_LICENSES.md')
