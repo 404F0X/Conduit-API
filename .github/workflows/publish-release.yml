@@ -13,22 +13,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  quality-gates:
-    uses: ./.github/workflows/release-gates.yml
+  validate-release:
+    name: Validate immutable release input
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
-
-  publish-image:
-    needs: quality-gates
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    permissions:
-      contents: write
-      packages: write
-      id-token: write
-      attestations: write
-    env:
-      REGISTRY: ghcr.io
+    outputs:
+      build_time: ${{ steps.release.outputs.build_time }}
+      image: ${{ steps.release.outputs.image }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      tag_object: ${{ steps.release.outputs.tag_object }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Check out release source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -36,11 +32,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate release tag and source commit
+      - name: Validate tag, source commit, and release immutability
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY: ghcr.io
         run: |
           set -euo pipefail
+          export LC_ALL=C
 
           version="$(python3 - <<'PY'
           import tomllib
@@ -59,29 +59,370 @@ jobs:
             echo "origin/main was not fetched by the release checkout" >&2
             exit 1
           fi
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            echo "release commit ${GITHUB_SHA} is not contained in origin/main" >&2
+
+          source_sha="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+          if ! git merge-base --is-ancestor "${source_sha}" origin/main; then
+            echo "release commit ${source_sha} is not contained in origin/main" >&2
             exit 1
           fi
 
+          tag_object="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")"
+          remote_tag_object="$(
+            git ls-remote --refs origin "refs/tags/${GITHUB_REF_NAME}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${tag_object}" ]]; then
+            echo "release tag changed or disappeared while validation was running" >&2
+            exit 1
+          fi
+
+          release_status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
+          )"
+          case "${release_status}" in
+            404) ;;
+            200)
+              echo "release ${GITHUB_REF_NAME} already exists; published releases are immutable" >&2
+              exit 1
+              ;;
+            *)
+              echo "could not verify release immutability (GitHub API HTTP ${release_status})" >&2
+              exit 1
+              ;;
+          esac
+
           image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
-          build_time="$(git show -s --format=%cI "${GITHUB_SHA}")"
+          build_time="$(git show -s --format=%cI "${source_sha}")"
           {
             echo "version=${version}"
+            echo "source_sha=${source_sha}"
+            echo "tag_object=${tag_object}"
             echo "image=${image}"
             echo "build_time=${build_time}"
           } >>"${GITHUB_OUTPUT}"
 
+  quality-gates:
+    needs: validate-release
+    uses: ./.github/workflows/release-gates.yml
+    with:
+      upload-release-frontend: true
+    permissions:
+      contents: read
+
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    needs: [validate-release, quality-gates]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable: conduit-api
+            archive-extension: tar.gz
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable: conduit-api.exe
+            archive-extension: zip
+    env:
+      ARCHIVE_BASENAME: conduit-api-v${{ needs.validate-release.outputs.version }}-${{ matrix.target }}
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      CONDUIT_BRANCH: ${{ github.ref_name }}
+      CONDUIT_BUILD_TIME: ${{ needs.validate-release.outputs.build_time }}
+      CONDUIT_COMMIT: ${{ needs.validate-release.outputs.source_sha }}
+      CONDUIT_VERSION: ${{ needs.validate-release.outputs.version }}
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.version }}
+      SOURCE_SHA: ${{ needs.validate-release.outputs.source_sha }}
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.validate-release.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Restore verified frontend build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-frontend-${{ github.run_id }}
+          path: frontend/dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e # 1.96.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build native release binary
+        run: >-
+          cargo build --locked --release -p conduit-bin --bin conduit-api
+          --features release-binary
+
+      - name: Package and smoke-test Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          package_dir="dist/${ARCHIVE_BASENAME}"
+          mkdir -p "${package_dir}/frontend"
+          install -m 0755 "target/${TARGET}/release/${EXECUTABLE}" "${package_dir}/${EXECUTABLE}"
+          cp config.example.yml LICENSE LICENSING.md NOTICE README.md RELINKING.md "${package_dir}/"
+          cp -R LICENSES "${package_dir}/LICENSES"
+          cp frontend/NOTICE "${package_dir}/frontend/NOTICE"
+          cp frontend/dist/licenses/frontend/THIRD_PARTY_LICENSES.md \
+            "${package_dir}/frontend/THIRD_PARTY_LICENSES.md"
+          test -s "${package_dir}/LICENSES/RUST_THIRD_PARTY_LICENSES.html"
+          cat >"${package_dir}/SOURCE.md" <<EOF
+          # Corresponding source
+
+          Version: ${RELEASE_VERSION}
+          Commit: ${SOURCE_SHA}
+          Source archive: conduit-api-v${RELEASE_VERSION}-source.tar.gz
+          Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}
+
+          See RELINKING.md for rebuilding and relinking instructions.
+          EOF
+
+          tar -C dist -czf "dist/${ARCHIVE_BASENAME}.tar.gz" "${ARCHIVE_BASENAME}"
+
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "${smoke_dir}"' EXIT
+          tar -C "${smoke_dir}" -xzf "dist/${ARCHIVE_BASENAME}.tar.gz"
+          binary_path="${smoke_dir}/${ARCHIVE_BASENAME}/${EXECUTABLE}"
+          python3 - "${binary_path}" frontend/dist/index.html <<'PY'
+          from pathlib import Path
+          import sys
+
+          binary = Path(sys.argv[1]).read_bytes()
+          index = Path(sys.argv[2]).read_bytes()
+          if not index:
+              raise SystemExit("built frontend index.html is empty")
+          if index not in binary:
+              raise SystemExit("release binary does not contain the built frontend index.html")
+          PY
+
+          elf_header="$(readelf --file-header --wide "${binary_path}")"
+          grep --extended-regexp --quiet 'Class:[[:space:]]+ELF64' <<<"${elf_header}"
+          grep --extended-regexp --quiet \
+            'Machine:[[:space:]]+Advanced Micro Devices X86-64' \
+            <<<"${elf_header}"
+          program_headers="$(readelf --program-headers --wide "${binary_path}")"
+          grep --fixed-strings --quiet \
+            'Requesting program interpreter: /lib64/ld-linux-x86-64.so.2' \
+            <<<"${program_headers}"
+          dependencies="$(ldd "${binary_path}")"
+          printf '%s\n' "${dependencies}"
+          if grep --fixed-strings --quiet 'not found' <<<"${dependencies}"; then
+            echo "release binary has unresolved ELF dependencies" >&2
+            exit 1
+          fi
+          glibc_symbol="$(
+            readelf --version-info --wide "${binary_path}" |
+              grep --only-matching --extended-regexp 'GLIBC_[0-9]+(\.[0-9]+)*' |
+              LC_ALL=C sort --version-sort |
+              tail --lines=1
+          )"
+          test -n "${glibc_symbol}"
+          glibc_version="${glibc_symbol#GLIBC_}"
+          glibc_ceiling='2.39'
+          printf 'maximum required GLIBC version: %s\n' "${glibc_version}"
+          if [[ "$(printf '%s\n' "${glibc_version}" "${glibc_ceiling}" | LC_ALL=C sort --version-sort | tail --lines=1)" != "${glibc_ceiling}" ]]; then
+            echo "release binary requires glibc ${glibc_version}, above the ${glibc_ceiling} release ceiling" >&2
+            exit 1
+          fi
+
+          info="$(
+            cd "${smoke_dir}"
+            "./${ARCHIVE_BASENAME}/${EXECUTABLE}" build-info
+          )"
+          printf '%s\n' "${info}"
+          grep --fixed-strings --line-regexp "version: ${RELEASE_VERSION}" <<<"${info}"
+          grep --fixed-strings --line-regexp "commit: ${SOURCE_SHA}" <<<"${info}"
+          grep --fixed-strings --line-regexp "target: ${TARGET}" <<<"${info}"
+          config_result="$(
+            cd "${smoke_dir}"
+            "./${ARCHIVE_BASENAME}/${EXECUTABLE}" \
+              --config "./${ARCHIVE_BASENAME}/config.example.yml" config validate
+          )"
+          grep --fixed-strings --line-regexp 'config valid' <<<"${config_result}"
+
+      - name: Package and smoke-test Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EXECUTABLE: ${{ matrix.executable }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $packageDir = Join-Path 'dist' $env:ARCHIVE_BASENAME
+          $frontendDir = Join-Path $packageDir 'frontend'
+          New-Item -ItemType Directory -Path $frontendDir -Force | Out-Null
+          Copy-Item "target/$env:TARGET/release/$env:EXECUTABLE" $packageDir
+          Copy-Item config.example.yml, LICENSE, LICENSING.md, NOTICE, README.md, RELINKING.md $packageDir
+          Copy-Item LICENSES (Join-Path $packageDir 'LICENSES') -Recurse
+          Copy-Item frontend/NOTICE (Join-Path $frontendDir 'NOTICE')
+          Copy-Item frontend/dist/licenses/frontend/THIRD_PARTY_LICENSES.md (Join-Path $frontendDir 'THIRD_PARTY_LICENSES.md')
+          if (-not (Test-Path (Join-Path $packageDir 'LICENSES/RUST_THIRD_PARTY_LICENSES.html') -PathType Leaf)) {
+            throw 'Rust third-party license bundle is missing'
+          }
+
+          $sourceArchive = "conduit-api-v$env:RELEASE_VERSION-source.tar.gz"
+          @"
+          # Corresponding source
+
+          Version: $env:RELEASE_VERSION
+          Commit: $env:SOURCE_SHA
+          Source archive: $sourceArchive
+          Release: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/releases/tag/$env:GITHUB_REF_NAME
+
+          See RELINKING.md for rebuilding and relinking instructions.
+          "@ | Set-Content (Join-Path $packageDir 'SOURCE.md') -Encoding utf8
+
+          $archive = "dist/$env:ARCHIVE_BASENAME.zip"
+          Compress-Archive -Path $packageDir -DestinationPath $archive
+
+          $smokeDir = Join-Path $env:RUNNER_TEMP 'conduit-release-smoke'
+          Expand-Archive -Path $archive -DestinationPath $smokeDir
+          $executablePath = Join-Path (Join-Path $smokeDir $env:ARCHIVE_BASENAME) $env:EXECUTABLE
+          python -c "from pathlib import Path; import sys; binary = Path(sys.argv[1]).read_bytes(); index = Path(sys.argv[2]).read_bytes(); index or sys.exit('built frontend index.html is empty'); index in binary or sys.exit('release binary does not contain the built frontend index.html')" $executablePath 'frontend/dist/index.html'
+          if ($LASTEXITCODE -ne 0) {
+            throw "embedded frontend verification exited with $LASTEXITCODE"
+          }
+
+          Push-Location $smokeDir
+          try {
+            $executable = Join-Path $env:ARCHIVE_BASENAME $env:EXECUTABLE
+            $info = (& $executable build-info | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "release binary exited with $LASTEXITCODE"
+            }
+            Write-Output $info
+            foreach ($expected in @(
+              "version: $env:RELEASE_VERSION",
+              "commit: $env:SOURCE_SHA",
+              "target: $env:TARGET"
+            )) {
+              if (-not ($info -split '\r?\n').Contains($expected)) {
+                throw "build-info is missing: $expected"
+              }
+            }
+
+            $configPath = Join-Path $env:ARCHIVE_BASENAME 'config.example.yml'
+            $configResult = (& $executable --config $configPath config validate | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+              throw "config validate exited with $LASTEXITCODE"
+            }
+            if (-not ($configResult -split '\r?\n').Contains('config valid')) {
+              throw 'config validate did not report success'
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Upload native release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-native-${{ matrix.target }}
+          path: dist/${{ env.ARCHIVE_BASENAME }}.${{ matrix.archive-extension }}
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-image:
+    name: Publish signed container image
+    needs: [validate-release, quality-gates]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # Publish the release image to GHCR.
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ needs.validate-release.outputs.image }}
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.validate-release.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Revalidate release boundary before publishing
+        shell: bash
+        env:
+          EXPECTED_TAG_OBJECT: ${{ needs.validate-release.outputs.tag_object }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          remote_tag_object="$(
+            git ls-remote --refs origin "refs/tags/${GITHUB_REF_NAME}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]]; then
+            echo "release tag changed or disappeared before image publication" >&2
+            exit 1
+          fi
+
+          release_status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
+          )"
+          if [[ "${release_status}" != "404" ]]; then
+            echo "release boundary is no longer publishable (GitHub API HTTP ${release_status})" >&2
+            exit 1
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Install verified Docker Buildx
+        shell: bash
+        env:
+          BUILDX_SHA256: 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778
+          BUILDX_VERSION: v0.36.1
+        run: |
+          set -euo pipefail
+
+          docker_config="${RUNNER_TEMP}/docker-config"
+          plugin_dir="${docker_config}/cli-plugins"
+          download="${RUNNER_TEMP}/docker-buildx"
+          mkdir -p "${plugin_dir}"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --silent --show-error --tlsv1.2 \
+            "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64" \
+            --output "${download}"
+          printf '%s  %s\n' "${BUILDX_SHA256}" "${download}" | sha256sum --check --status
+          install -m 0755 "${download}" "${plugin_dir}/docker-buildx"
+          echo "DOCKER_CONFIG=${docker_config}" >>"${GITHUB_ENV}"
+          buildx_info="$(DOCKER_CONFIG="${docker_config}" docker buildx version)"
+          grep --fixed-strings --quiet "github.com/docker/buildx ${BUILDX_VERSION}" <<<"${buildx_info}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
 
       - name: Sign in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -89,18 +430,18 @@ jobs:
         id: metadata
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ${{ steps.release.outputs.image }}
+          images: ${{ needs.validate-release.outputs.image }}
           flavor: latest=false
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.release.outputs.version }}
-            type=sha,format=long
-            type=raw,value=latest,enable=${{ !contains(steps.release.outputs.version, '-') }}
+            type=semver,pattern={{version}},value=${{ needs.validate-release.outputs.version }}
+            type=raw,value=sha-${{ needs.validate-release.outputs.source_sha }}
+            type=raw,value=latest,enable=${{ !contains(needs.validate-release.outputs.version, '-') }}
           labels: |
             org.opencontainers.image.title=Conduit API
             org.opencontainers.image.description=Production-oriented LLM gateway and control plane
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.validate-release.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate-release.outputs.version }}
 
       - name: Build and publish multi-architecture image
         id: build
@@ -112,20 +453,54 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
-            CONDUIT_VERSION=${{ steps.release.outputs.version }}
-            CONDUIT_COMMIT=${{ github.sha }}
-            CONDUIT_BUILD_TIME=${{ steps.release.outputs.build_time }}
+            CONDUIT_VERSION=${{ needs.validate-release.outputs.version }}
+            CONDUIT_COMMIT=${{ needs.validate-release.outputs.source_sha }}
+            CONDUIT_BUILD_TIME=${{ needs.validate-release.outputs.build_time }}
             CONDUIT_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha,scope=release-image
-          cache-to: type=gha,mode=max,scope=release-image
           provenance: mode=max
           sbom: true
+
+      - name: Preserve immutable image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ needs.validate-release.outputs.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-image
+          printf '%s@%s\n' "${IMAGE}" "${DIGEST}" >release-image/image-digest.txt
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-image-metadata
+          path: release-image/image-digest.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  attest-image:
+    name: Sign and attest container image
+    needs: [validate-release, publish-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # Attach the keyless signature to the immutable GHCR digest.
+      id-token: write # Request the short-lived Sigstore signing identity.
+      attestations: write # Store GitHub provenance for the image digest.
+    steps:
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Attest image provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-name: ${{ steps.release.outputs.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-name: ${{ needs.validate-release.outputs.image }}
+          subject-digest: ${{ needs.publish-image.outputs.digest }}
           push-to-registry: true
 
       - name: Install Cosign
@@ -134,8 +509,8 @@ jobs:
       - name: Sign and verify published image
         shell: bash
         env:
-          IMAGE: ${{ steps.release.outputs.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+          IMAGE: ${{ needs.validate-release.outputs.image }}
         run: |
           set -euo pipefail
           identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/publish-release.yml@${GITHUB_REF}"
@@ -145,30 +520,284 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             "${IMAGE}@${DIGEST}"
 
-      - name: Create release manifest
-        shell: bash
-        env:
-          IMAGE: ${{ steps.release.outputs.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          printf '%s@%s\n' "${IMAGE}" "${DIGEST}" >release/image-digest.txt
-          sha256sum release/image-digest.txt >release/SHA256SUMS
+  build-sbom:
+    name: Build release SBOM
+    needs: [validate-release, quality-gates]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.validate-release.outputs.source_sha }}
+          persist-credentials: false
 
-      - name: Create GitHub release
+      - name: Install verified Syft
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.release.outputs.version }}
+          SYFT_SHA256: 8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3
+          SYFT_VERSION: 1.51.1
         run: |
           set -euo pipefail
-          assets=(release/image-digest.txt release/SHA256SUMS)
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
-            exit 0
+
+          temporary_dir="$(mktemp -d)"
+          trap 'rm -rf "${temporary_dir}"' EXIT
+          archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --silent --show-error --tlsv1.2 \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${archive}" \
+            --output "${temporary_dir}/${archive}"
+          printf '%s  %s\n' "${SYFT_SHA256}" "${temporary_dir}/${archive}" | sha256sum --check --status
+          tar -C "${temporary_dir}" -xzf "${temporary_dir}/${archive}" syft
+          install -m 0755 "${temporary_dir}/syft" "${RUNNER_TEMP}/syft"
+          echo "SYFT_BIN=${RUNNER_TEMP}/syft" >>"${GITHUB_ENV}"
+          "${RUNNER_TEMP}/syft" version
+
+      - name: Generate release SBOM
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          "${SYFT_BIN}" scan dir:. \
+            --output "spdx-json=sbom/conduit-api-v${VERSION}.spdx.json"
+
+      - name: Upload release SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-sbom
+          path: sbom/*.spdx.json
+          if-no-files-found: error
+          retention-days: 3
+
+  assemble-release:
+    name: Assemble immutable release bundle
+    needs: [validate-release, build-binaries, build-sbom, publish-image, attest-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact_digest: ${{ steps.bundle.outputs.artifact-digest }}
+      artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate-release.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Download Linux native archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-native-x86_64-unknown-linux-gnu
+          path: release
+
+      - name: Download Windows native archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-native-x86_64-pc-windows-msvc
+          path: release
+
+      - name: Download image digest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-image-metadata
+          path: release
+
+      - name: Download release SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-sbom
+          path: release
+
+      - name: Create corresponding-source archive
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.validate-release.outputs.source_sha }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive_root="conduit-api-v${VERSION}-source"
+          git archive --format=tar --prefix="${archive_root}/" "${SOURCE_SHA}" |
+            gzip -n >"release/${archive_root}.tar.gz"
+
+      - name: Create and verify release manifests
+        shell: bash
+        env:
+          EXPECTED_CONTAINER: ${{ needs.publish-image.outputs.image }}@${{ needs.publish-image.outputs.digest }}
+          SOURCE_SHA: ${{ needs.validate-release.outputs.source_sha }}
+          TAG_OBJECT: ${{ needs.validate-release.outputs.tag_object }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          release = Path("release")
+          image_digest = (release / "image-digest.txt").read_text(encoding="utf-8").strip()
+          expected_container = os.environ["EXPECTED_CONTAINER"]
+          if image_digest != expected_container:
+              raise SystemExit("downloaded image digest does not match the publishing job output")
+          if not re.fullmatch(r"ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}", image_digest):
+              raise SystemExit("published image reference is not a canonical GHCR digest")
+          manifest = {
+              "schema_version": 1,
+              "version": os.environ["VERSION"],
+              "tag": os.environ["GITHUB_REF_NAME"],
+              "tag_object": os.environ["TAG_OBJECT"],
+              "source_commit": os.environ["SOURCE_SHA"],
+              "container": image_digest,
+              "native_targets": [
+                  "x86_64-unknown-linux-gnu",
+                  "x86_64-pc-windows-msvc",
+              ],
+          }
+          (release / "release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          expected=(
+            "conduit-api-v${VERSION}-source.tar.gz"
+            "conduit-api-v${VERSION}-x86_64-pc-windows-msvc.zip"
+            "conduit-api-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "conduit-api-v${VERSION}.spdx.json"
+            "image-digest.txt"
+            "release-manifest.json"
+          )
+          for file in "${expected[@]}"; do
+            test -s "release/${file}"
+          done
+          actual_count="$(find release -maxdepth 1 -type f | wc -l)"
+          test "${actual_count}" -eq "${#expected[@]}"
+
+          (
+            cd release
+            for file in $(printf '%s\n' "${expected[@]}" | LC_ALL=C sort); do
+              sha256sum "${file}"
+            done >SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Upload immutable release bundle
+        id: bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle-${{ github.run_id }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 3
+
+  attest-release:
+    name: Attest release bundle
+    needs: assemble-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # Request a short-lived identity for artifact provenance.
+      attestations: write # Store GitHub provenance for the release files.
+    steps:
+      - name: Download exact release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.assemble-release.outputs.artifact_id }}
+          merge-multiple: true
+          path: release
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: release/*
+
+  publish-release:
+    name: Publish immutable GitHub Release
+    needs: [validate-release, assemble-release, attest-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read # Download the exact bundle produced by this workflow run.
+      contents: write # Create the GitHub Release and upload its assets.
+    steps:
+      - name: Download attested release bundle
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ needs.assemble-release.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.assemble-release.outputs.artifact_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          metadata="$(mktemp)"
+          trap 'rm -f "${metadata}"' EXIT
+          gh api \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" >"${metadata}"
+          python3 - "${metadata}" "${GITHUB_RUN_ID}" "${ARTIFACT_DIGEST}" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as artifact_file:
+              artifact = json.load(artifact_file)
+          if artifact.get("expired"):
+              raise SystemExit("release bundle artifact expired")
+          if str(artifact.get("workflow_run", {}).get("id")) != sys.argv[2]:
+              raise SystemExit("release bundle belongs to a different workflow run")
+          if artifact.get("digest") != sys.argv[3]:
+              raise SystemExit("release bundle digest does not match the assembly output")
+          PY
+
+          mkdir -p release
+          gh run download "${GITHUB_RUN_ID}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --name "release-bundle-${GITHUB_RUN_ID}" \
+            --dir release
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq 7
+          (cd release && sha256sum --check SHA256SUMS)
+
+      - name: Revalidate tag and create GitHub Release
+        shell: bash
+        env:
+          EXPECTED_TAG_OBJECT: ${{ needs.validate-release.outputs.tag_object }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          remote_tag_object="$(
+            git ls-remote --refs "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              "refs/tags/${GITHUB_REF_NAME}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]]; then
+            echo "release tag changed or disappeared during the build" >&2
+            exit 1
           fi
 
+          release_status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
+          )"
+          if [[ "${release_status}" != "404" ]]; then
+            echo "release boundary is no longer publishable (GitHub API HTTP ${release_status})" >&2
+            exit 1
+          fi
+
+          mapfile -d '' assets < <(find release -maxdepth 1 -type f -print0)
           flags=(--verify-tag --generate-notes --title "Conduit API ${VERSION}")
           if [[ "${VERSION}" == *-* ]]; then
             flags+=(--prerelease)

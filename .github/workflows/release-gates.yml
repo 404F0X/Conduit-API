@@ -2,6 +2,12 @@ name: Release gates
 
 on:
   workflow_call:
+    inputs:
+      upload-release-frontend:
+        description: Upload the verified frontend build for native release jobs
+        required: false
+        type: boolean
+        default: false
   pull_request:
     branches: [main]
   push:
@@ -17,7 +23,7 @@ concurrency:
 jobs:
   dependency-review:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Review dependency changes
@@ -26,7 +32,7 @@ jobs:
           fail-on-severity: high
 
   test-and-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     services:
       postgres:
@@ -68,7 +74,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version-file: .node-version
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
@@ -100,9 +106,11 @@ jobs:
         working-directory: frontend
         shell: bash
         run: |
+          test -s dist/index.html
           test -r dist/licenses/LICENSE
           test -r dist/licenses/NOTICE
           test -r dist/licenses/LICENSING.md
+          test -r dist/licenses/RELINKING.md
           test -r dist/licenses/LICENSES/LGPL-3.0-only.txt
           test -r dist/licenses/frontend/NOTICE
           test -s dist/licenses/frontend/THIRD_PARTY_LICENSES.md
@@ -111,11 +119,23 @@ jobs:
           ! grep --fixed-strings --quiet '@splinetool/runtime' dist/licenses/frontend/THIRD_PARTY_LICENSES.md
           ! grep --fixed-strings --quiet '@splinetool/runtime' pnpm-lock.yaml
 
+      - name: Preserve verified frontend for release binaries
+        if: inputs.upload-release-frontend == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-frontend-${{ github.run_id }}
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
       - name: Check Rust workspace metadata
         run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+      - name: Verify Rust third-party license bundle
+        run: bash scripts/licenses/check-rust-third-party.sh --check
 
       - name: Check configuration schema drift
         run: bash scripts/generate_config_schema.sh --check
@@ -128,6 +148,9 @@ jobs:
 
       - name: Check PostgreSQL production binary
         run: cargo check --locked -p conduit-bin
+
+      - name: Check native release feature wiring
+        run: cargo check --locked -p conduit-bin --bin conduit-api --features release-binary
 
       - name: Lint Rust workspace
         run: cargo clippy --locked --workspace --all-targets
@@ -150,7 +173,7 @@ jobs:
         run: docker compose -f compose.yml config --quiet
 
   container-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test-and-build
     timeout-minutes: 30
     env:
@@ -204,7 +227,10 @@ jobs:
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSE
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/NOTICE
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSING.md
+          docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/RELINKING.md
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/LICENSES/LGPL-3.0-only.txt
+          docker compose -f compose.yml exec --no-TTY conduit-api test -s /app/licenses/LICENSES/RUST_THIRD_PARTY_LICENSES.html
+          docker compose -f compose.yml exec --no-TTY conduit-api grep --fixed-strings --quiet 'redis 0.25.5' /app/licenses/LICENSES/RUST_THIRD_PARTY_LICENSES.html
           docker compose -f compose.yml exec --no-TTY conduit-api test -r /app/licenses/frontend/NOTICE
           docker compose -f compose.yml exec --no-TTY conduit-api test -s /app/licenses/frontend/THIRD_PARTY_LICENSES.md
 

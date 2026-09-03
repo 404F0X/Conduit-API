@@ -45,12 +45,22 @@ A tag that exactly matches the workspace version, such as
 `ghcr.io/404f0x/conduit-api`. Each release records the immutable image digest;
 the registry image carries an SBOM and build provenance attestation.
 
+The same workflow publishes frontend-embedded x86-64 archives for Linux (GNU)
+and Windows (MSVC). Release assets also include checksums, an SPDX SBOM, build
+provenance, a separate exact-source archive, license notices, and
+rebuild/relinking instructions. The Linux binary is built and smoke-tested on
+Ubuntu 24.04 with imported glibc symbols capped at 2.39; the Windows binary is
+built and smoke-tested on Windows Server 2025. These are CI validation
+baselines, not broader compatibility guarantees. Alpha native binaries are not
+yet Authenticode- or platform-code-signed; verify them with the release
+`SHA256SUMS` file and GitHub artifact attestation before use.
+
 ## Build From Source
 
 Requirements:
 
 - Rust 1.96.0, pinned by `rust-toolchain.toml`
-- Node.js 22
+- Node.js 22.23.2, pinned by `.node-version`
 - pnpm 10.23.0
 - PostgreSQL 17
 
@@ -58,7 +68,7 @@ Requirements:
 corepack enable
 pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend build
-cargo build --release -p conduit-bin --bin conduit-api
+cargo build --release -p conduit-bin --bin conduit-api --features release-binary
 
 CONDUIT_DB_DSN='postgresql://conduit:password@127.0.0.1:5432/conduit' \
   ./target/release/conduit-api --config config.example.yml
@@ -66,7 +76,9 @@ CONDUIT_DB_DSN='postgresql://conduit:password@127.0.0.1:5432/conduit' \
 
 The source configuration binds HTTP and metrics to `127.0.0.1` by default.
 Use deployment-specific environment variables and a TLS reverse proxy for
-networked installations.
+networked installations. `release-binary` also enables optional Redis support
+and embeds the generated frontend; omit it for the filesystem-backed
+development build.
 
 ## Development
 

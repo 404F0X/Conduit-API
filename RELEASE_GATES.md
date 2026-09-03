@@ -19,6 +19,7 @@ security, licensing, or data-integrity checks.
 - [ ] `cargo test --locked --workspace --all-targets`
 - [ ] `cargo clippy --locked --workspace --all-targets`
 - [ ] `bash scripts/generate_config_schema.sh --check`
+- [ ] `bash scripts/licenses/check-rust-third-party.sh --check`
 - [ ] `node scripts/rust/security-static-check.mjs`
 - [ ] `node scripts/rust/security-static-check.mjs --self-test`
 
@@ -50,6 +51,9 @@ security, licensing, or data-integrity checks.
 - [ ] `pnpm --dir frontend audit --prod` has no critical or high finding.
 - [ ] Container runs as a non-root user with loopback-safe source defaults.
 - [ ] Release artifacts include checksums, build provenance, and an SBOM.
+- [ ] The Release includes a separate exact-source archive; native archives
+      include its `SOURCE.md` pointer, rebuilding/relinking instructions, and
+      every applicable license and notice file.
 
 The Rust security-invariant check is intentionally repository-specific. It
 blocks test/system bypass principals at request boundaries, empty project-id
@@ -74,11 +78,27 @@ turn every stylistic/pedantic lint into a release blocker.
 
 `.github/workflows/publish-release.yml` accepts only a `v*` tag whose value
 exactly matches `workspace.package.version` and whose commit is contained in
-`main`. It reuses the complete release-gates workflow before publishing. The
-result is a multi-architecture GHCR image, keyless Cosign signature, GitHub
-build-provenance attestation, registry SBOM/provenance attestations, immutable
-image-digest manifest, checksum, and GitHub Release. Third-party Actions are
-pinned to immutable commits and updated through Dependabot.
+`main`. It rejects a tag if a release with that name already exists, verifies
+the remote tag object both before and after building, and reuses the complete
+release-gates workflow before publishing.
+
+The result is a multi-architecture GHCR image, keyless Cosign signature,
+registry SBOM/provenance attestations, and frontend-embedded x86-64 Linux GNU
+and Windows MSVC archives. The GitHub Release also carries an SPDX SBOM, a
+separate exact-source archive, image digest, release manifest, relative-path
+`SHA256SUMS`, and GitHub build-provenance attestations. Binary archives contain
+the applicable Apache/LGPL texts, generated Rust/frontend dependency notices,
+`SOURCE.md`, and `RELINKING.md`. The Linux archive is built and smoke-tested on
+Ubuntu 24.04 with a glibc 2.39 imported-symbol ceiling; Windows is built and
+smoke-tested on Windows Server 2025. These are validation baselines, not
+compatibility guarantees. Third-party Actions are pinned to immutable commits
+and updated through Dependabot.
+
+Repository administrators must protect the `v*` tag namespace from deletion
+and force updates and enable immutable GitHub Releases. Do not reuse a version
+or move a published tag; advance the workspace version and create a new tag
+instead. Alpha native archives are not yet platform-code-signed, so their
+checksums and GitHub attestations are the current authenticity mechanism.
 
 Record the command output and commit SHA with each release. Do not check an item
 based on an older dirty-worktree run.

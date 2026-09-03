@@ -24,7 +24,9 @@ When redistributing Conduit API or a derivative, preserve the applicable
 license texts and relevant copyright, patent, trademark, and attribution
 notices. In particular:
 
-1. Include `LICENSE`, `NOTICE`, and `LICENSES/LGPL-3.0-only.txt`.
+1. Include `LICENSE`, `NOTICE`, `LICENSING.md`, `RELINKING.md`,
+   `LICENSES/LGPL-3.0-only.txt`, and
+   `LICENSES/RUST_THIRD_PARTY_LICENSES.html`.
 2. If the web console is included, also include `frontend/NOTICE` and the
    build-generated `dist/licenses/frontend/THIRD_PARTY_LICENSES.md`.
 3. Retain the relevant contents of `NOTICE` in a readable notice file,
@@ -38,11 +40,21 @@ notices. In particular:
    statically, so distributors should review the complete LGPL text rather
    than assuming dynamic-library rules apply.
 
-The production image places these materials under `/app/licenses`. The web
-build also contains them under `dist/licenses` so a standalone console
-distribution carries the same notices. Vite generates
+Official GitHub Releases attach the exact tagged source as a separate asset and
+place `SOURCE.md` plus `RELINKING.md` in each native binary archive.
+Distributors of modified builds must provide corresponding source and
+rebuilding/relinking materials for their own binaries rather than referring to
+an unrelated official archive.
+
+The production image places the license and relinking materials under
+`/app/licenses`. The web build contains its applicable product and frontend
+materials under `dist/licenses` so a standalone console distribution carries
+the relevant notices. Vite generates
 `dist/licenses/frontend/THIRD_PARTY_LICENSES.md` from the production modules
 that are actually bundled; it is a build artifact and is not hand-maintained.
+The committed Rust report is generated from the locked production graph with
+`scripts/licenses/check-rust-third-party.sh --write`; CI reruns the generator
+and rejects drift.
 
 ## Commercial use
 

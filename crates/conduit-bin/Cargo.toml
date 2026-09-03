@@ -14,6 +14,8 @@ path = "src/main.rs"
 default = []
 redis = ["conduit-cache/redis"]
 otel = []
+embed-frontend = ["conduit-http/embed-frontend"]
+release-binary = ["redis", "embed-frontend"]
 full = ["redis", "otel"]
 
 [dependencies]
