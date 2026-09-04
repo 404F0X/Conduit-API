@@ -5338,10 +5338,17 @@ impl crate::OutboundTransformer for AnthropicOutboundTransformer {
     /// Falls back to raw body text.
     fn outbound_error(&self, response: HttpResponse) -> TransformerResult<ConduitError> {
         let status = response.status;
+        let headers = response.headers.clone();
+        let parsed_body = response.json_body.clone().or_else(|| {
+            response
+                .body
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+        });
         let body_bytes = response.body.as_deref().unwrap_or(&[]);
 
         // Try to parse as Anthropic error envelope.
-        if let Ok(parsed) = serde_json::from_slice::<Value>(body_bytes)
+        if let Some(parsed) = parsed_body.as_ref()
             && let Some(err_obj) = parsed.get("error")
         {
             let message = err_obj
@@ -5353,8 +5360,13 @@ impl crate::OutboundTransformer for AnthropicOutboundTransformer {
                 .and_then(Value::as_str)
                 .unwrap_or("api_error");
 
-            return Ok(ConduitError::upstream(format!("[{err_type}] {message}"))
-                .with_provider_status(status));
+            let mut error = ConduitError::upstream(format!("[{err_type}] {message}"))
+                .with_provider_status(status)
+                .with_http_status(provider_client_status(status))
+                .with_safe_message(message)
+                .with_provider_headers(headers);
+            error = error.with_provider_body(parsed.clone());
+            return Ok(error);
         }
 
         // Fallback: raw body text.
@@ -5364,7 +5376,14 @@ impl crate::OutboundTransformer for AnthropicOutboundTransformer {
         } else {
             raw.trim().to_string()
         };
-        Ok(ConduitError::upstream(format!("HTTP {status}: {detail}")).with_provider_status(status))
+        let mut error = ConduitError::upstream(format!("HTTP {status}: {detail}"))
+            .with_provider_status(status)
+            .with_http_status(provider_client_status(status))
+            .with_provider_headers(headers);
+        if let Some(body) = parsed_body {
+            error = error.with_provider_body(body);
+        }
+        Ok(error)
     }
 
     /// Convert an Anthropic Message HTTP response into the unified `LlmResponse`.
@@ -5727,6 +5746,14 @@ fn convert_anthropic_message_to_llm_response(msg: &Value) -> TransformerResult<L
 }
 
 /// Minimal HTTP status text fallback. Mirrors Go `http.StatusText`.
+const fn provider_client_status(status: u16) -> u16 {
+    if status >= 400 && status <= 599 {
+        status
+    } else {
+        502
+    }
+}
+
 fn http_status_text(status: u16) -> String {
     match status {
         400 => "Bad Request".to_string(),

@@ -1016,6 +1016,8 @@ async fn build_postgres_proxy_service(
         Arc::new(SystemRuntimeRetryPolicySource::new(system.clone()));
     let attempt_observer =
         crate::auto_disable_runtime::start_auto_disable_runtime(pool.clone(), system.clone());
+    let channel_cooldowns =
+        Arc::new(conduit_orchestrator::middlewares::ChannelCooldownTracker::default());
     let pipeline = Arc::new(
         Pipeline::new(inbound, outbound, executor)
             .with_retry_hooks(conduit_pipeline::RetryHooks {
@@ -1066,8 +1068,14 @@ async fn build_postgres_proxy_service(
                     .with_artifact_storage(request_artifact_storage.clone()),
                 ),
                 Arc::new(conduit_orchestrator::middlewares::ChannelConcurrencyMiddleware::new(0)),
-                Arc::new(conduit_orchestrator::middlewares::RateLimitAdmissionMiddleware::new()),
-                Arc::new(conduit_orchestrator::middlewares::RateLimitTrackingMiddleware),
+                Arc::new(
+                    conduit_orchestrator::middlewares::RateLimitAdmissionMiddleware::with_cooldown_tracker(
+                        channel_cooldowns.clone(),
+                    ),
+                ),
+                Arc::new(conduit_orchestrator::middlewares::RateLimitTrackingMiddleware::new(
+                    channel_cooldowns,
+                )),
                 Arc::new(conduit_orchestrator::middlewares::CaptureRawProviderMiddleware),
                 Arc::new(conduit_orchestrator::middlewares::CaptureStreamMiddleware::new()),
                 Arc::new(
@@ -1642,7 +1650,7 @@ impl Default for WireRetryPolicy {
             max_channel_retries: 3,
             max_single_channel_retries: 2,
             retry_delay_ms: 1000,
-            stream_first_event_timeout_seconds: 0,
+            stream_first_event_timeout_seconds: 30,
             non_stream_response_timeout_seconds: 0,
             load_balancer_strategy: "adaptive".to_string(),
             cost_score_weight: 0,
@@ -5838,6 +5846,7 @@ impl conduit_transformers::OutboundTransformer for OpenAiCompatOutbound {
         response: conduit_llm::HttpResponse,
     ) -> conduit_transformers::TransformerResult<ConduitError> {
         let status = response.status;
+        let provider_headers = response.headers.clone();
         // The executor decodes JSON responses into `json_body` and leaves
         // `body` empty. Reading only `body` therefore discarded every normal
         // OpenAI-compatible error envelope and produced an empty execution
@@ -5873,7 +5882,8 @@ impl conduit_transformers::OutboundTransformer for OpenAiCompatOutbound {
         let mut error = ConduitError::upstream(message.clone())
             .with_provider_status(status)
             .with_http_status(client_status)
-            .with_safe_message(message);
+            .with_safe_message(message)
+            .with_provider_headers(provider_headers);
         if let Some(code) = code {
             error = error.with_code(code);
         }

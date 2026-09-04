@@ -1712,6 +1712,7 @@ impl OutboundTransformer for OpenAiResponsesOutbound {
 
     fn outbound_error(&self, response: HttpResponse) -> TransformerResult<ConduitError> {
         let status = response.status;
+        let headers = response.headers.clone();
         let parsed = response.json_body.clone().or_else(|| {
             response
                 .body
@@ -1734,8 +1735,16 @@ impl OutboundTransformer for OpenAiResponsesOutbound {
             })
             .unwrap_or_else(|| "Responses API request failed".to_string());
 
-        let mut error =
-            ConduitError::upstream(format!("[{status}] {message}")).with_provider_status(status);
+        let client_status = if (400..=599).contains(&status) {
+            status
+        } else {
+            502
+        };
+        let mut error = ConduitError::upstream(format!("[{status}] {message}"))
+            .with_provider_status(status)
+            .with_http_status(client_status)
+            .with_safe_message(message)
+            .with_provider_headers(headers);
         if let Some(body) = parsed {
             error = error.with_provider_body(body);
         }

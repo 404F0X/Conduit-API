@@ -1561,6 +1561,30 @@ impl CommandOrchestrator {
                 ));
             }
         }
+        // Within the administrator's priority boundary, prefer routes whose
+        // recent PostgreSQL-backed health is known-good over unknown/degraded
+        // routes. Preserve the load-balancer order for equal health ranks.
+        healthy_ordered_indices.sort_by_key(|index| {
+            let candidate = &resolved[*index];
+            let actual_model = candidate
+                .models
+                .first()
+                .map(|model| model.actual_model.clone())
+                .unwrap_or_default();
+            let credential_identity = selected_credentials
+                .get(index)
+                .and_then(|credential| credential.as_deref())
+                .map(conduit_services::credential_fingerprint);
+            let status = health_statuses
+                .get(&RouteHealthTarget {
+                    channel_id: candidate.channel_id.clone(),
+                    actual_model,
+                    credential_identity,
+                })
+                .copied()
+                .unwrap_or(RouteHealthStatus::Unknown);
+            (candidate.priority, route_health_rank(status))
+        });
         if healthy_ordered_indices.is_empty() {
             return Err(OrchestratorError::new(
                 OrchestratorStage::LoadBalance,
@@ -1874,42 +1898,118 @@ impl CommandOrchestrator {
             "stream request future dropped before finalizer handoff",
         );
 
-        // ---- S03 Pipeline (live): inbound → outbound → execute_stream_live ----
-        let mut pipeline_ctx = PipelineContext::new();
-        for (key, value) in &http_request.metadata {
-            if let Some(s) = value.as_str() {
-                pipeline_ctx.metadata.insert(key.clone(), s.to_string());
-            } else if let Some(n) = value.as_i64() {
-                pipeline_ctx.metadata.insert(key.clone(), n.to_string());
+        // ---- S03 Pipeline (live): retry/fail over before client commitment ----
+        let pipeline_retry_policy = runtime_retry_policy
+            .map(|policy| policy.pipeline)
+            .unwrap_or_else(|| self.pipeline.retry_policy());
+        let max_channels = if pipeline_retry_policy.enabled {
+            1usize.saturating_add(pipeline_retry_policy.max_channel_retries as usize)
+        } else {
+            1
+        };
+        let mut persisted_metadata = BTreeMap::<String, String>::new();
+        let mut last_error: Option<ConduitError> = None;
+        let mut last_pipeline_ctx = PipelineContext::new();
+        let mut selected_live = None;
+        let mut attempt_sequence = 0_u32;
+
+        let channel_attempt_limit = ordered_candidates.len().min(max_channels);
+        'channels: for (candidate_index, candidate) in ordered_candidates
+            .iter()
+            .take(channel_attempt_limit)
+            .enumerate()
+        {
+            let same_channel_attempts = if pipeline_retry_policy.enabled {
+                1_u32.saturating_add(pipeline_retry_policy.max_single_channel_retries)
+            } else {
+                1
+            };
+            for same_attempt in 0..same_channel_attempts {
+                attempt_sequence = attempt_sequence.saturating_add(1);
+                let mut attempt_ctx = PipelineContext::new();
+                for (key, value) in &http_request.metadata {
+                    if let Some(s) = value.as_str() {
+                        attempt_ctx.metadata.insert(key.clone(), s.to_string());
+                    } else if let Some(n) = value.as_i64() {
+                        attempt_ctx.metadata.insert(key.clone(), n.to_string());
+                    }
+                }
+                attempt_ctx.metadata.extend(persisted_metadata.clone());
+                attempt_ctx.metadata.insert(
+                    LOAD_BALANCE_STRATEGY_METADATA.to_string(),
+                    load_balance_strategy.as_str().to_string(),
+                );
+                let attempt_cancel = conduit_pipeline::CancelToken::new();
+                match self
+                    .pipeline
+                    .stream_live_with_inbound_policy(
+                        &mut attempt_ctx,
+                        std::sync::Arc::clone(&inbound),
+                        http_request.clone(),
+                        raw_inbound,
+                        std::slice::from_ref(candidate),
+                        attempt_cancel.clone(),
+                        pipeline_retry_policy,
+                    )
+                    .await
+                {
+                    Ok(mut live) => {
+                        live.sequence = attempt_sequence;
+                        selected_live = Some((live, attempt_ctx, attempt_cancel));
+                        break 'channels;
+                    }
+                    Err(error) => {
+                        for key in ["__persist_request_id", "__persist_project_id"] {
+                            if let Some(value) = attempt_ctx.metadata.get(key) {
+                                persisted_metadata.insert(key.to_string(), value.clone());
+                            }
+                        }
+                        let circuit_rejection = error.code.as_deref().is_some_and(|code| {
+                            matches!(code, "model_circuit_open" | "model_circuit_half_open")
+                        });
+                        let retry_same = !circuit_rejection
+                            && same_attempt + 1 < same_channel_attempts
+                            && (conduit_pipeline::is_retryable_error(&error)
+                                || conduit_pipeline::is_response_timeout_error(&error)
+                                || (error.kind == conduit_core::ErrorKind::Upstream
+                                    && error.provider_status.is_none()));
+                        last_error = Some(error);
+                        last_pipeline_ctx = attempt_ctx;
+                        if retry_same && pipeline_retry_policy.retry_delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                pipeline_retry_policy.retry_delay_ms,
+                            ))
+                            .await;
+                        }
+                        if !retry_same {
+                            break;
+                        }
+                    }
+                }
+            }
+            if pipeline_retry_policy.enabled
+                && pipeline_retry_policy.retry_delay_ms > 0
+                && selected_live.is_none()
+                && candidate_index + 1 < channel_attempt_limit
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    pipeline_retry_policy.retry_delay_ms,
+                ))
+                .await;
             }
         }
-        pipeline_ctx.metadata.insert(
-            LOAD_BALANCE_STRATEGY_METADATA.to_string(),
-            load_balance_strategy.as_str().to_string(),
-        );
 
-        // S13 — per-request upstream cancel token, shared by the executor's
-        // read loop and the forward loop's client-disconnect handler.
-        let upstream_cancel = conduit_pipeline::CancelToken::new();
-        let live = self
-            .pipeline
-            .stream_live_with_inbound(
-                &mut pipeline_ctx,
-                std::sync::Arc::clone(&inbound),
-                http_request,
-                raw_inbound,
-                &ordered_candidates,
-                upstream_cancel.clone(),
-            )
-            .await;
-        let live = match live {
-            Ok(live) => live,
-            Err(error) => {
+        let (live, pipeline_ctx, upstream_cancel) = match selected_live {
+            Some(selected) => selected,
+            None => {
+                let error = last_error.unwrap_or_else(|| {
+                    ConduitError::not_found("no candidates available for live pipeline")
+                });
                 // Admission already reserved customer funds. A stream that
                 // fails before returning its live handle has no finalizer, so
                 // release through the recorder here instead of waiting for
                 // reservation expiry.
-                let persisted_request_id = pipeline_ctx
+                let persisted_request_id = last_pipeline_ctx
                     .metadata
                     .get("__persist_request_id")
                     .map(String::as_str)
@@ -9129,16 +9229,38 @@ fn select_healthy_credential(
     if choices.is_empty() {
         choices.push(None);
     }
-    choices.into_iter().find(|credential| {
-        let target = RouteHealthTarget {
-            channel_id: channel_id.to_string(),
-            actual_model: actual_model.to_string(),
-            credential_identity: credential
-                .as_deref()
-                .map(conduit_services::credential_fingerprint),
-        };
-        statuses.get(&target).copied() != Some(RouteHealthStatus::Unhealthy)
-    })
+    choices
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, credential)| {
+            let target = RouteHealthTarget {
+                channel_id: channel_id.to_string(),
+                actual_model: actual_model.to_string(),
+                credential_identity: credential
+                    .as_deref()
+                    .map(conduit_services::credential_fingerprint),
+            };
+            let status = statuses
+                .get(&target)
+                .copied()
+                .unwrap_or(RouteHealthStatus::Unknown);
+            (status != RouteHealthStatus::Unhealthy).then_some((
+                route_health_rank(status),
+                position,
+                credential,
+            ))
+        })
+        .min_by_key(|(rank, position, _)| (*rank, *position))
+        .map(|(_, _, credential)| credential)
+}
+
+const fn route_health_rank(status: RouteHealthStatus) -> u8 {
+    match status {
+        RouteHealthStatus::Healthy => 0,
+        RouteHealthStatus::Unknown => 1,
+        RouteHealthStatus::Degraded => 2,
+        RouteHealthStatus::Unhealthy => 3,
+    }
 }
 
 #[cfg(test)]
@@ -9195,6 +9317,41 @@ mod route_health_credential_tests {
             select_healthy_credential(&keys, Some(&keys[0]), None, "7", "same-model", &statuses,),
             None
         );
+    }
+
+    #[test]
+    fn healthy_key_is_preferred_over_sticky_degraded_key() {
+        let degraded = "provider-key-degraded".to_string();
+        let healthy = "provider-key-healthy".to_string();
+        let statuses = BTreeMap::from([
+            (
+                RouteHealthTarget {
+                    channel_id: "7".into(),
+                    actual_model: "same-model".into(),
+                    credential_identity: Some(conduit_services::credential_fingerprint(&degraded)),
+                },
+                RouteHealthStatus::Degraded,
+            ),
+            (
+                RouteHealthTarget {
+                    channel_id: "7".into(),
+                    actual_model: "same-model".into(),
+                    credential_identity: Some(conduit_services::credential_fingerprint(&healthy)),
+                },
+                RouteHealthStatus::Healthy,
+            ),
+        ]);
+
+        let selected = select_healthy_credential(
+            &[degraded.clone(), healthy.clone()],
+            Some(&degraded),
+            None,
+            "7",
+            "same-model",
+            &statuses,
+        );
+
+        assert_eq!(selected, Some(Some(healthy)));
     }
 }
 

@@ -26,6 +26,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{InboundTransformer, OutboundTransformer, TransformerResult};
 
+const fn provider_client_status(status: u16) -> u16 {
+    if status >= 400 && status <= 599 {
+        status
+    } else {
+        502
+    }
+}
+
 /// Error surfaced by the path-action parser.
 #[derive(Debug, thiserror::Error)]
 pub enum GeminiActionError {
@@ -2245,10 +2253,17 @@ impl OutboundTransformer for GeminiOutboundTransformer {
     /// Go parity: `OutboundTransformer.TransformError` (outbound.go:264-294).
     fn outbound_error(&self, response: HttpResponse) -> TransformerResult<ConduitError> {
         let status = response.status;
+        let headers = response.headers.clone();
+        let parsed_body = response.json_body.clone().or_else(|| {
+            response
+                .body
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+        });
         let body_bytes = response.body.as_deref().unwrap_or(&[]);
 
         // Try to parse as a Gemini error envelope.
-        if let Ok(gemini_err) = serde_json::from_slice::<Value>(body_bytes)
+        if let Some(gemini_err) = parsed_body.as_ref()
             && let Some(err_obj) = gemini_err.get("error")
         {
             let message = err_obj
@@ -2260,18 +2275,26 @@ impl OutboundTransformer for GeminiOutboundTransformer {
                 .and_then(|v| v.as_str())
                 .unwrap_or("api_error");
 
-            return Ok(ConduitError::new(
-                ErrorKind::InvalidResponse,
-                format!("[{err_status}] {message} (HTTP {status})"),
-            ));
+            return Ok(
+                ConduitError::upstream(format!("[{err_status}] {message} (HTTP {status})"))
+                    .with_provider_status(status)
+                    .with_http_status(provider_client_status(status))
+                    .with_safe_message(message)
+                    .with_provider_body(gemini_err.clone())
+                    .with_provider_headers(headers),
+            );
         }
 
         // Fallback: raw body as the error message.
         let raw = String::from_utf8_lossy(body_bytes);
-        Ok(ConduitError::new(
-            ErrorKind::InvalidResponse,
-            format!("HTTP {status}: {raw}"),
-        ))
+        let mut error = ConduitError::upstream(format!("HTTP {status}: {raw}"))
+            .with_provider_status(status)
+            .with_http_status(provider_client_status(status))
+            .with_provider_headers(headers);
+        if let Some(body) = parsed_body {
+            error = error.with_provider_body(body);
+        }
+        Ok(error)
     }
 
     /// Convert a Gemini-format HTTP response into the unified [`LlmResponse`].
@@ -5635,5 +5658,36 @@ mod tests {
     fn inbound_transformer_name() {
         let transformer = GeminiInboundTransformer::new();
         assert_eq!(transformer.name(), "gemini");
+    }
+
+    #[test]
+    fn outbound_error_preserves_decoded_status_body_and_retry_after()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let transformer =
+            GeminiOutboundTransformer::new("https://generativelanguage.googleapis.com", "test-key");
+        let mut headers = BTreeMap::new();
+        headers.insert("retry-after".to_string(), "12".to_string());
+        let error = transformer.outbound_error(HttpResponse {
+            status: 429,
+            headers,
+            json_body: Some(serde_json::json!({
+                "error": {"message": "quota reached", "status": "RESOURCE_EXHAUSTED"}
+            })),
+            ..HttpResponse::default()
+        })?;
+
+        assert_eq!(error.kind, ErrorKind::Upstream);
+        assert_eq!(error.http_status, 429);
+        assert_eq!(error.provider_status, Some(429));
+        assert_eq!(error.public_message(), "quota reached");
+        assert_eq!(
+            error
+                .provider_headers_subset
+                .get("retry-after")
+                .map(String::as_str),
+            Some("12")
+        );
+        assert!(error.provider_body.is_some());
+        Ok(())
     }
 }

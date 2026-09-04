@@ -18,12 +18,17 @@
 //! - `rate_limit_error_time_ms`: epoch millis when an outbound error was
 //!   observed (for cooldown tracking)
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use conduit_core::ConduitError;
 use conduit_llm::HttpResponse;
 use conduit_pipeline::PipelineMiddleware;
 use conduit_pipeline::middleware::{PipelineContext, PipelineResult};
+
+use super::rate_limit_admission::ChannelCooldownTracker;
+
+const MAX_PROVIDER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Returns current epoch milliseconds as a `String`, or `"0"` if the system
 /// clock is before the Unix epoch.
@@ -38,7 +43,26 @@ fn epoch_millis_string() -> String {
 /// `PipelineContext.metadata`. Go parity: `rateLimitTracking`
 /// (`orchestrator/rate_limit_tracking.go:30-35`), minus the
 /// `ChannelRequestTracker` / `PersistentOutboundTransformer` dependencies.
-pub struct RateLimitTrackingMiddleware;
+pub struct RateLimitTrackingMiddleware {
+    cooldowns: Arc<ChannelCooldownTracker>,
+}
+
+impl RateLimitTrackingMiddleware {
+    pub fn new(cooldowns: Arc<ChannelCooldownTracker>) -> Self {
+        Self { cooldowns }
+    }
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(MAX_PROVIDER_COOLDOWN));
+    }
+    let target = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    let target = target.with_timezone(&chrono::Utc);
+    let now: chrono::DateTime<chrono::Utc> = now.into();
+    let duration = (target - now).to_std().ok()?;
+    Some(duration.min(MAX_PROVIDER_COOLDOWN))
+}
 
 impl PipelineMiddleware for RateLimitTrackingMiddleware {
     fn name(&self) -> &'static str {
@@ -85,21 +109,37 @@ impl PipelineMiddleware for RateLimitTrackingMiddleware {
 
     /// Record the error timestamp for cooldown tracking.
     /// Go: `OnOutboundRawError` (rate_limit_tracking.go:75-109).
-    fn on_outbound_raw_error(&self, ctx: &mut PipelineContext, _error: &ConduitError) {
+    fn on_outbound_raw_error(&self, ctx: &mut PipelineContext, error: &ConduitError) {
         ctx.metadata.insert(
             "rate_limit_error_time_ms".to_string(),
             epoch_millis_string(),
         );
+        if error.provider_status != Some(429) {
+            return;
+        }
+        let Some(channel_id) = ctx.metadata.get("channel_id").filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let Some(value) = error.provider_headers_subset.get("retry-after") else {
+            return;
+        };
+        let Some(duration) = parse_retry_after(value, SystemTime::now()) else {
+            return;
+        };
+        self.cooldowns.set_cooldown(channel_id, duration);
+        ctx.metadata
+            .insert("rate_limit_retry_after".to_string(), value.clone());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conduit_llm::HttpRequest;
 
     #[test]
     fn outbound_response_records_timestamp_and_headers() -> Result<(), Box<dyn std::error::Error>> {
-        let mw = RateLimitTrackingMiddleware;
+        let mw = RateLimitTrackingMiddleware::new(Arc::new(ChannelCooldownTracker::default()));
         let mut ctx = PipelineContext::new();
 
         // Pre-populate channel_id so the middleware can copy it.
@@ -162,7 +202,7 @@ mod tests {
     #[test]
     fn outbound_response_without_headers_only_records_timestamp()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mw = RateLimitTrackingMiddleware;
+        let mw = RateLimitTrackingMiddleware::new(Arc::new(ChannelCooldownTracker::default()));
         let mut ctx = PipelineContext::new();
         let response = HttpResponse::default();
 
@@ -198,7 +238,7 @@ mod tests {
 
     #[test]
     fn outbound_error_records_error_timestamp() -> Result<(), Box<dyn std::error::Error>> {
-        let mw = RateLimitTrackingMiddleware;
+        let mw = RateLimitTrackingMiddleware::new(Arc::new(ChannelCooldownTracker::default()));
         let mut ctx = PipelineContext::new();
         let error = ConduitError::upstream("rate limited");
 
@@ -213,5 +253,34 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn retry_after_429_blocks_the_next_channel_admission() {
+        use conduit_pipeline::PipelineMiddleware;
+
+        let cooldowns = Arc::new(ChannelCooldownTracker::default());
+        let tracker = RateLimitTrackingMiddleware::new(cooldowns.clone());
+        let admission =
+            super::super::rate_limit_admission::RateLimitAdmissionMiddleware::with_cooldown_tracker(
+                cooldowns,
+            );
+        let mut ctx = PipelineContext::new();
+        ctx.metadata
+            .insert("channel_id".to_string(), "ch-rate-limited".to_string());
+        let error = ConduitError::upstream("rate limited")
+            .with_provider_status(429)
+            .with_provider_headers([("retry-after", "30")]);
+
+        tracker.on_outbound_raw_error(&mut ctx, &error);
+        let result = admission.on_outbound_raw_request(&mut ctx, HttpRequest::default());
+
+        assert!(result.is_err());
+        assert_eq!(
+            ctx.metadata
+                .get("rate_limit_retry_after")
+                .map(String::as_str),
+            Some("30")
+        );
     }
 }

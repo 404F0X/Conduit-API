@@ -507,6 +507,8 @@ impl OutboundTransformer for OpenAiCompletionOutbound {
     /// (an upstream error carrying the provider status + body); Go routes the
     /// same information through `TransformOpenAIError`.
     fn outbound_error(&self, response: HttpResponse) -> TransformerResult<ConduitError> {
+        let status = response.status;
+        let headers = response.headers.clone();
         let body = response
             .json_body
             .clone()
@@ -517,8 +519,15 @@ impl OutboundTransformer for OpenAiCompletionOutbound {
                     .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             })
             .unwrap_or(Value::Null);
+        let client_status = if (400..=599).contains(&status) {
+            status
+        } else {
+            502
+        };
         Ok(ConduitError::upstream("openai completion provider error")
-            .with_provider_status(response.status)
+            .with_provider_status(status)
+            .with_http_status(client_status)
+            .with_provider_headers(headers)
             .with_provider_body(body))
     }
 
