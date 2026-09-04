@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-admin-graphql"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-graphql",
  "async-trait",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-auth"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "bcrypt",
  "chrono",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-bin"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-graphql",
  "async-trait",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-cache"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-config"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "schemars",
  "serde",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "chrono",
  "rust_decimal",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-db"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-http"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-llm"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "conduit-core",
  "reqwest",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-openapi-graphql"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-graphql",
  "async-trait",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-orchestrator"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-pipeline"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "conduit-core",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-scheduler"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "chrono",
  "serde",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-services"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-storage"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-testkit"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "axum",
  "conduit-core",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-transformers"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "chrono",
  "conduit-core",
