@@ -1194,7 +1194,9 @@ jobs:
               raise SystemExit("release bundle artifact expired")
           if str(artifact.get("workflow_run", {}).get("id")) != sys.argv[2]:
               raise SystemExit("release bundle belongs to a different workflow run")
-          if artifact.get("digest") != sys.argv[3]:
+          # upload-artifact emits bare hex; the Artifact REST API prefixes its algorithm.
+          expected_digest = f"sha256:{sys.argv[3]}"
+          if artifact.get("digest") != expected_digest:
               raise SystemExit("release bundle digest does not match the assembly output")
           PY
 
