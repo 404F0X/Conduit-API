@@ -24,7 +24,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 repository = "https://github.com/404F0X/Conduit-API"
 
 [workspace.lints.rust]
@@ -44,22 +44,22 @@ unwrap_used = "deny"
 result_large_err = "allow"
 
 [workspace.dependencies]
-conduit-admin-graphql = { path = "crates/conduit-admin-graphql", version = "0.1.0-alpha.2" }
-conduit-auth = { path = "crates/conduit-auth", version = "0.1.0-alpha.2" }
-conduit-cache = { path = "crates/conduit-cache", version = "0.1.0-alpha.2" }
-conduit-config = { path = "crates/conduit-config", version = "0.1.0-alpha.2" }
-conduit-core = { path = "crates/conduit-core", version = "0.1.0-alpha.2" }
-conduit-db = { path = "crates/conduit-db", version = "0.1.0-alpha.2" }
-conduit-http = { path = "crates/conduit-http", version = "0.1.0-alpha.2" }
-conduit-llm = { path = "crates/conduit-llm", version = "0.1.0-alpha.2" }
-conduit-openapi-graphql = { path = "crates/conduit-openapi-graphql", version = "0.1.0-alpha.2" }
-conduit-orchestrator = { path = "crates/conduit-orchestrator", version = "0.1.0-alpha.2" }
-conduit-pipeline = { path = "crates/conduit-pipeline", version = "0.1.0-alpha.2" }
-conduit-scheduler = { path = "crates/conduit-scheduler", version = "0.1.0-alpha.2" }
-conduit-services = { path = "crates/conduit-services", version = "0.1.0-alpha.2" }
-conduit-storage = { path = "crates/conduit-storage", version = "0.1.0-alpha.2" }
-conduit-testkit = { path = "crates/conduit-testkit", version = "0.1.0-alpha.2" }
-conduit-transformers = { path = "crates/conduit-transformers", version = "0.1.0-alpha.2" }
+conduit-admin-graphql = { path = "crates/conduit-admin-graphql", version = "0.1.0-alpha.3" }
+conduit-auth = { path = "crates/conduit-auth", version = "0.1.0-alpha.3" }
+conduit-cache = { path = "crates/conduit-cache", version = "0.1.0-alpha.3" }
+conduit-config = { path = "crates/conduit-config", version = "0.1.0-alpha.3" }
+conduit-core = { path = "crates/conduit-core", version = "0.1.0-alpha.3" }
+conduit-db = { path = "crates/conduit-db", version = "0.1.0-alpha.3" }
+conduit-http = { path = "crates/conduit-http", version = "0.1.0-alpha.3" }
+conduit-llm = { path = "crates/conduit-llm", version = "0.1.0-alpha.3" }
+conduit-openapi-graphql = { path = "crates/conduit-openapi-graphql", version = "0.1.0-alpha.3" }
+conduit-orchestrator = { path = "crates/conduit-orchestrator", version = "0.1.0-alpha.3" }
+conduit-pipeline = { path = "crates/conduit-pipeline", version = "0.1.0-alpha.3" }
+conduit-scheduler = { path = "crates/conduit-scheduler", version = "0.1.0-alpha.3" }
+conduit-services = { path = "crates/conduit-services", version = "0.1.0-alpha.3" }
+conduit-storage = { path = "crates/conduit-storage", version = "0.1.0-alpha.3" }
+conduit-testkit = { path = "crates/conduit-testkit", version = "0.1.0-alpha.3" }
+conduit-transformers = { path = "crates/conduit-transformers", version = "0.1.0-alpha.3" }
 
 anyhow = "1"
 async-graphql = "7"
