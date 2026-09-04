@@ -354,17 +354,30 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  publish-image:
-    name: Publish signed container image
+  build-image-platforms:
+    name: Build image ${{ matrix.platform }}
     needs: [validate-release, quality-gates]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
-      packages: write # Publish the release image to GHCR.
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-      image: ${{ needs.validate-release.outputs.image }}
+      packages: write # Push an untagged platform image to GHCR by digest.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+            machine: x86_64
+            buildx_asset: linux-amd64
+            buildx_sha256: 48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+            machine: aarch64
+            buildx_asset: linux-arm64
+            buildx_sha256: 5d0cafd9d16afe1a0f0d9529885344ace2cc99efdd531b6c783c5455a6001569
     steps:
       - name: Check out validated source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -398,15 +411,161 @@ jobs:
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
           )"
           if [[ "${release_status}" != "404" ]]; then
-            echo "release boundary is no longer publishable (GitHub API HTTP ${release_status})" >&2
+            echo "release boundary is no longer buildable (GitHub API HTTP ${release_status})" >&2
             exit 1
           fi
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - name: Install verified Docker Buildx
+        shell: bash
+        env:
+          BUILDX_ASSET: ${{ matrix.buildx_asset }}
+          BUILDX_SHA256: ${{ matrix.buildx_sha256 }}
+          BUILDX_VERSION: v0.36.1
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+        run: |
+          set -euo pipefail
+
+          actual_machine="$(uname -m)"
+          if [[ "${actual_machine}" != "${EXPECTED_MACHINE}" ]]; then
+            echo "runner architecture ${actual_machine} does not match ${EXPECTED_MACHINE}" >&2
+            exit 1
+          fi
+
+          docker_config="${RUNNER_TEMP}/docker-config"
+          plugin_dir="${docker_config}/cli-plugins"
+          download="${RUNNER_TEMP}/docker-buildx"
+          mkdir -p "${plugin_dir}"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --silent --show-error --tlsv1.2 \
+            "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.${BUILDX_ASSET}" \
+            --output "${download}"
+          printf '%s  %s\n' "${BUILDX_SHA256}" "${download}" | sha256sum --check --status
+          install -m 0755 "${download}" "${plugin_dir}/docker-buildx"
+          echo "DOCKER_CONFIG=${docker_config}" >>"${GITHUB_ENV}"
+          buildx_info="$(DOCKER_CONFIG="${docker_config}" docker buildx version)"
+          grep --fixed-strings --quiet "github.com/docker/buildx ${BUILDX_VERSION}" <<<"${buildx_info}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
-          image: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
-          platforms: arm64
+          driver-opts: image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ needs.validate-release.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.validate-release.outputs.version }}
+            type=raw,value=sha-${{ needs.validate-release.outputs.source_sha }}
+            type=raw,value=latest,enable=${{ !contains(needs.validate-release.outputs.version, '-') }}
+          labels: |
+            org.opencontainers.image.title=Conduit API
+            org.opencontainers.image.description=Production-oriented LLM gateway and control plane
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.validate-release.outputs.source_sha }}
+            org.opencontainers.image.version=${{ needs.validate-release.outputs.version }}
+
+      - name: Build and publish platform image by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ needs.validate-release.outputs.image }},oci-artifact=true,push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            CONDUIT_VERSION=${{ needs.validate-release.outputs.version }}
+            CONDUIT_COMMIT=${{ needs.validate-release.outputs.source_sha }}
+            CONDUIT_BUILD_TIME=${{ needs.validate-release.outputs.build_time }}
+            CONDUIT_BRANCH=${{ github.ref_name }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Preserve platform image digest
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "platform build returned an invalid digest" >&2
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/release-image-digests"
+          printf '%s\n' "${DIGEST}" >"${RUNNER_TEMP}/release-image-digests/${ARCH}.txt"
+
+      - name: Upload platform image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-image-digests/${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-image:
+    name: Publish multi-architecture image
+    needs: [validate-release, quality-gates, build-image-platforms]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # Create the tagged multi-architecture image in GHCR.
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+      image: ${{ needs.validate-release.outputs.image }}
+    steps:
+      - name: Check out validated source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.validate-release.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Download platform image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-image-digest-*
+          path: ${{ runner.temp }}/release-image-digests
+          merge-multiple: true
+
+      - name: Revalidate release boundary before publishing
+        shell: bash
+        env:
+          EXPECTED_TAG_OBJECT: ${{ needs.validate-release.outputs.tag_object }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          remote_tag_object="$(
+            git ls-remote --refs origin "refs/tags/${GITHUB_REF_NAME}" |
+              awk -v ref="refs/tags/${GITHUB_REF_NAME}" \
+                '$2 == ref { print $1; exit }'
+          )"
+          if [[ -z "${remote_tag_object}" || "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]]; then
+            echo "release tag changed or disappeared before image publication" >&2
+            exit 1
+          fi
+
+          release_status="$(
+            curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
+          )"
+          if [[ "${release_status}" != "404" ]]; then
+            echo "release boundary is no longer publishable (GitHub API HTTP ${release_status})" >&2
+            exit 1
+          fi
 
       - name: Install verified Docker Buildx
         shell: bash
@@ -452,38 +611,304 @@ jobs:
             type=semver,pattern={{version}},value=${{ needs.validate-release.outputs.version }}
             type=raw,value=sha-${{ needs.validate-release.outputs.source_sha }}
             type=raw,value=latest,enable=${{ !contains(needs.validate-release.outputs.version, '-') }}
-          labels: |
-            org.opencontainers.image.title=Conduit API
-            org.opencontainers.image.description=Production-oriented LLM gateway and control plane
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ needs.validate-release.outputs.source_sha }}
-            org.opencontainers.image.version=${{ needs.validate-release.outputs.version }}
 
-      - name: Build and publish multi-architecture image
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: |
-            CONDUIT_VERSION=${{ needs.validate-release.outputs.version }}
-            CONDUIT_COMMIT=${{ needs.validate-release.outputs.source_sha }}
-            CONDUIT_BUILD_TIME=${{ needs.validate-release.outputs.build_time }}
-            CONDUIT_BRANCH=${{ github.ref_name }}
-          provenance: mode=max
-          sbom: true
+      - name: Create and validate multi-architecture manifest
+        id: manifest
+        shell: bash
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ needs.validate-release.outputs.image }}
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          SOURCE_SHA: ${{ needs.validate-release.outputs.source_sha }}
+          VERSION: ${{ needs.validate-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          digest_dir="${RUNNER_TEMP}/release-image-digests"
+          expected_files=(amd64.txt arm64.txt)
+          mapfile -t actual_files < <(
+            find "${digest_dir}" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
+          )
+          if [[ "${#actual_files[@]}" -ne "${#expected_files[@]}" ]]; then
+            echo "expected exactly two platform digest files" >&2
+            exit 1
+          fi
+          for index in "${!expected_files[@]}"; do
+            if [[ "${actual_files[${index}]}" != "${expected_files[${index}]}" ]]; then
+              echo "unexpected platform digest file set" >&2
+              exit 1
+            fi
+          done
+
+          amd64_digest="$(<"${digest_dir}/amd64.txt")"
+          arm64_digest="$(<"${digest_dir}/arm64.txt")"
+          for digest in "${amd64_digest}" "${arm64_digest}"; do
+            if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "downloaded platform digest is invalid" >&2
+              exit 1
+            fi
+          done
+          if [[ "${amd64_digest}" == "${arm64_digest}" ]]; then
+            echo "platform image digests must be distinct" >&2
+            exit 1
+          fi
+
+          mapfile -t tags <<<"${IMAGE_TAGS}"
+          tag_args=()
+          expected_tags=(
+            "${IMAGE}:${VERSION}"
+            "${IMAGE}:sha-${SOURCE_SHA}"
+          )
+          if [[ "${VERSION}" != *-* ]]; then
+            expected_tags+=("${IMAGE}:latest")
+          fi
+          for tag in "${tags[@]}"; do
+            [[ -n "${tag}" ]] || continue
+            if [[ "${tag}" != "${IMAGE}:"* ]]; then
+              echo "metadata produced an unexpected image tag: ${tag}" >&2
+              exit 1
+            fi
+            tag_args+=(--tag "${tag}")
+          done
+          mapfile -t sorted_tags < <(printf '%s\n' "${tags[@]}" | sed '/^$/d' | LC_ALL=C sort)
+          mapfile -t sorted_expected_tags < <(printf '%s\n' "${expected_tags[@]}" | LC_ALL=C sort)
+          if [[ "${sorted_tags[*]}" != "${sorted_expected_tags[*]}" ]]; then
+            echo "metadata did not produce the expected immutable image tags" >&2
+            exit 1
+          fi
+
+          mkdir -p release-image
+          sources=(
+            "${IMAGE}@${amd64_digest}"
+            "${IMAGE}@${arm64_digest}"
+          )
+          docker buildx imagetools create --dry-run --progress=none "${sources[@]}" \
+            >release-image/intended-manifest.json
+          intended_digest="$(python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          manifest = Path("release-image/intended-manifest.json").read_bytes()
+          if manifest.endswith(b"\n"):
+              manifest = manifest[:-1]
+          print("sha256:" + hashlib.sha256(manifest).hexdigest())
+          PY
+          )"
+          if [[ ! "${intended_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "could not determine the intended multi-architecture digest" >&2
+            exit 1
+          fi
+
+          registry_repository="${GITHUB_REPOSITORY,,}"
+          registry_token="$(
+            curl --fail --location --proto '=https' --proto-redir '=https' \
+              --silent --show-error --tlsv1.2 \
+              --user "${GHCR_USERNAME}:${GH_TOKEN}" \
+              --get \
+              --data-urlencode 'service=ghcr.io' \
+              --data-urlencode "scope=repository:${registry_repository}:pull,push" \
+              'https://ghcr.io/token' |
+              python3 -c '
+          import json
+          import sys
+
+          response = json.load(sys.stdin)
+          token = response.get("token") or response.get("access_token") or ""
+          if not token:
+              raise SystemExit("GHCR did not issue a registry token")
+          print(token)
+          '
+          )"
+
+          registry_manifest_digest() {
+            local tag_name="$1"
+            local digest=""
+            local headers_file=""
+            local status=""
+
+            headers_file="$(mktemp)"
+            status="$(
+              curl --silent --show-error --output /dev/null \
+                --dump-header "${headers_file}" \
+                --write-out '%{http_code}' \
+                --request HEAD \
+                --header "Authorization: Bearer ${registry_token}" \
+                --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                "https://ghcr.io/v2/${registry_repository}/manifests/${tag_name}"
+            )"
+            case "${status}" in
+              200)
+                digest="$(
+                  awk 'tolower($1) == "docker-content-digest:" {
+                      gsub(/\r/, "", $2)
+                      print $2
+                      exit
+                    }' "${headers_file}"
+                )"
+                rm -f "${headers_file}"
+                if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  echo "GHCR returned an invalid digest for ${tag_name}" >&2
+                  return 1
+                fi
+                printf '%s\n' "${digest}"
+                ;;
+              404)
+                rm -f "${headers_file}"
+                ;;
+              *)
+                rm -f "${headers_file}"
+                echo "could not verify GHCR tag ${tag_name} (HTTP ${status})" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          immutable_tags=("${VERSION}" "sha-${SOURCE_SHA}")
+          for tag_name in "${immutable_tags[@]}"; do
+            if ! existing_digest="$(registry_manifest_digest "${tag_name}")"; then
+              exit 1
+            fi
+            if [[ -n "${existing_digest}" && "${existing_digest}" != "${intended_digest}" ]]; then
+              echo "refusing to overwrite immutable image tag ${IMAGE}:${tag_name}" >&2
+              exit 1
+            fi
+          done
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            --metadata-file release-image/manifest-metadata.json \
+            "${sources[@]}"
+
+          manifest_digest="$(python3 - <<'PY'
+          import json
+          import re
+
+          with open("release-image/manifest-metadata.json", encoding="utf-8") as metadata_file:
+              metadata = json.load(metadata_file)
+          digest = metadata.get("containerimage.descriptor", {}).get("digest", "")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("manifest creation returned an invalid digest")
+          print(digest)
+          PY
+          )"
+          if [[ "${manifest_digest}" != "${intended_digest}" ]]; then
+            echo "published manifest digest differs from the verified dry run" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "${IMAGE}@${manifest_digest}" --raw \
+            >release-image/manifest.json
+          export MANIFEST_DIGEST="${manifest_digest}"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          raw_manifest = Path("release-image/manifest.json").read_bytes()
+          actual_digest = "sha256:" + hashlib.sha256(raw_manifest).hexdigest()
+          if actual_digest != os.environ["MANIFEST_DIGEST"]:
+              raise SystemExit("registry manifest bytes do not match the reported digest")
+          manifest = json.loads(raw_manifest)
+
+          expected = {("linux", "amd64"), ("linux", "arm64")}
+          concrete = {}
+          unexpected = set()
+          attestations = {}
+          for descriptor in manifest.get("manifests", []):
+              platform = descriptor.get("platform", {})
+              pair = (platform.get("os"), platform.get("architecture"))
+              if pair == ("unknown", "unknown"):
+                  annotations = descriptor.get("annotations", {})
+                  if annotations.get("vnd.docker.reference.type") == "attestation-manifest":
+                      target_digest = annotations.get("vnd.docker.reference.digest", "")
+                      attestation_digest = descriptor.get("digest", "")
+                      if not re.fullmatch(r"sha256:[0-9a-f]{64}", target_digest):
+                          raise SystemExit("attestation descriptor has an invalid target digest")
+                      if not re.fullmatch(r"sha256:[0-9a-f]{64}", attestation_digest):
+                          raise SystemExit("attestation descriptor has an invalid manifest digest")
+                      attestations.setdefault(target_digest, []).append(attestation_digest)
+                  continue
+              if pair in expected:
+                  if pair in concrete:
+                      raise SystemExit(f"duplicate platform manifest: {pair!r}")
+                  concrete[pair] = descriptor.get("digest")
+              else:
+                  unexpected.add(pair)
+          if set(concrete) != expected or unexpected:
+              raise SystemExit(
+                  f"unexpected final image platforms: concrete={sorted(concrete)!r}, "
+                  f"unexpected={sorted(unexpected)!r}"
+              )
+          platform_digests = set(concrete.values())
+          if None in platform_digests or set(attestations) != platform_digests:
+              raise SystemExit("final image does not have attestations for exactly its two platforms")
+          Path("release-image/attestation-map.json").write_text(
+              json.dumps(attestations, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          mkdir -p release-image/attestations
+          mapfile -t attestation_digests < <(python3 - <<'PY'
+          import json
+
+          with open("release-image/attestation-map.json", encoding="utf-8") as mapping_file:
+              mapping = json.load(mapping_file)
+          print("\n".join(sorted({digest for digests in mapping.values() for digest in digests})))
+          PY
+          )
+          for attestation_digest in "${attestation_digests[@]}"; do
+            docker buildx imagetools inspect "${IMAGE}@${attestation_digest}" --raw \
+              >"release-image/attestations/${attestation_digest#sha256:}.json"
+          done
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          with open("release-image/attestation-map.json", encoding="utf-8") as mapping_file:
+              mapping = json.load(mapping_file)
+
+          for target_digest, attestation_digests in mapping.items():
+              predicates = set()
+              for attestation_digest in attestation_digests:
+                  path = Path("release-image/attestations") / f"{attestation_digest.removeprefix('sha256:')}.json"
+                  raw_attestation = path.read_bytes()
+                  actual_digest = "sha256:" + hashlib.sha256(raw_attestation).hexdigest()
+                  if actual_digest != attestation_digest:
+                      raise SystemExit("attestation manifest bytes do not match their descriptor")
+                  attestation = json.loads(raw_attestation)
+                  if attestation.get("artifactType") != "application/vnd.docker.attestation.manifest.v1+json":
+                      raise SystemExit("attestation manifest is not stored as an OCI artifact")
+                  if attestation.get("subject", {}).get("digest") != target_digest:
+                      raise SystemExit("attestation manifest subject does not match its platform image")
+                  for layer in attestation.get("layers", []):
+                      predicate = layer.get("annotations", {}).get("in-toto.io/predicate-type")
+                      if predicate:
+                          predicates.add(predicate)
+              if "https://spdx.dev/Document" not in predicates:
+                  raise SystemExit("platform image is missing its SPDX SBOM attestation")
+              if not any(predicate.startswith("https://slsa.dev/provenance/") for predicate in predicates):
+                  raise SystemExit("platform image is missing its SLSA provenance attestation")
+          PY
+          for tag in "${tags[@]}"; do
+            [[ -n "${tag}" ]] || continue
+            docker buildx imagetools inspect "${tag}" --raw >release-image/tag-manifest.json
+            tag_digest="sha256:$(sha256sum release-image/tag-manifest.json | awk '{print $1}')"
+            if [[ "${tag_digest}" != "${manifest_digest}" ]]; then
+              echo "published image tag does not resolve to the final manifest: ${tag}" >&2
+              exit 1
+            fi
+          done
+          printf 'digest=%s\n' "${manifest_digest}" >>"${GITHUB_OUTPUT}"
 
       - name: Preserve immutable image digest
         shell: bash
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
           IMAGE: ${{ needs.validate-release.outputs.image }}
         run: |
           set -euo pipefail
-          mkdir -p release-image
           printf '%s@%s\n' "${IMAGE}" "${DIGEST}" >release-image/image-digest.txt
 
       - name: Upload image digest
