@@ -4,9 +4,10 @@
 //! (`conduit/internal/server/orchestrator/model_circuit_breaker.go`).
 //!
 //! Go source uses `biz.ModelCircuitBreaker` with Open/HalfOpen/Closed states
-//! and probe logic. This Rust port distills the core circuit-breaker pattern:
+//! and probe logic. This Rust port implements the same core pattern:
 //! - `Closed` (normal): requests pass through.
 //! - `Open` (cooldown): requests are rejected until cooldown expires.
+//! - `HalfOpen`: exactly one provider probe is admitted.
 //! - A successful response resets the error count immediately.
 
 use std::collections::HashMap;
@@ -23,6 +24,7 @@ use conduit_pipeline::middleware::{PipelineContext, PipelineResult};
 struct CircuitState {
     error_count: u32,
     cooldown_until: Option<Instant>,
+    half_open_probe_in_flight: bool,
 }
 
 /// Model circuit breaker middleware configuration.
@@ -51,8 +53,7 @@ type SharedState = Arc<Mutex<HashMap<String, CircuitState>>>;
 /// duration. Successful responses reset the circuit immediately.
 ///
 /// Go parity: `modelCircuitBreakerTracker`
-/// (`orchestrator/model_circuit_breaker.go:23-33`). This Rust version uses a
-/// simplified `Closed`/`Open` model without probe logic or half-open state.
+/// (`orchestrator/model_circuit_breaker.go:23-33`).
 pub struct ModelCircuitBreakerMiddleware {
     state: SharedState,
     config: CircuitBreakerConfig,
@@ -81,6 +82,25 @@ impl ModelCircuitBreakerMiddleware {
             .get("actual_model")
             .cloned()
             .or_else(|| request_model.map(|s| s.to_string()))
+    }
+
+    fn resolve_key(ctx: &PipelineContext, request_model: Option<&str>) -> Option<String> {
+        let model = Self::resolve_model(ctx, request_model)?;
+        let channel = ctx
+            .metadata
+            .get("channel_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        let credential = ctx
+            .metadata
+            .get("credential_identity")
+            .map(String::as_str)
+            .unwrap_or("");
+        if channel.is_empty() && credential.is_empty() {
+            Some(model)
+        } else {
+            Some(format!("{channel}\u{1f}{model}\u{1f}{credential}"))
+        }
     }
 
     /// Go only installs the model-circuit-breaker tracker for the effective
@@ -119,23 +139,36 @@ impl PipelineMiddleware for ModelCircuitBreakerMiddleware {
         if !Self::enabled_for(ctx) {
             return Ok(request);
         }
-        let model = match Self::resolve_model(ctx, None) {
+        let key = match Self::resolve_key(ctx, None) {
             Some(m) if !m.is_empty() => m,
             _ => return Ok(request),
         };
+        let model = Self::resolve_model(ctx, None).unwrap_or_default();
 
-        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(circuit) = guard.get(&model)
-            && let Some(until) = circuit.cooldown_until
-            && Instant::now() < until
-        {
-            return Err(ConduitError::new(
-                ErrorKind::Upstream,
-                format!(
-                    "model circuit breaker open: {model} is in cooldown after {} consecutive errors",
-                    circuit.error_count,
-                ),
-            ));
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(circuit) = guard.get_mut(&key) {
+            if let Some(until) = circuit.cooldown_until {
+                if Instant::now() < until {
+                    return Err(ConduitError::new(
+                        ErrorKind::Upstream,
+                        format!(
+                            "model circuit breaker open: {model} is in cooldown after {} consecutive errors",
+                            circuit.error_count,
+                        ),
+                    )
+                    .with_code("model_circuit_open"));
+                }
+                // Cooldown elapsed: allow exactly one probe. Concurrent
+                // requests remain rejected until that probe succeeds/fails.
+                circuit.cooldown_until = None;
+                circuit.half_open_probe_in_flight = true;
+            } else if circuit.half_open_probe_in_flight {
+                return Err(ConduitError::new(
+                    ErrorKind::Upstream,
+                    format!("model circuit breaker half-open: probe in flight for {model}"),
+                )
+                .with_code("model_circuit_half_open"));
+            }
         }
 
         Ok(request)
@@ -152,16 +185,17 @@ impl PipelineMiddleware for ModelCircuitBreakerMiddleware {
         if !Self::enabled_for(ctx) {
             return Ok(response);
         }
-        let model =
-            match Self::resolve_model(ctx, ctx.metadata.get("request_model").map(|s| s.as_str())) {
+        let key =
+            match Self::resolve_key(ctx, ctx.metadata.get("request_model").map(|s| s.as_str())) {
                 Some(m) if !m.is_empty() => m,
                 _ => return Ok(response),
             };
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(circuit) = guard.get_mut(&model) {
+        if let Some(circuit) = guard.get_mut(&key) {
             circuit.error_count = 0;
             circuit.cooldown_until = None;
+            circuit.half_open_probe_in_flight = false;
         }
 
         Ok(response)
@@ -172,25 +206,63 @@ impl PipelineMiddleware for ModelCircuitBreakerMiddleware {
     /// `OnOutboundRawError` (model_circuit_breaker.go:85-107) calls
     /// `RecordError` which increments `ConsecutiveFailures` and may transition
     /// to `StateOpen`.
-    fn on_outbound_raw_error(&self, ctx: &mut PipelineContext, _error: &ConduitError) {
+    fn on_outbound_raw_error(&self, ctx: &mut PipelineContext, error: &ConduitError) {
         if !Self::enabled_for(ctx) {
             return;
         }
-        let model =
-            match Self::resolve_model(ctx, ctx.metadata.get("request_model").map(|s| s.as_str())) {
+        if error
+            .code
+            .as_deref()
+            .is_some_and(|code| matches!(code, "model_circuit_open" | "model_circuit_half_open"))
+        {
+            return;
+        }
+        let key =
+            match Self::resolve_key(ctx, ctx.metadata.get("request_model").map(|s| s.as_str())) {
                 Some(m) if !m.is_empty() => m,
                 _ => return,
             };
+        // Client mistakes must not take a healthy provider out of service.
+        // Count transport failures, 429, and server-side provider failures.
+        if error.kind != ErrorKind::Upstream {
+            // A later local middleware rejected the half-open request before
+            // it reached the provider. Release the single probe slot without
+            // treating that local admission result as provider health.
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(circuit) = guard.get_mut(&key)
+                && circuit.half_open_probe_in_flight
+            {
+                circuit.half_open_probe_in_flight = false;
+                circuit.cooldown_until = Some(Instant::now());
+            }
+            return;
+        }
+        if error
+            .provider_status
+            .is_some_and(|status| (400..500).contains(&status) && status != 429)
+        {
+            // A provider 4xx proves the route is reachable. It is a successful
+            // half-open health probe even though the caller's request failed.
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(circuit) = guard.get_mut(&key) {
+                circuit.error_count = 0;
+                circuit.cooldown_until = None;
+                circuit.half_open_probe_in_flight = false;
+            }
+            return;
+        }
 
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let circuit = guard.entry(model).or_insert(CircuitState {
+        let circuit = guard.entry(key).or_insert(CircuitState {
             error_count: 0,
             cooldown_until: None,
+            half_open_probe_in_flight: false,
         });
 
-        circuit.error_count += 1;
-        if circuit.error_count >= self.config.max_errors {
+        circuit.error_count = circuit.error_count.saturating_add(1);
+        if circuit.half_open_probe_in_flight || circuit.error_count >= self.config.max_errors {
             circuit.cooldown_until = Some(Instant::now() + self.config.cooldown_duration);
+            circuit.half_open_probe_in_flight = false;
         }
     }
 }
@@ -405,6 +477,90 @@ mod tests {
         let result = mw.on_outbound_raw_request(&mut ctx, http_request())?;
         assert_eq!(result.path, "/v1/chat/completions");
 
+        Ok(())
+    }
+
+    #[test]
+    fn client_400_does_not_open_the_circuit() -> Result<(), Box<dyn std::error::Error>> {
+        let mw = ModelCircuitBreakerMiddleware::new(CircuitBreakerConfig {
+            max_errors: 1,
+            cooldown_duration: Duration::from_secs(60),
+        });
+        let error = ConduitError::upstream("bad request").with_provider_status(400);
+        let mut ctx = ctx_with_actual_model("gpt-4o");
+
+        mw.on_outbound_raw_error(&mut ctx, &error);
+        mw.on_outbound_raw_request(&mut ctx, http_request())?;
+        assert!(
+            mw.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn circuit_isolated_by_channel_and_credential() -> Result<(), Box<dyn std::error::Error>> {
+        let mw = ModelCircuitBreakerMiddleware::new(CircuitBreakerConfig {
+            max_errors: 1,
+            cooldown_duration: Duration::from_secs(60),
+        });
+        let error = ConduitError::upstream("provider failure").with_provider_status(503);
+        let mut failed = ctx_with_actual_model("gpt-4o");
+        failed.metadata.insert("channel_id".into(), "a".into());
+        failed
+            .metadata
+            .insert("credential_identity".into(), "key-1".into());
+        mw.on_outbound_raw_error(&mut failed, &error);
+
+        let mut healthy = ctx_with_actual_model("gpt-4o");
+        healthy.metadata.insert("channel_id".into(), "b".into());
+        healthy
+            .metadata
+            .insert("credential_identity".into(), "key-2".into());
+        mw.on_outbound_raw_request(&mut healthy, http_request())?;
+        assert!(
+            mw.on_outbound_raw_request(&mut failed, http_request())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cooldown_transitions_to_single_half_open_probe() -> Result<(), Box<dyn std::error::Error>> {
+        let mw = ModelCircuitBreakerMiddleware::new(CircuitBreakerConfig {
+            max_errors: 1,
+            cooldown_duration: Duration::ZERO,
+        });
+        let error = ConduitError::upstream("provider failure").with_provider_status(503);
+        let mut ctx = ctx_with_actual_model("gpt-4o");
+        mw.on_outbound_raw_error(&mut ctx, &error);
+
+        mw.on_outbound_raw_request(&mut ctx, http_request())?;
+        assert!(
+            mw.on_outbound_raw_request(&mut ctx, http_request())
+                .is_err()
+        );
+        mw.on_outbound_raw_response(&mut ctx, HttpResponse::default())?;
+        mw.on_outbound_raw_request(&mut ctx, http_request())?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_rejection_releases_half_open_probe_slot() -> Result<(), Box<dyn std::error::Error>> {
+        let mw = ModelCircuitBreakerMiddleware::new(CircuitBreakerConfig {
+            max_errors: 1,
+            cooldown_duration: Duration::ZERO,
+        });
+        let provider_error = ConduitError::upstream("provider failure").with_provider_status(503);
+        let mut ctx = ctx_with_actual_model("gpt-4o");
+        mw.on_outbound_raw_error(&mut ctx, &provider_error);
+
+        mw.on_outbound_raw_request(&mut ctx, http_request())?;
+        mw.on_outbound_raw_error(&mut ctx, &ConduitError::rate_limited("local admission"));
+
+        mw.on_outbound_raw_request(&mut ctx, http_request())?;
         Ok(())
     }
 }

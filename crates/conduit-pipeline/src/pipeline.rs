@@ -922,6 +922,10 @@ impl Pipeline {
         self
     }
 
+    pub const fn retry_policy(&self) -> RetryPolicy {
+        self.retry_policy
+    }
+
     /// Configure the two response timeouts, mirroring Go
     /// `WithResponseTimeouts(streamFirstEventTimeout, nonStreamTimeout)`
     /// (`pipeline.go:77-82`). `0` disables a timeout. Values are consumed by
@@ -1375,6 +1379,33 @@ impl Pipeline {
         candidates: &[PipelineCandidate],
         cancel: CancelToken,
     ) -> Result<LiveStreamAttempt, ConduitError> {
+        self.stream_live_with_inbound_policy(
+            ctx,
+            inbound,
+            original_request,
+            raw_inbound,
+            candidates,
+            cancel,
+            self.retry_policy,
+        )
+        .await
+    }
+
+    /// Live-stream attempt with the request-scoped retry/timeout snapshot used
+    /// by production settings. The stream is not committed to the caller until
+    /// one real provider event arrives, allowing the orchestrator to fail over
+    /// safely before any client bytes have been written.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_live_with_inbound_policy(
+        &self,
+        ctx: &mut PipelineContext,
+        inbound: Arc<dyn InboundTransformer>,
+        original_request: HttpRequest,
+        raw_inbound: &HttpRequest,
+        candidates: &[PipelineCandidate],
+        cancel: CancelToken,
+        retry_policy: RetryPolicy,
+    ) -> Result<LiveStreamAttempt, ConduitError> {
         // S04 — inbound transform (once, mirrors `process`).
         ctx.record_order("inbound:transform_request");
         let mut llm_request = inbound
@@ -1550,20 +1581,26 @@ impl Pipeline {
 
         // S13 — hand the executor the per-attempt cancel token so it can abort
         // the upstream provider call on client disconnect.
-        let raw_upstream = match self.executor.execute_stream_live(&http_req, cancel).await {
+        let raw_upstream = match self
+            .executor
+            .execute_stream_live(&http_req, cancel.clone())
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
+                // Request middlewares may have acquired attempt-scoped
+                // resources (notably a channel concurrency permit). A live
+                // connection failure must unwind them just like buffered
+                // execution failures do.
+                apply_raw_error_response_middlewares(&self.middlewares, ctx, &err);
+                // Persist/error middlewares run before the asynchronous
+                // observer queries request_executions for its shared counter.
                 self.observe_attempt(
                     target,
                     AttemptObservationOutcome::Failed {
                         provider_status: err.provider_status,
                     },
                 );
-                // Request middlewares may have acquired attempt-scoped
-                // resources (notably a channel concurrency permit). A live
-                // connection failure must unwind them just like buffered
-                // execution failures do.
-                apply_raw_error_response_middlewares(&self.middlewares, ctx, &err);
                 return Err(apply_error_response_rewrite(
                     &channel_id,
                     &target.error_response_rewrite_rules,
@@ -1572,7 +1609,75 @@ impl Pipeline {
             }
         };
         let response_content_type = raw_upstream.content_type;
-        let raw_upstream_rx = raw_upstream.events;
+        let mut raw_upstream_rx = raw_upstream.events;
+
+        // Do not commit a live response until the provider produces its first
+        // actual event. HTTP 429/5xx is already rejected by the executor; this
+        // additionally catches a stalled, empty, or immediately-broken body so
+        // the orchestrator can retry another credential/channel safely.
+        let first = if retry_policy.stream_first_event_timeout_ms == 0 {
+            raw_upstream_rx.recv().await
+        } else {
+            match tokio::time::timeout(
+                Duration::from_millis(retry_policy.stream_first_event_timeout_ms),
+                raw_upstream_rx.recv(),
+            )
+            .await
+            {
+                Ok(item) => item,
+                Err(_) => {
+                    cancel.cancel();
+                    let error = stream_first_event_timeout_error();
+                    apply_raw_error_response_middlewares(&self.middlewares, ctx, &error);
+                    self.observe_attempt(
+                        target,
+                        AttemptObservationOutcome::Failed {
+                            provider_status: error.provider_status,
+                        },
+                    );
+                    return Err(ctx.fail("execute:stream_live:first_event_timeout", error));
+                }
+            }
+        };
+        let first = match first {
+            Some(Ok(event)) => event,
+            Some(Err(error)) => {
+                cancel.cancel();
+                apply_raw_error_response_middlewares(&self.middlewares, ctx, &error);
+                self.observe_attempt(
+                    target,
+                    AttemptObservationOutcome::Failed {
+                        provider_status: error.provider_status,
+                    },
+                );
+                return Err(ctx.fail("execute:stream_live:first_event", error));
+            }
+            None => {
+                cancel.cancel();
+                let error = ConduitError::upstream("upstream stream ended before first event");
+                apply_raw_error_response_middlewares(&self.middlewares, ctx, &error);
+                self.observe_attempt(
+                    target,
+                    AttemptObservationOutcome::Failed {
+                        provider_status: error.provider_status,
+                    },
+                );
+                return Err(ctx.fail("execute:stream_live:empty", error));
+            }
+        };
+        let (prefetch_tx, prefetched_raw_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            if prefetch_tx.send(Ok(first)).await.is_err() {
+                return;
+            }
+            while let Some(item) = raw_upstream_rx.recv().await {
+                let terminal = item.is_err();
+                if prefetch_tx.send(item).await.is_err() || terminal {
+                    return;
+                }
+            }
+        });
+        let raw_upstream_rx = prefetched_raw_rx;
 
         // Transform stage (mirrors the buffered `finish_stream_events`): raw
         // provider events → `outbound.transform_stream` → unified `LlmResponse`
@@ -3605,6 +3710,40 @@ mod tests {
         /// Side-effect fired at the start of every execute* call — e.g. cancel
         /// the client handle to simulate a mid-flight disconnect (S17).
         on_execute: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    struct StalledLiveExecutor;
+
+    #[async_trait]
+    impl Executor for StalledLiveExecutor {
+        async fn execute(&self, _request: &HttpRequest) -> Result<HttpResponse, ConduitError> {
+            Err(ConduitError::internal("unexpected non-stream execution"))
+        }
+
+        async fn execute_stream(
+            &self,
+            _request: &HttpRequest,
+        ) -> Result<Vec<StreamEvent>, ConduitError> {
+            Err(ConduitError::internal(
+                "unexpected buffered stream execution",
+            ))
+        }
+
+        async fn execute_stream_live(
+            &self,
+            _request: &HttpRequest,
+            cancel: CancelToken,
+        ) -> Result<LiveUpstreamResponse, ConduitError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                drop(tx);
+            });
+            Ok(LiveUpstreamResponse {
+                content_type: Some("text/event-stream".to_string()),
+                events: rx,
+            })
+        }
     }
 
     use std::collections::VecDeque;
@@ -8290,6 +8429,62 @@ mod tests {
             "a rejecting middleware must abort the live stream (P-34)"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_live_rejects_empty_provider_stream_before_commit() {
+        let executor: Arc<dyn Executor> = Arc::new(StubExecutor::stream(vec![Ok(Vec::new())]));
+        let observer = Arc::new(CapturingAttemptObserver::default());
+        let pipeline = build_pipeline(executor, None, RetryHooks::default())
+            .with_attempt_observer(observer.clone());
+        let mut ctx = PipelineContext::new();
+
+        let result = pipeline
+            .stream_live(
+                &mut ctx,
+                raw_inbound(true),
+                &raw_inbound(true),
+                &pc(&["a"]),
+                CancelToken::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let observations = observer.take();
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].outcome,
+            AttemptObservationOutcome::Failed {
+                provider_status: None
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_live_first_event_timeout_fires_before_commit() {
+        let executor: Arc<dyn Executor> = Arc::new(StalledLiveExecutor);
+        let pipeline = build_pipeline(executor, None, RetryHooks::default());
+        let mut ctx = PipelineContext::new();
+        let policy = RetryPolicy {
+            stream_first_event_timeout_ms: 50,
+            ..RetryPolicy::default()
+        };
+
+        let error = pipeline
+            .stream_live_with_inbound_policy(
+                &mut ctx,
+                Arc::new(StubInbound),
+                raw_inbound(true),
+                &raw_inbound(true),
+                &pc(&["a"]),
+                CancelToken::new(),
+                policy,
+            )
+            .await
+            .err()
+            .expect("stalled stream must time out");
+
+        assert!(is_stream_first_event_timeout(&error));
     }
 
     #[tokio::test]

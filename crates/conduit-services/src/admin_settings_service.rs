@@ -344,7 +344,7 @@ fn retry_json_to_gql(v: &serde_json::Value) -> RetryPolicy {
         max_single_channel_retries: get_i64("max_single_channel_retries").unwrap_or(2) as i32,
         retry_delay_ms: get_i64("retry_delay_ms").unwrap_or(1000) as i32,
         stream_first_event_timeout_seconds: get_i64("stream_first_event_timeout_seconds")
-            .unwrap_or(0) as i32,
+            .unwrap_or(30) as i32,
         non_stream_response_timeout_seconds: get_i64("non_stream_response_timeout_seconds")
             .unwrap_or(0) as i32,
         load_balancer_strategy: get_str("load_balancer_strategy")

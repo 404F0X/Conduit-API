@@ -43,6 +43,6 @@ pub use prompt_injection::InjectPromptsMiddleware;
 pub use prompt_protection::PromptProtectionMiddleware;
 pub use quota::QuotaEnforcementMiddleware;
 pub use rate_limit::RateLimitTrackingMiddleware;
-pub use rate_limit_admission::RateLimitAdmissionMiddleware;
+pub use rate_limit_admission::{ChannelCooldownTracker, RateLimitAdmissionMiddleware};
 pub use strip_billing_header::StripBillingHeaderMiddleware;
 pub use user_agent::DefaultUserAgentMiddleware;

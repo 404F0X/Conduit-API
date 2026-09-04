@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +48,6 @@ async fn run_worker(
     system: Arc<SystemService>,
     notifier: Arc<WebhookNotifierRuntime>,
 ) {
-    let mut tracker = ConsecutiveErrorTracker::default();
     while let Some(observation) = rx.recv().await {
         let Ok(channel_id) = observation.channel_id.parse::<i64>() else {
             tracing::warn!(
@@ -59,11 +59,8 @@ async fn run_worker(
 
         match observation.outcome {
             AttemptObservationOutcome::Succeeded => {
-                tracker.record_success(
-                    channel_id,
-                    observation.credential_identity.as_deref(),
-                    observation.credential.as_deref(),
-                );
+                // Successful executions are persisted and naturally terminate
+                // the consecutive-error query used by every process.
             }
             AttemptObservationOutcome::Failed {
                 provider_status: Some(status),
@@ -75,10 +72,21 @@ async fn run_worker(
                         continue;
                     }
                 };
-                let Some(action) =
-                    tracker.record_failure(channel_id, status, &observation, &config)
-                else {
-                    continue;
+                let action = match persistent_disable_action(
+                    &pool,
+                    channel_id,
+                    status,
+                    &observation,
+                    &config,
+                )
+                .await
+                {
+                    Ok(Some(action)) => action,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(channel_id, %error, "failed to evaluate persistent auto-disable counter");
+                        continue;
+                    }
                 };
                 match apply_disable_action(&pool, action).await {
                     Ok(Some(event)) => {
@@ -95,9 +103,74 @@ async fn run_worker(
             }
             AttemptObservationOutcome::Failed {
                 provider_status: None,
-            } => tracker.record_interruption(channel_id, &observation),
+            } => {}
         }
     }
+}
+
+async fn persistent_disable_action(
+    pool: &PgPool,
+    channel_id: i64,
+    status: u16,
+    observation: &AttemptObservation,
+    config: &AutoDisableConfig,
+) -> Result<Option<DisableAction>, String> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let Some(threshold) = config
+        .statuses
+        .iter()
+        .find(|rule| rule.status == status)
+        .map(|rule| rule.times)
+    else {
+        return Ok(None);
+    };
+    let credential = observation
+        .credential
+        .as_deref()
+        .filter(|credential| !credential.is_empty());
+    let identity = credential.map(|credential| {
+        observation
+            .credential_identity
+            .clone()
+            .unwrap_or_else(|| credential_fingerprint(credential))
+    });
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT status,response_status_code FROM request_executions \
+         WHERE channel_id=$1 AND ($2::text IS NULL OR credential_identity=$2) \
+         ORDER BY created_at DESC,id DESC LIMIT $3",
+    )
+    .bind(channel_id)
+    .bind(identity.as_deref())
+    .bind(threshold)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    let actual_count = rows
+        .iter()
+        .take_while(|(execution_status, response_status)| {
+            execution_status == "failed" && *response_status == Some(i64::from(status))
+        })
+        .count() as i64;
+    if actual_count < threshold {
+        return Ok(None);
+    }
+    Ok(Some(match credential {
+        Some(credential) => DisableAction::Credential {
+            channel_id,
+            credential: credential.to_string(),
+            status,
+            threshold,
+            actual_count,
+        },
+        None => DisableAction::Channel {
+            channel_id,
+            status,
+            threshold,
+            actual_count,
+        },
+    }))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -158,6 +231,7 @@ fn validate_auto_disable_config(config: &AutoDisableConfig) -> Result<(), String
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ErrorCounterKey {
     Channel {
@@ -171,11 +245,13 @@ enum ErrorCounterKey {
     },
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct ConsecutiveErrorTracker {
     counts: HashMap<ErrorCounterKey, i64>,
 }
 
+#[cfg(test)]
 impl ConsecutiveErrorTracker {
     fn record_success(
         &mut self,
@@ -889,6 +965,74 @@ mod tests {
             .fetch_one(&database.pool)
             .await?;
         assert_eq!(status, "disabled");
+
+        database.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_counter_requires_consecutive_persisted_failures()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let channel_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO channels (\"type\",name,status,credentials,supported_models,default_test_model) \
+             VALUES ('openai','persistent-counter-test','enabled','{}'::jsonb,'[]'::jsonb,'test-model') \
+             RETURNING id",
+        )
+        .fetch_one(&database.pool)
+        .await?;
+        let observation = AttemptObservation {
+            channel_id: channel_id.to_string(),
+            credential: Some("secret".to_string()),
+            credential_identity: Some("sha256:secret".to_string()),
+            outcome: AttemptObservationOutcome::Failed {
+                provider_status: Some(401),
+            },
+        };
+
+        for request_id in [1_i64, 2] {
+            sqlx::query(
+                "INSERT INTO request_executions \
+                 (request_id,channel_id,credential_identity,model_id,request_body,status,response_status_code) \
+                 VALUES ($1,$2,'sha256:secret','test-model','{}'::jsonb,'failed',401)",
+            )
+            .bind(request_id)
+            .bind(channel_id)
+            .execute(&database.pool)
+            .await?;
+            let action =
+                persistent_disable_action(&database.pool, channel_id, 401, &observation, &config())
+                    .await?;
+            if request_id == 1 {
+                assert!(action.is_none());
+            } else {
+                assert!(matches!(
+                    action,
+                    Some(DisableAction::Credential {
+                        actual_count: 2,
+                        ..
+                    })
+                ));
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO request_executions \
+             (request_id,channel_id,credential_identity,model_id,request_body,status,response_status_code) \
+             VALUES (3,$1,'sha256:secret','test-model','{}'::jsonb,'completed',200), \
+                    (4,$1,'sha256:secret','test-model','{}'::jsonb,'failed',401)",
+        )
+        .bind(channel_id)
+        .execute(&database.pool)
+        .await?;
+        assert!(
+            persistent_disable_action(&database.pool, channel_id, 401, &observation, &config(),)
+                .await?
+                .is_none()
+        );
 
         database.cleanup().await?;
         Ok(())
