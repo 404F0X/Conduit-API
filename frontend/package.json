@@ -67,7 +67,7 @@
     "date-fns": "^4.4.0",
     "driver.js": "^1.8.0",
     "framer-motion": "^11.18.2",
-    "i18next": "^25.10.10",
+    "i18next": "^26.4.0",
     "i18next-browser-languagedetector": "^8.2.1",
     "js-cookie": "^3.0.8",
     "lucide-react": "^0.523.0",
