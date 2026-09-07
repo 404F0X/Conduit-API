@@ -51,6 +51,19 @@ docker compose up --build -d
 Invoke-WebRequest http://127.0.0.1:8090/health | Out-Null
 ```
 
+如果使用下载的原生程序包而不是 Compose，请先安装并启动 PostgreSQL。Conduit
+API 可使用一次性的管理员连接自行创建业务角色与数据库；服务启动后不会保留该高权限凭据：
+
+```powershell
+$env:CONDUIT_DB_ADMIN_DSN = 'postgresql://postgres:admin-password@127.0.0.1:5432/postgres'
+$env:CONDUIT_DB_DSN = 'postgresql://conduit:application-password@127.0.0.1:5432/conduit'
+.\conduit-api.exe database bootstrap --confirm conduit
+Remove-Item Env:CONDUIT_DB_ADMIN_DSN
+.\conduit-api.exe
+```
+
+密码若包含 URL 保留字符，需要进行 URL 编码。重复执行 bootstrap 是安全的：目标数据库已存在时不会覆盖或删除任何内容。
+
 随后打开 <http://127.0.0.1:8090>。系统没有默认管理员密码，首次访问时需要创建站点所有者账号，并选择实际记账货币和站内积分的显示名称。请在初始化时认真核对这些信息。
 
 ## 开始使用

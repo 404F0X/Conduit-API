@@ -12,14 +12,19 @@ use conduit_config::{AppConfig, ConfigError, load_default_search, load_from_path
 use conduit_db::connection::connect_postgres;
 use conduit_db::{DatabaseConfig, DbDialect};
 use conduit_http::{AppState, serve_listener_with_graceful_timeout, shutdown_signal};
+use percent_encoding::percent_decode_str;
 use serde_yaml::{Mapping, Value};
+use sqlx::{Connection, PgConnection};
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
+use url::Url;
 
 const CONFIG_LOAD_FAILED: u8 = 2;
 const CONFIG_VALIDATE_FAILED: u8 = 3;
 const UNKNOWN_CONFIG_KEY: u8 = 4;
 const SERVER_START_FAILED: u8 = 10;
+const DATABASE_ADMIN_DSN_ENV: &str = "CONDUIT_DB_ADMIN_DSN";
+const DATABASE_BOOTSTRAP_LOCK_KEY: i64 = 0x434f_4e44_5549_5402;
 
 const SUPPORTED_CONFIG_KEYS: &[&str] = &[
     "server.port",
@@ -50,6 +55,8 @@ enum Commands {
     Config(ConfigCommand),
     #[command(subcommand)]
     Admin(AdminCommand),
+    #[command(subcommand)]
+    Database(DatabaseCommand),
     Version,
     BuildInfo,
     Help,
@@ -60,6 +67,17 @@ enum AdminCommand {
     /// Reset an existing system owner's password. The new password is read
     /// from CONDUIT_ADMIN_RESET_PASSWORD and is never accepted on argv.
     ResetPassword { email: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum DatabaseCommand {
+    /// Create the configured PostgreSQL role and database using a one-time
+    /// administrator DSN from CONDUIT_DB_ADMIN_DSN.
+    Bootstrap {
+        /// Must exactly match the database name in the configured db.dsn.
+        #[arg(long)]
+        confirm: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -129,6 +147,7 @@ where
     match cli.command {
         Some(Commands::Config(command)) => run_config(&cli.config, command, output),
         Some(Commands::Admin(command)) => run_admin(&cli.config, command, output),
+        Some(Commands::Database(command)) => run_database(&cli.config, command, output),
         Some(Commands::Version) => {
             writeln!(output, "{}", build_version())
                 .map_err(|err| CliError::ServerStart(err.to_string()))?;
@@ -185,6 +204,283 @@ where
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresBootstrapTarget {
+    host: String,
+    port: u16,
+    database: String,
+    owner: String,
+    password: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DatabaseBootstrapOutcome {
+    role_created: bool,
+    database_created: bool,
+}
+
+fn run_database<W>(
+    config_path: &Path,
+    command: DatabaseCommand,
+    output: &mut W,
+) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let config = load_config(config_path)?;
+    validate_config(&config)?;
+    match command {
+        DatabaseCommand::Bootstrap { confirm } => {
+            let target = parse_postgres_bootstrap_target("configured db.dsn", &config.db.dsn)?;
+            if confirm != target.database {
+                return Err(CliError::ServerStart(format!(
+                    "database confirmation mismatch: expected --confirm {}",
+                    target.database
+                )));
+            }
+            let admin_dsn = env::var(DATABASE_ADMIN_DSN_ENV).map_err(|_| {
+                CliError::ServerStart(format!(
+                    "{DATABASE_ADMIN_DSN_ENV} must be set to a temporary PostgreSQL administrator connection URL"
+                ))
+            })?;
+            let admin = parse_postgres_bootstrap_target(DATABASE_ADMIN_DSN_ENV, &admin_dsn)?;
+            if admin.host != target.host || admin.port != target.port {
+                return Err(CliError::ServerStart(format!(
+                    "{DATABASE_ADMIN_DSN_ENV} must point to the same PostgreSQL host and port as db.dsn"
+                )));
+            }
+            if admin.database == target.database {
+                return Err(CliError::ServerStart(format!(
+                    "{DATABASE_ADMIN_DSN_ENV} must connect to a maintenance database such as postgres, not the target database"
+                )));
+            }
+
+            let outcome = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| CliError::ServerStart(error.to_string()))?
+                .block_on(bootstrap_postgres_database(&admin_dsn, &target))?;
+            if outcome.database_created {
+                if outcome.role_created {
+                    writeln!(
+                        output,
+                        "created PostgreSQL role {} and database {}",
+                        target.owner, target.database
+                    )
+                } else {
+                    writeln!(
+                        output,
+                        "created PostgreSQL database {} for existing role {}",
+                        target.database, target.owner
+                    )
+                }
+            } else {
+                writeln!(
+                    output,
+                    "PostgreSQL database {} already exists; no changes made",
+                    target.database
+                )
+            }
+            .map_err(|error| CliError::ServerStart(error.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
+fn parse_postgres_bootstrap_target(
+    label: &str,
+    dsn: &str,
+) -> Result<PostgresBootstrapTarget, CliError> {
+    let url = Url::parse(dsn).map_err(|_| {
+        CliError::ServerStart(format!("{label} must be a valid PostgreSQL connection URL"))
+    })?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        return Err(CliError::ServerStart(format!(
+            "{label} must use the postgres:// or postgresql:// scheme"
+        )));
+    }
+    let host = url
+        .host_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::ServerStart(format!("{label} must include a host")))?
+        .to_ascii_lowercase();
+    let port = url.port_or_known_default().ok_or_else(|| {
+        CliError::ServerStart(format!("{label} must include a valid PostgreSQL port"))
+    })?;
+    let owner = decode_dsn_component(label, "username", url.username())?;
+    let database_path = url.path().strip_prefix('/').unwrap_or(url.path());
+    let database = decode_dsn_component(label, "database name", database_path)?;
+    validate_bootstrap_identifier(label, "username", &owner)?;
+    validate_bootstrap_identifier(label, "database name", &database)?;
+    let password = url
+        .password()
+        .map(|value| decode_dsn_component(label, "password", value))
+        .transpose()?;
+    Ok(PostgresBootstrapTarget {
+        host,
+        port,
+        database,
+        owner,
+        password,
+    })
+}
+
+fn decode_dsn_component(label: &str, field: &str, value: &str) -> Result<String, CliError> {
+    percent_decode_str(value)
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| CliError::ServerStart(format!("{label} contains invalid UTF-8 in {field}")))
+}
+
+fn validate_bootstrap_identifier(label: &str, field: &str, value: &str) -> Result<(), CliError> {
+    if value.is_empty()
+        || value.len() > 63
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(CliError::ServerStart(format!(
+            "{label} {field} must contain 1-63 ASCII letters, digits, underscores, or hyphens"
+        )));
+    }
+    Ok(())
+}
+
+async fn bootstrap_postgres_database(
+    admin_dsn: &str,
+    target: &PostgresBootstrapTarget,
+) -> Result<DatabaseBootstrapOutcome, CliError> {
+    let mut connection = PgConnection::connect(admin_dsn).await.map_err(|error| {
+        CliError::ServerStart(format!(
+            "failed to connect with {DATABASE_ADMIN_DSN_ENV}: {error}"
+        ))
+    })?;
+    sqlx::query("SET application_name = 'conduit-database-bootstrap'")
+        .execute(&mut connection)
+        .await
+        .map_err(|error| CliError::ServerStart(format!("database bootstrap failed: {error}")))?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(DATABASE_BOOTSTRAP_LOCK_KEY)
+        .execute(&mut connection)
+        .await
+        .map_err(|error| {
+            CliError::ServerStart(format!("database bootstrap lock failed: {error}"))
+        })?;
+
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+    )
+    .bind(&target.database)
+    .fetch_one(&mut connection)
+    .await
+    .map_err(|error| CliError::ServerStart(format!("database bootstrap check failed: {error}")))?;
+    if exists {
+        return Ok(DatabaseBootstrapOutcome {
+            role_created: false,
+            database_created: false,
+        });
+    }
+
+    let (can_create_database, can_create_role, is_superuser) = sqlx::query_as::<
+        _,
+        (bool, bool, bool),
+    >(
+        "SELECT rolcreatedb, rolcreaterole, rolsuper FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .map_err(|error| {
+        CliError::ServerStart(format!(
+            "database bootstrap privilege check failed: {error}"
+        ))
+    })?;
+    if !can_create_database && !is_superuser {
+        return Err(CliError::ServerStart(format!(
+            "the {DATABASE_ADMIN_DSN_ENV} role needs CREATEDB permission"
+        )));
+    }
+
+    let role_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(&target.owner)
+            .fetch_one(&mut connection)
+            .await
+            .map_err(|error| {
+                CliError::ServerStart(format!("database owner check failed: {error}"))
+            })?;
+    let mut role_created = false;
+    if !role_exists {
+        if !can_create_role && !is_superuser {
+            return Err(CliError::ServerStart(format!(
+                "the {DATABASE_ADMIN_DSN_ENV} role needs CREATEROLE permission because target role {} does not exist",
+                target.owner
+            )));
+        }
+        let password = target
+            .password
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::ServerStart(format!(
+                    "configured db.dsn must include a password when target role {} does not exist",
+                    target.owner
+                ))
+            })?;
+        let create_role = format!(
+            "CREATE ROLE {} LOGIN PASSWORD {}",
+            quote_postgres_identifier(&target.owner),
+            quote_postgres_literal(password)?
+        );
+        sqlx::query(&create_role)
+            .execute(&mut connection)
+            .await
+            .map_err(|error| {
+                CliError::ServerStart(format!(
+                    "failed to create PostgreSQL role {}: {error}",
+                    target.owner
+                ))
+            })?;
+        role_created = true;
+    }
+
+    let create_database = format!(
+        "CREATE DATABASE {} OWNER {}",
+        quote_postgres_identifier(&target.database),
+        quote_postgres_identifier(&target.owner)
+    );
+    sqlx::query(&create_database)
+        .execute(&mut connection)
+        .await
+        .map_err(|error| {
+            let partial = if role_created {
+                format!("; role {} was created and was not removed", target.owner)
+            } else {
+                String::new()
+            };
+            CliError::ServerStart(format!(
+                "failed to create PostgreSQL database {}: {error}{partial}",
+                target.database
+            ))
+        })?;
+    Ok(DatabaseBootstrapOutcome {
+        role_created,
+        database_created: true,
+    })
+}
+
+fn quote_postgres_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn quote_postgres_literal(value: &str) -> Result<String, CliError> {
+    if value.contains('\0') {
+        return Err(CliError::ServerStart(
+            "configured db.dsn password must not contain a NUL byte".into(),
+        ));
+    }
+    Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
 async fn reset_owner_password(
@@ -630,6 +926,53 @@ mod tests {
 
         assert_eq!(err.exit_code(), SERVER_START_FAILED);
         assert_eq!(err.to_string(), "server start failed: bind failed");
+    }
+
+    #[test]
+    fn database_bootstrap_target_decodes_password_without_relaxing_identifiers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let target = parse_postgres_bootstrap_target(
+            "test dsn",
+            "postgresql://conduit:p%40ss%27word@LOCALHOST:5432/conduit_test?sslmode=require",
+        )?;
+
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.port, 5432);
+        assert_eq!(target.database, "conduit_test");
+        assert_eq!(target.owner, "conduit");
+        assert_eq!(target.password.as_deref(), Some("p@ss'word"));
+        assert_eq!(quote_postgres_literal("p@ss'word")?, "'p@ss''word'");
+        Ok(())
+    }
+
+    #[test]
+    fn database_bootstrap_rejects_unsafe_or_ambiguous_targets() {
+        for dsn in [
+            "mysql://conduit:password@localhost/conduit",
+            "postgresql://conduit:password@localhost/conduit/extra",
+            "postgresql://bad%20role:password@localhost/conduit",
+            "postgresql://conduit:password@localhost/bad%20database",
+        ] {
+            assert!(parse_postgres_bootstrap_target("test dsn", dsn).is_err());
+        }
+    }
+
+    #[test]
+    fn database_bootstrap_requires_exact_confirmation_before_reading_admin_credentials() {
+        let mut output = Vec::new();
+        let error = match run_database(
+            Path::new("config.yml"),
+            DatabaseCommand::Bootstrap {
+                confirm: "wrong-database".to_string(),
+            },
+            &mut output,
+        ) {
+            Ok(()) => panic!("mismatched database confirmation was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("database confirmation mismatch"));
+        assert!(output.is_empty());
     }
 
     fn assert_build_info_field(line: &str, field: &str) {

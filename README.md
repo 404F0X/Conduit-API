@@ -59,6 +59,22 @@ docker compose up --build -d
 Invoke-WebRequest http://127.0.0.1:8090/health | Out-Null
 ```
 
+If you downloaded a native archive instead of using Compose, install and start
+PostgreSQL first. Conduit API can create its own role and database with a
+one-time administrator connection; the server never retains that elevated
+credential:
+
+```powershell
+$env:CONDUIT_DB_ADMIN_DSN = 'postgresql://postgres:admin-password@127.0.0.1:5432/postgres'
+$env:CONDUIT_DB_DSN = 'postgresql://conduit:application-password@127.0.0.1:5432/conduit'
+.\conduit-api.exe database bootstrap --confirm conduit
+Remove-Item Env:CONDUIT_DB_ADMIN_DSN
+.\conduit-api.exe
+```
+
+Use URL encoding for reserved characters in either password. Running the
+bootstrap command again is safe: an existing target database is left intact.
+
 Then open <http://127.0.0.1:8090>. There is no default administrator
 password. The first visitor creates the owner account and chooses the actual
 accounting currency and the name shown for site credits. Review those values
