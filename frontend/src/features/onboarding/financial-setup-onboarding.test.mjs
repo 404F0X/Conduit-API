@@ -6,6 +6,7 @@ import test from 'node:test';
 const provider = readFileSync(join(import.meta.dirname, 'onboarding-provider.tsx'), 'utf8');
 const flow = readFileSync(join(import.meta.dirname, 'financial-setup-onboarding.tsx'), 'utf8');
 const systemData = readFileSync(join(import.meta.dirname, '..', 'system', 'data', 'system.ts'), 'utf8');
+const setupSpec = readFileSync(join(import.meta.dirname, '..', '..', '..', 'tests', 'setup.spec.ts'), 'utf8');
 
 test('owner financial onboarding replaces routed content and takes priority', () => {
   const financialReturn = provider.indexOf('onboardingInfo?.financialSetup?.onboarded === false');
@@ -39,4 +40,9 @@ test('easter-egg defaults are hints and never prefilled form values', () => {
   assert.match(flow, /financialOnboarding\.creditNamePlaceholder/);
   assert.match(flow, /financialOnboarding\.creditsPerUnitPlaceholder/);
   assert.doesNotMatch(flow, /setValues\([\s\S]*settingsQuery\.data\.creditDisplayName/);
+});
+
+test('e2e setup waits for asynchronous financial onboarding before continuing', () => {
+  assert.match(setupSpec, /financialHeading[\s\S]*\.waitFor\(\{ state: 'visible', timeout: 15000 \}\)/);
+  assert.doesNotMatch(setupSpec, /financialHeading\.isVisible\(\{ timeout:/);
 });

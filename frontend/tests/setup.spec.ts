@@ -98,7 +98,11 @@ test.describe('System Setup', () => {
     const financialHeading = page.getByRole('heading', {
       name: /Configure accounting currency and internal credits|配置记账货币与站内积分/i,
     })
-    if (await financialHeading.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const financialSetupVisible = await financialHeading
+      .waitFor({ state: 'visible', timeout: 15000 })
+      .then(() => true)
+      .catch(() => false)
+    if (financialSetupVisible) {
       const currencyField = page.getByLabel(/ISO accounting currency|ISO 记账货币/i)
       await currencyField.click()
       await currencyField.fill('CNY')
