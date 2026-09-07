@@ -258,7 +258,8 @@ pub fn field_authz(field: &str) -> FieldAuthz {
             Scope(slug::READ_COMMERCIALIZATION)
         }
 
-        "clearCache" | "getCacheDiagnostics" | "updateProductExperienceSettings" => OwnerOnly,
+        "clearCache" | "getCacheDiagnostics" | "updateProductExperienceSettings"
+        | "completeFinancialSetupOnboarding" => OwnerOnly,
 
         // owner-only in Go (backup.resolvers.go:57 checks user.IsOwner).
         "updateAutoBackupSettings" | "triggerAutoBackup" => OwnerOnly,
@@ -418,6 +419,10 @@ mod tests {
         );
         assert_eq!(field_authz("backup"), FieldAuthz::OwnerOnly);
         assert_eq!(field_authz("restore"), FieldAuthz::OwnerOnly);
+        assert_eq!(
+            field_authz("completeFinancialSetupOnboarding"),
+            FieldAuthz::OwnerOnly
+        );
         // Go WithSystemBypass reads / self-service.
         assert_eq!(field_authz("me"), FieldAuthz::Authenticated);
         assert_eq!(field_authz("myBalance"), FieldAuthz::Authenticated);

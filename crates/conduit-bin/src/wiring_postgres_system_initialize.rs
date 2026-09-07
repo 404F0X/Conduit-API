@@ -15,7 +15,7 @@ const INITIALIZE_LOCK_KEY: i64 = 0x434f_4e44_5549_5401;
 /// Number of writes made by a bootstrap with a non-empty version. Kept for the
 /// fault-injection regression so every mutation boundary is exercised.
 #[cfg(test)]
-const BOOTSTRAP_WRITE_COUNT: usize = 13;
+const BOOTSTRAP_WRITE_COUNT: usize = 14;
 
 pub(crate) async fn initialize_system(
     pool: &PgPool,
@@ -191,6 +191,14 @@ async fn initialize_in_transaction(
     write_system_value(tx, system_key::GENERAL_SETTINGS, general_settings).await?;
     checkpoint(&mut write_number, fail_after_write)?;
 
+    let onboarding = serde_json::json!({
+        "financial_setup": { "onboarded": !params.defer_financial_setup }
+    });
+    let onboarding = serde_json::to_string(&onboarding)
+        .map_err(|error| format!("failed to encode bootstrap onboarding state: {error}"))?;
+    write_system_value(tx, system_key::ONBOARDED, &onboarding).await?;
+    checkpoint(&mut write_number, fail_after_write)?;
+
     // The initialized flag is the final mutation in the same transaction.
     write_system_value(tx, system_key::INITIALIZED, "true").await?;
     checkpoint(&mut write_number, fail_after_write)?;
@@ -289,6 +297,7 @@ mod tests {
                 exchange_rates: Vec::new(),
                 version: 1,
             },
+            defer_financial_setup: false,
             version: "0.1.0-test".to_string(),
             now: chrono::Utc::now().to_rfc3339(),
         }
@@ -343,7 +352,7 @@ mod tests {
         assert_eq!(count(&database.pool, "roles").await?, 3);
         assert_eq!(count(&database.pool, "user_projects").await?, 1);
         assert_eq!(count(&database.pool, "data_storages").await?, 1);
-        assert_eq!(count(&database.pool, "systems").await?, 6);
+        assert_eq!(count(&database.pool, "systems").await?, 7);
         let stored = sqlx::query_scalar::<_, String>(
             "SELECT value FROM systems WHERE key = $1 AND deleted_at = 0",
         )
@@ -354,6 +363,16 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&stored)?,
             bootstrap_general_settings_value(&init.accounting_settings)
                 .expect("test accounting settings are valid")
+        );
+        let onboarding = sqlx::query_scalar::<_, String>(
+            "SELECT value FROM systems WHERE key = $1 AND deleted_at = 0",
+        )
+        .bind(system_key::ONBOARDED)
+        .fetch_one(&database.pool)
+        .await?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&onboarding)?,
+            serde_json::json!({"financial_setup": {"onboarded": true}})
         );
 
         database.cleanup().await?;

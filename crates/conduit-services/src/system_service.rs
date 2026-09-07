@@ -160,6 +160,8 @@ pub struct InitializeParams {
     pub prefer_language: Option<String>,
     /// Required first-run accounting and internal-credit configuration.
     pub accounting_settings: AccountingSettings,
+    /// When true, require the owner to confirm financial settings after sign-in.
+    pub defer_financial_setup: bool,
     /// Recorded build version (Go sets `build.Version`). Empty skips the write.
     pub version: String,
     /// Caller-supplied timestamp for created rows (epoch millis or ISO-8601).
@@ -649,6 +651,12 @@ pub struct OnboardingRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub auto_disable_channel: Option<OnboardingModule>,
+    #[serde(
+        default,
+        rename = "financial_setup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub financial_setup: Option<OnboardingModule>,
 }
 
 ///
@@ -1228,6 +1236,18 @@ impl SystemService {
         }
         self.set_system_value(ctx, system_key::GENERAL_SETTINGS, general_settings.clone())
             .await?;
+        self.set_json(
+            ctx,
+            system_key::ONBOARDED,
+            &OnboardingRecord {
+                financial_setup: Some(OnboardingModule {
+                    onboarded: !params.defer_financial_setup,
+                    completed_at: None,
+                }),
+                ..OnboardingRecord::default()
+            },
+        )
+        .await?;
         self.set_system_value(ctx, SYSTEM_INITIALIZED, Value::from(true))
             .await?;
         Ok(())
@@ -1563,6 +1583,21 @@ impl SystemService {
         let mut info = self.onboarding_info(ctx).await?.unwrap_or_default();
         let now = chrono::Utc::now();
         info.auto_disable_channel = Some(OnboardingModule {
+            onboarded: true,
+            completed_at: Some(now),
+        });
+        self.set_json(ctx, system_key::ONBOARDED, &info).await?;
+        Ok(())
+    }
+
+    /// Mark the mandatory first-login financial setup as completed.
+    pub async fn complete_financial_setup_onboarding(
+        &self,
+        ctx: &RequestContext,
+    ) -> ServiceResult<()> {
+        let mut info = self.onboarding_info(ctx).await?.unwrap_or_default();
+        let now = chrono::Utc::now();
+        info.financial_setup = Some(OnboardingModule {
             onboarded: true,
             completed_at: Some(now),
         });
@@ -2452,6 +2487,7 @@ mod tests {
                 exchange_rates: Vec::new(),
                 version: 1,
             },
+            defer_financial_setup: false,
             version: "0.1.0-test".to_string(),
             now: "2026-06-27T00:00:00Z".to_string(),
         }
@@ -2554,6 +2590,13 @@ mod tests {
             .position(|key| key == system_key::INITIALIZED)
             .expect("initialized flag must be persisted");
         assert!(general_index < initialized_index);
+        assert!(
+            service
+                .onboarding_info(&ctx)
+                .await?
+                .and_then(|info| info.financial_setup)
+                .is_some_and(|module| module.onboarded)
+        );
 
         // Owner user created with is_owner + wildcard scopes.
         assert_eq!(user_repo.len()?, 1);
@@ -2595,6 +2638,33 @@ mod tests {
         let fetched = service.secret_key(&ctx).await?;
         assert_eq!(fetched.as_str(), secret.as_str());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialize_can_defer_financial_setup_without_changing_atomic_bootstrap()
+    -> ServiceResult<()> {
+        let (service, _, _, _, _, _) = init_service();
+        let ctx = ctx();
+        let mut params = init_params("deferred-owner@example.com");
+        params.defer_financial_setup = true;
+        service.initialize(&ctx, &params).await?;
+        let module = service
+            .onboarding_info(&ctx)
+            .await?
+            .and_then(|info| info.financial_setup)
+            .ok_or(RepoError::NotFound("financial setup onboarding"))?;
+        assert!(!module.onboarded);
+        assert!(module.completed_at.is_none());
+        assert!(service.is_initialized(&ctx).await?);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_onboarding_json_without_financial_setup_remains_unaffected() -> ServiceResult<()> {
+        let record: OnboardingRecord = serde_json::from_value(json!({"onboarded": true}))?;
+        assert!(record.onboarded);
+        assert!(record.financial_setup.is_none());
         Ok(())
     }
 
@@ -3120,6 +3190,30 @@ mod tests {
                 .as_ref()
                 .map(|m| m.onboarded)
                 .unwrap_or(false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_financial_setup_preserves_other_onboarding_state() -> ServiceResult<()> {
+        let repo = Arc::new(InMemorySettingsRepo::default());
+        let svc = service(repo);
+        let ctx = ctx();
+        svc.complete_system_model_setting_onboarding(&ctx).await?;
+        svc.complete_financial_setup_onboarding(&ctx).await?;
+
+        let info = svc.onboarding_info(&ctx).await?.unwrap_or_default();
+        assert!(info.financial_setup.as_ref().is_some_and(|m| m.onboarded));
+        assert!(
+            info.financial_setup
+                .as_ref()
+                .and_then(|m| m.completed_at)
+                .is_some()
+        );
+        assert!(
+            info.system_model_setting
+                .as_ref()
+                .is_some_and(|m| m.onboarded)
         );
         Ok(())
     }

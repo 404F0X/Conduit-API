@@ -125,9 +125,10 @@ export const systemApi = {
     ownerLastName: string;
     brandName: string;
     preferLanguage?: string;
-    accountingCurrencyCode: string;
-    creditDisplayName: string;
-    creditsPerAccountingUnit: string;
+    accountingCurrencyCode?: string;
+    creditDisplayName?: string;
+    creditsPerAccountingUnit?: string;
+    deferFinancialSetup?: boolean;
   }): Promise<{ success: boolean; message: string }> =>
     apiRequest('/admin/system/initialize', {
       method: 'POST',

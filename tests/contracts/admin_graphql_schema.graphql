@@ -9571,11 +9571,17 @@ type AutoDisableChannelOnboarding {
   completedAt: Time
 }
 
+type FinancialSetupOnboarding {
+  onboarded: Boolean!
+  completedAt: Time
+}
+
 type OnboardingInfo {
   onboarded: Boolean!
   completedAt: Time
   systemModelSetting: SystemModelSettingOnboarding
   autoDisableChannel: AutoDisableChannelOnboarding
+  financialSetup: FinancialSetupOnboarding
 }
 
 input CompleteOnboardingInput {
@@ -9705,6 +9711,7 @@ extend type Mutation {
   updateSystemModelSettings(input: UpdateSystemModelSettingsInput!): Boolean!
   updateDefaultDataStorage(input: UpdateDefaultDataStorageInput!): Boolean!
   completeOnboarding(input: CompleteOnboardingInput!): Boolean!
+  completeFinancialSetupOnboarding: Boolean!
   completeSystemModelSettingOnboarding(input: CompleteSystemModelSettingOnboardingInput!): Boolean!
   completeAutoDisableChannelOnboarding(input: CompleteAutoDisableChannelOnboardingInput!): Boolean!
   updateSystemChannelSettings(input: UpdateSystemChannelSettingsInput!): Boolean!

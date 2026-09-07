@@ -2442,6 +2442,17 @@ impl MutationRoot {
         }
     }
 
+    /// Complete the owner-only first-login financial setup after its settings
+    /// have been persisted successfully.
+    async fn complete_financial_setup_onboarding(&self, ctx: &Context<'_>) -> Result<bool, String> {
+        let services = system_settings_services(ctx)?;
+        services
+            .complete_financial_setup_onboarding()
+            .await
+            .map(|()| true)
+            .map_err(|err| err.to_string())
+    }
+
     /// Mirrors Go `Mutation.updateSecuritySettings` (system.resolvers.go:209-234):
     /// read current settings, apply the partial merge (`None` fields preserve
     /// current), persist, return `true`.

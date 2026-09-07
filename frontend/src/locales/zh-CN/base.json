@@ -267,7 +267,7 @@
   "initialization.form.validation.ownerLastNameRequired": "请输入所有者姓",
   "initialization.form.validation.brandNameRequired": "请输入品牌名称",
   "initialization.form.submit": "初始化系统",
-  "initialization.form.continue": "继续配置财务信息",
+  "initialization.form.continue": "创建所有者账户",
   "initialization.form.submitting": "初始化中...",
   "initialization.financial.title": "设置实际货币与站内积分",
   "initialization.financial.description": "在初始化 Conduit API 前，请确认实际成本的记账货币以及向用户展示的站内积分方式。",

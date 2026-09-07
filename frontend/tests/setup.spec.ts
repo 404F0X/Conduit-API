@@ -64,33 +64,18 @@ test.describe('System Setup', () => {
       await page.getByRole('textbox', { name: /Brand Name/i }).fill('Conduit API')
 
       // Submit initialization form
-      const submitButton = page.getByRole('button', { name: /Continue to financial setup|继续配置财务信息/i })
+      const submitButton = page.getByRole('button', { name: /Create owner account|创建所有者账户/i })
       await expect(submitButton).toBeVisible()
       await expect(submitButton).toBeDisabled()
       await confirmPasswordField.fill(ownerPassword)
       await expect(submitButton).toBeEnabled()
 
-      await submitButton.click()
-
-      const financialDialog = page.getByRole('dialog', { name: /Set currency and internal credits|设置实际货币与站内积分/i })
-      await expect(financialDialog).toBeVisible()
-      const currencyField = page.getByLabel(/Real accounting currency|实际记账货币/i)
-      await currencyField.click()
-      await currencyField.fill('CNY')
-      await page.getByRole('option', { name: 'CNY', exact: true }).click()
-      await page.getByLabel(/Internal credit display name|站内积分显示名称/i).fill('Credits')
-      await page.getByLabel(/Credits per 1 accounting currency unit|每 1 单位记账货币对应积分数/i).fill('10000')
-      const confirmInitializationButton = page.getByRole('button', {
-        name: /Confirm and initialize|确认并初始化/i,
-      })
-      await expect(confirmInitializationButton).toBeEnabled()
-
-      // After final confirmation, system redirects to sign-in page
+      // Owner creation completes immediately; finance is confirmed after login.
       await Promise.all([
         page.waitForURL((url) => url.toString().includes('/sign-in'), {
           timeout: 15000,
         }),
-        confirmInitializationButton.click(),
+        submitButton.click(),
       ])
 
       console.log('System initialized successfully, now on sign-in page')
@@ -107,6 +92,27 @@ test.describe('System Setup', () => {
     } else {
       // Already logged in or on dashboard
       console.log('System already initialized and logged in')
+    }
+
+    // New installations require an authenticated, page-level financial setup.
+    const financialHeading = page.getByRole('heading', {
+      name: /Configure accounting currency and internal credits|配置记账货币与站内积分/i,
+    })
+    const financialSetupVisible = await financialHeading
+      .waitFor({ state: 'visible', timeout: 15000 })
+      .then(() => true)
+      .catch(() => false)
+    if (financialSetupVisible) {
+      const currencyField = page.getByLabel(/ISO accounting currency|ISO 记账货币/i)
+      await currencyField.click()
+      await currencyField.fill('CNY')
+      await page.getByRole('option', { name: /CNY/, exact: false }).click()
+      await page.getByLabel(/Internal credit display name|站内积分显示名称/i).fill('Credits')
+      await page.getByLabel(/Credits per accounting unit|每 1 单位记账货币对应积分数/i).fill('10000')
+      const saveFinance = page.getByRole('button', { name: /Save financial foundation|保存财务基础/i })
+      await expect(saveFinance).toBeEnabled()
+      await saveFinance.click()
+      await expect(financialHeading).toBeHidden({ timeout: 15000 })
     }
 
     // Verify we're logged in by checking we're not on sign-in or initialization page
