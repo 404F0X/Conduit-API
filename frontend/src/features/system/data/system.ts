@@ -174,6 +174,10 @@ const ONBOARDING_INFO_QUERY = `
         onboarded
         completedAt
       }
+      financialSetup {
+        onboarded
+        completedAt
+      }
     }
   }
 `;
@@ -181,6 +185,12 @@ const ONBOARDING_INFO_QUERY = `
 const COMPLETE_ONBOARDING_MUTATION = `
   mutation CompleteOnboarding($input: CompleteOnboardingInput!) {
     completeOnboarding(input: $input)
+  }
+`;
+
+const COMPLETE_FINANCIAL_SETUP_ONBOARDING_MUTATION = `
+  mutation CompleteFinancialSetupOnboarding {
+    completeFinancialSetupOnboarding
   }
 `;
 
@@ -407,6 +417,7 @@ export interface OnboardingInfo {
   completedAt?: string;
   systemModelSetting?: SystemModelSettingOnboarding;
   autoDisableChannel?: AutoDisableChannelOnboarding;
+  financialSetup?: SystemModelSettingOnboarding;
 }
 
 export interface CompleteOnboardingInput {
@@ -650,16 +661,21 @@ export function useOnboardingInfo() {
   return useQuery({
     queryKey: ['onboardingInfo'],
     queryFn: async () => {
-      try {
-        const data = await graphqlRequest<{ onboardingInfo: OnboardingInfo | null }>(ONBOARDING_INFO_QUERY);
-        return data.onboardingInfo;
-      } catch (_error) {
-        return {
-          onboarded: true,
-          completedAt: new Date().toISOString(),
-        };
-      }
+      const data = await graphqlRequest<{ onboardingInfo: OnboardingInfo | null }>(ONBOARDING_INFO_QUERY);
+      return data.onboardingInfo;
     },
+    retry: 1,
+  });
+}
+
+export function useCompleteFinancialSetupOnboarding() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => {
+      const data = await graphqlRequest<{ completeFinancialSetupOnboarding: boolean }>(COMPLETE_FINANCIAL_SETUP_ONBOARDING_MUTATION);
+      return data.completeFinancialSetupOnboarding;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['onboardingInfo'] }),
   });
 }
 

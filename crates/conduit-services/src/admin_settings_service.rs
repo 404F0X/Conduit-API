@@ -652,6 +652,7 @@ fn onboarding_to_gql(r: crate::system_service::OnboardingRecord) -> GqlOnboardin
         completed_at: r.completed_at,
         system_model_setting: r.system_model_setting.map(onboarding_module_to_gql),
         auto_disable_channel: r.auto_disable_channel.map(onboarding_module_to_gql),
+        financial_setup: r.financial_setup.map(onboarding_module_to_gql),
     }
 }
 
@@ -764,6 +765,14 @@ impl SystemSettingsServices for DbSystemSettingsBackend {
             .complete_onboarding(&ctx)
             .await
             .map_err(|e| SystemSettingsError::CompleteOnboarding(e.to_string()))
+    }
+
+    async fn complete_financial_setup_onboarding(&self) -> Result<(), SystemSettingsError> {
+        let ctx = self.ctx();
+        self.system
+            .complete_financial_setup_onboarding(&ctx)
+            .await
+            .map_err(|e| SystemSettingsError::CompleteFinancialSetupOnboarding(e.to_string()))
     }
 
     // --- brandSettings getters (Go system.resolvers.go:383-405) -----------

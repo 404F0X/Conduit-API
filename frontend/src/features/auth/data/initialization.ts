@@ -15,9 +15,10 @@ export interface InitializeSystemInput {
   ownerLastName: string;
   brandName: string;
   preferLanguage?: string;
-  accountingCurrencyCode: string;
-  creditDisplayName: string;
-  creditsPerAccountingUnit: string;
+  accountingCurrencyCode?: string;
+  creditDisplayName?: string;
+  creditsPerAccountingUnit?: string;
+  deferFinancialSetup?: boolean;
 }
 
 export interface InitializeSystemPayload {

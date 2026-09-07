@@ -2057,6 +2057,10 @@ impl gql_system::SystemSettingsServices for SystemSettingsAdapter {
                     onboarded: m.onboarded,
                     completed_at: m.completed_at,
                 }),
+            financial_setup: r.financial_setup.map(|m| gql_system::OnboardingModule {
+                onboarded: m.onboarded,
+                completed_at: m.completed_at,
+            }),
         }))
     }
 
@@ -2066,6 +2070,14 @@ impl gql_system::SystemSettingsServices for SystemSettingsAdapter {
             .complete_onboarding(&ctx)
             .await
             .map_err(|err| SSErr::CompleteOnboarding(err.to_string()))
+    }
+
+    async fn complete_financial_setup_onboarding(&self) -> Result<(), SSErr> {
+        let ctx = boot_request_context();
+        self.system
+            .complete_financial_setup_onboarding(&ctx)
+            .await
+            .map_err(|err| SSErr::CompleteFinancialSetupOnboarding(err.to_string()))
     }
 
     async fn set_security_settings(
@@ -4401,6 +4413,7 @@ impl SystemService for DbSystemService {
             brand_name: params.brand_name,
             prefer_language: non_empty_option(params.prefer_language),
             accounting_settings: params.accounting_settings,
+            defer_financial_setup: params.defer_financial_setup,
             // Go records build.Version; the binary's package version stands in
             // until the build script stamps CONDUIT_BUILD_VERSION. Empty would
             // skip the write, but recording it is more faithful.
@@ -4419,6 +4432,7 @@ impl SystemService for DbSystemService {
             system_key::BRAND_NAME,
             system_key::DEFAULT_DATA_STORAGE_ID,
             system_key::GENERAL_SETTINGS,
+            system_key::ONBOARDED,
             system_key::VERSION,
             system_key::INITIALIZED,
         ] {

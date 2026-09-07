@@ -205,7 +205,7 @@
   "initialization.form.validation.ownerLastNameRequired": "Please enter owner last name",
   "initialization.form.validation.brandNameRequired": "Please enter brand name",
   "initialization.form.submit": "Initialize System",
-  "initialization.form.continue": "Continue to financial setup",
+  "initialization.form.continue": "Create owner account",
   "initialization.form.submitting": "Initializing...",
   "initialization.financial.title": "Set currency and internal credits",
   "initialization.financial.description": "Confirm how real-world costs are recorded and shown as credits before Conduit API is initialized.",

@@ -199,6 +199,14 @@ pub struct OnboardingInfo {
     pub completed_at: Option<TimeScalar>,
     pub system_model_setting: Option<SystemModelSettingOnboarding>,
     pub auto_disable_channel: Option<AutoDisableChannelOnboarding>,
+    pub financial_setup: Option<OnboardingModuleInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "FinancialSetupOnboarding")]
+pub struct OnboardingModuleInfo {
+    pub onboarded: bool,
+    pub completed_at: Option<TimeScalar>,
 }
 
 /// GraphQL `CompleteOnboardingInput` (snapshot lines 9581-9583).
@@ -693,6 +701,7 @@ pub struct OnboardingRecord {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub system_model_setting: Option<OnboardingModule>,
     pub auto_disable_channel: Option<OnboardingModule>,
+    pub financial_setup: Option<OnboardingModule>,
 }
 
 /// Service-layer representation of one onboarding module.
@@ -731,6 +740,8 @@ pub enum SystemSettingsError {
     OnboardingInfo(String),
     #[error("failed to complete onboarding: {0}")]
     CompleteOnboarding(String),
+    #[error("failed to complete financial setup onboarding: {0}")]
+    CompleteFinancialSetupOnboarding(String),
     #[error("failed to get brand name: {0}")]
     BrandName(String),
     #[error("failed to get brand logo: {0}")]
@@ -808,6 +819,9 @@ pub trait SystemSettingsServices: Send + Sync {
     /// Mirrors Go resolver `CompleteOnboarding` (system.resolvers.go:112-120):
     /// mark the system-level onboarding as completed.
     async fn complete_onboarding(&self) -> Result<(), SystemSettingsError>;
+
+    /// Mark the owner's mandatory first-login financial setup as complete.
+    async fn complete_financial_setup_onboarding(&self) -> Result<(), SystemSettingsError>;
 
     /// Mirrors Go resolver `UpdateSecuritySettings` write half
     /// (system.resolvers.go:228): persist the merged settings. The resolver
@@ -960,11 +974,19 @@ pub fn onboarding_info_from_record(record: OnboardingRecord) -> OnboardingInfo {
             completed_at,
         }
     });
+    let financial_setup = record.financial_setup.map(|m| {
+        let (onboarded, completed_at) = map_module(m);
+        OnboardingModuleInfo {
+            onboarded,
+            completed_at,
+        }
+    });
     OnboardingInfo {
         onboarded: record.onboarded,
         completed_at: record.completed_at.map(TimeScalar),
         system_model_setting,
         auto_disable_channel,
+        financial_setup,
     }
 }
 
@@ -1125,6 +1147,14 @@ mod tests {
         }
 
         async fn complete_onboarding(&self) -> Result<(), SystemSettingsError> {
+            *lock(&self.complete_calls) += 1;
+            match &self.complete_error {
+                Some(err) => Err(err.clone()),
+                None => Ok(()),
+            }
+        }
+
+        async fn complete_financial_setup_onboarding(&self) -> Result<(), SystemSettingsError> {
             *lock(&self.complete_calls) += 1;
             match &self.complete_error {
                 Some(err) => Err(err.clone()),
@@ -1372,6 +1402,10 @@ mod tests {
                 completed_at: Some(t),
             }),
             auto_disable_channel: None,
+            financial_setup: Some(OnboardingModule {
+                onboarded: false,
+                completed_at: None,
+            }),
         };
         let info = onboarding_info_from_record(record);
         assert!(info.onboarded);
@@ -1384,6 +1418,10 @@ mod tests {
             None => panic!("system_model_setting should be present"),
         }
         assert!(info.auto_disable_channel.is_none());
+        assert_eq!(
+            info.financial_setup.map(|module| module.onboarded),
+            Some(false)
+        );
         Ok(())
     }
 
@@ -1573,6 +1611,10 @@ mod tests {
                     completed_at: Some(t),
                 }),
                 auto_disable_channel: None,
+                financial_setup: Some(OnboardingModule {
+                    onboarded: false,
+                    completed_at: None,
+                }),
             }))),
             ..FakeSystemServices::default()
         };
@@ -1603,6 +1645,21 @@ mod tests {
         assert_eq!(
             resp.data,
             data_object([("completeOnboarding", Value::Boolean(true))])
+        );
+        assert_eq!(*lock(&fake.complete_calls), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_financial_setup_returns_true_and_invokes_service() {
+        let fake = FakeSystemServices::default();
+        let schema = schema_with_services(fake.clone());
+        let resp = schema
+            .execute("mutation { completeFinancialSetupOnboarding }")
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            resp.data,
+            data_object([("completeFinancialSetupOnboarding", Value::Boolean(true))])
         );
         assert_eq!(*lock(&fake.complete_calls), 1);
     }

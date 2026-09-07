@@ -44,6 +44,7 @@ pub struct InitializeSystemParams {
     pub brand_name: String,
     pub prefer_language: String,
     pub accounting_settings: AccountingSettings,
+    pub defer_financial_setup: bool,
 }
 
 /// Minimal system-service trait consumed by the two handlers. Stands in for
@@ -129,11 +130,13 @@ pub struct InitializeSystemRequest {
     #[serde(default)]
     pub prefer_language: String,
     #[serde(default)]
-    pub accounting_currency_code: String,
+    pub accounting_currency_code: Option<String>,
     #[serde(default)]
-    pub credit_display_name: String,
+    pub credit_display_name: Option<String>,
     #[serde(default)]
-    pub credits_per_accounting_unit: String,
+    pub credits_per_accounting_unit: Option<String>,
+    #[serde(default)]
+    pub defer_financial_setup: bool,
 }
 
 impl InitializeSystemRequest {
@@ -152,11 +155,20 @@ impl InitializeSystemRequest {
     }
 
     fn normalized_accounting_settings(&self) -> Option<AccountingSettings> {
+        if self.defer_financial_setup {
+            return Some(AccountingSettings::default());
+        }
         let settings = AccountingSettings {
-            accounting_currency: self.accounting_currency_code.trim().to_ascii_uppercase(),
-            credit_display_name: self.credit_display_name.trim().to_string(),
-            credits_per_accounting_unit: Decimal::from_str(self.credits_per_accounting_unit.trim())
-                .ok()?,
+            accounting_currency: self
+                .accounting_currency_code
+                .as_deref()?
+                .trim()
+                .to_ascii_uppercase(),
+            credit_display_name: self.credit_display_name.as_deref()?.trim().to_string(),
+            credits_per_accounting_unit: Decimal::from_str(
+                self.credits_per_accounting_unit.as_deref()?.trim(),
+            )
+            .ok()?,
             exchange_rates: Vec::new(),
             version: 1,
         };
@@ -277,6 +289,7 @@ pub async fn initialize_system(
             brand_name: request.brand_name,
             prefer_language: request.prefer_language,
             accounting_settings,
+            defer_financial_setup: request.defer_financial_setup,
         })
         .await;
 
@@ -665,8 +678,38 @@ mod tests {
                     exchange_rates: Vec::new(),
                     version: 1,
                 },
+                defer_financial_setup: false,
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_financial_setup_uses_canonical_defaults_without_public_finance_fields()
+    -> Result<(), Box<dyn StdError>> {
+        let service = Arc::new(FakeSystemService::default());
+        let mut app = app_with(service.clone());
+        let payload = json!({
+            "ownerEmail": "owner@example.com",
+            "ownerPassword": "secret123",
+            "ownerFirstName": "Ada",
+            "ownerLastName": "Lovelace",
+            "brandName": "Conduit API",
+            "deferFinancialSetup": true
+        })
+        .to_string();
+        let (status, _) = call(
+            &mut app,
+            Method::POST,
+            "/admin/system/initialize",
+            Some(&payload),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        let seen = service.seen.lock().ok().and_then(|guard| guard.clone());
+        let params = seen.ok_or("initialize parameters were not captured")?;
+        assert!(params.defer_financial_setup);
+        assert_eq!(params.accounting_settings, AccountingSettings::default());
         Ok(())
     }
 
