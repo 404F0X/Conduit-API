@@ -693,6 +693,7 @@ dependencies = [
  "conduit-storage",
  "conduit-transformers",
  "jsonwebtoken",
+ "percent-encoding",
  "regex",
  "reqwest",
  "rust_decimal",
@@ -706,6 +707,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
 ]

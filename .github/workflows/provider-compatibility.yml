@@ -1,0 +1,65 @@
+name: Provider compatibility
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/provider-compatibility.yml'
+      - 'scripts/provider-compatibility/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-compatibility
+  cancel-in-progress: false
+
+jobs:
+  deterministic-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Test provider compatibility probe
+        run: node --test scripts/provider-compatibility/provider-smoke.test.mjs
+
+  real-provider:
+    # Never expose the live-provider environment to pull-request code.
+    if: github.event_name != 'pull_request' && vars.CONDUIT_REAL_PROVIDER_ENABLED == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: provider-compatibility
+    env:
+      CONDUIT_TEST_REAL_PROVIDER: '1'
+      CONDUIT_COMPAT_GATEWAY_URL: ${{ secrets.CONDUIT_COMPAT_GATEWAY_URL }}
+      CONDUIT_COMPAT_GATEWAY_API_KEY: ${{ secrets.CONDUIT_COMPAT_GATEWAY_API_KEY }}
+      CONDUIT_COMPAT_MODEL: ${{ vars.CONDUIT_COMPAT_MODEL }}
+      CONDUIT_COMPAT_PROTOCOLS: ${{ vars.CONDUIT_COMPAT_PROTOCOLS }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Run end-to-end provider compatibility
+        run: node scripts/provider-compatibility/provider-smoke.mjs
+
+  real-provider-not-configured:
+    if: github.event_name != 'pull_request' && vars.CONDUIT_REAL_PROVIDER_ENABLED != '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Report opt-in status
+        run: echo 'Real-provider traffic is disabled; set CONDUIT_REAL_PROVIDER_ENABLED=1 and configure the provider-compatibility environment to enable the scheduled live probe.'

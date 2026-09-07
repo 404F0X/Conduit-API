@@ -491,7 +491,17 @@ async fn build_postgres_core_services(
         read_replica.fallback_on_replica_failure,
     )
     .await
-    .map_err(|e| format!("failed to open PostgreSQL pool: {e}"))?;
+    .map_err(|error| {
+        let hint = error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .filter(|code| code.as_ref() == "3D000")
+            .map(|_| {
+                "; the configured database does not exist. Set CONDUIT_DB_ADMIN_DSN, then run `conduit-api database bootstrap --confirm <database-name>` once"
+            })
+            .unwrap_or_default();
+        format!("failed to open PostgreSQL pool: {error}{hint}")
+    })?;
     let pool = pools.master_clone();
     migrate_postgres_with_flag(&pool, config.db.disable_auto_migration)
         .await
