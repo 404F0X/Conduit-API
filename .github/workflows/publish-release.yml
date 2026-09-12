@@ -175,6 +175,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build native release binary
+        env:
+          # postgresql_embedded enumerates GitHub releases while staging the
+          # bundled Windows archive; authenticate to avoid anonymous API limits.
+          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           cargo build --locked --release -p conduit-bin --bin conduit-api
           --features release-binary
@@ -341,6 +345,73 @@ jobs:
             }
             if (-not ($configResult -split '\r?\n').Contains('config valid')) {
               throw 'config validate did not report success'
+            }
+
+            $databaseDir = Join-Path $env:RUNNER_TEMP "conduit-managed-postgres-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+            $stdoutPath = Join-Path $env:RUNNER_TEMP 'conduit-managed-smoke.stdout.log'
+            $stderrPath = Join-Path $env:RUNNER_TEMP 'conduit-managed-smoke.stderr.log'
+            $portListener = [System.Net.Sockets.TcpListener]::new(
+              [System.Net.IPAddress]::Loopback,
+              0
+            )
+            $portListener.Start()
+            $serverPort = ([System.Net.IPEndPoint]$portListener.LocalEndpoint).Port
+            $portListener.Stop()
+            $env:CONDUIT_DATABASE_MODE = 'embedded'
+            $env:CONDUIT_EMBEDDED_POSTGRES_DIR = $databaseDir
+            $env:CONDUIT_SERVER_PORT = [string]$serverPort
+            $serverProcess = $null
+            try {
+              $serverProcess = Start-Process `
+                -FilePath (Resolve-Path $executable).Path `
+                -PassThru `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput $stdoutPath `
+                -RedirectStandardError $stderrPath
+              $healthy = $false
+              $deadline = [DateTime]::UtcNow.AddMinutes(3)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                if ($serverProcess.HasExited) {
+                  throw "managed database smoke process exited with $($serverProcess.ExitCode)"
+                }
+                try {
+                  $health = Invoke-RestMethod "http://127.0.0.1:$serverPort/health" -TimeoutSec 2
+                  if ($health.status -eq 'ok') {
+                    $healthy = $true
+                    break
+                  }
+                } catch {
+                  Start-Sleep -Milliseconds 500
+                }
+              }
+              if (-not $healthy) {
+                throw 'managed database smoke did not become healthy within three minutes'
+              }
+              if (-not (Test-Path (Join-Path $databaseDir 'state.json') -PathType Leaf)) {
+                throw 'managed database smoke did not persist its state'
+              }
+            } finally {
+              if ($serverProcess -and -not $serverProcess.HasExited) {
+                Stop-Process -Id $serverProcess.Id -Force
+                $serverProcess.WaitForExit()
+              }
+              Get-CimInstance Win32_Process |
+                Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($databaseDir, [StringComparison]::OrdinalIgnoreCase) } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+              Remove-Item Env:CONDUIT_DATABASE_MODE -ErrorAction SilentlyContinue
+              Remove-Item Env:CONDUIT_EMBEDDED_POSTGRES_DIR -ErrorAction SilentlyContinue
+              Remove-Item Env:CONDUIT_SERVER_PORT -ErrorAction SilentlyContinue
+              if (Test-Path $databaseDir) {
+                $resolvedDatabaseDir = (Resolve-Path $databaseDir).Path
+                $resolvedRunnerTemp = (Resolve-Path $env:RUNNER_TEMP).Path
+                if (-not $resolvedDatabaseDir.StartsWith(
+                  $resolvedRunnerTemp + [IO.Path]::DirectorySeparatorChar,
+                  [StringComparison]::OrdinalIgnoreCase
+                )) {
+                  throw "refusing to remove managed database smoke directory outside RUNNER_TEMP"
+                }
+                Remove-Item -LiteralPath $resolvedDatabaseDir -Recurse -Force
+              }
             }
           } finally {
             Pop-Location

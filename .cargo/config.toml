@@ -1,0 +1,4 @@
+[env]
+# Keep the bundled Windows PostgreSQL payload reproducible. This exact version
+# must also match `embedded_postgres::BUNDLED_POSTGRESQL_VERSION`.
+POSTGRESQL_VERSION = { value = "=17.11.0", force = true }

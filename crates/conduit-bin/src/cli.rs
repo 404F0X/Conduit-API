@@ -8,7 +8,9 @@ use std::{
 
 use clap::{CommandFactory, Parser, Subcommand};
 use conduit_auth::password::{DEFAULT_BCRYPT_COST, encode_password_bcrypt_hex};
-use conduit_config::{AppConfig, ConfigError, load_default_search, load_from_path, validate};
+use conduit_config::{
+    AppConfig, ConfigError, discover_config_file, load_default_search, load_from_path, validate,
+};
 use conduit_db::connection::connect_postgres;
 use conduit_db::{DatabaseConfig, DbDialect};
 use conduit_http::{AppState, serve_listener_with_graceful_timeout, shutdown_signal};
@@ -470,6 +472,58 @@ async fn bootstrap_postgres_database(
     })
 }
 
+#[cfg(all(windows, feature = "embedded-postgres"))]
+pub(crate) fn bootstrap_postgres_from_dsns(
+    admin_dsn: &str,
+    target_dsn: &str,
+) -> Result<(), String> {
+    let target =
+        parse_postgres_bootstrap_target("managed PostgreSQL application connection", target_dsn)
+            .map_err(|error| redact_bootstrap_error(error.to_string(), admin_dsn, target_dsn))?;
+    let admin =
+        parse_postgres_bootstrap_target("managed PostgreSQL administrator connection", admin_dsn)
+            .map_err(|error| redact_bootstrap_error(error.to_string(), admin_dsn, target_dsn))?;
+    if admin.host != target.host || admin.port != target.port {
+        return Err("managed PostgreSQL connections do not use the same host and port".to_string());
+    }
+    if admin.database == target.database {
+        return Err(
+            "managed PostgreSQL administrator connection must use a maintenance database"
+                .to_string(),
+        );
+    }
+
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            format!("failed to create the managed PostgreSQL bootstrap runtime: {error}")
+        })?
+        .block_on(bootstrap_postgres_database(admin_dsn, &target))
+        .map(|_| ())
+        .map_err(|error| redact_bootstrap_error(error.to_string(), admin_dsn, target_dsn))
+}
+
+#[cfg(all(windows, feature = "embedded-postgres"))]
+pub(crate) fn redact_bootstrap_error(
+    mut message: String,
+    admin_dsn: &str,
+    target_dsn: &str,
+) -> String {
+    for dsn in [admin_dsn, target_dsn] {
+        message = message.replace(dsn, "[REDACTED DATABASE URL]");
+        if let Ok(url) = Url::parse(dsn)
+            && let Some(password) = url.password().filter(|value| !value.is_empty())
+        {
+            message = message.replace(password, "[REDACTED]");
+            if let Ok(decoded) = percent_decode_str(password).decode_utf8() {
+                message = message.replace(decoded.as_ref(), "[REDACTED]");
+            }
+        }
+    }
+    message
+}
+
 fn quote_postgres_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -613,7 +667,14 @@ fn start_server_from_config<F>(config_path: &Path, start_server: F) -> Result<()
 where
     F: FnOnce(AppConfig) -> Result<(), String>,
 {
-    let config = load_config(config_path)?;
+    let config_source_exists = if config_path == Path::new("config.yml") && !config_path.exists() {
+        discover_config_file().is_some()
+    } else {
+        true
+    };
+    let mut config = load_config(config_path)?;
+    let _managed_database = crate::embedded_postgres::prepare(&mut config, config_source_exists)
+        .map_err(CliError::ServerStart)?;
     validate_config(&config)?;
     // P-50: the previous `StartupPlan::validate_order()` here was pure
     // decoration — it validated a hard-coded stage list whose "passing" implied

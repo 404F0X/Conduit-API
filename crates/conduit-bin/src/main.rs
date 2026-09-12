@@ -3,6 +3,7 @@
 mod auto_disable_runtime;
 mod cli;
 mod conv;
+mod embedded_postgres;
 mod maintenance;
 mod model_fetch;
 mod model_matcher;
