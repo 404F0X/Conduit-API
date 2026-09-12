@@ -175,9 +175,74 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build native release binary
+        if: runner.os != 'Windows'
         run: >-
           cargo build --locked --release -p conduit-bin --bin conduit-api
           --features release-binary
+
+      - name: Build Windows release binary with verified PostgreSQL fallback
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $buildArguments = @(
+            'build',
+            '--locked',
+            '--release',
+            '-p', 'conduit-bin',
+            '--bin', 'conduit-api',
+            '--features', 'release-binary'
+          )
+          & cargo @buildArguments
+          if ($LASTEXITCODE -eq 0) {
+            exit 0
+          }
+
+          Write-Warning 'postgresql_embedded could not stage its archive; using the pinned release asset fallback'
+          $postgresqlVersion = '17.11.0'
+          $archiveName = "postgresql-$postgresqlVersion-x86_64-pc-windows-msvc.tar.gz"
+          $archiveUrl = "https://github.com/theseus-rs/postgresql-binaries/releases/download/$postgresqlVersion/$archiveName"
+          $expectedHash = 'a013f0e082826f53985c7bc2a0fe1c2dcc47a9f3797023938cf1ff8c9d6d1792'
+          $downloadPath = Join-Path $env:RUNNER_TEMP $archiveName
+          & curl.exe `
+            --fail `
+            --location `
+            --retry 5 `
+            --retry-all-errors `
+            --connect-timeout 20 `
+            --max-time 300 `
+            --output $downloadPath `
+            $archiveUrl
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to download the pinned PostgreSQL archive after retries"
+          }
+          $actualHash = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "pinned PostgreSQL archive SHA-256 mismatch"
+          }
+
+          $buildRoot = Join-Path 'target' "$env:CARGO_BUILD_TARGET/release/build"
+          $archiveDirectories = @(
+            Get-ChildItem -LiteralPath $buildRoot -Directory -Filter 'postgresql_embedded-*' |
+              ForEach-Object { Join-Path $_.FullName 'out' } |
+              Where-Object { Test-Path -LiteralPath $_ -PathType Container }
+          )
+          if ($archiveDirectories.Count -eq 0) {
+            throw "cargo did not create a postgresql_embedded build output directory"
+          }
+          foreach ($directory in $archiveDirectories) {
+            Copy-Item -LiteralPath $downloadPath -Destination (Join-Path $directory 'postgresql.tar.gz') -Force
+            [IO.File]::WriteAllText(
+              (Join-Path $directory 'postgresql.version'),
+              $postgresqlVersion,
+              [Text.UTF8Encoding]::new($false)
+            )
+          }
+
+          & cargo @buildArguments
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Package and smoke-test Unix archive
         if: runner.os != 'Windows'
