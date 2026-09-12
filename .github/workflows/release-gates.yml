@@ -112,6 +112,8 @@ jobs:
           test -r dist/licenses/LICENSING.md
           test -r dist/licenses/RELINKING.md
           test -r dist/licenses/LICENSES/LGPL-3.0-only.txt
+          test -r dist/licenses/LICENSES/PostgreSQL.txt
+          test -r dist/licenses/LICENSES/POSTGRESQL_WINDOWS_THIRD_PARTY_LICENSES.txt
           test -r dist/licenses/frontend/NOTICE
           test -s dist/licenses/frontend/THIRD_PARTY_LICENSES.md
           grep --fixed-strings --quiet '## react - ' dist/licenses/frontend/THIRD_PARTY_LICENSES.md

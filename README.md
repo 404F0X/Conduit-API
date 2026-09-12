@@ -59,10 +59,18 @@ docker compose up --build -d
 Invoke-WebRequest http://127.0.0.1:8090/health | Out-Null
 ```
 
-If you downloaded a native archive instead of using Compose, install and start
-PostgreSQL first. Conduit API can create its own role and database with a
-one-time administrator connection; the server never retains that elevated
-credential:
+The official Windows archive is ready to run without a separate PostgreSQL
+installation. Start `conduit-api.exe` and choose **Managed local PostgreSQL**
+at the first-run prompt. Conduit API installs its bundled database for the
+current Windows user, creates the application database, and reuses it on later
+starts. Its data is stored under
+`%LOCALAPPDATA%\Conduit API\embedded-postgresql` and is not deleted when the
+program archive is removed.
+
+Choose **External PostgreSQL** when you already operate a database. Set its
+application connection URL in `CONDUIT_DB_DSN` or `config.yml`. If the role and
+database do not exist yet, Conduit API can create them using a one-time
+administrator connection; the server never retains that elevated credential:
 
 ```powershell
 $env:CONDUIT_DB_ADMIN_DSN = 'postgresql://postgres:admin-password@127.0.0.1:5432/postgres'
@@ -74,6 +82,7 @@ Remove-Item Env:CONDUIT_DB_ADMIN_DSN
 
 Use URL encoding for reserved characters in either password. Running the
 bootstrap command again is safe: an existing target database is left intact.
+Linux native archives continue to require an external PostgreSQL server.
 
 Then open <http://127.0.0.1:8090>. There is no default administrator
 password. The first visitor creates the owner account and chooses the actual

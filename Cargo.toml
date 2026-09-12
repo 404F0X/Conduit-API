@@ -78,6 +78,7 @@ jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 moka = { version = "0.12", features = ["future"] }
 opentelemetry = "0.27"
 percent-encoding = "2"
+postgresql_embedded = { version = "=0.20.0", default-features = false, features = ["blocking", "bundled", "theseus"] }
 redis = { version = "0.25", default-features = false, features = ["tokio-comp", "cluster-async"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 rust_decimal = { version = "1", features = ["serde"] }

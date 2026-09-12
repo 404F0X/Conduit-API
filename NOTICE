@@ -10,3 +10,8 @@ terms in the scopes described by the root LICENSE file.
 The web console includes code from shadcn-admin
 (https://github.com/satnaing/shadcn-admin), Copyright 2024 Sat Naing, licensed
 under the MIT License. See `frontend/NOTICE` for the full notice.
+
+The official Windows binary bundles PostgreSQL 17.11 and supporting runtime
+libraries. PostgreSQL's license is reproduced in `LICENSES/PostgreSQL.txt`;
+the notices supplied with the Windows PostgreSQL distribution are reproduced
+in `LICENSES/POSTGRESQL_WINDOWS_THIRD_PARTY_LICENSES.txt`.

@@ -43,6 +43,11 @@ function includeLegalNotices(): Plugin {
         copyFile(path.resolve(__dirname, '../LICENSING.md'), path.join(licenseDirectory, 'LICENSING.md')),
         copyFile(path.resolve(__dirname, '../RELINKING.md'), path.join(licenseDirectory, 'RELINKING.md')),
         copyFile(path.resolve(__dirname, '../LICENSES/LGPL-3.0-only.txt'), path.join(licenseTextsDirectory, 'LGPL-3.0-only.txt')),
+        copyFile(path.resolve(__dirname, '../LICENSES/PostgreSQL.txt'), path.join(licenseTextsDirectory, 'PostgreSQL.txt')),
+        copyFile(
+          path.resolve(__dirname, '../LICENSES/POSTGRESQL_WINDOWS_THIRD_PARTY_LICENSES.txt'),
+          path.join(licenseTextsDirectory, 'POSTGRESQL_WINDOWS_THIRD_PARTY_LICENSES.txt')
+        ),
         copyFile(path.resolve(__dirname, 'NOTICE'), path.join(frontendNoticeDirectory, 'NOTICE')),
       ]);
     },
