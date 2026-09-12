@@ -175,10 +175,6 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build native release binary
-        env:
-          # postgresql_embedded enumerates GitHub releases while staging the
-          # bundled Windows archive; authenticate to avoid anonymous API limits.
-          GITHUB_TOKEN: ${{ github.token }}
         run: >-
           cargo build --locked --release -p conduit-bin --bin conduit-api
           --features release-binary
