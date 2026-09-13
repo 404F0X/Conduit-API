@@ -888,6 +888,7 @@ async fn build_postgres_core_services(
         cache.clone(),
         &config.cache.route_affinity,
         config.server.disable_ssl_verify,
+        config.server.llm_request_timeout,
     )
     .await?;
     let openapi_schema = conduit_openapi_graphql::build_openapi_schema(
@@ -904,6 +905,9 @@ async fn build_postgres_core_services(
             pool.clone(),
         ));
     let services = AppServices::new()
+        .with_readiness_service(Arc::new(
+            crate::wiring_route_health::PgReadinessService::new(pool.clone()),
+        ))
         .with_system_service(Arc::new(DbSystemService {
             system,
             pool: pool.clone(),
@@ -933,6 +937,7 @@ async fn build_postgres_proxy_service(
     cache: Arc<dyn Cache>,
     route_affinity_config: &conduit_config::model::RouteAffinityConfig,
     insecure_skip_verify: bool,
+    llm_request_timeout: std::time::Duration,
 ) -> Result<Arc<dyn OpenAiOrchestratorService>, String> {
     let model_repo: Arc<dyn ModelRepo> = Arc::new(conduit_db::PgModelRepo::new(pool.clone()));
     let channel_repo: Arc<dyn ChannelRepo> = Arc::new(conduit_db::PgChannelRepo::new(pool.clone()));
@@ -981,7 +986,10 @@ async fn build_postgres_proxy_service(
             .with_route_affinity_runtime(route_affinity.clone())
             .with_price_repo(price_repo)
             .with_charge_settler(charge_settler)
-            .with_postgres_stream_persistence(pool.clone()),
+            .with_postgres_stream_persistence(pool.clone())
+            .with_api_key_concurrency_lease_ttl(
+                llm_request_timeout.saturating_add(std::time::Duration::from_secs(5 * 60)),
+            ),
     );
     let request_repo: Arc<dyn conduit_db::repo::request_repo::RequestRepo> =
         Arc::new(conduit_db::PgRequestRepo::new(pool.clone()));

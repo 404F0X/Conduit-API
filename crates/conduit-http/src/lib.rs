@@ -65,7 +65,7 @@ pub use gemini_handlers::{
     parse_gemini_model_list_response, parse_gemini_model_list_route_parts,
     parse_gemini_route_parts, select_gemini_stream_format,
 };
-pub use health::{HealthResponse, health};
+pub use health::{HealthResponse, ReadinessResponse, ReadinessService, health, readiness};
 pub use jina_handlers::{
     JinaEndpointKind, JinaRequestPolicy, JinaRouteParseError, jina_endpoint_kind_for_path,
     jina_request_policy_for_path, openai_compatible_rerank_policy_for_path,

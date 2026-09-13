@@ -77,6 +77,7 @@ pub fn route_group_for_path(request_path: &str) -> RouteGroupMetadata {
     let kind = if matches_path_prefix(path, "/admin") || matches_path_prefix(path, "/internal") {
         RouteGroupKind::Admin
     } else if matches_path_prefix(path, "/health")
+        || matches_path_prefix(path, "/ready")
         || matches_path_prefix(path, "/system")
         || matches_path_prefix(path, "/api/system")
     {
@@ -456,6 +457,7 @@ pub fn build_router_with_asset_source(
     // non-empty base path it is available at `<base_path>/health`; the legacy
     // root route remains suppressed unless a future compatibility flag opts in.
     router = router.route(&mount_path(&base_path, "/health"), get(health::health));
+    router = router.route(&mount_path(&base_path, "/ready"), get(health::readiness));
 
     // ===== Public routes (no auth required) =====
     // Go routes.go:76-89 — "System Status and Initialize - DO NOT AUTH",
@@ -783,8 +785,25 @@ pub fn metrics_router(state: crate::middleware::metrics::MetricsState, path: &st
 conduit_http_requests_total {}\n\
 # HELP conduit_http_requests_in_flight Current in-flight HTTP requests.\n\
 # TYPE conduit_http_requests_in_flight gauge\n\
-conduit_http_requests_in_flight {}\n",
-                            snapshot.request_count, snapshot.in_flight
+conduit_http_requests_in_flight {}\n\
+# HELP conduit_http_responses_total HTTP responses by status class.\n\
+# TYPE conduit_http_responses_total counter\n\
+conduit_http_responses_total{{class=\"success\"}} {}\n\
+conduit_http_responses_total{{class=\"client_error\"}} {}\n\
+conduit_http_responses_total{{class=\"server_error\"}} {}\n\
+# HELP conduit_http_request_duration_milliseconds_sum Cumulative request latency in milliseconds.\n\
+# TYPE conduit_http_request_duration_milliseconds_sum counter\n\
+conduit_http_request_duration_milliseconds_sum {}\n\
+# HELP conduit_http_request_duration_milliseconds_max Maximum observed request latency in milliseconds.\n\
+# TYPE conduit_http_request_duration_milliseconds_max gauge\n\
+conduit_http_request_duration_milliseconds_max {}\n",
+                            snapshot.request_count,
+                            snapshot.in_flight,
+                            snapshot.success_count,
+                            snapshot.client_error_count,
+                            snapshot.server_error_count,
+                            snapshot.duration_ms_sum,
+                            snapshot.duration_ms_max,
                         ),
                     )
                 },
@@ -1119,6 +1138,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_route_fails_closed_when_dependency_service_is_unwired()
+    -> Result<(), Box<dyn Error>> {
+        let mut app = build_router(AppState::default());
+        let response = app
+            .call(Request::builder().uri("/ready").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)?,
+            serde_json::json!({"status": "not_ready", "database": "unavailable"})
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn metrics_router_exposes_prometheus_text() -> Result<(), Box<dyn Error>> {
         let state = crate::middleware::metrics::MetricsState::new(true);
         state
@@ -1150,6 +1185,12 @@ mod tests {
             ),
             (
                 "/health",
+                RouteGroupKind::System,
+                RouteTimeoutKind::Request,
+                RequestSource::SourceAPI,
+            ),
+            (
+                "/ready",
                 RouteGroupKind::System,
                 RouteTimeoutKind::Request,
                 RequestSource::SourceAPI,

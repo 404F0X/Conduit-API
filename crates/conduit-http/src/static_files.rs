@@ -194,6 +194,8 @@ pub fn is_api_path(path: &str) -> bool {
         "/gemini",
         "/jina",
         "/doubao",
+        "/health",
+        "/ready",
     ]
     .iter()
     .any(|prefix| matches_api_prefix(path, prefix))

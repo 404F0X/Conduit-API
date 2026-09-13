@@ -38,6 +38,8 @@ deployments.
   redemption receipts, and transaction-local audit history.
 - `000034`: bounded per-code redemption counts with user-scoped idempotency;
   existing codes retain a one-redemption limit.
+- `000035`: expiring API-key concurrency leases for cross-replica atomic
+  admission and cancellation-safe recovery.
 
 Numeric gaps are historical and must not be filled by renaming an already
 released migration. New migrations use the next unused monotonically increasing

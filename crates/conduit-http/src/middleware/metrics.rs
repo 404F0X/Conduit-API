@@ -64,6 +64,11 @@ pub struct MetricsState {
     /// Signed because concurrent decrements on shutdown could momentarily
     /// race; `i64` prevents wrapping to `u64::MAX`.
     pub in_flight: Arc<AtomicI64>,
+    pub success_count: Arc<AtomicU64>,
+    pub client_error_count: Arc<AtomicU64>,
+    pub server_error_count: Arc<AtomicU64>,
+    pub duration_ms_sum: Arc<AtomicU64>,
+    pub duration_ms_max: Arc<AtomicU64>,
 }
 
 impl MetricsState {
@@ -73,6 +78,11 @@ impl MetricsState {
             enabled,
             request_count: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(AtomicI64::new(0)),
+            success_count: Arc::new(AtomicU64::new(0)),
+            client_error_count: Arc::new(AtomicU64::new(0)),
+            server_error_count: Arc::new(AtomicU64::new(0)),
+            duration_ms_sum: Arc::new(AtomicU64::new(0)),
+            duration_ms_max: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -91,6 +101,11 @@ impl MetricsState {
             enabled: self.enabled,
             request_count: self.request_count.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
+            success_count: self.success_count.load(Ordering::Relaxed),
+            client_error_count: self.client_error_count.load(Ordering::Relaxed),
+            server_error_count: self.server_error_count.load(Ordering::Relaxed),
+            duration_ms_sum: self.duration_ms_sum.load(Ordering::Relaxed),
+            duration_ms_max: self.duration_ms_max.load(Ordering::Relaxed),
         }
     }
 }
@@ -104,6 +119,11 @@ pub struct MetricsSnapshot {
     pub enabled: bool,
     pub request_count: u64,
     pub in_flight: i64,
+    pub success_count: u64,
+    pub client_error_count: u64,
+    pub server_error_count: u64,
+    pub duration_ms_sum: u64,
+    pub duration_ms_max: u64,
 }
 
 /// Per-request metrics inserted as a response extension after the handler
@@ -174,6 +194,23 @@ pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Respons
 
     // Increment total request counter.
     state.request_count.fetch_add(1, Ordering::Relaxed);
+    state
+        .duration_ms_sum
+        .fetch_add(latency_ms, Ordering::Relaxed);
+    state
+        .duration_ms_max
+        .fetch_max(latency_ms, Ordering::Relaxed);
+    match response.status().as_u16() {
+        200..=399 => {
+            state.success_count.fetch_add(1, Ordering::Relaxed);
+        }
+        400..=499 => {
+            state.client_error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            state.server_error_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     // Insert latency into response extensions for downstream (AccessLog) to read.
     response
@@ -212,6 +249,10 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn failure_handler() -> impl IntoResponse {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
     /// Build a test router with MetricsState injected into every request
     /// via a wrapping layer that inserts the extension.
     fn build_router_with_metrics(state: MetricsState) -> Router {
@@ -222,6 +263,7 @@ mod tests {
         Router::new()
             .route("/ok", get(ok_handler))
             .route("/slow", get(slow_handler))
+            .route("/failure", get(failure_handler))
             .layer(from_fn(inject_metrics_state))
             .layer(axum::middleware::from_fn(
                 move |mut req: Request<Body>, next: Next| {
@@ -270,6 +312,25 @@ mod tests {
 
         let snap = state.snapshot();
         assert_eq!(snap.request_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_classify_status_and_accumulate_latency() -> Result<(), Box<dyn Error>> {
+        let state = MetricsState::new(true);
+        let mut router = build_router_with_metrics(state.clone());
+        let _ = router
+            .call(Request::builder().uri("/ok").body(Body::empty())?)
+            .await?;
+        let _ = router
+            .call(Request::builder().uri("/failure").body(Body::empty())?)
+            .await?;
+
+        let snap = state.snapshot();
+        assert_eq!(snap.success_count, 1);
+        assert_eq!(snap.server_error_count, 1);
+        assert_eq!(snap.client_error_count, 0);
+        assert!(snap.duration_ms_sum >= snap.duration_ms_max);
         Ok(())
     }
 

@@ -46,7 +46,10 @@ use conduit_db::repo::channel_model_price_repo::ChannelModelPriceRepo;
 use conduit_db::repo::usage_repo::{CreateUsageLogInput, UsageRepo};
 use conduit_db::{PolicyContext, Principal, RequestContext};
 use conduit_llm::HttpResponse;
-use conduit_orchestrator::orchestrator::{OrchestratorContext, RequestRecorder};
+use conduit_orchestrator::orchestrator::{
+    BILLING_ADMISSION_REQUEST_KEY_METADATA, BillingAdmissionInput, OrchestratorContext,
+    RequestRecorder,
+};
 use conduit_pipeline::pipeline::AttemptRecord as PipelineAttempt;
 use conduit_services::usage_service::{
     CreateUsageLogParams, ResolvedModelPrice, UsageLog, UsageLogSource,
@@ -83,15 +86,29 @@ pub struct UsageLogRecorder {
     /// finalizes request/execution rows. This pool is used only by the stream
     /// recorder callbacks to close those already-created rows and save chunks.
     stream_persistence: Option<StreamPersistence>,
-    /// Active request-scoped lease ids grouped by API key. Tracking the lease
-    /// rather than only a counter makes release idempotent: a timeout cleanup
-    /// racing a normal recorder callback cannot decrement a later request's
-    /// slot.
+    /// In-memory fallback used by recorder-only tests and hosts without the
+    /// production PostgreSQL pool. Production admission uses durable leases.
     api_key_concurrency: Mutex<HashMap<i64, HashSet<String>>>,
+    api_key_concurrency_lease_ttl: std::time::Duration,
 }
 
 enum StreamPersistence {
     Postgres(PgPool),
+}
+
+struct RecorderAdmissionCleanup<'a> {
+    recorder: &'a UsageLogRecorder,
+    context: OrchestratorContext,
+    armed: bool,
+}
+
+impl Drop for RecorderAdmissionCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.recorder
+                .abandon_request(&self.context, "request admission interrupted");
+        }
+    }
 }
 
 struct ResolvedChannelPrice {
@@ -293,6 +310,7 @@ impl UsageLogRecorder {
             charge_settler: None,
             stream_persistence: None,
             api_key_concurrency: Mutex::new(HashMap::new()),
+            api_key_concurrency_lease_ttl: std::time::Duration::from_secs(15 * 60),
         }
     }
 
@@ -327,6 +345,126 @@ impl UsageLogRecorder {
     pub fn with_postgres_stream_persistence(mut self, pool: PgPool) -> Self {
         self.stream_persistence = Some(StreamPersistence::Postgres(pool));
         self
+    }
+
+    pub fn with_api_key_concurrency_lease_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.api_key_concurrency_lease_ttl = ttl.max(std::time::Duration::from_secs(60));
+        self
+    }
+
+    fn postgres_pool(&self) -> Option<&PgPool> {
+        match self.stream_persistence.as_ref() {
+            Some(StreamPersistence::Postgres(pool)) => Some(pool),
+            None => None,
+        }
+    }
+
+    async fn acquire_postgres_api_key_slot(
+        &self,
+        api_key_id: i64,
+        request_key: &str,
+        limit: u32,
+    ) -> Result<String, ConduitError> {
+        let pool = self
+            .postgres_pool()
+            .ok_or_else(|| ConduitError::internal("PostgreSQL admission pool is unavailable"))?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|error| ConduitError::internal(format!("admission begin failed: {error}")))?;
+        // Serialize only requests for the same API key across every replica.
+        // The namespace constant separates these locks from ordinary ids.
+        let lock_key = api_key_id ^ 0x434F_4E44_5549_5400_i64;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| ConduitError::internal(format!("admission lock failed: {error}")))?;
+        sqlx::query(
+            "DELETE FROM api_key_concurrency_leases WHERE api_key_id=$1 AND expires_at<=now()",
+        )
+        .bind(api_key_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| {
+            ConduitError::internal(format!("expired lease cleanup failed: {error}"))
+        })?;
+
+        if let Some(existing) = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT lease_id FROM api_key_concurrency_leases WHERE api_key_id=$1 AND request_key=$2",
+        )
+        .bind(api_key_id)
+        .bind(request_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| ConduitError::internal(format!("admission lookup failed: {error}")))?
+        {
+            tx.commit().await.map_err(|error| {
+                ConduitError::internal(format!("admission commit failed: {error}"))
+            })?;
+            return Ok(existing.to_string());
+        }
+
+        let current = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::bigint FROM api_key_concurrency_leases WHERE api_key_id=$1 AND expires_at>now()",
+        )
+        .bind(api_key_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| ConduitError::internal(format!("admission count failed: {error}")))?;
+        if current >= i64::from(limit) {
+            return Err(ConduitError::rate_limited(format!(
+                "API key concurrency limit exceeded ({current}/{limit})"
+            )));
+        }
+
+        let lease_id = uuid::Uuid::new_v4();
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(self.api_key_concurrency_lease_ttl).map_err(|error| {
+                ConduitError::internal(format!("invalid admission lease duration: {error}"))
+            })?;
+        sqlx::query(
+            "INSERT INTO api_key_concurrency_leases(lease_id,api_key_id,request_key,expires_at) \
+             VALUES($1,$2,$3,$4)",
+        )
+        .bind(lease_id)
+        .bind(api_key_id)
+        .bind(request_key)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| ConduitError::internal(format!("admission insert failed: {error}")))?;
+        tx.commit()
+            .await
+            .map_err(|error| ConduitError::internal(format!("admission commit failed: {error}")))?;
+        Ok(lease_id.to_string())
+    }
+
+    async fn release_api_key_slot_async(&self, ctx: &OrchestratorContext) {
+        let (Some(api_key_id), Some(lease_id)) = (
+            ctx.metadata
+                .get("api_key_concurrency_slot")
+                .and_then(|value| value.parse::<i64>().ok()),
+            ctx.metadata
+                .get("api_key_concurrency_lease")
+                .and_then(|value| uuid::Uuid::parse_str(value).ok()),
+        ) else {
+            return;
+        };
+        let Some(pool) = self.postgres_pool() else {
+            self.release_api_key_slot(ctx);
+            return;
+        };
+        if let Err(error) = sqlx::query(
+            "DELETE FROM api_key_concurrency_leases WHERE api_key_id=$1 AND lease_id=$2",
+        )
+        .bind(api_key_id)
+        .bind(lease_id)
+        .execute(pool)
+        .await
+        {
+            warn!(%error, api_key_id, "failed to release distributed API key concurrency lease; expiry will recover it");
+        }
     }
 
     async fn finish_stream_request(
@@ -592,6 +730,48 @@ impl UsageLogRecorder {
 
 #[async_trait]
 impl RequestRecorder for UsageLogRecorder {
+    async fn admit_request(
+        &self,
+        ctx: &mut OrchestratorContext,
+        input: &BillingAdmissionInput,
+        api_key_limit: Option<u32>,
+    ) -> Result<(), ConduitError> {
+        ctx.metadata.insert(
+            BILLING_ADMISSION_REQUEST_KEY_METADATA.to_string(),
+            input.request_key.clone(),
+        );
+        if let (Some(api_key_id), Some(limit)) = (
+            input
+                .api_key_id
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok()),
+            api_key_limit.filter(|limit| *limit > 0),
+        ) {
+            if self.postgres_pool().is_some() {
+                let lease_id = self
+                    .acquire_postgres_api_key_slot(api_key_id, &input.request_key, limit)
+                    .await?;
+                ctx.metadata.insert(
+                    "api_key_concurrency_slot".to_string(),
+                    api_key_id.to_string(),
+                );
+                ctx.metadata
+                    .insert("api_key_concurrency_lease".to_string(), lease_id);
+            } else {
+                self.acquire_api_key_slot(ctx, api_key_id, limit)?;
+            }
+        }
+
+        let mut cleanup = RecorderAdmissionCleanup {
+            recorder: self,
+            context: ctx.clone(),
+            armed: true,
+        };
+        self.reserve_request(ctx, input).await?;
+        cleanup.armed = false;
+        Ok(())
+    }
+
     fn acquire_api_key_slot(
         &self,
         ctx: &mut OrchestratorContext,
@@ -629,6 +809,28 @@ impl RequestRecorder for UsageLogRecorder {
         ) else {
             return;
         };
+        if let Some(pool) = self.postgres_pool().cloned() {
+            let lease_id = lease_id.clone();
+            let Ok(lease_id) = uuid::Uuid::parse_str(&lease_id) else {
+                return;
+            };
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            handle.spawn(async move {
+                if let Err(error) = sqlx::query(
+                    "DELETE FROM api_key_concurrency_leases WHERE api_key_id=$1 AND lease_id=$2",
+                )
+                .bind(api_key_id)
+                .bind(lease_id)
+                .execute(&pool)
+                .await
+                {
+                    warn!(%error, api_key_id, "failed to release distributed API key concurrency lease; expiry will recover it");
+                }
+            });
+            return;
+        }
         let Ok(mut counts) = self.api_key_concurrency.lock() else {
             return;
         };
@@ -642,8 +844,8 @@ impl RequestRecorder for UsageLogRecorder {
     }
 
     fn abandon_request(&self, ctx: &OrchestratorContext, reason: &'static str) {
-        // In-memory admission is released synchronously from Drop so a second
-        // request can proceed immediately after timeout/cancellation.
+        // Drop cannot await PostgreSQL, so production release is scheduled on
+        // the runtime; the lease expiry is the crash/shutdown backstop.
         self.release_api_key_slot(ctx);
 
         // Durable wallet cleanup is async. PostgreSQL release is idempotent,
@@ -711,7 +913,7 @@ impl RequestRecorder for UsageLogRecorder {
         attempt: &PipelineAttempt,
         response: &HttpResponse,
     ) -> Result<(), ConduitError> {
-        self.release_api_key_slot(ctx);
+        self.release_api_key_slot_async(ctx).await;
         if matches!(
             attempt.mode,
             conduit_pipeline::pipeline::ExecutionMode::Stream
@@ -914,7 +1116,7 @@ impl RequestRecorder for UsageLogRecorder {
         project_id: &str,
         error: &ConduitError,
     ) -> Result<(), ConduitError> {
-        self.release_api_key_slot(_ctx);
+        self.release_api_key_slot_async(_ctx).await;
         self.release_reservation(_ctx, &format!("request_failed:{error}"))
             .await;
         self.persist_route_explanation(
@@ -2028,6 +2230,53 @@ mod tests {
             None => {}
             Some(cost) => assert_eq!(cost, 0.0, "no price must not bill a positive cost"),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrency_lease_is_shared_across_recorders_when_dsn_is_provided()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let api_key_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO api_keys(key,name) VALUES($1,$2) RETURNING id",
+        )
+        .bind(format!("conduit-lease-test-{}", uuid::Uuid::new_v4()))
+        .bind("distributed-concurrency-test")
+        .fetch_one(&database.pool)
+        .await?;
+        let first = UsageLogRecorder::new(Arc::new(InMemoryUsageRepo::new()))
+            .with_postgres_stream_persistence(database.pool.clone());
+        let second = UsageLogRecorder::new(Arc::new(InMemoryUsageRepo::new()))
+            .with_postgres_stream_persistence(database.pool.clone());
+
+        let lease = first
+            .acquire_postgres_api_key_slot(api_key_id, "request-one", 1)
+            .await?;
+        let duplicate = second
+            .acquire_postgres_api_key_slot(api_key_id, "request-one", 1)
+            .await?;
+        assert_eq!(duplicate, lease, "same request must be idempotent");
+        let error = second
+            .acquire_postgres_api_key_slot(api_key_id, "request-two", 1)
+            .await
+            .expect_err("a second request must not exceed the shared limit");
+        assert!(error.to_string().contains("concurrency limit exceeded"));
+
+        let mut release_context = OrchestratorContext::new();
+        release_context
+            .metadata
+            .insert("api_key_concurrency_slot".into(), api_key_id.to_string());
+        release_context
+            .metadata
+            .insert("api_key_concurrency_lease".into(), lease);
+        first.release_api_key_slot_async(&release_context).await;
+        second
+            .acquire_postgres_api_key_slot(api_key_id, "request-two", 1)
+            .await?;
+        database.cleanup().await?;
         Ok(())
     }
 }

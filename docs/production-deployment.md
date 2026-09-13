@@ -13,8 +13,8 @@ container, and a TLS reverse proxy in front of the loopback-bound HTTP port.
 - The application image runs as UID/GID 10001, writes logs to stdout, and
   exposes application port 8090 plus internal metrics port 9090. PostgreSQL
   data is owned by the PostgreSQL container.
-- Container health requires both the liveness endpoint and a database-backed
-  system-status read to succeed.
+- Container health uses the database-backed `/ready` endpoint. `/health` is a
+  process-only liveness endpoint and deliberately does not query dependencies.
 - `compose.yml` publishes the application on `127.0.0.1:8090` by default. A
   reverse proxy should terminate TLS and forward to that address.
 
@@ -56,7 +56,7 @@ docker compose build
 docker compose up -d
 docker compose ps
 curl -fsS http://127.0.0.1:8090/health
-curl -fsS http://127.0.0.1:8090/admin/system/status
+curl -fsS http://127.0.0.1:8090/ready
 ```
 
 Open `http://127.0.0.1:8090` through the intended reverse proxy and complete

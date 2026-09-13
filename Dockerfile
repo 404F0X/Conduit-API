@@ -76,8 +76,7 @@ EXPOSE 8090 9090
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${CONDUIT_SERVER_PORT:-8090}/health" >/dev/null \
-        && curl -fsS "http://127.0.0.1:${CONDUIT_SERVER_PORT:-8090}/admin/system/status" >/dev/null \
+    CMD curl -fsS "http://127.0.0.1:${CONDUIT_SERVER_PORT:-8090}${CONDUIT_SERVER_BASE_PATH:-}/ready" >/dev/null \
         || exit 1
 
 ENTRYPOINT ["/app/conduit-api"]

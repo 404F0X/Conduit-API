@@ -8,10 +8,31 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use conduit_core::ConduitError;
-use conduit_orchestrator::orchestrator::{RouteHealthSource, RouteHealthTarget};
+use conduit_orchestrator::orchestrator::{RouteHealthSignal, RouteHealthSource, RouteHealthTarget};
 use conduit_services::{RouteHealthSample, RouteHealthStatus, classify_route_health};
 
 use crate::wiring_operations::ERROR_CATEGORY_SQL;
+
+pub(crate) struct PgReadinessService {
+    pool: sqlx::PgPool,
+}
+
+impl PgReadinessService {
+    pub(crate) fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl conduit_http::ReadinessService for PgReadinessService {
+    async fn check(&self) -> Result<(), String> {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("PostgreSQL readiness check failed: {error}"))
+    }
+}
 
 fn sample(attempts: i64, successes: i64, errors: Vec<(String, i64)>) -> RouteHealthStatus {
     let category_count = |category: &str| {
@@ -51,17 +72,18 @@ impl PgRouteHealthSource {
 
 #[async_trait]
 impl RouteHealthSource for PgRouteHealthSource {
-    async fn statuses(
+    async fn signals(
         &self,
         targets: &[RouteHealthTarget],
-    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError> {
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthSignal>, ConduitError> {
         let mut result = BTreeMap::new();
         for target in targets {
             let Some(channel_id) = target.channel_id.parse::<i64>().ok() else {
                 continue;
             };
-            let attempts: (i64, i64) = sqlx::query_as(
-                "SELECT COUNT(*)::bigint, COALESCE(SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),0)::bigint \
+            let attempts: (i64, i64, Option<f64>) = sqlx::query_as(
+                "SELECT COUNT(*)::bigint, COALESCE(SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),0)::bigint, \
+                        (AVG(metrics_latency_ms) FILTER (WHERE status='completed' AND metrics_latency_ms IS NOT NULL))::float8 \
                  FROM request_executions WHERE channel_id=$1 AND model_id=$2 AND credential_identity IS NOT DISTINCT FROM $3 \
                    AND created_at >= now() - interval '15 minutes'",
             )
@@ -89,7 +111,13 @@ impl RouteHealthSource for PgRouteHealthSource {
                 .map_err(|error| {
                     ConduitError::internal(format!("route health error query failed: {error}"))
                 })?;
-            result.insert(target.clone(), sample(attempts.0, attempts.1, errors));
+            let average_latency_ms = attempts
+                .2
+                .and_then(|value| value.is_finite().then(|| value.max(0.0).round() as u64));
+            result.insert(
+                target.clone(),
+                RouteHealthSignal::new(sample(attempts.0, attempts.1, errors), average_latency_ms),
+            );
         }
         Ok(result)
     }
@@ -120,10 +148,10 @@ mod postgres_tests {
         .await?;
         sqlx::query(
             "INSERT INTO request_executions \
-                (project_id,request_id,channel_id,model_id,credential_identity,request_body,status,response_status_code,error_message) \
+                (project_id,request_id,channel_id,model_id,credential_identity,request_body,status,response_status_code,error_message,metrics_latency_ms) \
              VALUES \
-                (1,$1,$2,'same-model','sha256:bad','{}'::jsonb,'failed',401,'unauthorized'), \
-                (1,$1,$2,'same-model','sha256:good','{}'::jsonb,'completed',200,NULL)",
+                (1,$1,$2,'same-model','sha256:bad','{}'::jsonb,'failed',401,'unauthorized',NULL), \
+                (1,$1,$2,'same-model','sha256:good','{}'::jsonb,'completed',200,NULL,123)",
         )
         .bind(request_id)
         .bind(channel_id)
@@ -145,6 +173,15 @@ mod postgres_tests {
 
         assert_eq!(statuses.get(&bad), Some(&RouteHealthStatus::Unhealthy));
         assert_eq!(statuses.get(&good), Some(&RouteHealthStatus::Healthy));
+        let signals = PgRouteHealthSource::new(database.pool.clone())
+            .signals(std::slice::from_ref(&good))
+            .await?;
+        assert_eq!(
+            signals
+                .get(&good)
+                .and_then(|signal| signal.average_latency_ms),
+            Some(123)
+        );
         database.cleanup().await?;
         Ok(())
     }

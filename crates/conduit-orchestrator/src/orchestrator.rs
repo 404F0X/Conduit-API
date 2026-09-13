@@ -58,12 +58,42 @@ pub struct RouteHealthTarget {
     pub credential_identity: Option<String>,
 }
 
+/// Recent, credential-scoped routing signal supplied by the runtime health
+/// backend. Latency is optional so a route with no samples remains eligible
+/// and keeps the load balancer's deterministic order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteHealthSignal {
+    pub status: RouteHealthStatus,
+    pub average_latency_ms: Option<u64>,
+}
+
+impl RouteHealthSignal {
+    pub const fn new(status: RouteHealthStatus, average_latency_ms: Option<u64>) -> Self {
+        Self {
+            status,
+            average_latency_ms,
+        }
+    }
+}
+
 #[async_trait]
 pub trait RouteHealthSource: Send + Sync {
+    async fn signals(
+        &self,
+        targets: &[RouteHealthTarget],
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthSignal>, ConduitError>;
+
     async fn statuses(
         &self,
         targets: &[RouteHealthTarget],
-    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError>;
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError> {
+        Ok(self
+            .signals(targets)
+            .await?
+            .into_iter()
+            .map(|(target, signal)| (target, signal.status))
+            .collect())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -71,10 +101,10 @@ pub struct NoopRouteHealthSource;
 
 #[async_trait]
 impl RouteHealthSource for NoopRouteHealthSource {
-    async fn statuses(
+    async fn signals(
         &self,
         _targets: &[RouteHealthTarget],
-    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError> {
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthSignal>, ConduitError> {
         Ok(BTreeMap::new())
     }
 }
@@ -1490,11 +1520,15 @@ impl CommandOrchestrator {
                 });
             }
         }
-        let health_statuses = self
+        let health_signals = self
             .route_health
-            .statuses(&health_targets)
+            .signals(&health_targets)
             .await
             .map_err(|error| OrchestratorError::new(OrchestratorStage::LoadBalance, error))?;
+        let health_statuses: BTreeMap<_, _> = health_signals
+            .iter()
+            .map(|(target, signal)| (target.clone(), signal.status))
+            .collect();
         let affinity_hints = request_route_affinity_hints(ctx);
         let resolved_affinity = resolve_route_affinity(
             &affinity_hints,
@@ -1575,15 +1609,16 @@ impl CommandOrchestrator {
                 .get(index)
                 .and_then(|credential| credential.as_deref())
                 .map(conduit_services::credential_fingerprint);
-            let status = health_statuses
-                .get(&RouteHealthTarget {
-                    channel_id: candidate.channel_id.clone(),
-                    actual_model,
-                    credential_identity,
-                })
-                .copied()
-                .unwrap_or(RouteHealthStatus::Unknown);
-            (candidate.priority, route_health_rank(status))
+            let target = RouteHealthTarget {
+                channel_id: candidate.channel_id.clone(),
+                actual_model,
+                credential_identity,
+            };
+            route_health_sort_key(
+                load_balance_strategy,
+                candidate.priority,
+                health_signals.get(&target).copied(),
+            )
         });
         if healthy_ordered_indices.is_empty() {
             return Err(OrchestratorError::new(
@@ -9263,9 +9298,52 @@ const fn route_health_rank(status: RouteHealthStatus) -> u8 {
     }
 }
 
+fn route_health_sort_key(
+    strategy: LoadBalancerStrategy,
+    priority: i64,
+    signal: Option<RouteHealthSignal>,
+) -> (i64, u8, u64) {
+    let status = signal
+        .map(|signal| signal.status)
+        .unwrap_or(RouteHealthStatus::Unknown);
+    // Adaptive routing uses measured latency after the coarse health class.
+    // Other strategies retain their configured weight order. Unknown latency
+    // sorts last inside the same health class.
+    let latency_rank = if strategy == LoadBalancerStrategy::Adaptive {
+        signal
+            .and_then(|signal| signal.average_latency_ms)
+            .unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    (priority, route_health_rank(status), latency_rank)
+}
+
 #[cfg(test)]
 mod route_health_credential_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_prefers_measured_low_latency_without_changing_priority_or_health_boundaries() {
+        let fast = RouteHealthSignal::new(RouteHealthStatus::Healthy, Some(80));
+        let slow = RouteHealthSignal::new(RouteHealthStatus::Healthy, Some(500));
+        assert!(
+            route_health_sort_key(LoadBalancerStrategy::Adaptive, 0, Some(fast))
+                < route_health_sort_key(LoadBalancerStrategy::Adaptive, 0, Some(slow))
+        );
+        assert_eq!(
+            route_health_sort_key(LoadBalancerStrategy::Failover, 0, Some(fast)),
+            route_health_sort_key(LoadBalancerStrategy::Failover, 0, Some(slow))
+        );
+        assert!(
+            route_health_sort_key(LoadBalancerStrategy::Adaptive, 0, Some(slow))
+                < route_health_sort_key(
+                    LoadBalancerStrategy::Adaptive,
+                    0,
+                    Some(RouteHealthSignal::new(RouteHealthStatus::Degraded, Some(1)))
+                )
+        );
+    }
 
     #[test]
     fn unhealthy_preferred_key_falls_back_without_exposing_plaintext() {
