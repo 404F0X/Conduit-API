@@ -165,8 +165,11 @@ impl RouteAffinityRuntime {
     }
 }
 
-pub(crate) fn start_route_affinity_cleanup(runtime: Arc<RouteAffinityRuntime>) {
-    tokio::spawn(async move {
+pub(crate) fn start_route_affinity_cleanup(
+    runtime: Arc<RouteAffinityRuntime>,
+    tasks: &conduit_scheduler::TaskSupervisor,
+) {
+    tasks.spawn(async move {
         const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
         const CLEANUP_BATCH: u32 = 5_000;
 

@@ -955,6 +955,7 @@ mod tests {
     ) -> RequestExecutionRow {
         let timestamp = DateTime::<Utc>::from_timestamp(id, 0).unwrap_or_default();
         RequestExecutionRow {
+            expired_artifacts: Vec::new(),
             id: id.to_string(),
             project_id: project_id.to_owned(),
             request_id: "1".to_owned(),

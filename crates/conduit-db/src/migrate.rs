@@ -148,7 +148,8 @@ pub const CHANGE_SETS_SCHEMA_VERSION: &str = "000032";
 pub const CREDIT_REDEMPTIONS_SCHEMA_VERSION: &str = "000033";
 pub const CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION: &str = "000034";
 pub const API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION: &str = "000035";
-pub const LATEST_SCHEMA_VERSION: &str = API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION;
+pub const RECOVERY_LIFECYCLE_SCHEMA_VERSION: &str = "000036";
+pub const LATEST_SCHEMA_VERSION: &str = RECOVERY_LIFECYCLE_SCHEMA_VERSION;
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
 
 // Keep this stable across releases: an instance running an older binary must
@@ -331,6 +332,10 @@ const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
     EmbeddedMigration {
         version: API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION,
         sql: include_str!("../../../migrations/postgres/000035_api_key_concurrency_leases.sql"),
+    },
+    EmbeddedMigration {
+        version: RECOVERY_LIFECYCLE_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000036_recovery_lifecycle.sql"),
     },
 ];
 
@@ -686,7 +691,11 @@ mod tests {
             migrations.last().map(|migration| migration.version),
             Some(LATEST_SCHEMA_VERSION)
         );
-        assert_eq!(migrations.len(), 32);
+        assert_eq!(migrations.len(), 33);
+        let recovery = migration_sql(&migrations, RECOVERY_LIFECYCLE_SCHEMA_VERSION)?;
+        assert!(recovery.contains("CREATE TABLE usage_recovery_receipts"));
+        assert!(recovery.contains("CREATE TABLE maintenance_claims"));
+        assert!(recovery.contains("CREATE TABLE artifact_deletion_queue"));
         assert!(
             migrations
                 .iter()
@@ -889,7 +898,7 @@ mod tests {
         assert_eq!(prepared.len(), EMBEDDED_MIGRATIONS.len());
         assert_eq!(
             prepared.last().map(|migration| migration.version),
-            Some(API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION)
+            Some(RECOVERY_LIFECYCLE_SCHEMA_VERSION)
         );
 
         let redemption_limits = prepared

@@ -139,6 +139,7 @@ pub struct UpdateRequestInput {
 fn row_from_input(input: &CreateRequestInput) -> RequestRow {
     let now = parse_dt(&input.created_at);
     RequestRow {
+        expired_artifacts: Vec::new(),
         id: input.id.clone(),
         project_id: input.project_id.clone(),
         status: STATUS_PENDING.into(),

@@ -21,6 +21,19 @@ impl PgUsageRepo {
         &self.pool
     }
 
+    pub async fn insert_on_connection(
+        connection: &mut sqlx::PgConnection,
+        r: UsageLogRow,
+    ) -> RepoResult<UsageLogRow> {
+        let new_id=sqlx::query_scalar::<_,i64>("INSERT INTO usage_logs(request_id,api_key_id,project_id,channel_id,model_id,prompt_tokens,completion_tokens,total_tokens,prompt_audio_tokens,prompt_cached_tokens,prompt_write_cached_tokens,prompt_write_cached_tokens_5m,prompt_write_cached_tokens_1h,completion_audio_tokens,completion_reasoning_tokens,completion_accepted_prediction_tokens,completion_rejected_prediction_tokens,\"source\",format,total_cost,cost_items,cost_price_reference_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id")
+   .bind(id(&r.request_id)?).bind(opt_id(&r.api_key_id)?).bind(id(&r.project_id)?).bind(opt_id(&r.channel_id)?).bind(&r.model_id).bind(r.prompt_tokens).bind(r.completion_tokens).bind(r.total_tokens).bind(r.prompt_audio_tokens).bind(r.prompt_cached_tokens).bind(r.prompt_write_cached_tokens).bind(r.prompt_write_cached_tokens_5m).bind(r.prompt_write_cached_tokens_1h).bind(r.completion_audio_tokens).bind(r.completion_reasoning_tokens).bind(r.completion_accepted_prediction_tokens).bind(r.completion_rejected_prediction_tokens).bind(&r.source).bind(&r.format).bind(r.total_cost).bind(sqlx::types::Json(r.cost_items)).bind(r.cost_price_reference_id).bind(r.created_at).bind(r.updated_at).fetch_one(&mut *connection).await.map_err(|e|error("insert",e))?;
+        sqlx::query_as::<_, UsageLogRow>(&format!("SELECT {COLUMNS} FROM usage_logs WHERE id=$1"))
+            .bind(new_id)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|e| error("readback", e))
+    }
+
     pub async fn find_by_id(&self, value: i64) -> RepoResult<Option<UsageLogRow>> {
         sqlx::query_as::<_, UsageLogRow>(&format!("SELECT {COLUMNS} FROM usage_logs WHERE id=$1"))
             .bind(value)
@@ -107,14 +120,10 @@ impl UsageRepo for PgUsageRepo {
         _: &RequestContext,
         r: UsageLogRow,
     ) -> RepoResult<UsageLogRow> {
-        let new_id=sqlx::query_scalar::<_,i64>("INSERT INTO usage_logs(request_id,api_key_id,project_id,channel_id,model_id,prompt_tokens,completion_tokens,total_tokens,prompt_audio_tokens,prompt_cached_tokens,prompt_write_cached_tokens,prompt_write_cached_tokens_5m,prompt_write_cached_tokens_1h,completion_audio_tokens,completion_reasoning_tokens,completion_accepted_prediction_tokens,completion_rejected_prediction_tokens,\"source\",format,total_cost,cost_items,cost_price_reference_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id")
-   .bind(id(&r.request_id)?).bind(opt_id(&r.api_key_id)?).bind(id(&r.project_id)?).bind(opt_id(&r.channel_id)?).bind(&r.model_id).bind(r.prompt_tokens).bind(r.completion_tokens).bind(r.total_tokens).bind(r.prompt_audio_tokens).bind(r.prompt_cached_tokens).bind(r.prompt_write_cached_tokens).bind(r.prompt_write_cached_tokens_5m).bind(r.prompt_write_cached_tokens_1h).bind(r.completion_audio_tokens).bind(r.completion_reasoning_tokens).bind(r.completion_accepted_prediction_tokens).bind(r.completion_rejected_prediction_tokens).bind(&r.source).bind(&r.format).bind(r.total_cost).bind(sqlx::types::Json(r.cost_items)).bind(r.cost_price_reference_id).bind(r.created_at).bind(r.updated_at).fetch_one(&self.pool).await.map_err(|e|error("insert",e))?;
-        sqlx::query_as::<_, UsageLogRow>(&format!("SELECT {COLUMNS} FROM usage_logs WHERE id=$1"))
-            .bind(new_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| error("readback", e))
+        let mut connection = self.pool.acquire().await.map_err(|e| error("acquire", e))?;
+        Self::insert_on_connection(&mut connection, r).await
     }
+
     async fn aggregate_usage_unchecked(
         &self,
         _: &RequestContext,

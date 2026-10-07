@@ -165,6 +165,30 @@ fn apply_env_overrides(
     config: &mut AppConfig,
     env_lookup: EnvLookup<'_>,
 ) -> Result<(), ConfigError> {
+    set_string(
+        env_lookup,
+        "CONDUIT_USAGE_RECOVERY_DIRECTORY",
+        &mut config.usage_recovery.directory,
+    )?;
+    set_u64(
+        env_lookup,
+        "CONDUIT_USAGE_RECOVERY_MAX_BYTES",
+        &mut config.usage_recovery.max_bytes,
+    )?;
+    set_u64(
+        env_lookup,
+        "CONDUIT_USAGE_RECOVERY_MAX_EVENT_BYTES",
+        &mut config.usage_recovery.max_event_bytes,
+    )?;
+    set_u64(
+        env_lookup,
+        "CONDUIT_USAGE_RECOVERY_REPLAY_INTERVAL_SECONDS",
+        &mut config.usage_recovery.replay_interval_seconds,
+    )?;
+    if let Some(value) = env_value(env_lookup, "CONDUIT_USAGE_RECOVERY_REPLAY_BATCH_SIZE") {
+        config.usage_recovery.replay_batch_size =
+            parse_number("CONDUIT_USAGE_RECOVERY_REPLAY_BATCH_SIZE", &value)?;
+    }
     set_string(env_lookup, "CONDUIT_SERVER_NAME", &mut config.server.name)?;
     set_string(env_lookup, "CONDUIT_SERVER_HOST", &mut config.server.host)?;
     set_string(
@@ -679,6 +703,26 @@ fn _assert_oidc_provider_env_supported(_: Vec<OidcProviderConfig>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_usage_journal_environment_overrides_are_consumed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let env = |key: &str| match key {
+            "CONDUIT_USAGE_RECOVERY_DIRECTORY" => Some("task-volume/journal".into()),
+            "CONDUIT_USAGE_RECOVERY_MAX_BYTES" => Some("1048576".into()),
+            "CONDUIT_USAGE_RECOVERY_MAX_EVENT_BYTES" => Some("4096".into()),
+            "CONDUIT_USAGE_RECOVERY_REPLAY_INTERVAL_SECONDS" => Some("2".into()),
+            "CONDUIT_USAGE_RECOVERY_REPLAY_BATCH_SIZE" => Some("10".into()),
+            _ => None,
+        };
+        let config = load_from_optional_path_with_env(None, &CliOverrides::default(), &env)?;
+        assert_eq!(config.usage_recovery.directory, "task-volume/journal");
+        assert_eq!(config.usage_recovery.max_bytes, 1048576);
+        assert_eq!(config.usage_recovery.max_event_bytes, 4096);
+        assert_eq!(config.usage_recovery.replay_interval_seconds, 2);
+        assert_eq!(config.usage_recovery.replay_batch_size, 10);
+        Ok(())
+    }
 
     #[test]
     fn yaml_overrides_defaults() -> Result<(), Box<dyn std::error::Error>> {

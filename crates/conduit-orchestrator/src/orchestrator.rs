@@ -676,6 +676,18 @@ pub trait RequestRecorder: Send + Sync {
         error: &ConduitError,
     ) -> Result<(), ConduitError>;
 
+    /// Persist a confirmed client cancellation, independently of error text.
+    async fn record_cancellation(
+        &self,
+        ctx: &OrchestratorContext,
+        request_id: &str,
+        project_id: &str,
+        error: &ConduitError,
+    ) -> Result<(), ConduitError> {
+        self.record_failure(ctx, request_id, project_id, error)
+            .await
+    }
+
     /// Consume a [`StreamFinalPlan`] and persist the streaming attempt's
     /// execution + chunks + usage (Go `OutboundPersistentStream.Close` ->
     /// `persistAggregatedResponse` / `SaveRequestExecutionChunks` /
@@ -931,6 +943,7 @@ impl CandidateProjector for DefaultCandidateProjector {
 /// Held together by trait objects so the pure-logic stages are unit-testable
 /// with in-memory stubs.
 pub struct CommandOrchestrator {
+    tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>,
     candidate_source: Arc<dyn CandidateSource>,
     candidate_projector: Arc<dyn CandidateProjector>,
     scoring_strategies: ScoringStrategySet,
@@ -956,6 +969,7 @@ impl CommandOrchestrator {
         cancel_token: Arc<dyn CancelToken>,
     ) -> Self {
         Self {
+            tasks: None,
             candidate_source,
             candidate_projector,
             scoring_strategies: ScoringStrategySet::uniform(scoring_strategy),
@@ -972,6 +986,11 @@ impl CommandOrchestrator {
     /// Install the three long-lived load-balancer implementations selected by
     /// the effective system/API-key strategy on each request. `new` remains
     /// backward compatible by applying its single scorer to all three modes.
+    pub fn with_task_supervisor(mut self, tasks: Arc<conduit_scheduler::TaskSupervisor>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
     pub fn with_scoring_strategies(mut self, scoring_strategies: ScoringStrategySet) -> Self {
         self.scoring_strategies = scoring_strategies;
         self
@@ -2137,7 +2156,7 @@ impl CommandOrchestrator {
         // receiver → orchestrator `UpstreamItem` sender the forward loop consumes.
         let (up_tx, up_rx) = tokio::sync::mpsc::channel::<UpstreamItem>(64);
         let mut upstream_rx = live.upstream_rx;
-        tokio::spawn(async move {
+        let feed = tokio::spawn(async move {
             while let Some(item) = upstream_rx.recv().await {
                 let (msg, stop) = match item {
                     Ok(event) => (UpstreamItem::Event(event), false),
@@ -2152,6 +2171,10 @@ impl CommandOrchestrator {
                 }
             }
         });
+
+        if let Some(tasks) = &self.tasks {
+            tasks.adopt(feed.abort_handle());
+        }
 
         // Forward-while-aggregating loop → client-facing receiver.
         let (client_tx, client_rx) =
@@ -2170,6 +2193,10 @@ impl CommandOrchestrator {
             }
             result
         });
+
+        if let Some(tasks) = &self.tasks {
+            tasks.adopt(finalizer_handle.abort_handle());
+        }
 
         Ok(CommandStreamHandle {
             client_rx,

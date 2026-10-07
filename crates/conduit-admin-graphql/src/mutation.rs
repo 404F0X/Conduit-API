@@ -1817,6 +1817,8 @@ impl MutationRoot {
     /// SetNillableFirstName/LastName, SetEmail, SetScopes, AddRoleIDs).
     async fn create_user(&self, ctx: &Context<'_>, input: CreateUserInput) -> Result<User, String> {
         validate_create_user_input(&input).map_err(|err| err.to_string())?;
+        crate::policy::guard_global_owner_grant(ctx, input.is_owner)
+            .map_err(|err| err.to_string())?;
         // P-31: a non-owner may not create an owner or seed scopes they lack.
         crate::policy::guard_scope_grant(ctx, input.is_owner, input.scopes.iter().flatten())
             .map_err(|err| err.to_string())?;
@@ -1843,6 +1845,8 @@ impl MutationRoot {
         input: UpdateUserInput,
     ) -> Result<User, String> {
         validate_update_user_input(&input).map_err(|err| err.to_string())?;
+        crate::policy::guard_global_owner_grant(ctx, input.is_owner)
+            .map_err(|err| err.to_string())?;
         // P-31: a non-owner may not self-promote to owner or grant scopes they
         // do not already hold.
         crate::policy::guard_scope_grant(

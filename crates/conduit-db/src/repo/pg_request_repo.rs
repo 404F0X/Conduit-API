@@ -9,14 +9,22 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
-const C: &str = "CAST(id AS TEXT) AS id,CAST(project_id AS TEXT) AS project_id,\"status\",\"source\",model_id,format,stream,client_ip,content_saved,CAST(api_key_id AS TEXT) AS api_key_id,CAST(trace_id AS TEXT) AS trace_id,CAST(data_storage_id AS TEXT) AS data_storage_id,reasoning_effort,request_headers,request_body,response_body,response_chunks,CAST(channel_id AS TEXT) AS channel_id,external_id,metrics_latency_ms,metrics_first_token_latency_ms,metrics_reasoning_duration_ms,CAST(content_storage_id AS TEXT) AS content_storage_id,content_storage_key,content_saved_at,created_at,updated_at";
+const C: &str = "expired_artifacts,CAST(id AS TEXT) AS id,CAST(project_id AS TEXT) AS project_id,\"status\",\"source\",model_id,format,stream,client_ip,content_saved,CAST(api_key_id AS TEXT) AS api_key_id,CAST(trace_id AS TEXT) AS trace_id,CAST(data_storage_id AS TEXT) AS data_storage_id,reasoning_effort,request_headers,request_body,response_body,response_chunks,CAST(channel_id AS TEXT) AS channel_id,external_id,metrics_latency_ms,metrics_first_token_latency_ms,metrics_reasoning_duration_ms,CAST(content_storage_id AS TEXT) AS content_storage_id,content_storage_key,content_saved_at,created_at,updated_at";
 #[derive(Debug, Clone)]
 pub struct PgRequestRepo {
     pool: PgPool,
+    activity_timeout: std::time::Duration,
 }
 impl PgRequestRepo {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            activity_timeout: std::time::Duration::from_secs(600),
+        }
+    }
+    pub fn with_activity_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.activity_timeout = timeout;
+        self
     }
     pub fn pool(&self) -> &PgPool {
         &self.pool
@@ -88,7 +96,7 @@ impl RequestRepo for PgRequestRepo {
         ctx: &RequestContext,
         r: RequestRow,
     ) -> RepoResult<RequestRow> {
-        let n=sqlx::query_scalar::<_,i64>("INSERT INTO requests(project_id,api_key_id,trace_id,data_storage_id,\"source\",model_id,reasoning_effort,format,request_headers,request_body,response_body,response_chunks,channel_id,external_id,\"status\",stream,client_ip,metrics_latency_ms,metrics_first_token_latency_ms,metrics_reasoning_duration_ms,content_saved,content_storage_id,content_storage_key,content_saved_at,created_at,updated_at)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)RETURNING id").bind(id(&r.project_id)?).bind(opt(&r.api_key_id)?).bind(opt(&r.trace_id)?).bind(opt(&r.data_storage_id)?).bind(r.source).bind(r.model_id).bind(r.reasoning_effort).bind(r.format).bind(r.request_headers.map(sqlx::types::Json)).bind(sqlx::types::Json(r.request_body)).bind(r.response_body.map(sqlx::types::Json)).bind(r.response_chunks.map(sqlx::types::Json)).bind(opt(&r.channel_id)?).bind(r.external_id).bind(r.status).bind(r.stream).bind(r.client_ip).bind(r.metrics_latency_ms).bind(r.metrics_first_token_latency_ms).bind(r.metrics_reasoning_duration_ms).bind(r.content_saved).bind(opt(&r.content_storage_id)?).bind(r.content_storage_key).bind(r.content_saved_at).bind(r.created_at).bind(r.updated_at).fetch_one(&self.pool).await.map_err(|e|err("create",e))?;
+        let n=sqlx::query_scalar::<_,i64>("INSERT INTO requests(project_id,api_key_id,trace_id,data_storage_id,\"source\",model_id,reasoning_effort,format,request_headers,request_body,response_body,response_chunks,channel_id,external_id,\"status\",stream,client_ip,metrics_latency_ms,metrics_first_token_latency_ms,metrics_reasoning_duration_ms,content_saved,content_storage_id,content_storage_key,content_saved_at,created_at,updated_at,activity_until)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)RETURNING id").bind(id(&r.project_id)?).bind(opt(&r.api_key_id)?).bind(opt(&r.trace_id)?).bind(opt(&r.data_storage_id)?).bind(r.source).bind(r.model_id).bind(r.reasoning_effort).bind(r.format).bind(r.request_headers.map(sqlx::types::Json)).bind(sqlx::types::Json(r.request_body)).bind(r.response_body.map(sqlx::types::Json)).bind(r.response_chunks.map(sqlx::types::Json)).bind(opt(&r.channel_id)?).bind(r.external_id).bind(r.status).bind(r.stream).bind(r.client_ip).bind(r.metrics_latency_ms).bind(r.metrics_first_token_latency_ms).bind(r.metrics_reasoning_duration_ms).bind(r.content_saved).bind(opt(&r.content_storage_id)?).bind(r.content_storage_key).bind(r.content_saved_at).bind(r.created_at).bind(r.updated_at).bind(Utc::now()+chrono::Duration::from_std(self.activity_timeout).unwrap_or(chrono::Duration::seconds(600))).fetch_one(&self.pool).await.map_err(|e|err("create",e))?;
         self.find_request_by_id_unchecked(ctx, &n.to_string())
             .await?
             .ok_or(RepoError::NotFound("request"))
@@ -216,10 +224,12 @@ impl RequestRepo for PgRequestRepo {
             }};
         }
         if let Some(value) = i.response_body {
-            set!("response_body=", sqlx::types::Json(value));
+            s.push("response_body=CASE WHEN 'response_body'=ANY(expired_artifacts) THEN response_body ELSE ")
+                .push_bind_unseparated(sqlx::types::Json(value)).push_unseparated(" END");
         }
         if let Some(value) = i.response_chunks {
-            set!("response_chunks=", sqlx::types::Json(value));
+            s.push("response_chunks=CASE WHEN 'response_chunks'=ANY(expired_artifacts) THEN response_chunks ELSE ")
+                .push_bind_unseparated(sqlx::types::Json(value)).push_unseparated(" END");
         }
         if let Some(value) = i.channel_id {
             set!("channel_id=", id(&value)?);
@@ -258,7 +268,7 @@ impl RequestRepo for PgRequestRepo {
         r: &str,
         i: ContentSavedInput,
     ) -> RepoResult<RequestRow> {
-        let changed=sqlx::query("UPDATE requests SET content_saved=TRUE,content_storage_id=$2,content_storage_key=$3,content_saved_at=$4,updated_at=now() WHERE id=$1").bind(id(r)?).bind(opt(&i.content_storage_id)?).bind(i.content_storage_key).bind(i.content_saved_at.as_deref().map(ts)).execute(&self.pool).await.map_err(|e|err("content saved",e))?.rows_affected();
+        let changed=sqlx::query("UPDATE requests SET content_saved=TRUE,content_storage_id=$2,content_storage_key=$3,content_saved_at=$4,updated_at=now() WHERE id=$1 AND NOT content_expired").bind(id(r)?).bind(opt(&i.content_storage_id)?).bind(i.content_storage_key).bind(i.content_saved_at.as_deref().map(ts)).execute(&self.pool).await.map_err(|e|err("content saved",e))?.rows_affected();
         if changed == 0 {
             return Err(RepoError::NotFound("request"));
         }
@@ -272,7 +282,7 @@ impl RequestRepo for PgRequestRepo {
         cutoff: &str,
         now: &str,
     ) -> RepoResult<Vec<String>> {
-        sqlx::query_scalar::<_,i64>("UPDATE requests SET \"status\"='canceled',updated_at=$2 WHERE \"status\"='processing' AND created_at<$1 RETURNING id").bind(ts(cutoff)).bind(ts(now)).fetch_all(&self.pool).await.map(|v|v.into_iter().map(|v|v.to_string()).collect()).map_err(|e|err("reclaim",e))
+        sqlx::query_scalar::<_,i64>("UPDATE requests SET \"status\"='canceled',updated_at=$2 WHERE \"status\"='processing' AND COALESCE(activity_until,updated_at)<$1 RETURNING id").bind(ts(cutoff)).bind(ts(now)).fetch_all(&self.pool).await.map(|v|v.into_iter().map(|v|v.to_string()).collect()).map_err(|e|err("reclaim",e))
     }
 }
 

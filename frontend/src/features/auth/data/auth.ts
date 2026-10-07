@@ -13,6 +13,7 @@ import { fetchProductModeOrDefault, resolveProductLandingPath } from '@/features
 export interface SignInInput {
   email: string;
   password: string;
+  rememberMe?: boolean;
 }
 
 export interface SignUpInput extends SignInInput {
@@ -60,16 +61,13 @@ export function useSignIn() {
 
   return useMutation({
     mutationFn: async (input: SignInInput) => {
-      return await authApi.signIn(input);
+      return await authApi.signIn({ email: input.email, password: input.password });
     },
-    onSuccess: async (data) => {
-      // Store token in localStorage
-      setTokenToStorage(data.token);
-
+    onSuccess: async (data, input) => {
       const userLanguage = data.user.preferLanguage || 'en';
 
       // Update auth store
-      setAccessToken(data.token);
+      setAccessToken(data.token, input.rememberMe === true);
       setUser(data.user);
 
       // Initialize i18n with user's preferred language

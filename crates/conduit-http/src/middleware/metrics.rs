@@ -163,6 +163,13 @@ pub struct RequestMetrics {
 /// between the counter increment and any subsequent read in a different
 /// request. This matches how Go's `prometheus` package handles counters
 /// (atomic add without memory barriers beyond the CPU's cache coherence).
+struct InFlightGuard(MetricsState);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Response {
     // Try to extract MetricsState from request extensions. If absent or
     // disabled, pass through immediately with zero overhead.
@@ -180,6 +187,7 @@ pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Respons
 
     // Increment in-flight gauge before downstream processing.
     state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _in_flight = InFlightGuard(state.clone());
 
     let start = Instant::now();
 
@@ -190,7 +198,6 @@ pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Respons
     let latency_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     // Decrement in-flight gauge — handler has returned.
-    state.in_flight.fetch_sub(1, Ordering::Relaxed);
 
     // Increment total request counter.
     state.request_count.fetch_add(1, Ordering::Relaxed);
@@ -237,6 +244,47 @@ mod tests {
     use tower::Service;
 
     use super::*;
+
+    #[tokio::test]
+    async fn repair_metrics_observe_actual_timeout_once_and_release_cancelled_gauge()
+    -> Result<(), Box<dyn Error>> {
+        let metrics = MetricsState::new(true);
+        let mut config = conduit_config::AppConfig::default();
+        config.server.request_timeout = std::time::Duration::from_millis(1);
+        let state = crate::AppState::new(Arc::new(config), Arc::new(crate::AppServices::default()));
+        let mut router = Router::new()
+            .route("/slow", get(slow_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                crate::middleware::runtime::production_request_middleware,
+            ))
+            .layer(from_fn(inject_metrics_state))
+            .layer(axum::Extension(metrics.clone()));
+        let response = router
+            .call(Request::builder().uri("/slow").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(metrics.snapshot().request_count, 1);
+        assert_eq!(metrics.snapshot().server_error_count, 1);
+        assert_eq!(metrics.snapshot().in_flight, 0);
+        let cancelled = MetricsState::new(true);
+        let mut router = build_router_with_metrics(cancelled.clone());
+        let handle = tokio::spawn(async move {
+            router
+                .call(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while cancelled.snapshot().in_flight == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(cancelled.snapshot().in_flight, 0);
+        Ok(())
+    }
 
     /// Handler that returns 200 OK immediately.
     async fn ok_handler() -> impl IntoResponse {

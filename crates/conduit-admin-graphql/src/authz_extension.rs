@@ -53,6 +53,16 @@ use std::sync::Arc;
 
 use crate::policy::{authorize_project_resolver, authorize_resolver};
 
+#[async_trait::async_trait]
+pub trait SettingsWritePermit: Send {
+    async fn release(self: Box<Self>);
+}
+
+#[async_trait::async_trait]
+pub trait SettingsWriteLock: Send + Sync {
+    async fn acquire(&self) -> Result<Box<dyn SettingsWritePermit>, String>;
+}
+
 /// The authorization requirement for one root field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldAuthz {
@@ -300,6 +310,24 @@ impl Extension for ScopeAuthExtension {
             && let Err(message) = enforce_field(ctx, info.name)
         {
             return Err(ServerError::new(message, None));
+        }
+        let writes_settings = info.parent_type == "MutationRoot"
+            && (field_authz(info.name) == FieldAuthz::Scope(slug::WRITE_SETTINGS)
+                || matches!(
+                    info.name,
+                    "updateAutoBackupSettings"
+                        | "updateProductExperienceSettings"
+                        | "completeFinancialSetupOnboarding"
+                        | "setChannelModelMappingAutomation"
+                ));
+        if writes_settings && let Some(lock) = ctx.data_opt::<Arc<dyn SettingsWriteLock>>() {
+            let permit = lock
+                .acquire()
+                .await
+                .map_err(|error| ServerError::new(error, None))?;
+            let result = next.run(ctx, info).await;
+            permit.release().await;
+            return result;
         }
         next.run(ctx, info).await
     }

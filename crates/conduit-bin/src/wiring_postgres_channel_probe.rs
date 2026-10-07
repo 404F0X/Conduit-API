@@ -27,7 +27,7 @@ impl PgChannelProbeAdapter {
         self
     }
 
-    async fn compute_and_store(
+    pub(crate) async fn compute_and_store(
         &self,
         aligned: DateTime<Utc>,
         interval_minutes: i64,
@@ -119,7 +119,7 @@ impl PgChannelProbeAdapter {
         Ok(inserted)
     }
 
-    async fn current_probe_plan(
+    pub(crate) async fn current_probe_plan(
         &self,
         now: DateTime<Utc>,
         fallback_interval_minutes: i64,

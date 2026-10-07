@@ -598,6 +598,26 @@ pub fn guard_scope_grant<'a>(
     Ok(())
 }
 
+/// Global user ownership must never inherit a selected project's ownership.
+#[allow(clippy::result_large_err)]
+pub fn guard_global_owner_grant(
+    ctx: &Context<'_>,
+    set_owner: Option<bool>,
+) -> Result<(), ConduitError> {
+    if set_owner != Some(true) {
+        return Ok(());
+    }
+    if request_context(ctx)
+        .and_then(|context| context.principal.as_ref())
+        .is_some_and(|principal| principal.is_owner)
+    {
+        return Ok(());
+    }
+    Err(ConduitError::forbidden(
+        "authz: only a platform owner may grant global owner (is_owner)",
+    ))
+}
+
 #[cfg(test)]
 mod resolver_guard_tests {
     use super::*;

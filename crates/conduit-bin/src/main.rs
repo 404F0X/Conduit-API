@@ -1,19 +1,24 @@
 #![forbid(unsafe_code)]
 
+mod artifact_cleanup;
 mod auto_disable_runtime;
 mod cli;
 mod conv;
 mod embedded_postgres;
 mod maintenance;
+mod maintenance_claim;
 mod model_fetch;
 mod model_matcher;
 #[cfg(test)]
 mod postgres_test_support;
+#[cfg(test)]
+mod repair_regressions;
 mod route_affinity;
 mod runtime_logging;
 mod usage_charge_settler;
 mod usage_charge_settler_postgres;
 mod usage_log_recorder;
+mod usage_recovery;
 mod wiring;
 mod wiring_apikey;
 mod wiring_channel_crud;

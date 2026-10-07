@@ -750,14 +750,14 @@ pub fn build_router_with_asset_source(
     // by the workspace `unsafe_code = "forbid"` lint.
     router = router
         .layer(crate::panic_layer::PanicCatchLayer::new())
-        .layer(axum::middleware::from_fn(
-            crate::middleware::metrics::inject_metrics_state,
-        ))
-        .layer(Extension(state.metrics().clone()))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::runtime::production_request_middleware,
-        ));
+        ))
+        .layer(axum::middleware::from_fn(
+            crate::middleware::metrics::inject_metrics_state,
+        ))
+        .layer(Extension(state.metrics().clone()));
 
     router.with_state(state)
 }

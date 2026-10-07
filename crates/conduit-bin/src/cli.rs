@@ -708,13 +708,15 @@ async fn start_http_server_async(config: AppConfig) -> Result<(), String> {
     // wiring) over the configured database, then hand them to AppState so the
     // router serves real handlers instead of the bare 5xx fallbacks. Without
     // this, AppServices::default() leaves every service slot None.
-    let (services, pools, live_registry) = crate::wiring::build_runtime_services(&config).await?;
+    let (services, pools, live_registry, tasks) =
+        crate::wiring::build_runtime_services(&config).await?;
     tracing::info!("PostgreSQL runtime and maintenance workers are active");
     let maintenance = crate::maintenance::start_postgres(
         pools.master_clone(),
         &config.gc,
         &config.provider_quota,
         live_registry,
+        tasks.0.clone(),
     )
     .await?;
     let metrics_config = config.metrics.clone();
@@ -723,9 +725,16 @@ async fn start_http_server_async(config: AppConfig) -> Result<(), String> {
 
     let metrics_task = if metrics_config.enabled {
         let metrics_addr = format!("{}:{}", metrics_config.host, metrics_config.port);
-        let metrics_listener = TcpListener::bind(&metrics_addr)
-            .await
-            .map_err(|err| format!("failed to bind metrics listener {metrics_addr}: {err}"))?;
+        let metrics_listener = match TcpListener::bind(&metrics_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                maintenance.shutdown().await;
+                tasks.0.shutdown(graceful_shutdown_timeout).await;
+                return Err(format!(
+                    "failed to bind metrics listener {metrics_addr}: {error}"
+                ));
+            }
+        };
         let metrics_app = conduit_http::metrics_router(metrics_state, &metrics_config.path);
         Some(tokio::spawn(async move {
             axum::serve(metrics_listener, metrics_app).await
@@ -748,6 +757,7 @@ async fn start_http_server_async(config: AppConfig) -> Result<(), String> {
         let _ = task.await;
     }
     maintenance.shutdown().await;
+    tasks.0.shutdown(graceful_shutdown_timeout).await;
     result.map_err(|err| format!("http server failed: {err}"))
 }
 

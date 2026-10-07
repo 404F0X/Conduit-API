@@ -45,6 +45,7 @@ export type RequestExecution = z.infer<typeof requestExecutionSchema>;
 // Request
 export const requestSchema = z.object({
   id: z.string(),
+  projectID: z.string().nullable().optional(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
   // apiKeyID: z.string().optional().nullable(),

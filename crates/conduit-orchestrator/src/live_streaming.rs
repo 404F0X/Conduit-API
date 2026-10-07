@@ -49,11 +49,13 @@ use crate::outbound_stream::summarize_binary_chunk;
 /// Maximum number of chunks a buffer accepts before rejecting appends.
 /// Mirrors Go `maxChunkCapacity = 50000` (`chunkbuffer.go:26`).
 pub const MAX_CHUNK_CAPACITY: usize = 50_000;
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 struct ChunkBufferState {
     /// Go `chunks []*httpclient.StreamEvent`.
     chunks: Vec<StreamEvent>,
+    bytes: usize,
     /// Go `closed bool`.
     closed: bool,
     /// Go `lastAppendedAt time.Time` (initialized to `time.Now()` in `New`).
@@ -85,6 +87,7 @@ impl ChunkBuffer {
         Self {
             inner: Arc::new(Mutex::new(ChunkBufferState {
                 chunks: Vec::new(),
+                bytes: 0,
                 closed: false,
                 last_appended_at: Instant::now(),
             })),
@@ -99,10 +102,17 @@ impl ChunkBuffer {
         let Ok(mut state) = self.inner.lock() else {
             return false;
         };
-        if state.closed || state.chunks.len() >= MAX_CHUNK_CAPACITY {
+        let bytes = serde_json::to_vec(&chunk)
+            .map(|value| value.len())
+            .unwrap_or(MAX_CHUNK_BYTES);
+        if state.closed
+            || state.chunks.len() >= MAX_CHUNK_CAPACITY
+            || state.bytes.saturating_add(bytes) > MAX_CHUNK_BYTES
+        {
             // Go: reject to prevent unbounded memory growth (chunkbuffer.go:52-55).
             return false;
         }
+        state.bytes += bytes;
         state.chunks.push(chunk);
         state.last_appended_at = Instant::now();
         true

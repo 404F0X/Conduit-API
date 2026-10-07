@@ -25,6 +25,19 @@ impl Error for ValidationError {}
 
 pub fn validate(config: &AppConfig) -> Result<(), ValidationError> {
     let mut errors = Vec::new();
+    let recovery = &config.usage_recovery;
+    if recovery.directory.trim().is_empty()
+        || recovery.max_event_bytes == 0
+        || recovery.max_bytes
+            < recovery
+                .max_event_bytes
+                .saturating_mul(2)
+                .saturating_add(1024)
+        || recovery.replay_interval_seconds == 0
+        || recovery.replay_batch_size == 0
+    {
+        errors.push("usage_recovery requires a directory, positive budgets/interval/batch, and capacity for two event copies plus 1024 bytes".into());
+    }
 
     validate_port("server.port", config.server.port, &mut errors);
     validate_port("metrics.port", config.metrics.port, &mut errors);

@@ -23,10 +23,11 @@ const ATTEMPT_EVENT_QUEUE_CAPACITY: usize = 4_096;
 pub(crate) fn start_auto_disable_runtime(
     pool: PgPool,
     system: Arc<SystemService>,
+    tasks: Arc<conduit_scheduler::TaskSupervisor>,
 ) -> Arc<dyn AttemptObserver> {
     let (tx, rx) = mpsc::channel(ATTEMPT_EVENT_QUEUE_CAPACITY);
     let notifier = Arc::new(WebhookNotifierRuntime::new(system.clone()));
-    tokio::spawn(run_worker(rx, pool, system, notifier));
+    tasks.spawn(run_worker(rx, pool, system, notifier));
     Arc::new(QueuedAttemptObserver { tx })
 }
 
@@ -90,10 +91,7 @@ async fn run_worker(
                 };
                 match apply_disable_action(&pool, action).await {
                     Ok(Some(event)) => {
-                        let notifier = notifier.clone();
-                        tokio::spawn(async move {
-                            notifier.notify_channel_auto_disabled(event).await;
-                        });
+                        notifier.notify_channel_auto_disabled(event).await;
                     }
                     Ok(None) => {}
                     Err(error) => {

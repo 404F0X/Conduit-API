@@ -2,6 +2,7 @@ import { format } from 'date-fns';
 import { useParams, useNavigate, useRouterState } from '@tanstack/react-router';
 import { ArrowLeft, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useProjectStore } from '@/stores/projectStore';
 import { extractNumberID } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -28,7 +29,10 @@ export default function RequestDetailGlobalPage() {
             <Button
               variant='ghost'
               size='sm'
-              onClick={() => navigate({ to: '/requests', search: currentSearch })}
+              onClick={() => {
+                if (request?.projectID) useProjectStore.getState().setSelectedProjectId(request.projectID);
+                navigate({ to: '/project/requests', search: currentSearch });
+              }}
               className='hover:bg-accent'
             >
               <ArrowLeft className='mr-2 h-4 w-4' />

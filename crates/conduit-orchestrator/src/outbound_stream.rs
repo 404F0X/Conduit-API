@@ -316,6 +316,8 @@ pub struct StreamChunkBuffer {
     /// Whether a terminal event ([`is_terminal_stream_event`]) has been
     /// observed. Mirrors Go `ts.state.StreamCompleted`.
     stream_completed: bool,
+    buffered_bytes: usize,
+    budget_exceeded: bool,
 }
 
 impl StreamChunkBuffer {
@@ -327,7 +329,14 @@ impl StreamChunkBuffer {
     /// Observe a chunk: append a (binary-summarized) copy and update the
     /// terminal-event flag. Mirrors Go `Current()` body at outbound.go:80-93.
     pub fn push(&mut self, event: &StreamEvent) {
-        self.chunks.push(summarize_binary_chunk(event));
+        let summary = summarize_binary_chunk(event);
+        let bytes = serde_json::to_vec(&summary).map_or(usize::MAX, |bytes| bytes.len());
+        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        if self.chunks.len() >= 50_000 || self.buffered_bytes > 64 * 1024 * 1024 {
+            self.budget_exceeded = true;
+            return;
+        }
+        self.chunks.push(summary);
         if is_terminal_stream_event(event) {
             self.stream_completed = true;
         }
@@ -541,7 +550,7 @@ impl PersistentStreamFinalizer {
         // a hard (non-cancel) stream error we never reach aggregation.
         let terminal_seen = self.buffer.stream_completed();
 
-        let mut completed_normally = terminal_seen;
+        let mut completed_normally = terminal_seen && observed.stream_error.is_none();
         let mut aggregated: Option<HttpResponse> = None;
 
         // Go's terminal-seen branch fires the success persist directly, so we
@@ -592,20 +601,9 @@ impl PersistentStreamFinalizer {
                         aggregated = Some(response);
                     }
                     Err(agg_err) => {
-                        // Go logs Warn + returns from persistResponseChunks
-                        // without flipping the row. The stream is still
-                        // "completed" (the terminal event was real), so we
-                        // keep completed_normally=true but have no body — we
-                        // synthesize an empty success response so the recorder
-                        // still runs. Go's persistAggregatedResponse would
-                        // skip the body write when responseBody is empty
-                        // (outbound.go:259-305 is gated on meta.Usage / being
-                        // called at all); the closest Rust equivalent is to
-                        // record success with an empty HttpResponse.
-                        warn!(
-                            error = %agg_err,
-                            "outbound-stream: terminal-event aggregation failed, recording success with empty body"
-                        );
+                        return Err(ConduitError::internal(format!(
+                            "durable metering unavailable: stream aggregation failed: {agg_err}"
+                        )));
                     }
                 }
             }
@@ -681,10 +679,6 @@ impl PersistentStreamFinalizer {
                 .or_else(|| plan.error_message.clone())
                 .unwrap_or_else(|| STREAM_FINAL_NO_TERMINAL_EVENT_MESSAGE.to_string());
             let error = if plan.is_canceled() {
-                // Cancel arm: surface as an internal "canceled" error so the
-                // recorder's is_canceled_error marker matches (it greps for
-                // "cancel" in the message). The plan already carries the
-                // "context canceled" default.
                 ConduitError::internal(message)
             } else {
                 // Failed arm: surface as an upstream error so the recorder
@@ -694,9 +688,15 @@ impl PersistentStreamFinalizer {
             // Request row (Go InboundPersistentStream.Close →
             // UpdateRequestStatusFromError, inbound.go:157-172: canceled ctx →
             // StatusCanceled via biz/request.go:1057-1058).
-            self.recorder
-                .record_failure(ctx, &self.request_id, &self.project_id, &error)
-                .await?;
+            if plan.is_canceled() {
+                self.recorder
+                    .record_cancellation(ctx, &self.request_id, &self.project_id, &error)
+                    .await?;
+            } else {
+                self.recorder
+                    .record_failure(ctx, &self.request_id, &self.project_id, &error)
+                    .await?;
+            }
 
             // Execution row (Go OutboundPersistentStream.Close →
             // UpdateRequestExecutionStatusFromError, outbound.go:160-195:
@@ -813,13 +813,25 @@ impl OutboundForwardingStream {
         let mut client_disconnected = false;
         let mut stream_error: Option<String> = None;
         let mut first_event_at_ms: Option<i64> = None;
-
+        let mut terminal = None;
+        let remaining_ms = ctx
+            .metadata
+            .get("stream_deadline_epoch_ms")
+            .and_then(|value| value.parse::<i64>().ok())
+            .map(|deadline| deadline.saturating_sub(epoch_millis()).max(0) as u64)
+            .unwrap_or(600_000);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms);
         loop {
             let item = tokio::select! {
                 biased;
                 _ = self.client_tx.closed() => {
                     self.upstream_cancel.cancel();
                     client_disconnected = true;
+                    break;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.upstream_cancel.cancel();
+                    stream_error = Some("request deadline exceeded during stream".into());
                     break;
                 }
                 item = self.upstream_rx.recv() => item,
@@ -830,30 +842,38 @@ impl OutboundForwardingStream {
             match item {
                 UpstreamItem::Event(event) => {
                     first_event_at_ms.get_or_insert_with(epoch_millis);
-                    // Buffer first (summarized copy + terminal-event check,
-                    // outbound.go:80-93), fan out to observers, then forward
-                    // the UNMODIFIED event to the client (Go returns the
-                    // original from Current()).
                     self.finalizer.on_event(&event);
+                    if self.finalizer.buffer.budget_exceeded {
+                        stream_error = Some("stream history budget exceeded".into());
+                        self.upstream_cancel.cancel();
+                        break;
+                    }
                     for observer in &self.observers {
                         observer.on_event(&event);
                     }
-                    if self.client_tx.send(Ok(event)).await.is_err() {
-                        // Client receiver dropped mid-stream. Go: the request
-                        // ctx cancels; cancelOnCloseStream fires the stream
-                        // ctx cancel which aborts the upstream HTTP request.
-                        self.upstream_cancel.cancel();
-                        client_disconnected = true;
+                    if is_terminal_stream_event(&event) {
+                        // A successful terminal is released only after durable accounting acceptance.
+                        terminal = Some(event);
                         break;
+                    }
+                    match tokio::time::timeout_at(deadline, self.client_tx.send(Ok(event))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => {
+                            client_disconnected = true;
+                            self.upstream_cancel.cancel();
+                            break;
+                        }
+                        Err(_) => {
+                            stream_error =
+                                Some("request deadline exceeded during stream backpressure".into());
+                            self.upstream_cancel.cancel();
+                            break;
+                        }
                     }
                 }
                 UpstreamItem::Error(err) => {
-                    // Go `stream.Err()` became non-nil; the stream yields no
-                    // further provider events. Preserve the typed error for
-                    // the route-aware HTTP writer instead of turning it into
-                    // a silent EOF.
-                    stream_error = Some(err.message.clone());
-                    let _ = self.client_tx.send(Err(err)).await;
+                    stream_error = Some(err.message);
+                    self.upstream_cancel.cancel();
                     break;
                 }
             }
@@ -870,7 +890,49 @@ impl OutboundForwardingStream {
             stream_error,
         };
         let persist_ctx = stream_persistence_context(ctx, first_event_at_ms, epoch_millis());
-        self.finalizer.close(&persist_ctx, &observed).await
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.finalizer.close(&persist_ctx, &observed),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ConduitError::internal(
+                "stream persistence cleanup deadline exceeded",
+            ))
+        });
+        match &result {
+            Ok(plan) if plan.is_completed() => {
+                if let Some(event) = terminal {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        self.client_tx.send(Ok(event)),
+                    )
+                    .await;
+                }
+            }
+            Ok(_) if !client_disconnected => {
+                let error = ConduitError::upstream(
+                    observed
+                        .stream_error
+                        .unwrap_or_else(|| "stream did not complete".into()),
+                );
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.client_tx.send(Err(error)),
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.client_tx
+                        .send(Err(ConduitError::internal(error.to_string()))),
+                )
+                .await;
+            }
+            _ => {}
+        }
+        result
     }
 }
 
@@ -885,6 +947,108 @@ impl OutboundForwardingStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repair_stream_deadline_terminates_an_idle_upstream_and_records_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = Arc::new(CapturingRecorder::default());
+        let (stream, _upstream, mut client, cancel) =
+            forwarding_parts(recorder.clone(), HttpResponse::default());
+        let mut ctx = OrchestratorContext::new();
+        ctx.metadata.insert(
+            "stream_deadline_epoch_ms".into(),
+            (epoch_millis() - 1).to_string(),
+        );
+        let handle = tokio::spawn(async move { stream.run(&ctx).await });
+        assert!(
+            client
+                .recv()
+                .await
+                .ok_or("missing deadline error")?
+                .is_err()
+        );
+        let plan = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await???;
+        assert!(!plan.is_completed());
+        assert!(cancel.is_canceled());
+        assert_eq!(recorder.success_count(), 0);
+        assert_eq!(recorder.failure_count(), 1);
+        assert!(
+            recorder
+                .last_failure()
+                .unwrap()
+                .error_message
+                .contains("deadline")
+        );
+        Ok(())
+    }
+
+    struct RejectedDurableRecorder {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl RequestRecorder for RejectedDurableRecorder {
+        async fn record_success(
+            &self,
+            _: &OrchestratorContext,
+            _: &str,
+            _: &str,
+            _: &PipelineAttempt,
+            _: &HttpResponse,
+        ) -> Result<(), ConduitError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(ConduitError::internal("durable metering acceptance failed"))
+        }
+        async fn record_failure(
+            &self,
+            _: &OrchestratorContext,
+            _: &str,
+            _: &str,
+            _: &ConduitError,
+        ) -> Result<(), ConduitError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_stream_never_releases_success_terminal_before_durable_acceptance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let recorder = Arc::new(RejectedDurableRecorder {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let (stream, upstream, mut client, _) =
+            forwarding_parts(recorder.clone(), response_with_completion(1));
+        let handle = tokio::spawn(async move { stream.run(&OrchestratorContext::new()).await });
+        upstream
+            .send(UpstreamItem::Event(event_with_data("[DONE]")))
+            .await?;
+        recorder.started.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), client.recv())
+                .await
+                .is_err()
+        );
+        recorder.release.notify_one();
+        assert!(
+            client
+                .recv()
+                .await
+                .ok_or("missing persistence error")?
+                .is_err()
+        );
+        assert!(handle.await?.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn repair_history_budget_rejects_an_oversized_frame_without_retaining_it() {
+        let mut buffer = StreamChunkBuffer::new();
+        buffer.push(&event_with_data(&"x".repeat(64 * 1024 * 1024)));
+        assert!(buffer.budget_exceeded);
+        assert!(buffer.is_empty());
+    }
     use crate::orchestrator::NoopRequestRecorder;
     use async_trait::async_trait;
     use conduit_core::ErrorKind;
@@ -1737,8 +1901,8 @@ mod tests {
         assert!(!plan.is_completed());
         assert_eq!(plan.final_status, RequestStatus::Failed);
         assert!(
-            !cancel.is_canceled(),
-            "upstream error is not a client cancel"
+            cancel.is_canceled(),
+            "upstream failure must stop resource reads; its persisted reason remains Failed"
         );
 
         let ctx = svc_ctx();
@@ -2085,8 +2249,12 @@ mod tests {
 
         drop(up_tx); // upstream channel closes immediately, no events
         assert!(
+            matches!(cl_rx.recv().await, Some(Err(_))),
+            "empty upstream must report failure instead of a successful empty stream"
+        );
+        assert!(
             cl_rx.recv().await.is_none(),
-            "client channel must close with no events forwarded"
+            "error notification must be followed by channel closure"
         );
 
         let plan = handle.await??;

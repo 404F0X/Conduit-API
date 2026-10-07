@@ -31,6 +31,8 @@ use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue};
 pub struct UpstreamExecutor {
     client: reqwest::Client,
     insecure_skip_verify: bool,
+    request_timeout: Option<std::time::Duration>,
+    tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>,
 }
 
 impl UpstreamExecutor {
@@ -40,6 +42,8 @@ impl UpstreamExecutor {
         Self {
             client,
             insecure_skip_verify: false,
+            request_timeout: None,
+            tasks: None,
         }
     }
 
@@ -49,6 +53,30 @@ impl UpstreamExecutor {
     pub fn with_insecure_skip_verify(mut self, insecure_skip_verify: bool) -> Self {
         self.insecure_skip_verify = insecure_skip_verify;
         self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_task_supervisor(mut self, tasks: Arc<conduit_scheduler::TaskSupervisor>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    fn spawn(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ConduitError> {
+        if let Some(tasks) = &self.tasks {
+            if !tasks.spawn(future) {
+                return Err(ConduitError::internal("upstream runtime is stopping"));
+            }
+        } else {
+            tokio::spawn(future);
+        }
+        Ok(())
     }
 
     /// Box as `Arc` for wiring into the pipeline (`Arc<Pipeline>` holds it).
@@ -62,6 +90,7 @@ impl UpstreamExecutor {
         };
         HttpClientBuilder::new()
             .insecure_skip_verify(self.insecure_skip_verify)
+            .request_timeout(self.request_timeout)
             .proxy(proxy)
             .build()
             .map_err(|error| {
@@ -182,7 +211,7 @@ impl Executor for UpstreamExecutor {
 
         if binary_speech {
             let event_content_type = content_type.clone();
-            tokio::spawn(async move {
+            self.spawn(async move {
                 loop {
                     // Reserve downstream capacity *before* reading the next
                     // provider chunk. This is the backpressure boundary: when
@@ -235,7 +264,7 @@ impl Executor for UpstreamExecutor {
                         }
                     }
                 }
-            });
+            })?;
 
             return Ok(LiveUpstreamResponse {
                 content_type,
@@ -243,7 +272,7 @@ impl Executor for UpstreamExecutor {
             });
         }
 
-        tokio::spawn(async move {
+        self.spawn(async move {
             let mut buffer: Vec<u8> = Vec::new();
             loop {
                 if cancel.is_canceled() {
@@ -257,13 +286,18 @@ impl Executor for UpstreamExecutor {
                 };
                 match chunk {
                     Ok(Some(bytes)) => {
+                        if buffer.len().saturating_add(bytes.len()) > crate::live_streaming::MAX_CHUNK_BYTES {
+                            let _ = tx.send(Err(ConduitError::upstream("upstream SSE frame budget exceeded"))).await;
+                            break;
+                        }
                         buffer.extend_from_slice(&bytes);
                         // Re-parse the accumulated buffer; `incomplete` is the
                         // partial trailing frame to carry into the next read.
                         match conduit_llm::http::parse_sse_frames(&buffer) {
                             Ok(parsed) => {
                                 for frame in parsed.frames {
-                                    if tx.send(Ok(StreamEvent::from(frame))).await.is_err() {
+                                    let sent = tokio::select! { _ = cancel.cancelled() => return, result = tx.send(Ok(StreamEvent::from(frame))) => result };
+                                    if sent.is_err() {
                                         // Client receiver dropped mid-stream.
                                         return;
                                     }
@@ -293,7 +327,7 @@ impl Executor for UpstreamExecutor {
                     }
                 }
             }
-        });
+        })?;
 
         Ok(LiveUpstreamResponse {
             content_type,

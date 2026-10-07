@@ -27,12 +27,11 @@
 //! * Writes only on success when token usage is non-zero, or when the resolved
 //!   channel price contains a per-request `flat_fee`. The latter covers image,
 //!   audio, and video providers that return no token usage at all.
-//! * A usage-log write failure is logged and swallowed — it MUST NOT fail the
-//!   request (Go: `log.Warn` + continue). `record_success` therefore always
-//!   returns `Ok`.
-//! * `record_failure` is a no-op: the failed request/execution rows are the
-//!   persist middlewares' responsibility, and a failed request has no usage to
-//!   bill.
+//! * Production reserves a bounded durable journal slot before upstream I/O.
+//!   Success requires fsynced metering input; PostgreSQL handoff failure is
+//!   replayable. A journal failure is a persistence error and stops admission.
+//! * Live request completion/cancellation is finalized here because SSE
+//!   bypasses the buffered response middleware. Content flags remain binding.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -89,6 +88,8 @@ pub struct UsageLogRecorder {
     /// In-memory fallback used by recorder-only tests and hosts without the
     /// production PostgreSQL pool. Production admission uses durable leases.
     api_key_concurrency: Mutex<HashMap<i64, HashSet<String>>>,
+    journal: Option<Arc<crate::usage_recovery::UsageJournal>>,
+    tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>,
     api_key_concurrency_lease_ttl: std::time::Duration,
 }
 
@@ -304,6 +305,8 @@ impl UsageLogRecorder {
     pub fn new(usage_repo: Arc<dyn UsageRepo>) -> Self {
         Self {
             usage_repo,
+            journal: None,
+            tasks: None,
             sticky_channel_cache: None,
             route_affinity: None,
             price_repo: None,
@@ -317,6 +320,16 @@ impl UsageLogRecorder {
     /// Attach a per-channel model-price source so `record_success` resolves the
     /// price and computes `total_cost` (Go `ComputeUsageCost` parity). Chainable
     /// after [`UsageLogRecorder::new`].
+    pub fn with_task_supervisor(mut self, tasks: Arc<conduit_scheduler::TaskSupervisor>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
+    pub fn with_usage_journal(mut self, journal: Arc<crate::usage_recovery::UsageJournal>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
     pub fn with_price_repo(mut self, price_repo: Arc<dyn ChannelModelPriceRepo>) -> Self {
         self.price_repo = Some(price_repo);
         self
@@ -501,7 +514,7 @@ impl UsageLogRecorder {
                          updated_at=CURRENT_TIMESTAMP WHERE id=$5 AND project_id=$6 \
                          AND status IN ('pending','processing')",
                     )
-                    .bind(response.json_body.clone())
+                    .bind(if ctx.metadata.get("storage_store_response_body").is_some_and(|flag| flag == "false") { None } else { response.json_body.clone() })
                     .bind(latency_ms)
                     .bind(first_token_latency_ms)
                     .bind(channel_id)
@@ -736,6 +749,11 @@ impl RequestRecorder for UsageLogRecorder {
         input: &BillingAdmissionInput,
         api_key_limit: Option<u32>,
     ) -> Result<(), ConduitError> {
+        if let Some(journal) = &self.journal {
+            journal
+                .reserve(&input.request_key)
+                .map_err(ConduitError::internal)?;
+        }
         ctx.metadata.insert(
             BILLING_ADMISSION_REQUEST_KEY_METADATA.to_string(),
             input.request_key.clone(),
@@ -750,7 +768,13 @@ impl RequestRecorder for UsageLogRecorder {
             if self.postgres_pool().is_some() {
                 let lease_id = self
                     .acquire_postgres_api_key_slot(api_key_id, &input.request_key, limit)
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        if let Some(journal) = &self.journal {
+                            journal.release(&input.request_key);
+                        }
+                        error
+                    })?;
                 ctx.metadata.insert(
                     "api_key_concurrency_slot".to_string(),
                     api_key_id.to_string(),
@@ -758,7 +782,13 @@ impl RequestRecorder for UsageLogRecorder {
                 ctx.metadata
                     .insert("api_key_concurrency_lease".to_string(), lease_id);
             } else {
-                self.acquire_api_key_slot(ctx, api_key_id, limit)?;
+                self.acquire_api_key_slot(ctx, api_key_id, limit)
+                    .map_err(|error| {
+                        if let Some(journal) = &self.journal {
+                            journal.release(&input.request_key);
+                        }
+                        error
+                    })?;
             }
         }
 
@@ -768,6 +798,29 @@ impl RequestRecorder for UsageLogRecorder {
             armed: true,
         };
         self.reserve_request(ctx, input).await?;
+        if let Some(pool) = self.postgres_pool().filter(|_| self.journal.is_some()) {
+            let request_id = input
+                .request_key
+                .parse::<i64>()
+                .map_err(|_| ConduitError::internal("invalid metering request id"))?;
+            let affected = sqlx::query(
+                "UPDATE requests SET metering_pending=TRUE WHERE id=$1 AND project_id=$2",
+            )
+            .bind(request_id)
+            .bind(
+                input
+                    .project_id
+                    .parse::<i64>()
+                    .map_err(|_| ConduitError::internal("invalid metering project id"))?,
+            )
+            .execute(pool)
+            .await
+            .map_err(|e| ConduitError::internal(format!("metering audit protection failed: {e}")))?
+            .rows_affected();
+            if affected != 1 {
+                return Err(ConduitError::internal("metering request audit is missing"));
+            }
+        }
         cleanup.armed = false;
         Ok(())
     }
@@ -817,7 +870,7 @@ impl RequestRecorder for UsageLogRecorder {
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
                 return;
             };
-            handle.spawn(async move {
+            let future = async move {
                 if let Err(error) = sqlx::query(
                     "DELETE FROM api_key_concurrency_leases WHERE api_key_id=$1 AND lease_id=$2",
                 )
@@ -828,7 +881,12 @@ impl RequestRecorder for UsageLogRecorder {
                 {
                     warn!(%error, api_key_id, "failed to release distributed API key concurrency lease; expiry will recover it");
                 }
-            });
+            };
+            if let Some(tasks) = &self.tasks {
+                tasks.spawn(future);
+            } else {
+                handle.spawn(future);
+            }
             return;
         }
         let Ok(mut counts) = self.api_key_concurrency.lock() else {
@@ -844,12 +902,18 @@ impl RequestRecorder for UsageLogRecorder {
     }
 
     fn abandon_request(&self, ctx: &OrchestratorContext, reason: &'static str) {
+        if let (Some(journal), Some(key)) = (
+            &self.journal,
+            ctx.metadata.get(BILLING_ADMISSION_REQUEST_KEY_METADATA),
+        ) {
+            journal.release(key);
+        }
         // Drop cannot await PostgreSQL, so production release is scheduled on
         // the runtime; the lease expiry is the crash/shutdown backstop.
         self.release_api_key_slot(ctx);
 
         // Durable wallet cleanup is async. PostgreSQL release is idempotent,
-        // and reservations also carry a 15-minute expiry consumed by the
+        // and reservations also carry a request-deadline plus cleanup expiry consumed by the
         // reconciler, so a runtime shutting down before this task runs cannot
         // leave funds reserved indefinitely.
         let (Some(settler), Some(reservation_key)) = (
@@ -872,7 +936,7 @@ impl RequestRecorder for UsageLogRecorder {
             );
             return;
         };
-        handle.spawn(async move {
+        let future = async move {
             if let Err(error) = settler.release_request(&reservation_key, reason).await {
                 warn!(
                     %error,
@@ -880,7 +944,12 @@ impl RequestRecorder for UsageLogRecorder {
                     "wallet cancellation cleanup failed; reservation expiry will retry"
                 );
             }
-        });
+        };
+        if let Some(tasks) = &self.tasks {
+            tasks.spawn(future);
+        } else {
+            handle.spawn(future);
+        }
     }
 
     async fn reserve_request(
@@ -913,14 +982,6 @@ impl RequestRecorder for UsageLogRecorder {
         attempt: &PipelineAttempt,
         response: &HttpResponse,
     ) -> Result<(), ConduitError> {
-        self.release_api_key_slot_async(ctx).await;
-        if matches!(
-            attempt.mode,
-            conduit_pipeline::pipeline::ExecutionMode::Stream
-        ) {
-            self.finish_stream_request(ctx, request_id, project_id, response)
-                .await;
-        }
         self.remember_successful_channel(ctx, &attempt.channel_id)
             .await;
         self.remember_explicit_route_affinity(ctx, project_id, &attempt.channel_id, response)
@@ -1007,6 +1068,18 @@ impl RequestRecorder for UsageLogRecorder {
             _ => {
                 self.release_reservation(ctx, "successful_unmetered_request")
                     .await;
+                if let Some(pool) = self.postgres_pool() {
+                    let _ = sqlx::query(
+                        "UPDATE requests SET metering_pending=FALSE WHERE id=$1 AND project_id=$2",
+                    )
+                    .bind(request_id_i64)
+                    .bind(project_id_i64)
+                    .execute(pool)
+                    .await;
+                }
+                self.finish_stream_request(ctx, request_id, project_id, response)
+                    .await;
+                self.release_api_key_slot_async(ctx).await;
                 return Ok(());
             }
         };
@@ -1077,83 +1150,89 @@ impl RequestRecorder for UsageLogRecorder {
         if let Some(audit) = conversion_audit {
             audit.attach_to_cost_items(&mut input.cost_items);
         }
-        match self.usage_repo.insert_usage(&svc_ctx, input).await {
-            Ok(created) => {
-                if let Some(settler) = &self.charge_settler
-                    && let Err(err) = settler
-                        .settle_usage(
-                            &created,
-                            usage,
-                            ctx.metadata
-                                .get("billing_reservation_key")
-                                .map(String::as_str),
-                        )
-                        .await
-                {
-                    // Usage remains authoritative even if customer charging
-                    // fails. The missing unique charge event is observable and
-                    // can be reconciled without billing the request twice.
-                    warn!(error = %err, usage_log_id = %created.id, "usage charge settlement failed (non-fatal)");
+        let created = if let Some(journal) = &self.journal {
+            let request_key = ctx
+                .metadata
+                .get(BILLING_ADMISSION_REQUEST_KEY_METADATA)
+                .ok_or_else(|| ConduitError::internal("missing metering admission key"))?;
+            let event = crate::usage_recovery::MeteredEvent {
+                version: 1,
+                event_key: crate::usage_recovery::event_key(request_key),
+                reservation_key: ctx.metadata.get("billing_reservation_key").cloned(),
+                usage: input,
+            };
+            journal.put_ready(&event).map_err(|error| {
+                ConduitError::internal(format!("durable metering acceptance failed: {error}"))
+            })?;
+            match crate::usage_recovery::handoff(
+                self.postgres_pool()
+                    .ok_or_else(|| ConduitError::internal("missing metering pool"))?,
+                &event,
+            )
+            .await
+            {
+                Ok(row) => {
+                    if let Err(error) = journal.ack(&event.event_key) {
+                        warn!(%error, "metering journal ack deferred");
+                    }
+                    row
+                }
+                Err(error) => {
+                    warn!(%error, "PostgreSQL metering handoff deferred; durable input retained");
+                    None
                 }
             }
-            Err(err) => {
-                // Non-fatal: mirror Go's `log.Warn` — a usage-log failure must not
-                // mask a successful request.
-                warn!(error = %err, "usage-log recorder: insert_usage failed (non-fatal)");
-                self.release_reservation(ctx, "usage_log_persist_failed")
-                    .await;
+        } else {
+            Some(
+                self.usage_repo
+                    .insert_usage(&svc_ctx, input)
+                    .await
+                    .map_err(|error| {
+                        ConduitError::internal(format!("usage persistence failed: {error}"))
+                    })?,
+            )
+        };
+        if let (Some(created), Some(settler)) = (created, &self.charge_settler) {
+            if let Err(error) = settler
+                .settle_usage(
+                    &created,
+                    usage,
+                    ctx.metadata
+                        .get("billing_reservation_key")
+                        .map(String::as_str),
+                )
+                .await
+            {
+                warn!(%error, "durable usage settlement deferred");
             }
         }
+        self.finish_stream_request(ctx, request_id, project_id, response)
+            .await;
+        self.release_api_key_slot_async(ctx).await;
+
         Ok(())
     }
 
-    /// No-op: the persist middlewares own the failed request/execution rows, and
-    /// a failed request has no usage to bill.
     async fn record_failure(
         &self,
-        _ctx: &OrchestratorContext,
+        ctx: &OrchestratorContext,
         request_id: &str,
         project_id: &str,
         error: &ConduitError,
     ) -> Result<(), ConduitError> {
-        self.release_api_key_slot_async(_ctx).await;
-        self.release_reservation(_ctx, &format!("request_failed:{error}"))
-            .await;
-        self.persist_route_explanation(
-            _ctx,
-            request_id,
-            project_id,
-            _ctx.metadata.get("channel_id").map(String::as_str),
-            _ctx.metadata
-                .get("actual_model")
-                .or_else(|| _ctx.metadata.get("request_model"))
-                .map(String::as_str),
-            Some(&error.to_string()),
-        )
-        .await;
-        let Some(persistence) = &self.stream_persistence else {
-            return Ok(());
-        };
-        let result = match persistence {
-            StreamPersistence::Postgres(pool) => {
-                match (request_id.parse::<i64>(), project_id.parse::<i64>()) {
-                    (Ok(request_id), Ok(project_id)) => sqlx::query(
-                        "UPDATE requests SET status='failed',updated_at=CURRENT_TIMESTAMP \
-                     WHERE id=$1 AND project_id=$2 AND status IN ('pending','processing')",
-                    )
-                    .bind(request_id)
-                    .bind(project_id)
-                    .execute(pool)
-                    .await
-                    .map(|_| ()),
-                    _ => return Ok(()),
-                }
-            }
-        };
-        if let Err(error) = result {
-            warn!(%error, request_id, "stream recorder: failed to mark request failed");
-        }
-        Ok(())
+        self.record_failed_request(ctx, request_id, project_id, error, "failed")
+            .await
+    }
+
+    async fn record_cancellation(
+        &self,
+        ctx: &OrchestratorContext,
+        request_id: &str,
+        project_id: &str,
+        error: &ConduitError,
+    ) -> Result<(), ConduitError> {
+        self.record_failed_request(ctx, request_id, project_id, error, "canceled")
+            .await
     }
 
     async fn record_stream_final(
@@ -1192,7 +1271,12 @@ impl RequestRecorder for UsageLogRecorder {
                 )
             })
             .flatten();
-        let chunks_json = if plan.write_chunks {
+        let chunks_json = if plan.write_chunks
+            && !ctx
+                .metadata
+                .get("storage_store_chunks")
+                .is_some_and(|flag| flag == "false")
+        {
             Some(stream_chunks_value(chunks))
         } else {
             None
@@ -1200,7 +1284,7 @@ impl RequestRecorder for UsageLogRecorder {
         let result = match persistence {
             StreamPersistence::Postgres(pool) => match (execution_id.parse::<i64>(), project_id.parse::<i64>()) {
                 (Ok(execution_id), Ok(project_id)) => sqlx::query(
-                    "UPDATE request_executions SET status=$1,response_chunks=COALESCE($2::jsonb,response_chunks), \
+                    "UPDATE request_executions SET status=$1,response_chunks=CASE WHEN 'response_chunks'=ANY(expired_artifacts) THEN response_chunks ELSE COALESCE($2::jsonb,response_chunks) END, \
                      error_message=COALESCE($3,error_message),metrics_latency_ms=COALESCE($4,metrics_latency_ms), \
                      metrics_first_token_latency_ms=COALESCE($5,metrics_first_token_latency_ms), \
                      updated_at=CURRENT_TIMESTAMP WHERE id=$6 AND project_id=$7",
@@ -1218,11 +1302,18 @@ impl RequestRecorder for UsageLogRecorder {
 
     async fn record_stream_request_chunks(
         &self,
-        _ctx: &OrchestratorContext,
+        ctx: &OrchestratorContext,
         request_id: &str,
         project_id: &str,
         chunks: &[conduit_llm::StreamEvent],
     ) -> Result<(), ConduitError> {
+        if ctx
+            .metadata
+            .get("storage_store_chunks")
+            .is_some_and(|flag| flag == "false")
+        {
+            return Ok(());
+        }
         let Some(persistence) = &self.stream_persistence else {
             return Ok(());
         };
@@ -1230,7 +1321,7 @@ impl RequestRecorder for UsageLogRecorder {
         let result = match persistence {
             StreamPersistence::Postgres(pool) => match (request_id.parse::<i64>(), project_id.parse::<i64>()) {
                 (Ok(request_id), Ok(project_id)) => sqlx::query(
-                    "UPDATE requests SET response_chunks=$1::jsonb,updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND project_id=$3",
+                    "UPDATE requests SET response_chunks=$1::jsonb,updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND project_id=$3 AND NOT('response_chunks'=ANY(expired_artifacts))",
                 ).bind(chunks_json)
                     .bind(request_id).bind(project_id).execute(pool).await.map(|_|()),
                 _ => return Ok(()),
@@ -1244,6 +1335,56 @@ impl RequestRecorder for UsageLogRecorder {
 }
 
 impl UsageLogRecorder {
+    async fn record_failed_request(
+        &self,
+        ctx: &OrchestratorContext,
+        request_id: &str,
+        project_id: &str,
+        error: &ConduitError,
+        status: &'static str,
+    ) -> Result<(), ConduitError> {
+        self.release_api_key_slot_async(ctx).await;
+        self.release_reservation(ctx, &format!("request_failed:{error}"))
+            .await;
+        self.persist_route_explanation(
+            ctx,
+            request_id,
+            project_id,
+            ctx.metadata.get("channel_id").map(String::as_str),
+            ctx.metadata
+                .get("actual_model")
+                .or_else(|| ctx.metadata.get("request_model"))
+                .map(String::as_str),
+            Some(&error.to_string()),
+        )
+        .await;
+        let Some(persistence) = &self.stream_persistence else {
+            return Ok(());
+        };
+        let result = match persistence {
+            StreamPersistence::Postgres(pool) => {
+                match (request_id.parse::<i64>(), project_id.parse::<i64>()) {
+                    (Ok(request_id), Ok(project_id)) => sqlx::query(
+                        "UPDATE requests SET status=$3,metering_pending=CASE WHEN $4 THEN metering_pending ELSE FALSE END,updated_at=CURRENT_TIMESTAMP \
+                     WHERE id=$1 AND project_id=$2 AND status IN ('pending','processing')",
+                    )
+                    .bind(request_id)
+                    .bind(project_id)
+                    .bind(status)
+                    .bind(error.message.contains("durable metering"))
+                    .execute(pool)
+                    .await
+                    .map(|_| ()),
+                    _ => return Ok(()),
+                }
+            }
+        };
+        if let Err(error) = result {
+            warn!(%error, request_id, "stream recorder: failed to mark request failed");
+        }
+        Ok(())
+    }
+
     async fn persist_route_explanation(
         &self,
         ctx: &OrchestratorContext,
@@ -1330,6 +1471,13 @@ impl UsageLogRecorder {
     }
 
     async fn release_reservation(&self, ctx: &OrchestratorContext, reason: &str) {
+        if let (Some(journal), Some(key)) = (
+            &self.journal,
+            ctx.metadata.get(BILLING_ADMISSION_REQUEST_KEY_METADATA),
+        ) {
+            journal.release(key);
+        }
+
         let (Some(settler), Some(key)) = (
             self.charge_settler.as_ref(),
             ctx.metadata.get("billing_reservation_key"),

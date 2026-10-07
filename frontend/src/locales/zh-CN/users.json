@@ -94,5 +94,7 @@
   "users.messages.userNotFound": "用户未找到",
   "users.messages.addToProjectSuccess": "用户已成功添加到项目",
   "users.messages.removeFromProjectSuccess": "用户已成功从项目中移除",
-  "users.errors.insufficientPermissions": "您没有足够的权限编辑此用户"
+  "users.errors.insufficientPermissions": "您没有足够的权限编辑此用户",
+  "users.errors.duplicateEmail": "此邮箱已被注册，请使用其他邮箱。",
+  "users.errors.saveForbidden": "无法保存这些用户权限。请联系平台 Owner 获取授权，或移除你无权授予的权限。"
 }

@@ -26,6 +26,25 @@ impl PgSystemRepo {
 
 #[async_trait]
 impl SystemRepo for PgSystemRepo {
+    async fn patch_system_value_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        key: &str,
+        patch: serde_json::Value,
+    ) -> RepoResult<SystemRow> {
+        if !patch.is_object() {
+            return Err(RepoError::Database(
+                "settings patch must be an object".into(),
+            ));
+        }
+        sqlx::query_as::<_, SystemRow>(&format!(
+            "INSERT INTO systems(key,value,created_at,updated_at) VALUES($1,$2::jsonb::text,now(),now()) \
+             ON CONFLICT(key) DO UPDATE SET value=(systems.value::jsonb || $2::jsonb)::text,updated_at=now(),deleted_at=0 \
+             RETURNING {SYSTEM_SELECT_COLUMNS}"
+        )).bind(key).bind(sqlx::types::Json(patch)).fetch_one(&self.pool).await
+            .map_err(|e| RepoError::Database(format!("settings atomic patch failed: {e}")))
+    }
+
     async fn get_system_value_unchecked(
         &self,
         _ctx: &RequestContext,

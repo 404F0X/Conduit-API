@@ -830,6 +830,12 @@ pub trait SystemSettingsRepo: Send + Sync {
         key: &str,
         value: Value,
     ) -> ServiceResult<Value>;
+    async fn patch_system_setting(
+        &self,
+        ctx: &RequestContext,
+        key: &str,
+        patch: Value,
+    ) -> ServiceResult<Value>;
 }
 
 #[async_trait]
@@ -837,6 +843,16 @@ impl<T> SystemSettingsRepo for T
 where
     T: SystemRepo + Send + Sync + ?Sized,
 {
+    async fn patch_system_setting(
+        &self,
+        ctx: &RequestContext,
+        key: &str,
+        patch: Value,
+    ) -> ServiceResult<Value> {
+        let saved = SystemRepo::patch_system_value(self, ctx, key, patch).await?;
+        Ok(system_row_value(saved).unwrap_or(Value::Null))
+    }
+
     async fn get_system_setting(
         &self,
         ctx: &RequestContext,
@@ -935,17 +951,41 @@ impl SystemService {
         ctx: &RequestContext,
         key: &str,
     ) -> ServiceResult<Option<Value>> {
-        let cache_key = cache_key(key);
-        if let Some(value) = self.cache.get(&cache_key).await? {
-            return Ok(Some(value));
-        }
-
+        // Validate the generation against the authoritative store before cache lookup.
+        // An old reader can only populate its old content-addressed key; TTL bounds garbage.
         let value = self.repo.get_system_setting(ctx, key).await?;
         if let Some(value) = value.as_ref() {
-            self.cache.set(&cache_key, value.clone(), None).await?;
+            use sha2::{Digest, Sha256};
+            let generation = format!("{:x}", Sha256::digest(serde_json::to_vec(value)?));
+            let versioned_key = format!("{}:{generation}", cache_key(key));
+            if let Ok(Some(cached)) = self.cache.get(&versioned_key).await {
+                return Ok(Some(cached));
+            }
+            if let Err(error) = self
+                .cache
+                .set(
+                    &versioned_key,
+                    value.clone(),
+                    Some(std::time::Duration::from_secs(60)),
+                )
+                .await
+            {
+                tracing::warn!(%error, "system setting cache fill deferred");
+            }
         }
 
         Ok(value)
+    }
+
+    pub async fn patch_system_value(
+        &self,
+        ctx: &RequestContext,
+        key: &str,
+        patch: Value,
+    ) -> ServiceResult<Value> {
+        let saved = self.repo.patch_system_setting(ctx, key, patch).await?;
+        self.invalidate_system_value_cache(key).await?;
+        Ok(saved)
     }
 
     pub async fn set_system_value(
@@ -956,7 +996,9 @@ impl SystemService {
     ) -> ServiceResult<Value> {
         let saved = self.repo.set_system_setting(ctx, key, value).await?;
         // Repository writes are authoritative; evict stale cache so the next read refetches it.
-        self.cache.delete(&cache_key(key)).await?;
+        if let Err(error) = self.cache.delete(&cache_key(key)).await {
+            tracing::warn!(%error, "system setting committed; cache eviction deferred");
+        }
         Ok(saved)
     }
 
@@ -964,7 +1006,9 @@ impl SystemService {
     /// adapters use this when the setting must commit atomically with state
     /// owned by another repository.
     pub async fn invalidate_system_value_cache(&self, key: &str) -> ServiceResult<()> {
-        self.cache.delete(&cache_key(key)).await?;
+        if let Err(error) = self.cache.delete(&cache_key(key)).await {
+            tracing::warn!(%error, "system setting committed; cache eviction deferred");
+        }
         Ok(())
     }
 
@@ -1623,19 +1667,8 @@ impl SystemService {
         ctx: &RequestContext,
         updates: Map<String, Value>,
     ) -> ServiceResult<Value> {
-        let current = self
-            .get_system_value(ctx, SYSTEM_ONBOARDING)
-            .await?
-            .unwrap_or_else(|| Value::Object(Map::new()));
-
-        let merged = merge_onboarding_info(current, updates).ok_or_else(|| {
-            ServiceError::InvalidSystemValue {
-                key: SYSTEM_ONBOARDING.to_string(),
-                message: "expected object".to_string(),
-            }
-        })?;
-
-        self.set_system_value(ctx, SYSTEM_ONBOARDING, merged).await
+        self.patch_system_value(ctx, SYSTEM_ONBOARDING, Value::Object(updates))
+            .await
     }
 
     /// Reads the storage policy. Parity: Go `SystemService.StoragePolicy`
@@ -2027,6 +2060,26 @@ mod tests {
 
     #[async_trait]
     impl SystemSettingsRepo for InMemorySettingsRepo {
+        async fn patch_system_setting(
+            &self,
+            _ctx: &RequestContext,
+            key: &str,
+            patch: Value,
+        ) -> ServiceResult<Value> {
+            let mut values = self.values.lock().await;
+            let value = values
+                .entry(key.into())
+                .or_insert_with(|| serde_json::json!({}));
+            let target = value
+                .as_object_mut()
+                .ok_or_else(|| ServiceError::InvalidSystemValue {
+                    key: key.into(),
+                    message: "expected object".into(),
+                })?;
+            target.extend(patch.as_object().cloned().unwrap_or_default());
+            Ok(value.clone())
+        }
+
         async fn get_system_setting(
             &self,
             _ctx: &RequestContext,
@@ -2154,6 +2207,74 @@ mod tests {
         assert_eq!(system_key::SECURITY_SETTINGS, "security_settings");
     }
 
+    struct FailedCache;
+    #[async_trait]
+    impl Cache for FailedCache {
+        async fn get(&self, _: &str) -> conduit_cache::CacheResult<Option<Value>> {
+            Err(conduit_cache::CacheError::Unavailable("injected".into()))
+        }
+        async fn set(
+            &self,
+            _: &str,
+            _: Value,
+            _: Option<Duration>,
+        ) -> conduit_cache::CacheResult<()> {
+            Err(conduit_cache::CacheError::Unavailable("injected".into()))
+        }
+        async fn delete(&self, _: &str) -> conduit_cache::CacheResult<()> {
+            Err(conduit_cache::CacheError::Unavailable("injected".into()))
+        }
+        async fn invalidate_prefix(&self, _: &str) -> conduit_cache::CacheResult<()> {
+            Err(conduit_cache::CacheError::Unavailable("injected".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_committed_setting_survives_cache_read_fill_and_eviction_failure()
+    -> ServiceResult<()> {
+        let repo = Arc::new(InMemorySettingsRepo::default());
+        let service = service_with_cache(repo.clone(), Arc::new(FailedCache));
+        assert_eq!(
+            service
+                .set_system_value(&ctx(), "fault", json!({"enabled":false}))
+                .await?,
+            json!({"enabled":false})
+        );
+        assert_eq!(
+            service.get_system_value(&ctx(), "fault").await?,
+            Some(json!({"enabled":false}))
+        );
+        service.invalidate_system_value_cache("fault").await?;
+        assert_eq!(repo.writes().await, vec!["fault"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_delayed_old_generation_fill_cannot_override_another_instances_committed_value()
+    -> ServiceResult<()> {
+        use sha2::{Digest, Sha256};
+        let repo = Arc::new(InMemorySettingsRepo::default());
+        let cache = Arc::new(MemoryCache::default());
+        let service = service_with_cache(repo.clone(), cache.clone());
+        repo.insert("race", json!({"enabled":true})).await;
+        assert_eq!(
+            service.get_system_value(&ctx(), "race").await?,
+            Some(json!({"enabled":true}))
+        );
+        // Another instance commits without invalidating this instance's L1.
+        repo.insert("race", json!({"enabled":false})).await;
+        let old = json!({"enabled":true});
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&old).unwrap()));
+        cache
+            .set(&format!("{}:{hash}", cache_key("race")), old, None)
+            .await?;
+        assert_eq!(
+            service.get_system_value(&ctx(), "race").await?,
+            Some(json!({"enabled":false}))
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn get_uses_cache_and_set_invalidates() -> ServiceResult<()> {
         let repo = Arc::new(InMemorySettingsRepo::default());
@@ -2169,7 +2290,7 @@ mod tests {
             service.get_system_value(&ctx, SYSTEM_BRAND).await?,
             Some(json!("old"))
         );
-        assert_eq!(repo.get_calls(), 1);
+        assert_eq!(repo.get_calls(), 2);
 
         service
             .set_system_value(&ctx, SYSTEM_BRAND, json!("new"))
@@ -2178,7 +2299,7 @@ mod tests {
             service.get_system_value(&ctx, SYSTEM_BRAND).await?,
             Some(json!("new"))
         );
-        assert_eq!(repo.get_calls(), 2);
+        assert_eq!(repo.get_calls(), 3);
 
         Ok(())
     }
@@ -3923,10 +4044,8 @@ mod tests {
     // contract: the getter caches, and `set_version` invalidates the cache.
     // =====================================================================
 
-    /// Parity: Go `TestSystemService_Version_WithCache` (`system_test.go`
-    /// lines 677-719). Set → read (cache) → read (cache hit) → update → read
-    /// (invalidated, new value). Asserts the repo is queried once per
-    /// cache-miss cycle.
+    /// Each getter validates the authoritative generation before using cache.
+    /// A setter must change the generation and preserve the committed value.
     #[tokio::test]
     async fn version_set_invalidates_cache() -> ServiceResult<()> {
         let repo = Arc::new(InMemorySettingsRepo::default());
@@ -3939,16 +4058,16 @@ mod tests {
         assert_eq!(service.version(&ctx).await?, "v0.4.0");
         assert_eq!(repo.get_calls(), 1);
 
-        // Second read hits the cache (no new repo query).
+        // Even a cache hit validates the authoritative generation.
         assert_eq!(service.version(&ctx).await?, "v0.4.0");
-        assert_eq!(repo.get_calls(), 1);
+        assert_eq!(repo.get_calls(), 2);
 
         // Update must invalidate the cache.
         service.set_version(&ctx, "v0.5.0").await?;
 
         // Next read re-queries the repo and sees the new value.
         assert_eq!(service.version(&ctx).await?, "v0.5.0");
-        assert_eq!(repo.get_calls(), 2);
+        assert_eq!(repo.get_calls(), 3);
         Ok(())
     }
 

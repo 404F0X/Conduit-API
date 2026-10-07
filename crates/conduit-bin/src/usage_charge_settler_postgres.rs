@@ -29,6 +29,7 @@ pub(crate) struct PgUsageChargeSettler {
     wallet_gates: Arc<WalletAdmissionGates>,
     settlement_tx: mpsc::Sender<SettlementJob>,
     async_settlement: bool,
+    reservation_ttl: Duration,
 }
 
 struct SettlementJob {
@@ -186,6 +187,22 @@ impl WalletAdmissionGates {
 
 impl PgUsageChargeSettler {
     pub(crate) fn new(pool: PgPool) -> Self {
+        Self::create(pool, None)
+    }
+
+    pub(crate) fn new_supervised(
+        pool: PgPool,
+        tasks: Arc<conduit_scheduler::TaskSupervisor>,
+    ) -> Self {
+        Self::create(pool, Some(tasks))
+    }
+
+    pub(crate) fn with_reservation_ttl(mut self, ttl: Duration) -> Self {
+        self.reservation_ttl = ttl;
+        self
+    }
+
+    fn create(pool: PgPool, tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>) -> Self {
         let queue_capacity = std::env::var("CONDUIT_BILLING_SETTLEMENT_QUEUE_CAPACITY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -197,12 +214,13 @@ impl PgUsageChargeSettler {
             enforcement_mode: BillingEnforcementMode::from_env(),
             wallet_gates: Arc::new(WalletAdmissionGates::default()),
             settlement_tx,
-            async_settlement: !cfg!(test),
+            async_settlement: tasks.is_some(),
+            reservation_ttl: Duration::from_secs(900),
         };
-        if cfg!(test) {
-            drop(settlement_rx);
+        if let Some(tasks) = tasks {
+            settler.start_settlement_workers(settlement_rx, tasks);
         } else {
-            settler.start_settlement_workers(settlement_rx);
+            drop(settlement_rx);
         }
         settler
     }
@@ -213,7 +231,11 @@ impl PgUsageChargeSettler {
         direct
     }
 
-    fn start_settlement_workers(&self, mut receiver: mpsc::Receiver<SettlementJob>) {
+    fn start_settlement_workers(
+        &self,
+        mut receiver: mpsc::Receiver<SettlementJob>,
+        tasks: Arc<conduit_scheduler::TaskSupervisor>,
+    ) {
         let worker_count = std::env::var("CONDUIT_BILLING_SETTLEMENT_WORKERS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -221,13 +243,14 @@ impl PgUsageChargeSettler {
             .clamp(1, 64);
         let permits = Arc::new(Semaphore::new(worker_count));
         let direct = self.direct_clone();
-        tokio::spawn(async move {
+        let child_tasks = tasks.clone();
+        tasks.spawn(async move {
             while let Some(job) = receiver.recv().await {
                 let Ok(permit) = permits.clone().acquire_owned().await else {
                     break;
                 };
                 let worker = direct.clone();
-                tokio::spawn(async move {
+                child_tasks.spawn(async move {
                     let usage_log_id = job.log.id.parse::<i64>().ok();
                     if let Err(error) = worker
                         .settle_usage(&job.log, &job.usage, job.reservation_key.as_deref())
@@ -482,8 +505,11 @@ impl PgUsageChargeSettler {
     }
 }
 
-pub(crate) fn start_reconciler(settler: Arc<PgUsageChargeSettler>) {
-    tokio::spawn(async move {
+pub(crate) fn start_reconciler(
+    settler: Arc<PgUsageChargeSettler>,
+    tasks: &conduit_scheduler::TaskSupervisor,
+) {
+    tasks.spawn(async move {
         loop {
             if let Err(error) = settler.cleanup_expired_reservations().await {
                 warn!(%error, "PostgreSQL wallet reservation expiry cleanup failed");
@@ -516,7 +542,8 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             None => return Ok(None),
         };
         let now = Utc::now();
-        let expires_at = now + chrono::Duration::minutes(15);
+        let expires_at =
+            now + chrono::Duration::from_std(self.reservation_ttl).map_err(|e| e.to_string())?;
         let user_id = sqlx::query_scalar::<_, i64>(
             "SELECT user_id FROM api_keys WHERE id=$1 AND project_id=$2 AND deleted_at=0 LIMIT 1",
         )

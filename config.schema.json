@@ -906,6 +906,41 @@
         }
       },
       "type": "object"
+    },
+    "UsageRecoveryConfig": {
+      "additionalProperties": false,
+      "description": "Local durable usage journal. Each instance needs its own persistent directory.",
+      "properties": {
+        "directory": {
+          "default": "data/usage-journal",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 1073741824,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "max_event_bytes": {
+          "default": 65536,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "replay_batch_size": {
+          "default": 100,
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "replay_interval_seconds": {
+          "default": 5,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     }
   },
   "properties": {
@@ -1140,6 +1175,20 @@
           "trace_header": "Conduit-Trace-Id"
         },
         "trusted_proxies": []
+      }
+    },
+    "usage_recovery": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/UsageRecoveryConfig"
+        }
+      ],
+      "default": {
+        "directory": "data/usage-journal",
+        "max_bytes": 1073741824,
+        "max_event_bytes": 65536,
+        "replay_batch_size": 100,
+        "replay_interval_seconds": 5
       }
     }
   },

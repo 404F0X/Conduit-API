@@ -17,6 +17,7 @@ conduit-core = { workspace = true }
 conduit-db = { workspace = true }
 conduit-llm = { workspace = true }
 conduit-pipeline = { workspace = true }
+conduit-scheduler = { workspace = true }
 conduit-services = { workspace = true }
 conduit-transformers = { workspace = true }
 async-trait = { workspace = true }

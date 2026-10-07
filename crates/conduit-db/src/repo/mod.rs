@@ -448,6 +448,38 @@ impl InMemorySystemRepo {
 
 #[async_trait]
 impl SystemRepo for InMemorySystemRepo {
+    async fn patch_system_value_unchecked(
+        &self,
+        _ctx: &RequestContext,
+        key: &str,
+        patch: serde_json::Value,
+    ) -> RepoResult<SystemRow> {
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| RepoError::LockPoisoned("system repo"))?;
+        let now = chrono::Utc::now();
+        let row = rows.entry(key.into()).or_insert_with(|| SystemRow {
+            id: String::new(),
+            key: key.into(),
+            value: "{}".into(),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        });
+        let mut value: serde_json::Value =
+            serde_json::from_str(&row.value).map_err(|e| RepoError::Database(e.to_string()))?;
+        let (Some(target), Some(patch)) = (value.as_object_mut(), patch.as_object()) else {
+            return Err(RepoError::Database(
+                "settings patch requires JSON objects".into(),
+            ));
+        };
+        target.extend(patch.clone());
+        row.value = value.to_string();
+        row.updated_at = now;
+        Ok(row.clone())
+    }
+
     async fn get_system_value_unchecked(
         &self,
         _ctx: &RequestContext,
@@ -488,6 +520,22 @@ pub trait SystemRepo: Send + Sync {
         ctx: &RequestContext,
         row: SystemRow,
     ) -> RepoResult<SystemRow>;
+
+    async fn patch_system_value_unchecked(
+        &self,
+        ctx: &RequestContext,
+        key: &str,
+        patch: serde_json::Value,
+    ) -> RepoResult<SystemRow>;
+    async fn patch_system_value(
+        &self,
+        ctx: &RequestContext,
+        key: &str,
+        patch: serde_json::Value,
+    ) -> RepoResult<SystemRow> {
+        guard_repo_principal(ctx)?;
+        self.patch_system_value_unchecked(ctx, key, patch).await
+    }
 
     async fn get_system_value(
         &self,

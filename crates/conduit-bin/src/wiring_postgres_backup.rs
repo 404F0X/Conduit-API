@@ -6,7 +6,7 @@
 //! PostgreSQL therefore performs the inverse type conversion instead of a
 //! fragile application-side string binder.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ use chrono::{DateTime, Timelike, Utc};
 use conduit_services::{BackupDataSource, BackupSection, BackupServiceError, BackupServiceResult};
 use conduit_storage::StorageError;
 use serde_json::{Map, Value};
-use sqlx::{PgPool, Postgres, Row, Transaction, types::Json};
+use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction, types::Json};
 
 const PRICING_CONFIGURATION_TABLES: &[&str] = &[
     "upstream_model_deployments",
@@ -45,11 +45,11 @@ impl PgBackupDataSourceAdapter {
         Self { pool }
     }
 
-    async fn load_table(&self, table: &str) -> BackupServiceResult<Value> {
+    async fn load_table(connection: &mut PgConnection, table: &str) -> BackupServiceResult<Value> {
         let rows = sqlx::query(&format!(
             "SELECT to_jsonb(backup_row) AS payload FROM (SELECT * FROM {table}) backup_row"
         ))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(|error| backup_storage_error(format!("load {table} failed: {error}")))?;
         let values = rows
@@ -59,13 +59,13 @@ impl PgBackupDataSourceAdapter {
         Ok(Value::Array(values))
     }
 
-    async fn load_api_keys(&self) -> BackupServiceResult<Value> {
+    async fn load_api_keys(connection: &mut PgConnection) -> BackupServiceResult<Value> {
         let rows = sqlx::query(
             "SELECT to_jsonb(api_key) || jsonb_build_object( \
                  'project_name', COALESCE(project.name, '')) AS payload \
              FROM api_keys api_key LEFT JOIN projects project ON project.id = api_key.project_id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(|error| {
             backup_storage_error(format!("load api_keys with project name failed: {error}"))
@@ -77,13 +77,15 @@ impl PgBackupDataSourceAdapter {
         ))
     }
 
-    async fn load_pricing_configuration(&self) -> BackupServiceResult<Value> {
+    async fn load_pricing_configuration(
+        connection: &mut PgConnection,
+    ) -> BackupServiceResult<Value> {
         let accounting_settings = sqlx::query(
             "SELECT to_jsonb(source) AS payload FROM (\
              SELECT * FROM systems WHERE key=$1 AND deleted_at=0) source",
         )
         .bind(conduit_services::system_key::GENERAL_SETTINGS)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
         .await
         .map_err(|error| backup_storage_error(format!("load accounting settings failed: {error}")))?
         .into_iter()
@@ -95,7 +97,10 @@ impl PgBackupDataSourceAdapter {
             Value::Array(accounting_settings),
         );
         for table in PRICING_CONFIGURATION_TABLES {
-            sections.insert((*table).to_string(), self.load_table(table).await?);
+            sections.insert(
+                (*table).to_string(),
+                Self::load_table(connection, table).await?,
+            );
         }
         Ok(Value::Object(sections))
     }
@@ -120,26 +125,51 @@ fn section_table(section: BackupSection) -> &'static str {
 
 #[async_trait]
 impl BackupDataSource for PgBackupDataSourceAdapter {
-    async fn load_section(
+    async fn load_sections(
         &self,
         _ctx: &conduit_db::RequestContext,
-        section: BackupSection,
-    ) -> BackupServiceResult<Value> {
-        match section {
-            BackupSection::ApiKeys => self.load_api_keys().await,
-            BackupSection::PricingConfiguration => self.load_pricing_configuration().await,
-            _ => self.load_table(section_table(section)).await,
+        selected: &[BackupSection],
+    ) -> BackupServiceResult<BTreeMap<BackupSection, Value>> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| backup_storage_error(format!("begin backup snapshot: {error}")))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| backup_storage_error(format!("set backup snapshot: {error}")))?;
+        let mut sections = BTreeMap::new();
+        for section in selected {
+            let rows = match section {
+                BackupSection::ApiKeys => Self::load_api_keys(&mut transaction).await?,
+                BackupSection::PricingConfiguration => {
+                    Self::load_pricing_configuration(&mut transaction).await?
+                }
+                _ => Self::load_table(&mut transaction, section_table(*section)).await?,
+            };
+            sections.insert(*section, rows);
         }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| backup_storage_error(format!("commit backup snapshot: {error}")))?;
+        Ok(sections)
     }
 }
 
 pub struct PgBackupExtAdapter {
     service: Arc<conduit_services::BackupService>,
+    tasks: Arc<conduit_scheduler::TaskSupervisor>,
     pool: PgPool,
     system: Arc<conduit_services::SystemService>,
     data_storage_repo: Arc<dyn conduit_db::repo::data_storage_repo::DataStorageRepo>,
     #[cfg(test)]
     test_backup_encryption_key: Option<[u8; 32]>,
+    #[cfg(test)]
+    test_scheduled_now: Option<DateTime<Utc>>,
+    #[cfg(test)]
+    test_scheduled_read_gate: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 impl PgBackupExtAdapter {
@@ -155,13 +185,82 @@ impl PgBackupExtAdapter {
             conduit_services::BackupService::new(repo, storage).with_data_source(data_source),
         );
         Self {
+            tasks: Arc::new(conduit_scheduler::TaskSupervisor::default()),
             service,
             pool,
             system,
             data_storage_repo,
             #[cfg(test)]
             test_backup_encryption_key: None,
+            #[cfg(test)]
+            test_scheduled_now: None,
+            #[cfg(test)]
+            test_scheduled_read_gate: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn with_task_supervisor(mut self, tasks: Arc<conduit_scheduler::TaskSupervisor>) -> Self {
+        self.tasks = tasks;
+        self
+    }
+
+    pub async fn run_scheduled(&self) -> Result<(), String> {
+        let now = Utc::now();
+        #[cfg(test)]
+        let now = self.test_scheduled_now.unwrap_or(now);
+        let result = self.run_scheduled_at(now).await;
+        if let Err(error) = &result {
+            record_auto_backup_error(&self.system, error.clone()).await;
+        }
+        result.map(|_| ())
+    }
+
+    async fn run_scheduled_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ScheduledBackupOutcome>, String> {
+        let settings = self
+            .system
+            .get_json::<conduit_services::AutoBackupSettings>(
+                &system_context(),
+                conduit_services::system_service::system_key::AUTO_BACKUP_SETTINGS,
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        if !scheduled_auto_backup_due(&settings, now) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        {
+            let gate = self.test_scheduled_read_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.wait().await;
+                gate.wait().await;
+            }
+        }
+        let key = format!("auto-backup:{}", now.date_naive());
+        crate::maintenance_claim::run_with_completion(
+            &self.pool,
+            &key,
+            async {
+                let executed = crate::maintenance_claim::run(
+                    &self.pool,
+                    "auto-backup",
+                    false,
+                    run_scheduled_auto_backup(
+                        self.service.clone(),
+                        self.system.clone(),
+                        self.data_storage_repo.clone(),
+                        now,
+                    ),
+                )
+                .await?;
+                executed.ok_or_else(|| "automatic backup already running".into())
+            },
+            |outcome| *outcome == ScheduledBackupOutcome::Executed,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -288,13 +387,27 @@ impl conduit_admin_graphql::backup_ext::BackupExtServices for PgBackupExtAdapter
         let service = self.service.clone();
         let system = self.system.clone();
         let data_storage_repo = self.data_storage_repo.clone();
-        tokio::spawn(async move {
-            if let Err(error) = run_auto_backup(service, system.clone(), data_storage_repo).await {
+        let pool = self.pool.clone();
+        let accepted = self.tasks.spawn(async move {
+            if let Err(error) = crate::maintenance_claim::run(
+                &pool,
+                "auto-backup",
+                false,
+                run_auto_backup(service, system.clone(), data_storage_repo),
+            )
+            .await
+            {
                 tracing::error!(%error, "manual PostgreSQL automatic-backup trigger failed");
                 record_auto_backup_error(&system, error).await;
             }
         });
-        Ok(())
+        if accepted {
+            Ok(())
+        } else {
+            Err(conduit_admin_graphql::backup_ext::BackupExtError::Backup(
+                "server is shutting down".into(),
+            ))
+        }
     }
 }
 
@@ -307,16 +420,16 @@ fn system_context() -> conduit_db::RequestContext {
 async fn record_auto_backup_error(system: &conduit_services::SystemService, error: String) {
     use conduit_services::system_service::system_key;
     let ctx = system_context();
-    let mut settings = system
-        .get_json::<conduit_services::AutoBackupSettings>(&ctx, system_key::AUTO_BACKUP_SETTINGS)
+    if let Err(write_error) = system
+        .patch_system_value(
+            &ctx,
+            system_key::AUTO_BACKUP_SETTINGS,
+            serde_json::json!({ "last_backup_error": error }),
+        )
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    settings.last_backup_error = Some(error);
-    let _ = system
-        .set_json(&ctx, system_key::AUTO_BACKUP_SETTINGS, &settings)
-        .await;
+    {
+        tracing::error!(%write_error, "failed to persist backup error status");
+    }
 }
 
 async fn run_auto_backup(
@@ -324,15 +437,35 @@ async fn run_auto_backup(
     system: Arc<conduit_services::SystemService>,
     data_storage_repo: Arc<dyn conduit_db::repo::data_storage_repo::DataStorageRepo>,
 ) -> Result<(), String> {
-    use conduit_services::system_service::system_key;
-    use conduit_storage::{DataStorageConfig, DataStorageKind, StorageMetadata, StorageObject};
+    run_auto_backup_at(service, system, data_storage_repo, Utc::now()).await
+}
 
+async fn run_auto_backup_at(
+    service: Arc<conduit_services::BackupService>,
+    system: Arc<conduit_services::SystemService>,
+    data_storage_repo: Arc<dyn conduit_db::repo::data_storage_repo::DataStorageRepo>,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), String> {
+    use conduit_services::system_service::system_key;
     let ctx = system_context();
-    let mut settings = system
+    let settings = system
         .get_json::<conduit_services::AutoBackupSettings>(&ctx, system_key::AUTO_BACKUP_SETTINGS)
         .await
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
+    execute_auto_backup(service, system, data_storage_repo, now, settings).await
+}
+
+async fn execute_auto_backup(
+    service: Arc<conduit_services::BackupService>,
+    system: Arc<conduit_services::SystemService>,
+    data_storage_repo: Arc<dyn conduit_db::repo::data_storage_repo::DataStorageRepo>,
+    now: DateTime<Utc>,
+    settings: conduit_services::AutoBackupSettings,
+) -> Result<(), String> {
+    use conduit_services::system_service::system_key;
+    use conduit_storage::{DataStorageConfig, DataStorageKind, StorageMetadata, StorageObject};
+    let ctx = system_context();
     if settings.data_storage_id == 0 {
         return Err("auto backup data storage is not configured".to_string());
     }
@@ -389,7 +522,6 @@ async fn run_auto_backup(
             include_request_logs: settings.include_request_logs,
         },
     )?;
-    let now = chrono::Utc::now();
     let key = format!("backups/auto/conduit-{}.json", now.format("%Y%m%dT%H%M%SZ"));
     let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     backend
@@ -400,23 +532,54 @@ async fn run_auto_backup(
         )
         .await
         .map_err(|error| error.to_string())?;
-    settings.last_backup_at = Some(now);
-    settings.last_backup_error = None;
+    cleanup_auto_backup_retention(backend.as_ref(), &settings, now).await?;
     system
-        .set_json(&ctx, system_key::AUTO_BACKUP_SETTINGS, &settings)
+        .patch_system_value(
+            &ctx,
+            system_key::AUTO_BACKUP_SETTINGS,
+            serde_json::json!({ "last_backup_at": now, "last_backup_error": null }),
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+async fn cleanup_auto_backup_retention(
+    backend: &dyn conduit_storage::StorageAdapter,
+    settings: &conduit_services::AutoBackupSettings,
+    now: chrono::DateTime<Utc>,
+) -> Result<(), String> {
+    if let Some(cutoff) = settings.retention_cutoff(now) {
+        for object in backend
+            .list("backups/auto")
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            if auto_backup_timestamp(&object.key).is_some_and(|timestamp| timestamp < cutoff) {
+                backend
+                    .delete(&object.key)
+                    .await
+                    .map_err(|e| format!("auto backup retention failed: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledBackupOutcome {
+    Executed,
+    Skipped,
 }
 
 async fn run_scheduled_auto_backup(
     service: Arc<conduit_services::BackupService>,
     system: Arc<conduit_services::SystemService>,
     data_storage_repo: Arc<dyn conduit_db::repo::data_storage_repo::DataStorageRepo>,
-) -> Result<(), String> {
+    now: DateTime<Utc>,
+) -> Result<ScheduledBackupOutcome, String> {
     use conduit_services::system_service::system_key;
 
-    let now = Utc::now();
     let settings = system
         .get_json::<conduit_services::AutoBackupSettings>(
             &system_context(),
@@ -426,9 +589,25 @@ async fn run_scheduled_auto_backup(
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     if !scheduled_auto_backup_due(&settings, now) {
-        return Ok(());
+        return Ok(ScheduledBackupOutcome::Skipped);
     }
-    run_auto_backup(service, system, data_storage_repo).await
+    // A lease lost after PUT retries the same daily object rather than making
+    // a second archive. The durable date claim prevents normal duplicate runs.
+    let slot = now
+        .date_naive()
+        .and_hms_opt(2, 0, 0)
+        .ok_or("invalid backup slot")?
+        .and_utc();
+    execute_auto_backup(service, system, data_storage_repo, slot, settings).await?;
+    Ok(ScheduledBackupOutcome::Executed)
+}
+
+fn auto_backup_timestamp(key: &str) -> Option<chrono::DateTime<Utc>> {
+    let name = key
+        .strip_prefix("backups/auto/conduit-")?
+        .strip_suffix(".json")?;
+    let timestamp = chrono::NaiveDateTime::parse_from_str(name, "%Y%m%dT%H%M%SZ").ok()?;
+    Some(timestamp.and_utc())
 }
 
 fn scheduled_auto_backup_due(
@@ -456,8 +635,15 @@ impl conduit_scheduler::AutoBackupExecutor for PgBackupExtAdapter {
         let data_storage_repo = self.data_storage_repo.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                match run_scheduled_auto_backup(service, system.clone(), data_storage_repo).await {
-                    Ok(()) => Ok(()),
+                match run_scheduled_auto_backup(
+                    service,
+                    system.clone(),
+                    data_storage_repo,
+                    Utc::now(),
+                )
+                .await
+                {
+                    Ok(_) => Ok(()),
                     Err(error) => {
                         record_auto_backup_error(&system, error.clone()).await;
                         Err(error)
@@ -1383,6 +1569,355 @@ mod tests {
         BackupConflictStrategy, BackupExtServices, BackupOptionsInput, RestoreOptionsInput,
     };
     use conduit_cache::NoopCache;
+
+    async fn scheduled_test_adapter(
+        pool: &PgPool,
+        settings: &conduit_services::AutoBackupSettings,
+    ) -> Result<PgBackupExtAdapter, Box<dyn std::error::Error>> {
+        let system = Arc::new(conduit_services::SystemService::from_system_repo(
+            Arc::new(conduit_db::PgSystemRepo::new(pool.clone())),
+            Arc::new(NoopCache::new()),
+        ));
+        system
+            .set_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+                settings,
+            )
+            .await?;
+        let mut adapter = PgBackupExtAdapter::new(
+            pool.clone(),
+            system,
+            Arc::new(conduit_db::PgDataStorageRepo::new(pool.clone())),
+        );
+        adapter.test_scheduled_now =
+            Some(DateTime::parse_from_rfc3339("2024-02-02T02:10:00Z")?.with_timezone(&Utc));
+        Ok(adapter)
+    }
+
+    #[tokio::test]
+    async fn repair_scheduled_backup_failure_is_visible_and_retry_clears_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let server = wiremock::MockServer::start().await;
+        for method in ["MKCOL", "PUT"] {
+            wiremock::Mock::given(wiremock::matchers::method(method))
+                .respond_with(wiremock::ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("PROPFIND"))
+            .respond_with(wiremock::ResponseTemplate::new(207).set_body_string("<multistatus xmlns=\"DAV:\"><response><href>/backups/auto/conduit-20240101T020000Z.json</href><propstat><prop><getcontentlength>7</getcontentlength><resourcetype/></prop></propstat></response></multistatus>"))
+            .mount(&server).await;
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_delete = fail.clone();
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .respond_with(move |_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(
+                    if fail_delete.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        500
+                    } else {
+                        204
+                    },
+                )
+            })
+            .mount(&server)
+            .await;
+        let sid: i64 = sqlx::query_scalar("INSERT INTO data_storages(name,description,\"primary\",\"type\",settings,status) VALUES('scheduled','',FALSE,'webdav',$1,'active') RETURNING id")
+            .bind(Json(serde_json::json!({"webdav":{"url":server.uri()}}))).fetch_one(&db.pool).await?;
+        let settings = conduit_services::AutoBackupSettings {
+            enabled: true,
+            include_channels: false,
+            include_model_prices: false,
+            retention_days: 1,
+            ..Default::default()
+        };
+        let adapter = scheduled_test_adapter(&db.pool, &settings).await?;
+        assert!(
+            adapter
+                .run_scheduled()
+                .await
+                .unwrap_err()
+                .contains("not configured")
+        );
+        let mut saved: conduit_services::AutoBackupSettings = adapter
+            .system
+            .get_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+            )
+            .await?
+            .unwrap();
+        assert!(
+            saved
+                .last_backup_error
+                .as_deref()
+                .unwrap()
+                .contains("not configured")
+        );
+        saved.data_storage_id = sid;
+        adapter
+            .system
+            .set_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+                &saved,
+            )
+            .await?;
+        assert!(
+            adapter
+                .run_scheduled()
+                .await
+                .unwrap_err()
+                .contains("retention failed")
+        );
+        saved = adapter
+            .system
+            .get_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+            )
+            .await?
+            .unwrap();
+        assert!(
+            saved
+                .last_backup_error
+                .as_deref()
+                .unwrap()
+                .contains("retention failed")
+        );
+        assert!(saved.last_backup_at.is_none());
+        assert_eq!(saved.data_storage_id, sid);
+        assert_eq!(saved.retention_days, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM maintenance_claims")
+                .fetch_one(&db.pool)
+                .await?,
+            0
+        );
+        adapter.run_scheduled().await?;
+        saved = adapter
+            .system
+            .get_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+            )
+            .await?
+            .unwrap();
+        assert!(saved.last_backup_error.is_none());
+        assert_eq!(
+            saved.last_backup_at,
+            Some(DateTime::parse_from_rfc3339("2024-02-02T02:00:00Z")?.with_timezone(&Utc))
+        );
+        assert_eq!(saved.data_storage_id, sid);
+        let before = server.received_requests().await.unwrap().len();
+        adapter
+            .system
+            .patch_system_value(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+                serde_json::json!({"last_backup_at":null}),
+            )
+            .await?;
+        adapter.run_scheduled().await?;
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_scheduled_backup_disabled_between_reads_can_retry_same_day()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let server = wiremock::MockServer::start().await;
+        for method in ["MKCOL", "PUT"] {
+            wiremock::Mock::given(wiremock::matchers::method(method))
+                .respond_with(wiremock::ResponseTemplate::new(201))
+                .mount(&server)
+                .await;
+        }
+        let sid: i64 = sqlx::query_scalar("INSERT INTO data_storages(name,description,\"primary\",\"type\",settings,status) VALUES('race','',FALSE,'webdav',$1,'active') RETURNING id")
+            .bind(Json(serde_json::json!({"webdav":{"url":server.uri()}}))).fetch_one(&db.pool).await?;
+        let mut settings = conduit_services::AutoBackupSettings {
+            enabled: true,
+            data_storage_id: sid,
+            include_channels: false,
+            include_model_prices: false,
+            retention_days: 0,
+            ..Default::default()
+        };
+        let adapter = scheduled_test_adapter(&db.pool, &settings).await?;
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        *adapter.test_scheduled_read_gate.lock().unwrap() = Some(gate.clone());
+        let adapter = Arc::new(adapter);
+        let runner = adapter.clone();
+        let first = tokio::spawn(async move { runner.run_scheduled().await });
+        gate.wait().await;
+        settings.enabled = false;
+        adapter
+            .system
+            .set_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+                &settings,
+            )
+            .await?;
+        gate.wait().await;
+        first.await??;
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM maintenance_claims")
+                .fetch_one(&db.pool)
+                .await?,
+            0
+        );
+        settings.enabled = true;
+        adapter
+            .system
+            .set_json(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+                &settings,
+            )
+            .await?;
+        adapter.run_scheduled().await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM maintenance_claims WHERE completed_at IS NOT NULL"
+            )
+            .fetch_one(&db.pool)
+            .await?,
+            1
+        );
+        let before = server.received_requests().await.unwrap().len();
+        assert!(before > 0);
+        adapter
+            .system
+            .patch_system_value(
+                &system_context(),
+                conduit_services::system_key::AUTO_BACKUP_SETTINGS,
+                serde_json::json!({"last_backup_at":null}),
+            )
+            .await?;
+        adapter.run_scheduled().await?;
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    struct FailingRetentionStorage {
+        inner: conduit_storage::InMemoryStorageAdapter,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl conduit_storage::StorageAdapter for FailingRetentionStorage {
+        async fn put(
+            &self,
+            object: conduit_storage::StorageObject,
+        ) -> conduit_storage::StorageResult<conduit_storage::StorageMetadata> {
+            self.inner.put(object).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+        ) -> conduit_storage::StorageResult<Option<conduit_storage::StorageObject>> {
+            self.inner.get(key).await
+        }
+        async fn head(
+            &self,
+            key: &str,
+        ) -> conduit_storage::StorageResult<Option<conduit_storage::StorageMetadata>> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+        ) -> conduit_storage::StorageResult<Vec<conduit_storage::StorageMetadata>> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> conduit_storage::StorageResult<bool> {
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(conduit_storage::StorageError::Unavailable(
+                    "injected deletion failure".into(),
+                ));
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_backup_retention_failure_is_reported_and_retry_is_idempotent()
+    -> Result<(), String> {
+        use conduit_storage::{StorageAdapter, StorageObject};
+        let storage = FailingRetentionStorage {
+            inner: conduit_storage::InMemoryStorageAdapter::new(),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        };
+        let key = "backups/auto/conduit-20240101T020000Z.json";
+        storage
+            .put(StorageObject::new(key, b"archive".to_vec()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let now = DateTime::parse_from_rfc3339("2024-02-02T02:00:00Z")
+            .map_err(|e| e.to_string())?
+            .with_timezone(&Utc);
+        let settings = conduit_services::AutoBackupSettings {
+            retention_days: 10,
+            ..Default::default()
+        };
+        assert!(
+            cleanup_auto_backup_retention(&storage, &settings, now)
+                .await
+                .is_err()
+        );
+        assert!(storage.exists(key).await.map_err(|e| e.to_string())?);
+        cleanup_auto_backup_retention(&storage, &settings, now).await?;
+        assert!(!storage.exists(key).await.map_err(|e| e.to_string())?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_backup_retention_uses_only_owned_timestamp_keys_and_zero_keeps_all()
+    -> Result<(), String> {
+        use conduit_storage::{InMemoryStorageAdapter, StorageAdapter, StorageObject};
+        let backend = InMemoryStorageAdapter::new();
+        let old = "backups/auto/conduit-20240101T020000Z.json";
+        let recent = "backups/auto/conduit-20240201T020000Z.json";
+        let unrelated = "backups/auto/customer-20240101T020000Z.json";
+        for key in [
+            old,
+            recent,
+            unrelated,
+            "backups/manual/conduit-20240101T020000Z.json",
+        ] {
+            backend
+                .put(StorageObject::new(key, b"archive".to_vec()))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let now = DateTime::parse_from_rfc3339("2024-02-02T02:00:00Z")
+            .map_err(|e| e.to_string())?
+            .with_timezone(&Utc);
+        let mut settings = conduit_services::AutoBackupSettings {
+            retention_days: 0,
+            ..Default::default()
+        };
+        cleanup_auto_backup_retention(&backend, &settings, now).await?;
+        assert!(backend.exists(old).await.map_err(|e| e.to_string())?);
+        settings.retention_days = 10;
+        cleanup_auto_backup_retention(&backend, &settings, now).await?;
+        assert!(!backend.exists(old).await.map_err(|e| e.to_string())?);
+        assert!(backend.exists(recent).await.map_err(|e| e.to_string())?);
+        assert!(backend.exists(unrelated).await.map_err(|e| e.to_string())?);
+        cleanup_auto_backup_retention(&backend, &settings, now).await?;
+        Ok(())
+    }
 
     const TEST_BACKUP_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
 

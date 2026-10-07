@@ -79,6 +79,7 @@ services:
       # Sensitive backups fail closed unless deployments provide this value.
       CONDUIT_BACKUP_ENCRYPTION_KEY: ${CONDUIT_BACKUP_ENCRYPTION_KEY:-}
       CONDUIT_LOG_STDOUT: "true"
+      CONDUIT_USAGE_RECOVERY_DIRECTORY: /data/usage-journal
       CONDUIT_METRICS_ENABLED: "true"
       CONDUIT_METRICS_HOST: 0.0.0.0
       CONDUIT_METRICS_PORT: 9090
@@ -92,6 +93,10 @@ services:
       # CONDUIT_HTTP_BIND=0.0.0.0 when direct exposure is intended.
       - "${CONDUIT_HTTP_BIND:-127.0.0.1}:${CONDUIT_HTTP_PORT:-8090}:8090"
     read_only: true
+    # One active instance owns this volume. Replicas need independent volumes;
+    # an empty named volume inherits the image's UID 10001 / mode 0700 directory.
+    volumes:
+      - conduit-usage-journal:/data/usage-journal
     tmpfs:
       - /tmp:size=128m,mode=1777
     expose:
@@ -112,3 +117,4 @@ services:
 
 volumes:
   conduit-postgres-data:
+  conduit-usage-journal:

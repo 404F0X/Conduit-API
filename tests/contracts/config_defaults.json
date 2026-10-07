@@ -2,7 +2,16 @@
   "_source": "Faithfully transcribed from conduit/conf/conf.go (setDefaults) and conduit/internal/server/biz/system_default.go. Per RUST-P0-001 S07. No value is synthesized.",
   "_env_prefix": "CONDUIT",
   "_env_key_rule": "Each dotted file/env path maps to an CONDUIT_* env key by uppercasing and replacing '.' with '_'. Example: server.request_timeout -> CONDUIT_SERVER_REQUEST_TIMEOUT; cache.redis.master_name -> CONDUIT_CACHE_REDIS_MASTER_NAME; db.read_replica.read_dsn -> CONDUIT_DB_READ_REPLICA_READ_DSN. (Viper AutomaticEnv + '.'->'_' key replacer; matches Rust RUST-P1-003 S06.)",
-  "_verification": "Pending drift-audit verification against the Go source.",
+  "_verification": "The file_env_defaults and system_defaults sections retain the historical fixture; they are not the current Rust configuration schema. New production options are recorded in current_rust_defaults and config.schema.json.",
+  "current_rust_defaults": {
+    "usage_recovery": {
+      "directory": "data/usage-journal",
+      "max_bytes": 1073741824,
+      "max_event_bytes": 65536,
+      "replay_interval_seconds": 5,
+      "replay_batch_size": 100
+    }
+  },
 
   "file_env_defaults": {
     "server.host": "127.0.0.1",

@@ -78,9 +78,8 @@ export function useCreateUser() {
       queryClient.invalidateQueries({ queryKey: ['users'] });
       toast.success(t('users.messages.createSuccess'));
     },
-    onError: () => {
-      toast.error(t('common.errors.internalServerError'));
-    },
+    // The form owns error feedback; override the application's default toast.
+    onError: () => {},
   });
 }
 
@@ -97,9 +96,7 @@ export function useUpdateUser() {
       queryClient.invalidateQueries({ queryKey: ['users'] });
       toast.success(t('users.messages.updateSuccess'));
     },
-    onError: () => {
-      toast.error(t('common.errors.internalServerError'));
-    },
+    onError: () => {},
   });
 }
 

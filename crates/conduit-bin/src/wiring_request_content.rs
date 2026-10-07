@@ -204,6 +204,7 @@ pub(crate) fn storage_object_key(key: &str) -> &str {
 /// default storage for every request and writes external artifacts through the
 /// same backend factory used by admin downloads and previews.
 pub(crate) struct DbRequestArtifactStorage {
+    pool: Option<sqlx::PgPool>,
     system: Arc<DomainSystemService>,
     data_storage_repo: Arc<dyn DataStorageRepo>,
 }
@@ -214,9 +215,17 @@ impl DbRequestArtifactStorage {
         data_storage_repo: Arc<dyn DataStorageRepo>,
     ) -> Self {
         Self {
+            pool: None,
             system,
             data_storage_repo,
         }
+    }
+}
+
+impl DbRequestArtifactStorage {
+    pub fn with_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 }
 
@@ -260,10 +269,35 @@ impl RequestArtifactStorage for DbRequestArtifactStorage {
             return Err(format!("data storage {storage_id} is not external"));
         }
         let service = build_data_storage_service(&row)?;
-        service
-            .save_data(storage_object_key(key), &data)
-            .await
-            .map_err(|error| error.to_string())
+        if let Some(pool) = &self.pool {
+            let storage = storage_id.parse::<i64>().map_err(|e| e.to_string())?;
+            let key = storage_object_key(key);
+            crate::artifact_cleanup::enqueue_write(pool, storage, key).await?;
+            let saved = crate::maintenance_claim::run(
+                pool,
+                &crate::artifact_cleanup::claim_key(storage, key),
+                false,
+                async {
+                    if !crate::artifact_cleanup::still_owned(pool, storage, key).await? {
+                        return Err("artifact owner expired or removed".into());
+                    }
+                    service
+                        .save_data(key, &data)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await?;
+            if saved.is_none() {
+                return Err("artifact is being cleaned up".into());
+            }
+            Ok(())
+        } else {
+            service
+                .save_data(storage_object_key(key), &data)
+                .await
+                .map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -295,17 +329,31 @@ pub(crate) async fn hydrate_request_artifacts(repo: &dyn DataStorageRepo, row: &
         return;
     };
     let prefix = format!("/{}/requests/{}", row.project_id, row.id);
-    if row.request_body.is_null()
+    if !row
+        .expired_artifacts
+        .iter()
+        .any(|name| name == "request_body")
+        && row.request_body.is_null()
         && let Some(value) =
             load_json_artifact(&service, format!("{prefix}/request_body.json")).await
     {
         row.request_body = value;
     }
-    if row.response_body.is_none() {
+    if !row
+        .expired_artifacts
+        .iter()
+        .any(|name| name == "response_body")
+        && row.response_body.is_none()
+    {
         row.response_body =
             load_json_artifact(&service, format!("{prefix}/response_body.json")).await;
     }
-    if row.response_chunks.is_none() {
+    if !row
+        .expired_artifacts
+        .iter()
+        .any(|name| name == "response_chunks")
+        && row.response_chunks.is_none()
+    {
         row.response_chunks =
             load_json_artifact(&service, format!("{prefix}/response_chunks.json")).await;
     }
@@ -323,17 +371,31 @@ pub(crate) async fn hydrate_execution_artifacts(
         "/{}/requests/{}/executions/{}",
         row.project_id, row.request_id, row.id
     );
-    if row.request_body.is_null()
+    if !row
+        .expired_artifacts
+        .iter()
+        .any(|name| name == "request_body")
+        && row.request_body.is_null()
         && let Some(value) =
             load_json_artifact(&service, format!("{prefix}/request_body.json")).await
     {
         row.request_body = value;
     }
-    if row.response_body.is_none() {
+    if !row
+        .expired_artifacts
+        .iter()
+        .any(|name| name == "response_body")
+        && row.response_body.is_none()
+    {
         row.response_body =
             load_json_artifact(&service, format!("{prefix}/response_body.json")).await;
     }
-    if row.response_chunks.is_none() {
+    if !row
+        .expired_artifacts
+        .iter()
+        .any(|name| name == "response_chunks")
+        && row.response_chunks.is_none()
+    {
         row.response_chunks =
             load_json_artifact(&service, format!("{prefix}/response_chunks.json")).await;
     }
@@ -642,6 +704,7 @@ mod tests {
     fn external_request_row() -> RequestRow {
         let now = Utc::now();
         RequestRow {
+            expired_artifacts: Vec::new(),
             id: "11".to_string(),
             project_id: "7".to_string(),
             status: "completed".to_string(),

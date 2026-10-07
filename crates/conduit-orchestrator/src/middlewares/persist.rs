@@ -252,6 +252,7 @@ impl PersistRequestMiddleware {
             .then(|| sanitized_headers(&request.extra_headers));
 
         RequestRow {
+            expired_artifacts: Vec::new(),
             id: request_id,
             project_id: ctx.metadata.get("project_id").cloned().unwrap_or_default(),
             status: req_repo::STATUS_PENDING.to_string(),
@@ -728,6 +729,7 @@ impl PersistRequestExecutionMiddleware {
             .then(|| sanitized_headers(&request.headers));
 
         RequestExecutionRow {
+            expired_artifacts: Vec::new(),
             id: execution_id,
             project_id,
             request_id,
