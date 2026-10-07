@@ -2058,4 +2058,34 @@ mod tests {
             membership.user_id.as_str() == "1" && membership.project_id.as_str() == "B"
         }));
     }
+    #[tokio::test]
+    async fn project_owner_with_global_write_users_cannot_grant_platform_ownership() {
+        let store = InMemoryUserService::default();
+        lock(&store.users).push(sample_user(1, "target@example.com"));
+        let schema = schema_with(&store);
+        let mut context = project_owner_ctx("A");
+        let principal = context
+            .principal
+            .take()
+            .expect("test principal")
+            .with_scope(conduit_auth::scopes::slug::WRITE_USERS);
+        let _ = context.set_principal(principal);
+        for mutation in [
+            r#"mutation { createUser(input: { email: "new@example.com", password: "secret", isOwner: true }) { id } }"#,
+            r#"mutation { updateUser(id: "1", input: { isOwner: true }) { id } }"#,
+        ] {
+            let response = schema
+                .execute(async_graphql::Request::new(mutation).data(context.clone()))
+                .await;
+            assert_eq!(response.errors.len(), 1);
+            assert!(response.errors[0].message.contains("platform owner"));
+        }
+        assert_eq!(lock(&store.users).len(), 1);
+        assert!(!lock(&store.users)[0].is_owner);
+        let allowed = schema
+            .execute(r#"mutation { updateUser(id: "1", input: { isOwner: true }) { isOwner } }"#)
+            .await;
+        assert!(allowed.errors.is_empty(), "{:?}", allowed.errors);
+        assert!(lock(&store.users)[0].is_owner);
+    }
 }

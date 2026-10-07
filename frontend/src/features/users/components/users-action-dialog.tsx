@@ -17,6 +17,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { ScopesSelect } from '@/components/scopes-select';
+import { classifyUserSaveError } from '../data/save-error';
 import { User, CreateUserInput, UpdateUserInput } from '../data/schema';
 import { useCreateUser, useUpdateUser } from '../data/users';
 
@@ -199,8 +200,13 @@ export function UsersActionDialog({ currentRow, open, onOpenChange }: Props) {
 
       form.reset();
       onOpenChange(false);
-    } catch {
-      toast.error(t('common.errors.userSaveFailed'));
+    } catch (error) {
+      const kind = classifyUserSaveError(error);
+      if (kind === 'duplicate-email') {
+        form.setError('email', { type: 'server', message: t('users.errors.duplicateEmail') }, { shouldFocus: true });
+      } else {
+        toast.error(t(kind === 'forbidden' ? 'users.errors.saveForbidden' : 'common.errors.userSaveFailed'));
+      }
     }
   };
 
@@ -320,7 +326,7 @@ export function UsersActionDialog({ currentRow, open, onOpenChange }: Props) {
                 render={({ field }) => (
                   <FormItem className='flex flex-row items-start space-y-0 space-x-3'>
                     <FormControl>
-                      <Checkbox checked={field.value} onCheckedChange={field.onChange} />
+                      <Checkbox checked={field.value} onCheckedChange={field.onChange} disabled={!currentUser?.isOwner} />
                     </FormControl>
                     <div className='space-y-1 leading-none'>
                       <FormLabel>{t('users.form.isOwner')}</FormLabel>

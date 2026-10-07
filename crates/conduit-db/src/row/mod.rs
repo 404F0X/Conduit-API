@@ -337,6 +337,8 @@ pub struct SystemRow {
 #[serde(rename_all = "camelCase")]
 #[derive(sqlx::FromRow)]
 pub struct RequestExecutionRow {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_artifacts: Vec<String>,
     pub id: String,
     /// Go `field.Int("project_id").Immutable().Default(1)`.
     pub project_id: String,
@@ -865,6 +867,8 @@ pub struct RoleRow {
 #[serde(rename_all = "camelCase")]
 #[derive(sqlx::FromRow)]
 pub struct RequestRow {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_artifacts: Vec<String>,
     pub id: String,
     pub project_id: String,
     /// Go enum `pending`|`processing`|`completed`|`failed`|`canceled`.
@@ -1162,6 +1166,7 @@ mod tests {
     #[test]
     fn request_execution_row_serde_shape() -> Result<(), Box<dyn std::error::Error>> {
         let row = RequestExecutionRow {
+            expired_artifacts: Vec::new(),
             id: "1".into(),
             project_id: "1".into(),
             request_id: "5".into(),

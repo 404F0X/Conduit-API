@@ -4,40 +4,22 @@ use std::time::Duration;
 use chrono::Utc;
 use conduit_cache::NoopCache;
 use conduit_config::model::GcConfig;
-use conduit_scheduler::AutoSyncFrequency;
-use conduit_scheduler::{
-    AutoBackupExecutor, AutoBackupWorker, BackupFrequency, ChannelModelSyncExecutor,
-    ChannelModelSyncWorker, ChannelProbeExecutor, ChannelProbeWorker, LiveStreamSweepExecutor,
-    LiveStreamSweepInterval, LiveStreamSweeperWorker, ProbeFrequency, VideoStorageExecutor,
-    VideoStorageScanInterval, VideoStorageWorker,
-};
-use conduit_scheduler::{
-    CancellationToken, JobSpec, ProviderQuotaCheckExecutor, ProviderQuotaCheckInterval,
-    ProviderQuotaCheckWorker, Scheduler, SchedulerWorkers, run_worker_loop,
-};
+use conduit_scheduler::{JobSpec, Scheduler, SchedulerWorkers, TaskSupervisor};
 use conduit_services::{GcConfig as GcRunConfig, SystemService as DomainSystemService};
 use sqlx::PgPool;
-use tokio::task::JoinHandle;
 
 pub struct MaintenanceRuntime {
     scheduler: Scheduler,
     workers: SchedulerWorkers,
-    /// P-02: shutdown handle + join for the business workers spawned via
-    /// `run_worker_loop` (currently the channel-probe worker; more follow as
-    /// their executors are ported). Empty when no worker was spawned.
-    worker_shutdown: CancellationToken,
-    worker_joins: Vec<JoinHandle<()>>,
+    tasks: Arc<TaskSupervisor>,
 }
 
 impl MaintenanceRuntime {
-    pub async fn shutdown(mut self) {
-        // Stop the GC jobs first, then signal + await the business workers.
+    pub async fn shutdown(self) {
         self.scheduler.shutdown();
+        self.tasks.cancel();
         self.workers.shutdown().await;
-        self.worker_shutdown.cancel();
-        while let Some(join) = self.worker_joins.pop() {
-            let _ = join.await;
-        }
+        self.tasks.shutdown(Duration::from_secs(10)).await;
     }
 }
 
@@ -46,6 +28,7 @@ pub async fn start_postgres(
     config: &GcConfig,
     quota_config: &conduit_config::model::ProviderQuotaConfig,
     live_registry: Arc<conduit_orchestrator::live_streaming::LiveStreamRegistry>,
+    tasks: Arc<TaskSupervisor>,
 ) -> Result<MaintenanceRuntime, String> {
     let mut scheduler = Scheduler::new();
     let maintenance_system = Arc::new(DomainSystemService::from_system_repo(
@@ -111,6 +94,7 @@ pub async fn start_postgres(
                     let system = gc_system.clone();
                     let config = gc_config.clone();
                     async move {
+                        let claimed = crate::maintenance_claim::run(&pool, "storage-policy-gc", false, async {
                         let report = crate::wiring_postgres_system_operations::run_postgres_storage_policy_gc(
                             &pool, &system, &config,
                         )
@@ -136,112 +120,122 @@ pub async fn start_postgres(
                             failed_resources = ?failed_resources,
                             "PostgreSQL storage-policy GC run complete"
                         );
+                        Ok(())
+                        }).await;
+                        if let Err(error) = claimed { tracing::error!(%error, "storage-policy GC claim failed"); }
                     }
                 },
             ))
             .map_err(|error| error.to_string())?;
     }
-    let worker_shutdown = CancellationToken::new();
-    let model_sync_executor: Arc<dyn ChannelModelSyncExecutor> = Arc::new(
+    let model_sync = Arc::new(
         crate::wiring_postgres_channel_model_sync::PgChannelModelSyncAdapter::new(pool.clone())
             .with_dynamic_settings(maintenance_system.clone()),
     );
-    let model_sync = ChannelModelSyncWorker::new(
-        ChannelModelSyncWorker::DEFAULT_NAME,
-        // Poll hourly and apply the current 1h/6h/1d setting in the executor.
-        AutoSyncFrequency::OneHour,
-        true,
-    )
-    .with_executor(model_sync_executor);
-    let model_sync_join = tokio::spawn(run_worker_loop(
-        model_sync,
-        worker_shutdown.clone(),
-        Utc::now,
-    ));
-    let probe_executor: Arc<dyn ChannelProbeExecutor> = Arc::new(
+    periodic(&tasks, Duration::from_secs(3600), move || {
+        let adapter = model_sync.clone();
+        async move { adapter.run().await }
+    });
+    let probe = Arc::new(
         crate::wiring_postgres_channel_probe::PgChannelProbeAdapter::new(pool.clone())
             .with_dynamic_settings(maintenance_system.clone()),
     );
-    let probe = ChannelProbeWorker::new(
-        ChannelProbeWorker::DEFAULT_NAME,
-        // Poll each minute so enable/frequency updates apply without restart.
-        ProbeFrequency::OneMinute,
-        true,
-    )
-    .with_executor(probe_executor);
-    let probe_join = tokio::spawn(run_worker_loop(probe, worker_shutdown.clone(), Utc::now));
-
-    let sweep_executor: Arc<dyn LiveStreamSweepExecutor> = Arc::new(
+    let probe_pool = pool.clone();
+    periodic(&tasks, Duration::from_secs(60), move || {
+        let adapter = probe.clone();
+        let pool = probe_pool.clone();
+        async move {
+            if let Some((aligned, minutes)) = adapter.current_probe_plan(Utc::now(), 1).await {
+                let key = format!("channel-probe:{}", aligned.timestamp());
+                crate::maintenance_claim::run(&pool, &key, true, async {
+                    adapter
+                        .compute_and_store(aligned, minutes)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+                .await?;
+            }
+            Ok(())
+        }
+    });
+    let sweep = Arc::new(
         crate::wiring_postgres_channel_probe::PgLiveStreamSweepAdapter::new(live_registry),
     );
-    let sweeper = LiveStreamSweeperWorker::new(
-        LiveStreamSweeperWorker::DEFAULT_NAME,
-        LiveStreamSweepInterval::DEFAULT,
-        true,
-    )
-    .with_executor(sweep_executor);
-    let sweeper_join = tokio::spawn(run_worker_loop(sweeper, worker_shutdown.clone(), Utc::now));
-
-    let video_executor: Arc<dyn VideoStorageExecutor> = Arc::new(
+    periodic(&tasks, Duration::from_secs(300), move || {
+        let adapter = sweep.clone();
+        async move { conduit_scheduler::LiveStreamSweepExecutor::sweep(adapter.as_ref(), 5).map(|_| ()) }
+    });
+    let video = Arc::new(
         crate::wiring_postgres_video_storage::PgVideoStorageAdapter::new(
             pool.clone(),
             maintenance_system.clone(),
             Arc::new(conduit_db::PgDataStorageRepo::new(pool.clone())),
         ),
     );
-    let video = VideoStorageWorker::new(
-        VideoStorageWorker::DEFAULT_NAME,
-        // Poll settings once per minute. The executor applies the current
-        // persisted scan interval, so updates do not require a process restart.
-        VideoStorageScanInterval::from_minutes(1),
-        true,
-    )
-    .with_executor(video_executor);
-    let video_join = tokio::spawn(run_worker_loop(video, worker_shutdown.clone(), Utc::now));
-
-    let backup_adapter = Arc::new(crate::wiring_postgres_backup::PgBackupExtAdapter::new(
-        pool.clone(),
-        maintenance_system.clone(),
-        Arc::new(conduit_db::PgDataStorageRepo::new(pool.clone())),
-    ));
-    let backup_executor: Arc<dyn AutoBackupExecutor> = backup_adapter;
-    let backup =
-        AutoBackupWorker::new(AutoBackupWorker::DEFAULT_NAME, BackupFrequency::Daily, true)
-            .with_poll_interval(Duration::from_secs(60 * 60))
-            .with_executor(backup_executor);
-    let backup_join = tokio::spawn(run_worker_loop(backup, worker_shutdown.clone(), Utc::now));
-
-    let quota_executor: Arc<dyn ProviderQuotaCheckExecutor> = Arc::new(
-        crate::wiring_postgres_provider_quota::PgProviderQuotaAdapter::new(
-            pool,
-            maintenance_system,
+    periodic(&tasks, Duration::from_secs(60), move || {
+        let adapter = video.clone();
+        async move { adapter.run().await }
+    });
+    let backup = Arc::new(
+        crate::wiring_postgres_backup::PgBackupExtAdapter::new(
+            pool.clone(),
+            maintenance_system.clone(),
+            Arc::new(conduit_db::PgDataStorageRepo::new(pool.clone())),
         )
-        .with_interval(quota_config.check_interval),
+        .with_task_supervisor(tasks.clone()),
     );
-    let quota_minutes = i64::try_from(quota_config.check_interval.as_secs() / 60)
-        .unwrap_or(i64::MAX)
-        .max(1);
-    let quota = ProviderQuotaCheckWorker::new(
-        ProviderQuotaCheckWorker::DEFAULT_NAME,
-        ProviderQuotaCheckInterval::round_from_minutes(quota_minutes),
-        quota_config.enabled,
-    )
-    .with_executor(quota_executor);
-    let quota_join = tokio::spawn(run_worker_loop(quota, worker_shutdown.clone(), Utc::now));
+    periodic(&tasks, Duration::from_secs(3600), move || {
+        let adapter = backup.clone();
+        async move { adapter.run_scheduled().await }
+    });
+    if quota_config.enabled {
+        let quota = Arc::new(
+            crate::wiring_postgres_provider_quota::PgProviderQuotaAdapter::new(
+                pool.clone(),
+                maintenance_system,
+            )
+            .with_interval(quota_config.check_interval),
+        );
+        periodic(
+            &tasks,
+            nonzero_interval(quota_config.check_interval),
+            move || {
+                let adapter = quota.clone();
+                async move { adapter.check(false).await }
+            },
+        );
+    }
+    let cleanup_pool = pool.clone();
+    let cleanup_repo = Arc::new(conduit_db::PgDataStorageRepo::new(pool.clone()));
+    periodic(&tasks, Duration::from_secs(30), move || {
+        let pool = cleanup_pool.clone();
+        let repo = cleanup_repo.clone();
+        async move { crate::artifact_cleanup::retry(&pool, repo).await }
+    });
     let workers = scheduler.start();
     Ok(MaintenanceRuntime {
         scheduler,
         workers,
-        worker_shutdown,
-        worker_joins: vec![
-            model_sync_join,
-            probe_join,
-            sweeper_join,
-            video_join,
-            backup_join,
-            quota_join,
-        ],
+        tasks,
     })
+}
+
+fn periodic<F, Fut>(tasks: &TaskSupervisor, interval: Duration, work: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
+{
+    tasks.spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if let Err(error) = work().await {
+                tracing::error!(%error, "maintenance work failed; next interval will retry");
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -314,7 +308,7 @@ fn nonzero_interval(interval: Duration) -> Duration {
     }
 }
 
-async fn mark_stale_processing_postgres(
+pub(crate) async fn mark_stale_processing_postgres(
     pool: &PgPool,
     stale_after: Duration,
 ) -> Result<u64, sqlx::Error> {
@@ -323,7 +317,7 @@ async fn mark_stale_processing_postgres(
     let mut transaction = pool.begin().await?;
     let requests = sqlx::query(
         "UPDATE requests SET status='failed',updated_at=now() \
-         WHERE status='processing' AND updated_at<$1",
+         WHERE status='processing' AND updated_at<$1 AND COALESCE(activity_until,updated_at)<now()",
     )
     .bind(cutoff)
     .execute(&mut *transaction)
@@ -332,7 +326,7 @@ async fn mark_stale_processing_postgres(
     let executions = sqlx::query(
         "UPDATE request_executions SET status='failed', \
          error_message=COALESCE(error_message,'stale processing request'),updated_at=now() \
-         WHERE status='processing' AND updated_at<$1",
+         WHERE status='processing' AND updated_at<$1 AND COALESCE(activity_until,updated_at)<now()",
     )
     .bind(cutoff)
     .execute(&mut *transaction)

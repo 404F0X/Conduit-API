@@ -591,16 +591,20 @@ impl Scheduler {
             let shutdown = self.shutdown.clone();
             joins.push(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(handle.spec().interval());
+                let mut runs = Vec::<JoinHandle<()>>::new();
 
                 loop {
                     tokio::select! {
                         () = shutdown.cancelled() => break,
                         _ = interval.tick() => {
-                            // Interval workers only submit a run; non-overlap is enforced in start_job.
-                            let _ = start_job(handle.clone(), shutdown.clone());
+                            runs.retain(|run| !run.is_finished());
+                            if let Ok(JobRun::Started(run)) = start_job(handle.clone(), shutdown.clone()) {
+                                runs.push(run);
+                            }
                         }
                     }
                 }
+                for run in runs { let _ = run.await; }
             }));
         }
 
@@ -663,7 +667,8 @@ fn start_job(handle: JobHandle, shutdown: CancellationToken) -> Result<JobRun, J
 
     let join = tokio::spawn(async move {
         let _permit = permit;
-        runner(context).await;
+        let shutdown = context.shutdown.clone();
+        tokio::select! { biased; () = shutdown.cancelled() => {}, () = runner(context) => {} }
     });
 
     Ok(JobRun::Started(join))

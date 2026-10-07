@@ -150,6 +150,7 @@ fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
 fn row_from_input(input: &CreateRequestExecutionInput) -> RequestExecutionRow {
     let now = parse_dt(&input.created_at);
     RequestExecutionRow {
+        expired_artifacts: Vec::new(),
         id: input.id.clone(),
         project_id: input.project_id.clone(),
         request_id: input.request_id.clone(),

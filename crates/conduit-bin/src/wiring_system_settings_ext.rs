@@ -549,13 +549,17 @@ impl SystemSettingsExtServices for SystemSettingsExtAdapter {
     ) -> Result<(), ExtErr> {
         let ctx = boot_request_context();
         let domain = auto_backup_to_domain(settings);
+        let mut patch =
+            serde_json::to_value(domain).map_err(|e| ExtErr::UpdateAutoBackup(e.to_string()))?;
+        if let Some(object) = patch.as_object_mut() {
+            object.remove("last_backup_at");
+            object.remove("last_backup_error");
+        }
         self.system
-            .set_json(&ctx, system_key::AUTO_BACKUP_SETTINGS, &domain)
+            .patch_system_value(&ctx, system_key::AUTO_BACKUP_SETTINGS, patch)
             .await
             .map(|_| ())
-            .map_err(|err| {
-                ExtErr::UpdateAutoBackup(format!("failed to set auto backup settings: {err}"))
-            })
+            .map_err(|e| ExtErr::UpdateAutoBackup(e.to_string()))
     }
 
     /// Go `CompleteSystemModelSettingOnboarding` (`system_onboarding.go:89-106`)

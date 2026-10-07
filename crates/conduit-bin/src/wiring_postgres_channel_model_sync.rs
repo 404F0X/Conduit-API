@@ -53,7 +53,7 @@ impl PgChannelModelSyncAdapter {
         self
     }
 
-    async fn run(&self) -> Result<(), String> {
+    pub(crate) async fn run(&self) -> Result<(), String> {
         if !self.should_run_for_current_settings(Utc::now()).await {
             return Ok(());
         }
@@ -69,7 +69,33 @@ impl PgChannelModelSyncAdapter {
         .map_err(|error| error.to_string())?;
         let mut failures = Vec::new();
         for channel in channels {
-            if let Err(error) = self.sync_one(&channel).await {
+            let settings = match &self.system {
+                Some(system) => Some(
+                    system
+                        .channel_setting_or_default(&RequestContext::new(PolicyContext::new(
+                            Principal::system(),
+                        )))
+                        .await,
+                ),
+                None => None,
+            };
+            let frequency = settings
+                .as_ref()
+                .map(|s| stored_auto_sync_frequency(&s.auto_sync.frequency.0))
+                .unwrap_or(AutoSyncFrequency::OneHour);
+            let bucket = align_to_interval(
+                AlignInterval::from_auto_sync_frequency(frequency),
+                Utc::now(),
+            );
+            let key = format!("model-sync:{}:{}", channel.id, bucket.timestamp());
+            if let Err(error) = crate::maintenance_claim::run(
+                &self.pool,
+                &key,
+                self.system.is_some(),
+                self.sync_one(&channel),
+            )
+            .await
+            {
                 tracing::warn!(
                     channel_id = channel.id,
                     channel_name = %channel.name,

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
+import { getTokenFromStorage, setTokenToStorage, removeTokenFromStorage, getUserFromStorage, setUserToStorage } from './auth-storage';
 
-export const ACCESS_TOKEN = 'conduit_access_token';
-const USER_INFO = 'conduit_user_info';
+export { ACCESS_TOKEN, getTokenFromStorage, setTokenToStorage, removeTokenFromStorage } from './auth-storage';
 
 interface Role {
   code: string;
@@ -35,69 +35,15 @@ interface AuthState {
     user: AuthUser | null;
     setUser: (user: AuthUser | null) => void;
     accessToken: string;
-    setAccessToken: (accessToken: string) => void;
+    setAccessToken: (accessToken: string, persistent?: boolean) => void;
     resetAccessToken: () => void;
     reset: () => void;
   };
 }
 
-// Helper functions for localStorage
-export const getTokenFromStorage = (): string => {
-  try {
-    return localStorage.getItem(ACCESS_TOKEN) || '';
-  } catch {
-    return '';
-  }
-};
-
-export const setTokenToStorage = (token: string): void => {
-  try {
-    localStorage.setItem(ACCESS_TOKEN, token);
-  } catch {
-    // Storage can be unavailable in privacy-restricted browser contexts.
-  }
-};
-
-export const removeTokenFromStorage = (): void => {
-  try {
-    localStorage.removeItem(ACCESS_TOKEN);
-  } catch {
-    // Storage can be unavailable in privacy-restricted browser contexts.
-  }
-};
-
-const getUserFromStorage = (): AuthUser | null => {
-  try {
-    const userStr = localStorage.getItem(USER_INFO);
-    return userStr ? JSON.parse(userStr) : null;
-  } catch {
-    return null;
-  }
-};
-
-const setUserToStorage = (user: AuthUser | null): void => {
-  try {
-    if (user) {
-      localStorage.setItem(USER_INFO, JSON.stringify(user));
-    } else {
-      localStorage.removeItem(USER_INFO);
-    }
-  } catch {
-    // Storage can be unavailable in privacy-restricted browser contexts.
-  }
-};
-
-const removeUserFromStorage = (): void => {
-  try {
-    localStorage.removeItem(USER_INFO);
-  } catch {
-    // Storage can be unavailable in privacy-restricted browser contexts.
-  }
-};
-
 export const useAuthStore = create<AuthState>()((set) => {
   const initToken = getTokenFromStorage();
-  const initUser = getUserFromStorage();
+  const initUser = getUserFromStorage<AuthUser>();
 
   return {
     auth: {
@@ -108,20 +54,19 @@ export const useAuthStore = create<AuthState>()((set) => {
           return { ...state, auth: { ...state.auth, user } };
         }),
       accessToken: initToken,
-      setAccessToken: (accessToken) =>
+      setAccessToken: (accessToken, persistent = true) =>
         set((state) => {
-          setTokenToStorage(accessToken);
+          setTokenToStorage(accessToken, persistent);
           return { ...state, auth: { ...state.auth, accessToken } };
         }),
       resetAccessToken: () =>
         set((state) => {
           removeTokenFromStorage();
-          return { ...state, auth: { ...state.auth, accessToken: '' } };
+          return { ...state, auth: { ...state.auth, accessToken: '', user: null } };
         }),
       reset: () =>
         set((state) => {
           removeTokenFromStorage();
-          removeUserFromStorage();
           return {
             ...state,
             auth: { ...state.auth, user: null, accessToken: '' },

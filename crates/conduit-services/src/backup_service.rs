@@ -1330,11 +1330,11 @@ pub trait BackupRepo: Send + Sync {
 pub trait BackupDataSource: Send + Sync {
     /// All rows for `section`, as a JSON array. An empty table yields
     /// `Value::Array(vec![])` — the caller applies Go's omitempty rules.
-    async fn load_section(
+    async fn load_sections(
         &self,
         ctx: &RequestContext,
-        section: BackupSection,
-    ) -> BackupServiceResult<Value>;
+        sections: &[BackupSection],
+    ) -> BackupServiceResult<BTreeMap<BackupSection, Value>>;
 }
 
 /// Assemble the backup archive JSON from per-section arrays.
@@ -1437,13 +1437,19 @@ impl BackupService {
             return Err(BackupServiceError::DataSourceUnavailable);
         };
 
-        let mut sections = BTreeMap::new();
-        for section in BackupSection::emit_order() {
-            if !section_is_emitted(*section, opts) {
-                continue;
-            }
-            let rows = source.load_section(ctx, *section).await?;
-            sections.insert(*section, rows);
+        let selected: Vec<_> = BackupSection::emit_order()
+            .iter()
+            .copied()
+            .filter(|section| section_is_emitted(*section, opts))
+            .collect();
+        let sections = source.load_sections(ctx, &selected).await?;
+        if selected
+            .iter()
+            .any(|section| !sections.contains_key(section))
+        {
+            return Err(BackupServiceError::Storage(StorageError::Operation(
+                "backup source omitted a selected section".into(),
+            )));
         }
 
         let archive = assemble_backup_archive(Utc::now(), &sections);
@@ -3568,13 +3574,16 @@ mod tests {
 
     #[async_trait]
     impl BackupDataSource for FakeDataSource {
-        async fn load_section(
+        async fn load_sections(
             &self,
             _ctx: &RequestContext,
-            section: BackupSection,
-        ) -> BackupServiceResult<Value> {
-            self.requested.lock().await.push(section);
-            Ok(json!([{ "tag": section_json_tag(section) }]))
+            sections: &[BackupSection],
+        ) -> BackupServiceResult<BTreeMap<BackupSection, Value>> {
+            self.requested.lock().await.extend_from_slice(sections);
+            Ok(sections
+                .iter()
+                .map(|section| (*section, json!([{ "tag": section_json_tag(*section) }])))
+                .collect())
         }
     }
 

@@ -58,12 +58,42 @@ pub struct RouteHealthTarget {
     pub credential_identity: Option<String>,
 }
 
+/// Recent, credential-scoped routing signal supplied by the runtime health
+/// backend. Latency is optional so a route with no samples remains eligible
+/// and keeps the load balancer's deterministic order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteHealthSignal {
+    pub status: RouteHealthStatus,
+    pub average_latency_ms: Option<u64>,
+}
+
+impl RouteHealthSignal {
+    pub const fn new(status: RouteHealthStatus, average_latency_ms: Option<u64>) -> Self {
+        Self {
+            status,
+            average_latency_ms,
+        }
+    }
+}
+
 #[async_trait]
 pub trait RouteHealthSource: Send + Sync {
+    async fn signals(
+        &self,
+        targets: &[RouteHealthTarget],
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthSignal>, ConduitError>;
+
     async fn statuses(
         &self,
         targets: &[RouteHealthTarget],
-    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError>;
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError> {
+        Ok(self
+            .signals(targets)
+            .await?
+            .into_iter()
+            .map(|(target, signal)| (target, signal.status))
+            .collect())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -71,10 +101,10 @@ pub struct NoopRouteHealthSource;
 
 #[async_trait]
 impl RouteHealthSource for NoopRouteHealthSource {
-    async fn statuses(
+    async fn signals(
         &self,
         _targets: &[RouteHealthTarget],
-    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthStatus>, ConduitError> {
+    ) -> Result<BTreeMap<RouteHealthTarget, RouteHealthSignal>, ConduitError> {
         Ok(BTreeMap::new())
     }
 }
@@ -646,6 +676,18 @@ pub trait RequestRecorder: Send + Sync {
         error: &ConduitError,
     ) -> Result<(), ConduitError>;
 
+    /// Persist a confirmed client cancellation, independently of error text.
+    async fn record_cancellation(
+        &self,
+        ctx: &OrchestratorContext,
+        request_id: &str,
+        project_id: &str,
+        error: &ConduitError,
+    ) -> Result<(), ConduitError> {
+        self.record_failure(ctx, request_id, project_id, error)
+            .await
+    }
+
     /// Consume a [`StreamFinalPlan`] and persist the streaming attempt's
     /// execution + chunks + usage (Go `OutboundPersistentStream.Close` ->
     /// `persistAggregatedResponse` / `SaveRequestExecutionChunks` /
@@ -901,6 +943,7 @@ impl CandidateProjector for DefaultCandidateProjector {
 /// Held together by trait objects so the pure-logic stages are unit-testable
 /// with in-memory stubs.
 pub struct CommandOrchestrator {
+    tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>,
     candidate_source: Arc<dyn CandidateSource>,
     candidate_projector: Arc<dyn CandidateProjector>,
     scoring_strategies: ScoringStrategySet,
@@ -926,6 +969,7 @@ impl CommandOrchestrator {
         cancel_token: Arc<dyn CancelToken>,
     ) -> Self {
         Self {
+            tasks: None,
             candidate_source,
             candidate_projector,
             scoring_strategies: ScoringStrategySet::uniform(scoring_strategy),
@@ -942,6 +986,11 @@ impl CommandOrchestrator {
     /// Install the three long-lived load-balancer implementations selected by
     /// the effective system/API-key strategy on each request. `new` remains
     /// backward compatible by applying its single scorer to all three modes.
+    pub fn with_task_supervisor(mut self, tasks: Arc<conduit_scheduler::TaskSupervisor>) -> Self {
+        self.tasks = Some(tasks);
+        self
+    }
+
     pub fn with_scoring_strategies(mut self, scoring_strategies: ScoringStrategySet) -> Self {
         self.scoring_strategies = scoring_strategies;
         self
@@ -1490,11 +1539,15 @@ impl CommandOrchestrator {
                 });
             }
         }
-        let health_statuses = self
+        let health_signals = self
             .route_health
-            .statuses(&health_targets)
+            .signals(&health_targets)
             .await
             .map_err(|error| OrchestratorError::new(OrchestratorStage::LoadBalance, error))?;
+        let health_statuses: BTreeMap<_, _> = health_signals
+            .iter()
+            .map(|(target, signal)| (target.clone(), signal.status))
+            .collect();
         let affinity_hints = request_route_affinity_hints(ctx);
         let resolved_affinity = resolve_route_affinity(
             &affinity_hints,
@@ -1575,15 +1628,16 @@ impl CommandOrchestrator {
                 .get(index)
                 .and_then(|credential| credential.as_deref())
                 .map(conduit_services::credential_fingerprint);
-            let status = health_statuses
-                .get(&RouteHealthTarget {
-                    channel_id: candidate.channel_id.clone(),
-                    actual_model,
-                    credential_identity,
-                })
-                .copied()
-                .unwrap_or(RouteHealthStatus::Unknown);
-            (candidate.priority, route_health_rank(status))
+            let target = RouteHealthTarget {
+                channel_id: candidate.channel_id.clone(),
+                actual_model,
+                credential_identity,
+            };
+            route_health_sort_key(
+                load_balance_strategy,
+                candidate.priority,
+                health_signals.get(&target).copied(),
+            )
         });
         if healthy_ordered_indices.is_empty() {
             return Err(OrchestratorError::new(
@@ -2102,7 +2156,7 @@ impl CommandOrchestrator {
         // receiver → orchestrator `UpstreamItem` sender the forward loop consumes.
         let (up_tx, up_rx) = tokio::sync::mpsc::channel::<UpstreamItem>(64);
         let mut upstream_rx = live.upstream_rx;
-        tokio::spawn(async move {
+        let feed = tokio::spawn(async move {
             while let Some(item) = upstream_rx.recv().await {
                 let (msg, stop) = match item {
                     Ok(event) => (UpstreamItem::Event(event), false),
@@ -2117,6 +2171,10 @@ impl CommandOrchestrator {
                 }
             }
         });
+
+        if let Some(tasks) = &self.tasks {
+            tasks.adopt(feed.abort_handle());
+        }
 
         // Forward-while-aggregating loop → client-facing receiver.
         let (client_tx, client_rx) =
@@ -2135,6 +2193,10 @@ impl CommandOrchestrator {
             }
             result
         });
+
+        if let Some(tasks) = &self.tasks {
+            tasks.adopt(finalizer_handle.abort_handle());
+        }
 
         Ok(CommandStreamHandle {
             client_rx,
@@ -9263,9 +9325,52 @@ const fn route_health_rank(status: RouteHealthStatus) -> u8 {
     }
 }
 
+fn route_health_sort_key(
+    strategy: LoadBalancerStrategy,
+    priority: i64,
+    signal: Option<RouteHealthSignal>,
+) -> (i64, u8, u64) {
+    let status = signal
+        .map(|signal| signal.status)
+        .unwrap_or(RouteHealthStatus::Unknown);
+    // Adaptive routing uses measured latency after the coarse health class.
+    // Other strategies retain their configured weight order. Unknown latency
+    // sorts last inside the same health class.
+    let latency_rank = if strategy == LoadBalancerStrategy::Adaptive {
+        signal
+            .and_then(|signal| signal.average_latency_ms)
+            .unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    (priority, route_health_rank(status), latency_rank)
+}
+
 #[cfg(test)]
 mod route_health_credential_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_prefers_measured_low_latency_without_changing_priority_or_health_boundaries() {
+        let fast = RouteHealthSignal::new(RouteHealthStatus::Healthy, Some(80));
+        let slow = RouteHealthSignal::new(RouteHealthStatus::Healthy, Some(500));
+        assert!(
+            route_health_sort_key(LoadBalancerStrategy::Adaptive, 0, Some(fast))
+                < route_health_sort_key(LoadBalancerStrategy::Adaptive, 0, Some(slow))
+        );
+        assert_eq!(
+            route_health_sort_key(LoadBalancerStrategy::Failover, 0, Some(fast)),
+            route_health_sort_key(LoadBalancerStrategy::Failover, 0, Some(slow))
+        );
+        assert!(
+            route_health_sort_key(LoadBalancerStrategy::Adaptive, 0, Some(slow))
+                < route_health_sort_key(
+                    LoadBalancerStrategy::Adaptive,
+                    0,
+                    Some(RouteHealthSignal::new(RouteHealthStatus::Degraded, Some(1)))
+                )
+        );
+    }
 
     #[test]
     fn unhealthy_preferred_key_falls_back_without_exposing_plaintext() {

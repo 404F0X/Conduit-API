@@ -64,6 +64,11 @@ pub struct MetricsState {
     /// Signed because concurrent decrements on shutdown could momentarily
     /// race; `i64` prevents wrapping to `u64::MAX`.
     pub in_flight: Arc<AtomicI64>,
+    pub success_count: Arc<AtomicU64>,
+    pub client_error_count: Arc<AtomicU64>,
+    pub server_error_count: Arc<AtomicU64>,
+    pub duration_ms_sum: Arc<AtomicU64>,
+    pub duration_ms_max: Arc<AtomicU64>,
 }
 
 impl MetricsState {
@@ -73,6 +78,11 @@ impl MetricsState {
             enabled,
             request_count: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(AtomicI64::new(0)),
+            success_count: Arc::new(AtomicU64::new(0)),
+            client_error_count: Arc::new(AtomicU64::new(0)),
+            server_error_count: Arc::new(AtomicU64::new(0)),
+            duration_ms_sum: Arc::new(AtomicU64::new(0)),
+            duration_ms_max: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -91,6 +101,11 @@ impl MetricsState {
             enabled: self.enabled,
             request_count: self.request_count.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
+            success_count: self.success_count.load(Ordering::Relaxed),
+            client_error_count: self.client_error_count.load(Ordering::Relaxed),
+            server_error_count: self.server_error_count.load(Ordering::Relaxed),
+            duration_ms_sum: self.duration_ms_sum.load(Ordering::Relaxed),
+            duration_ms_max: self.duration_ms_max.load(Ordering::Relaxed),
         }
     }
 }
@@ -104,6 +119,11 @@ pub struct MetricsSnapshot {
     pub enabled: bool,
     pub request_count: u64,
     pub in_flight: i64,
+    pub success_count: u64,
+    pub client_error_count: u64,
+    pub server_error_count: u64,
+    pub duration_ms_sum: u64,
+    pub duration_ms_max: u64,
 }
 
 /// Per-request metrics inserted as a response extension after the handler
@@ -143,6 +163,13 @@ pub struct RequestMetrics {
 /// between the counter increment and any subsequent read in a different
 /// request. This matches how Go's `prometheus` package handles counters
 /// (atomic add without memory barriers beyond the CPU's cache coherence).
+struct InFlightGuard(MetricsState);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Response {
     // Try to extract MetricsState from request extensions. If absent or
     // disabled, pass through immediately with zero overhead.
@@ -160,6 +187,7 @@ pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Respons
 
     // Increment in-flight gauge before downstream processing.
     state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _in_flight = InFlightGuard(state.clone());
 
     let start = Instant::now();
 
@@ -170,10 +198,26 @@ pub async fn inject_metrics_state(request: Request<Body>, next: Next) -> Respons
     let latency_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     // Decrement in-flight gauge — handler has returned.
-    state.in_flight.fetch_sub(1, Ordering::Relaxed);
 
     // Increment total request counter.
     state.request_count.fetch_add(1, Ordering::Relaxed);
+    state
+        .duration_ms_sum
+        .fetch_add(latency_ms, Ordering::Relaxed);
+    state
+        .duration_ms_max
+        .fetch_max(latency_ms, Ordering::Relaxed);
+    match response.status().as_u16() {
+        200..=399 => {
+            state.success_count.fetch_add(1, Ordering::Relaxed);
+        }
+        400..=499 => {
+            state.client_error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {
+            state.server_error_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     // Insert latency into response extensions for downstream (AccessLog) to read.
     response
@@ -201,6 +245,47 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn repair_metrics_observe_actual_timeout_once_and_release_cancelled_gauge()
+    -> Result<(), Box<dyn Error>> {
+        let metrics = MetricsState::new(true);
+        let mut config = conduit_config::AppConfig::default();
+        config.server.request_timeout = std::time::Duration::from_millis(1);
+        let state = crate::AppState::new(Arc::new(config), Arc::new(crate::AppServices::default()));
+        let mut router = Router::new()
+            .route("/slow", get(slow_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                crate::middleware::runtime::production_request_middleware,
+            ))
+            .layer(from_fn(inject_metrics_state))
+            .layer(axum::Extension(metrics.clone()));
+        let response = router
+            .call(Request::builder().uri("/slow").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(metrics.snapshot().request_count, 1);
+        assert_eq!(metrics.snapshot().server_error_count, 1);
+        assert_eq!(metrics.snapshot().in_flight, 0);
+        let cancelled = MetricsState::new(true);
+        let mut router = build_router_with_metrics(cancelled.clone());
+        let handle = tokio::spawn(async move {
+            router
+                .call(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while cancelled.snapshot().in_flight == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(cancelled.snapshot().in_flight, 0);
+        Ok(())
+    }
+
     /// Handler that returns 200 OK immediately.
     async fn ok_handler() -> impl IntoResponse {
         StatusCode::OK
@@ -210,6 +295,10 @@ mod tests {
     async fn slow_handler() -> impl IntoResponse {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         StatusCode::OK
+    }
+
+    async fn failure_handler() -> impl IntoResponse {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 
     /// Build a test router with MetricsState injected into every request
@@ -222,6 +311,7 @@ mod tests {
         Router::new()
             .route("/ok", get(ok_handler))
             .route("/slow", get(slow_handler))
+            .route("/failure", get(failure_handler))
             .layer(from_fn(inject_metrics_state))
             .layer(axum::middleware::from_fn(
                 move |mut req: Request<Body>, next: Next| {
@@ -270,6 +360,25 @@ mod tests {
 
         let snap = state.snapshot();
         assert_eq!(snap.request_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metrics_classify_status_and_accumulate_latency() -> Result<(), Box<dyn Error>> {
+        let state = MetricsState::new(true);
+        let mut router = build_router_with_metrics(state.clone());
+        let _ = router
+            .call(Request::builder().uri("/ok").body(Body::empty())?)
+            .await?;
+        let _ = router
+            .call(Request::builder().uri("/failure").body(Body::empty())?)
+            .await?;
+
+        let snap = state.snapshot();
+        assert_eq!(snap.success_count, 1);
+        assert_eq!(snap.server_error_count, 1);
+        assert_eq!(snap.client_error_count, 0);
+        assert!(snap.duration_ms_sum >= snap.duration_ms_max);
         Ok(())
     }
 

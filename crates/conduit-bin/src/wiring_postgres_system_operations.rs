@@ -34,6 +34,7 @@ pub struct PgSystemOperationsAdapter {
     cache: Arc<dyn Cache>,
     system: Arc<SystemService>,
     gc_config: GcConfig,
+    tasks: Arc<conduit_scheduler::TaskSupervisor>,
 }
 
 impl PgSystemOperationsAdapter {
@@ -48,7 +49,13 @@ impl PgSystemOperationsAdapter {
             cache,
             system,
             gc_config,
+            tasks: Arc::new(conduit_scheduler::TaskSupervisor::default()),
         }
+    }
+
+    pub fn with_task_supervisor(mut self, tasks: Arc<conduit_scheduler::TaskSupervisor>) -> Self {
+        self.tasks = tasks;
+        self
     }
 
     async fn count_before(
@@ -193,10 +200,20 @@ impl SystemOperationsServices for PgSystemOperationsAdapter {
             build_manual_gc_run_plan(&policy.cleanup_options, &input, &self.gc_config, Utc::now());
         let pool = self.pool.clone();
         let config = self.gc_config.clone();
-        tokio::spawn(async move {
-            execute_postgres_gc_plan(&pool, &config, &plan).await;
+        let accepted = self.tasks.spawn(async move {
+            let _ = crate::maintenance_claim::run(&pool, "storage-policy-gc", false, async {
+                execute_postgres_gc_plan(&pool, &config, &plan).await;
+                Ok(())
+            })
+            .await;
         });
-        Ok(true)
+        if accepted {
+            Ok(true)
+        } else {
+            Err(SystemOperationsError::Operation(
+                "server is shutting down".into(),
+            ))
+        }
     }
 }
 
@@ -332,13 +349,21 @@ async fn erase_request_content(
     let mut tx = pool.begin().await?;
     let mut affected = 0;
     for table in ["requests", "request_executions"] {
-        affected += sqlx::query(&format!(
-            "UPDATE {table} SET {column}={replacement}, updated_at=now() WHERE created_at < $1 AND {column} IS NOT NULL"
-        ))
-        .bind(cutoff)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let prefix = if table == "requests" {
+            "project_id::text||'/requests/'||id::text"
+        } else {
+            "project_id::text||'/requests/'||request_id::text||'/executions/'||id::text"
+        };
+        if column != "request_headers" {
+            sqlx::query(&format!("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT data_storage_id,{prefix}||'/{column}.json' FROM {table} WHERE created_at<$1 AND data_storage_id IS NOT NULL AND status NOT IN ('pending','processing') ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()"))
+                .bind(cutoff).execute(&mut *tx).await?;
+        }
+        affected += sqlx::query(&format!("UPDATE {table} SET {column}={replacement},expired_artifacts=array_append(expired_artifacts,$2),updated_at=now() WHERE created_at<$1 AND status NOT IN ('pending','processing') AND NOT($2=ANY(expired_artifacts))"))
+            .bind(cutoff).bind(column).execute(&mut *tx).await?.rows_affected();
+    }
+    if column == "response_body" {
+        sqlx::query("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT content_storage_id,content_storage_key FROM requests WHERE created_at<$1 AND status NOT IN ('pending','processing') AND content_storage_id IS NOT NULL AND content_storage_key IS NOT NULL ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()").bind(cutoff).execute(&mut *tx).await?;
+        sqlx::query("UPDATE requests SET content_expired=TRUE,content_saved=FALSE,content_storage_key=NULL,content_storage_id=NULL WHERE created_at<$1 AND status NOT IN ('pending','processing')").bind(cutoff).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(affected)
@@ -353,9 +378,14 @@ async fn delete_created_at_in_batches(
     table: &str,
     cutoff: chrono::DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
+    let pending_filter = if table == "usage_logs" {
+        " AND NOT EXISTS(SELECT 1 FROM usage_charge_outbox o WHERE o.usage_log_id=usage_logs.id AND o.status<>'completed')"
+    } else {
+        ""
+    };
     let sql = format!(
         "WITH doomed AS ( \
-           SELECT id FROM {table} WHERE created_at < $1 ORDER BY id LIMIT $2 \
+           SELECT id FROM {table} WHERE created_at < $1 {pending_filter} ORDER BY id LIMIT $2 \
          ) DELETE FROM {table} AS target USING doomed \
            WHERE target.id=doomed.id"
     );
@@ -412,7 +442,7 @@ async fn request_cascade_before(
     for _ in 0..100_000 {
         let mut transaction = pool.begin().await?;
         let ids = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM requests WHERE created_at < $1 \
+            "SELECT id FROM requests WHERE created_at < $1 AND NOT metering_pending AND status NOT IN ('pending','processing') AND NOT EXISTS(SELECT 1 FROM usage_logs u JOIN usage_charge_outbox o ON o.usage_log_id=u.id WHERE u.request_id=requests.id AND o.status<>'completed') \
              ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED",
         )
         .bind(cutoff)
@@ -423,6 +453,25 @@ async fn request_cascade_before(
             transaction.rollback().await?;
             break;
         }
+        for (table, predicate, prefix) in [
+            (
+                "requests",
+                "id=ANY($1)",
+                "project_id::text||'/requests/'||id::text",
+            ),
+            (
+                "request_executions",
+                "request_id=ANY($1)",
+                "project_id::text||'/requests/'||request_id::text||'/executions/'||id::text",
+            ),
+        ] {
+            for column in ["request_body", "response_body", "response_chunks"] {
+                sqlx::query(&format!("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT data_storage_id,{prefix}||'/{column}.json' FROM {table} WHERE {predicate} AND data_storage_id IS NOT NULL ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()"))
+                    .bind(&ids).execute(&mut *transaction).await?;
+            }
+        }
+        sqlx::query("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT content_storage_id,content_storage_key FROM requests WHERE id=ANY($1) AND content_storage_id IS NOT NULL AND content_storage_key IS NOT NULL ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()")
+            .bind(&ids).execute(&mut *transaction).await?;
         sqlx::query("DELETE FROM request_executions WHERE request_id=ANY($1)")
             .bind(&ids)
             .execute(&mut *transaction)

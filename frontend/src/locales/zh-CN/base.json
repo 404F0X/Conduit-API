@@ -405,5 +405,9 @@
   "projectDashboard.health.noData": "暂无探测数据",
   "settings.nav.appearance": "外观",
   "settings.nav.display": "显示",
-  "settings.nav.notifications": "通知"
+  "settings.nav.notifications": "通知",
+  "auth.passwordRecovery.title": "找回密码",
+  "auth.passwordRecovery.unavailable": "本实例暂不提供邮件重置密码。",
+  "auth.passwordRecovery.contactAdmin": "请联系实例管理员重置账号密码。使用单点登录的账号，请通过身份提供商找回访问权限。",
+  "auth.passwordRecovery.backToSignIn": "返回登录"
 }

@@ -177,7 +177,11 @@ impl PgProviderQuotaAdapter {
             let provider = verified_adapter
                 .or_else(|| provider_type(&row.channel_type, row.base_url.as_deref()));
             let Some(provider) = provider else { continue };
-            match self.check_one(&row, &provider).await {
+            let key = format!("provider-quota:{}", row.id);
+            crate::maintenance_claim::run(&self.pool, &key, false, async {
+                let due: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM provider_quota_status WHERE channel_id=$1 AND deleted_at=0 AND next_check_at>now())").bind(row.id).fetch_one(&self.pool).await.map_err(|e| e.to_string())?;
+                if !force && !due { return Ok(()); }
+                match self.check_one(&row, &provider).await {
                 Ok(result) => {
                     self.save_status(row.id, &provider, result, now).await?;
                     if provider == NEW_API_PROBE_ADAPTER
@@ -207,6 +211,8 @@ impl PgProviderQuotaAdapter {
                     self.save_error(row.id, &provider, &error, now).await?;
                 }
             }
+                Ok(())
+            }).await?;
         }
         Ok(())
     }

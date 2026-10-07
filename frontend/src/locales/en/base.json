@@ -405,5 +405,9 @@
   "projectDashboard.health.noData": "No probe data yet",
   "settings.nav.appearance": "Appearance",
   "settings.nav.display": "Display",
-  "settings.nav.notifications": "Notifications"
+  "settings.nav.notifications": "Notifications",
+  "auth.passwordRecovery.title": "Password recovery",
+  "auth.passwordRecovery.unavailable": "Email password reset is not available on this instance.",
+  "auth.passwordRecovery.contactAdmin": "Contact your instance administrator to reset your account password. If your account uses SSO, recover access with your identity provider.",
+  "auth.passwordRecovery.backToSignIn": "Back to sign in"
 }

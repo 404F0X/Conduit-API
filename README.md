@@ -43,6 +43,7 @@ export CONDUIT_POSTGRES_PASSWORD='replace-with-a-long-random-value'
 docker compose config --quiet
 docker compose up --build -d
 curl -fsS http://127.0.0.1:8090/health
+curl -fsS http://127.0.0.1:8090/ready
 ```
 
 Use only letters, digits, `-`, `.`, `_`, or `~` in this password because the

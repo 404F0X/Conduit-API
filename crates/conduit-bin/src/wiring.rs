@@ -446,6 +446,28 @@ fn runtime_scoring_strategies(cost_score_weight: i64) -> ScoringStrategySet {
     )
 }
 
+struct PgSettingsWriteLock(sqlx::PgPool);
+struct PgSettingsWritePermit(sqlx::Transaction<'static, sqlx::Postgres>);
+#[async_trait]
+impl conduit_admin_graphql::authz_extension::SettingsWriteLock for PgSettingsWriteLock {
+    async fn acquire(
+        &self,
+    ) -> Result<Box<dyn conduit_admin_graphql::authz_extension::SettingsWritePermit>, String> {
+        let mut tx = self.0.begin().await.map_err(|e| e.to_string())?;
+        sqlx::query("SELECT pg_advisory_xact_lock(871894007123)")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Box::new(PgSettingsWritePermit(tx)))
+    }
+}
+#[async_trait]
+impl conduit_admin_graphql::authz_extension::SettingsWritePermit for PgSettingsWritePermit {
+    async fn release(self: Box<Self>) {
+        let _ = self.0.rollback().await;
+    }
+}
+
 pub async fn build_runtime_services(
     config: &conduit_config::model::AppConfig,
 ) -> Result<
@@ -453,6 +475,7 @@ pub async fn build_runtime_services(
         AppServices,
         conduit_db::PostgresPools,
         Arc<conduit_orchestrator::live_streaming::LiveStreamRegistry>,
+        conduit_scheduler::TaskRuntime,
     ),
     String,
 > {
@@ -473,9 +496,11 @@ async fn build_postgres_core_services(
         AppServices,
         conduit_db::PostgresPools,
         Arc<conduit_orchestrator::live_streaming::LiveStreamRegistry>,
+        conduit_scheduler::TaskRuntime,
     ),
     String,
 > {
+    let tasks = conduit_scheduler::TaskRuntime::default();
     let mut db = DatabaseConfig::new(DbDialect::Postgres, &config.db.dsn);
     db.max_connections = config.db.max_open_conns;
     db.min_connections = config.db.max_idle_conns.min(config.db.max_open_conns);
@@ -650,12 +675,14 @@ async fn build_postgres_core_services(
     let data_storage: Arc<dyn DataStorageServices> = Arc::new(
         crate::wiring_data_storage::DataStorageAdapter::new(admin_data_storage_repo.clone()),
     );
-    let backup_ext: Arc<dyn conduit_admin_graphql::backup_ext::BackupExtServices> =
-        Arc::new(crate::wiring_postgres_backup::PgBackupExtAdapter::new(
+    let backup_ext: Arc<dyn conduit_admin_graphql::backup_ext::BackupExtServices> = Arc::new(
+        crate::wiring_postgres_backup::PgBackupExtAdapter::new(
             pool.clone(),
             system.clone(),
             admin_data_storage_repo.clone(),
-        ));
+        )
+        .with_task_supervisor(tasks.0.clone()),
+    );
     let execution_query: Arc<dyn RequestExecutionQueryServices> = Arc::new(
         crate::wiring_request_execution::RequestExecutionAdapter::new(Arc::new(
             conduit_db::PgRequestExecutionRepo::new(pool.clone()),
@@ -767,7 +794,8 @@ async fn build_postgres_core_services(
                 vacuum_enabled: config.gc.vacuum_enabled,
                 vacuum_full: config.gc.vacuum_full,
             },
-        ),
+        )
+        .with_task_supervisor(tasks.0.clone()),
     );
     let operations: Arc<dyn OperationsServices> = Arc::new(
         crate::wiring_postgres_operations::PgOperationsAdapter::new(pool.clone()).with_read_pool(
@@ -796,6 +824,16 @@ async fn build_postgres_core_services(
         crate::wiring_postgres_observability::build_postgres_observability_services(pool.clone());
     let admin_schema = conduit_admin_graphql::admin_schema_builder()
         .extension(conduit_admin_graphql::authz_extension::ScopeAuthExtensionFactory)
+        .data(Arc::new(PgSettingsWriteLock(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with((*pool.connect_options()).clone())
+                .await
+                .map_err(|e| e.to_string())?,
+        ))
+            as Arc<
+                dyn conduit_admin_graphql::authz_extension::SettingsWriteLock,
+            >)
         .data(Arc::new(SystemStatusAdapter {
             system: system.clone(),
         })
@@ -888,6 +926,9 @@ async fn build_postgres_core_services(
         cache.clone(),
         &config.cache.route_affinity,
         config.server.disable_ssl_verify,
+        config.server.llm_request_timeout,
+        tasks.0.clone(),
+        config.usage_recovery.clone(),
     )
     .await?;
     let openapi_schema = conduit_openapi_graphql::build_openapi_schema(
@@ -904,6 +945,9 @@ async fn build_postgres_core_services(
             pool.clone(),
         ));
     let services = AppServices::new()
+        .with_readiness_service(Arc::new(
+            crate::wiring_route_health::PgReadinessService::new(pool.clone()),
+        ))
         .with_system_service(Arc::new(DbSystemService {
             system,
             pool: pool.clone(),
@@ -923,7 +967,7 @@ async fn build_postgres_core_services(
         }))
         .with_admin_schema(admin_schema)
         .with_openapi_schema(openapi_schema);
-    Ok((services, pools, registry))
+    Ok((services, pools, registry, tasks))
 }
 
 async fn build_postgres_proxy_service(
@@ -933,6 +977,9 @@ async fn build_postgres_proxy_service(
     cache: Arc<dyn Cache>,
     route_affinity_config: &conduit_config::model::RouteAffinityConfig,
     insecure_skip_verify: bool,
+    llm_request_timeout: std::time::Duration,
+    tasks: Arc<conduit_scheduler::TaskSupervisor>,
+    journal_config: conduit_config::model::UsageRecoveryConfig,
 ) -> Result<Arc<dyn OpenAiOrchestratorService>, String> {
     let model_repo: Arc<dyn ModelRepo> = Arc::new(conduit_db::PgModelRepo::new(pool.clone()));
     let channel_repo: Arc<dyn ChannelRepo> = Arc::new(conduit_db::PgChannelRepo::new(pool.clone()));
@@ -968,25 +1015,57 @@ async fn build_postgres_proxy_service(
     ));
     // Retention remains active when routing affinity is disabled so rows from
     // an earlier enabled period do not become permanent.
-    crate::route_affinity::start_route_affinity_cleanup(route_affinity_runtime.clone());
+    crate::route_affinity::start_route_affinity_cleanup(route_affinity_runtime.clone(), &tasks);
     let route_affinity = route_affinity_config
         .enabled
         .then_some(route_affinity_runtime);
-    let charge_settler =
-        Arc::new(crate::usage_charge_settler_postgres::PgUsageChargeSettler::new(pool.clone()));
-    crate::usage_charge_settler_postgres::start_reconciler(charge_settler.clone());
+    let charge_settler = Arc::new(
+        crate::usage_charge_settler_postgres::PgUsageChargeSettler::new_supervised(
+            pool.clone(),
+            tasks.clone(),
+        )
+        .with_reservation_ttl(
+            llm_request_timeout.saturating_add(std::time::Duration::from_secs(300)),
+        ),
+    );
+    crate::usage_charge_settler_postgres::start_reconciler(charge_settler.clone(), &tasks);
+    let journal = Arc::new(crate::usage_recovery::UsageJournal::open(
+        journal_config.clone(),
+    )?);
+    let replay_journal = journal.clone();
+    let replay_pool = pool.clone();
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            journal_config.replay_interval_seconds,
+        ));
+        loop {
+            interval.tick().await;
+            if let Err(error) = replay_journal.replay(&replay_pool).await {
+                tracing::error!(%error, "usage journal handoff deferred");
+            }
+        }
+    });
     let recorder = Arc::new(
         crate::usage_log_recorder::UsageLogRecorder::new(usage_repo)
+            .with_usage_journal(journal)
+            .with_task_supervisor(tasks.clone())
             .with_sticky_channel_cache(cache.clone())
             .with_route_affinity_runtime(route_affinity.clone())
             .with_price_repo(price_repo)
             .with_charge_settler(charge_settler)
-            .with_postgres_stream_persistence(pool.clone()),
+            .with_postgres_stream_persistence(pool.clone())
+            .with_api_key_concurrency_lease_ttl(
+                llm_request_timeout.saturating_add(std::time::Duration::from_secs(5 * 60)),
+            ),
     );
-    let request_repo: Arc<dyn conduit_db::repo::request_repo::RequestRepo> =
-        Arc::new(conduit_db::PgRequestRepo::new(pool.clone()));
+    let request_repo: Arc<dyn conduit_db::repo::request_repo::RequestRepo> = Arc::new(
+        conduit_db::PgRequestRepo::new(pool.clone()).with_activity_timeout(llm_request_timeout),
+    );
     let execution_repo: Arc<dyn conduit_db::repo::request_execution_repo::RequestExecutionRepo> =
-        Arc::new(conduit_db::PgRequestExecutionRepo::new(pool.clone()));
+        Arc::new(
+            conduit_db::PgRequestExecutionRepo::new(pool.clone())
+                .with_activity_timeout(llm_request_timeout),
+        );
     let thread_repo: Arc<dyn ThreadRepo> = Arc::new(conduit_db::PgThreadRepo::new(pool.clone()));
     let trace_repo: Arc<dyn TraceRepo> = Arc::new(conduit_db::PgTraceRepo::new(pool.clone()));
     let request_artifact_storage: Arc<
@@ -995,7 +1074,8 @@ async fn build_postgres_proxy_service(
         crate::wiring_request_content::DbRequestArtifactStorage::new(
             system.clone(),
             Arc::new(conduit_db::PgDataStorageRepo::new(pool.clone())),
-        ),
+        )
+        .with_pool(pool.clone()),
     );
     let prompt_inject_source = Arc::new(PromptRepoSource {
         repo: Arc::new(conduit_db::PgPromptRepo::new(pool.clone())),
@@ -1015,17 +1095,23 @@ async fn build_postgres_proxy_service(
         Arc::new(OpenAiCompatOutbound);
     let client = HttpClientBuilder::new()
         .insecure_skip_verify(insecure_skip_verify)
+        .request_timeout(Some(llm_request_timeout))
         .build()
         .map_err(|e| format!("failed to build PostgreSQL runtime upstream client: {e}"))?;
     let executor: Arc<dyn conduit_pipeline::Executor> = Arc::new(
         conduit_orchestrator::upstream_executor::UpstreamExecutor::new(client)
+            .with_request_timeout(llm_request_timeout)
+            .with_task_supervisor(tasks.clone())
             .with_insecure_skip_verify(insecure_skip_verify),
     );
     let runtime_retry_policy = resolve_runtime_retry_policy(&system).await;
     let retry_policy_source: Arc<dyn RuntimeRetryPolicySource> =
         Arc::new(SystemRuntimeRetryPolicySource::new(system.clone()));
-    let attempt_observer =
-        crate::auto_disable_runtime::start_auto_disable_runtime(pool.clone(), system.clone());
+    let attempt_observer = crate::auto_disable_runtime::start_auto_disable_runtime(
+        pool.clone(),
+        system.clone(),
+        tasks.clone(),
+    );
     let channel_cooldowns =
         Arc::new(conduit_orchestrator::middlewares::ChannelCooldownTracker::default());
     let pipeline = Arc::new(
@@ -1111,6 +1197,7 @@ async fn build_postgres_proxy_service(
             recorder,
             Arc::new(FlagCancelToken::new()),
         )
+        .with_task_supervisor(tasks.clone())
         .with_scoring_strategies(runtime_scoring_strategies(0))
         .with_runtime_retry_policy_source(retry_policy_source)
         .with_route_health_source(Arc::new(
@@ -1126,6 +1213,8 @@ async fn build_postgres_proxy_service(
         cache,
         route_affinity,
         request_artifact_storage,
+        request_timeout: llm_request_timeout,
+        tasks,
     }))
 }
 
@@ -4878,6 +4967,8 @@ impl HttpModelService for DbModelService {
 // ---------------------------------------------------------------------------
 
 struct BridgeOrchestratorService {
+    tasks: Arc<conduit_scheduler::TaskSupervisor>,
+    request_timeout: std::time::Duration,
     bridge: Arc<OpenAiOrchestratorBridge>,
     system: Arc<DomainSystemService>,
     request_repo: Arc<dyn conduit_db::repo::request_repo::RequestRepo>,
@@ -5527,6 +5618,17 @@ impl OpenAiOrchestratorService for BridgeOrchestratorService {
         route: OpenAiRoute,
         mut request: LlmHttpRequest,
     ) -> Result<OpenAiHandlerOutput, ConduitError> {
+        request.metadata.insert(
+            "stream_deadline_epoch_ms".into(),
+            serde_json::Value::from(
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_add(
+                        i64::try_from(self.request_timeout.as_millis()).unwrap_or(i64::MAX),
+                    )
+                    .to_string(),
+            ),
+        );
         // Stamp live_preview_enabled from system storage policy so the
         // LivePreviewMiddleware can read it from PipelineContext.metadata.
         // Mirrors Go `livePreviewMiddleware.OnInboundLlmRequest` which reads
@@ -5697,7 +5799,7 @@ impl OpenAiOrchestratorService for BridgeOrchestratorService {
                 let policy = resolve_upstream_error_policy(&self.system).await;
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
                 let mut upstream = live.0;
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     while let Some(item) = upstream.recv().await {
                         let stop = item.is_err();
                         let item = item.map_err(|error| {
@@ -5724,7 +5826,7 @@ impl OpenAiOrchestratorService for BridgeOrchestratorService {
                 let policy = resolve_upstream_error_policy(&self.system).await;
                 let (tx, rx) = tokio::sync::mpsc::channel(64);
                 let mut upstream = live.0;
-                tokio::spawn(async move {
+                self.tasks.spawn(async move {
                     while let Some(item) = upstream.recv().await {
                         let stop = item.is_err();
                         let item = item.map_err(|error| {
@@ -5953,15 +6055,26 @@ mod postgres_runtime_boot_tests {
         let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
             return Ok(());
         };
+        let test_root = std::env::var_os("CONDUIT_TEST_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let journal = tempfile::Builder::new()
+            .prefix("boot-journal-")
+            .tempdir_in(test_root)
+            .map_err(|e| e.to_string())?;
         let config = conduit_config::model::AppConfig {
             db: conduit_config::model::DatabaseConfig {
                 dialect: "postgres".into(),
                 dsn,
                 ..Default::default()
             },
+            usage_recovery: conduit_config::model::UsageRecoveryConfig {
+                directory: journal.path().to_string_lossy().into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let (services, _pools, _) = build_runtime_services(&config).await?;
+        let (services, _pools, _, tasks) = build_runtime_services(&config).await?;
         let system = services
             .system_service()
             .ok_or("postgres system service missing")?;
@@ -5973,6 +6086,9 @@ mod postgres_runtime_boot_tests {
         assert!(services.model_service().is_some());
         assert!(services.api_key_validation_service().is_some());
         assert!(services.admin_schema().is_some());
+        tasks.0.shutdown(std::time::Duration::from_secs(2)).await;
+        drop(services);
+        drop(tasks);
         Ok(())
     }
 }

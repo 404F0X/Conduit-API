@@ -146,3 +146,12 @@ retry:
   strategy: adaptive
   upstream_error_passthrough: true
   timeout: 600s
+
+# Each replica owns a separate persistent volume/directory. Never share it
+# between processes or remove pending files while PostgreSQL is unavailable.
+usage_recovery:
+  directory: data/usage-journal
+  max_bytes: 1073741824
+  max_event_bytes: 65536
+  replay_interval_seconds: 5
+  replay_batch_size: 100

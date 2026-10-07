@@ -7,6 +7,7 @@
 | 方法 | 路径 | Handler | 用途 |
 |---|---|---|---|
 | GET | `/health` | `health::health` | 存活检查；是否挂根路径受 base path 条件影响 |
+| GET | `/ready` | `health::readiness` | 就绪检查；实时验证 PostgreSQL，失败返回 503 |
 | GET | `/api/system/version` | `admin_handlers::system_version` | 版本 |
 | GET | `/admin/system/status` | `system_handlers::get_system_status` | 初始化状态 |
 | POST | `/admin/system/initialize` | `system_handlers::initialize_system` | 首次初始化 |

@@ -39,7 +39,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   });
 
   function onSubmit(data: z.infer<typeof formSchema>) {
-    signInMutation.mutate(data);
+    signInMutation.mutate({ ...data, rememberMe });
   }
 
   const isPasswordLoginDisabled = oidcProviders?.some((p) => p.active && p.oidc_login_only);

@@ -6,7 +6,6 @@ use conduit_db::repo::data_storage_repo::DataStorageRepo;
 use conduit_db::{PolicyContext, Principal, RequestContext};
 use conduit_services::{SystemService, VideoStorageSettings, extract_video_url_from_response_body};
 use conduit_storage::{DataStorageConfig, DataStorageKind, DataStorageService};
-use reqwest::header::CONTENT_DISPOSITION;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
 const MAX_VIDEO_BYTES: u64 = 512 * 1024 * 1024;
@@ -45,7 +44,7 @@ impl PgVideoStorageAdapter {
         true
     }
 
-    async fn run(&self) -> Result<(), String> {
+    pub(crate) async fn run(&self) -> Result<(), String> {
         let ctx = RequestContext::new(PolicyContext::new(Principal::system()));
         let settings = self
             .system
@@ -88,7 +87,7 @@ impl PgVideoStorageAdapter {
             "SELECT id, project_id, response_body FROM requests \
              WHERE status IN ('processing', 'completed') \
              AND format IN ('openai/video', 'seedance/video') \
-             AND content_saved = FALSE ORDER BY id LIMIT $1",
+             AND content_saved = FALSE AND NOT content_expired AND archive_next_attempt_at<=now() ORDER BY archive_next_attempt_at,id LIMIT $1",
         )
         .bind(i64::from(settings.effective_scan_limit()))
         .fetch_all(&self.pool)
@@ -97,11 +96,20 @@ impl PgVideoStorageAdapter {
 
         for row in rows {
             let request_id: i64 = row.get("id");
-            if let Err(error) = self
-                .process_one(&service, settings.data_storage_id, &row)
-                .await
-            {
-                tracing::warn!(request_id, %error, "failed to save PostgreSQL video request");
+            let key = format!("video-archive:{request_id}");
+            let result = crate::maintenance_claim::run(&self.pool, &key, false, async {
+                let eligible: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM requests WHERE id=$1 AND NOT content_saved AND NOT content_expired AND archive_next_attempt_at<=now())").bind(request_id).fetch_one(&self.pool).await.map_err(|e| e.to_string())?;
+                if eligible { self.process_one(&service, settings.data_storage_id, &row).await?; }
+                Ok(())
+            }).await;
+            if result.is_err() {
+                // Persist a bounded delay for every skipped/failed item, so an old prefix cannot monopolize LIMIT.
+                sqlx::query("UPDATE requests SET archive_attempts=LEAST(archive_attempts+1,20),archive_next_attempt_at=now()+make_interval(secs=>LEAST(3600,30*power(2,LEAST(archive_attempts,7)))::int),archive_last_error='video archival failed; check storage or source availability' WHERE id=$1 AND NOT content_saved")
+                    .bind(request_id).execute(&self.pool).await.map_err(|e| e.to_string())?;
+                tracing::warn!(
+                    request_id,
+                    "failed to save PostgreSQL video request; retry scheduled"
+                );
             }
         }
         Ok(())
@@ -119,7 +127,7 @@ impl PgVideoStorageAdapter {
             .and_then(|value| serde_json::to_vec(&value.0).ok())
             .unwrap_or_default();
         let Some(url) = extract_video_url_from_response_body(&raw) else {
-            return Ok(());
+            return Err("video URL is not available yet".into());
         };
         let mut response = self
             .client
@@ -136,7 +144,6 @@ impl PgVideoStorageAdapter {
         {
             return Err(format!("video exceeds {MAX_VIDEO_BYTES} byte limit"));
         }
-        let filename = response_filename(&response, &url);
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -153,15 +160,31 @@ impl PgVideoStorageAdapter {
         }
         let request_id: i64 = row.get("id");
         let project_id: i64 = row.get("project_id");
-        let key = format!("{project_id}/requests/{request_id}/video/{filename}");
-        service
-            .save_data(&key, &bytes)
-            .await
-            .map_err(|error| format!("failed to save video to storage: {error}"))?;
+        // Stable across a crash between object PUT and the database update.
+        let key = format!("{project_id}/requests/{request_id}/video/content");
+        crate::artifact_cleanup::enqueue_write(&self.pool, storage_id, &key).await?;
+        let stored = crate::maintenance_claim::run(
+            &self.pool,
+            &crate::artifact_cleanup::claim_key(storage_id, &key),
+            false,
+            async {
+                if !crate::artifact_cleanup::still_owned(&self.pool, storage_id, &key).await? {
+                    return Err("video owner expired or removed".into());
+                }
+                service
+                    .save_data(&key, &bytes)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .await?;
+        if stored.is_none() {
+            return Err("video is being cleaned up".into());
+        }
         sqlx::query(
             "UPDATE requests SET content_saved = TRUE, content_storage_id = $1, \
              content_storage_key = $2, content_saved_at = now(), updated_at = now() \
-             WHERE id = $3 AND content_saved = FALSE",
+             WHERE id = $3 AND content_saved = FALSE AND NOT content_expired",
         )
         .bind(storage_id)
         .bind(&key)
@@ -200,36 +223,6 @@ fn storage_kind(raw: &str) -> DataStorageKind {
     }
 }
 
-fn response_filename(response: &reqwest::Response, fallback_url: &str) -> String {
-    if let Some(value) = response
-        .headers()
-        .get(CONTENT_DISPOSITION)
-        .and_then(|value| value.to_str().ok())
-        && let Some((_, filename)) = value.split_once("filename=")
-    {
-        let filename = filename.trim().trim_matches('"');
-        if !filename.is_empty() {
-            return sanitize_filename(filename);
-        }
-    }
-    let path = fallback_url.split('?').next().unwrap_or(fallback_url);
-    sanitize_filename(
-        path.rsplit('/')
-            .next()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("video.mp4"),
-    )
-}
-
-fn sanitize_filename(value: &str) -> String {
-    value
-        .rsplit(['/', '\\'])
-        .next()
-        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
-        .unwrap_or("video.mp4")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,12 +231,6 @@ mod tests {
     use sqlx::types::Json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[test]
-    fn filename_sanitization_strips_path_traversal() {
-        assert_eq!(sanitize_filename("../clip.mp4"), "clip.mp4");
-        assert_eq!(sanitize_filename(".."), "video.mp4");
-    }
 
     #[test]
     fn scan_due_uses_current_interval_instead_of_startup_interval() {
@@ -256,7 +243,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_scan_downloads_video_and_marks_request_saved_when_dsn_is_provided()
+    async fn repair_postgres_scan_retries_a_broken_prefix_and_archives_a_later_video()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
             return Ok(());
@@ -278,6 +265,9 @@ mod tests {
         .bind(Json(storage_settings.clone()))
         .fetch_one(&database.pool)
         .await?;
+        for _ in 0..2 {
+            sqlx::query("INSERT INTO requests(project_id,model_id,format,request_body,response_body,status) VALUES(3,'bad','openai/video','{}','{}','completed')").execute(&database.pool).await?;
+        }
         let request_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO requests \
              (project_id, model_id, format, request_body, response_body, status) \
@@ -301,10 +291,20 @@ mod tests {
                     enabled: true,
                     data_storage_id: storage_id,
                     scan_interval_minutes: 1,
-                    scan_limit: 50,
+                    scan_limit: 2,
                 },
             )
             .await?;
+        PgVideoStorageAdapter::new(
+            database.pool.clone(),
+            system.clone(),
+            Arc::new(conduit_db::PgDataStorageRepo::new(database.pool.clone())),
+        )
+        .run()
+        .await?;
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM requests WHERE archive_attempts=1 AND archive_next_attempt_at>now()").fetch_one(&database.pool).await?,2);
+        // A new instance resumes the persisted due queue; the broken prefix
+        // no longer consumes LIMIT and the valid later row is archived.
         PgVideoStorageAdapter::new(
             database.pool.clone(),
             system,
@@ -322,7 +322,7 @@ mod tests {
         assert!(row.get::<bool, _>("content_saved"));
         assert_eq!(row.get::<i64, _>("content_storage_id"), storage_id);
         let key: String = row.get("content_storage_key");
-        assert_eq!(key, format!("3/requests/{request_id}/video/clip.mp4"));
+        assert_eq!(key, format!("3/requests/{request_id}/video/content"));
         let storage_config = DataStorageConfig::from_value(&storage_settings)?;
         let storage_service =
             DataStorageService::new(DataStorageKind::Local, Some(&storage_config))?;

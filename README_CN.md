@@ -35,6 +35,7 @@ export CONDUIT_POSTGRES_PASSWORD='replace-with-a-long-random-value'
 docker compose config --quiet
 docker compose up --build -d
 curl -fsS http://127.0.0.1:8090/health
+curl -fsS http://127.0.0.1:8090/ready
 ```
 
 由于 Compose 会将数据库密码放入 PostgreSQL 连接地址，请只使用字母、数字、

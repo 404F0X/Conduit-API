@@ -114,6 +114,16 @@ export async function signInAsAdmin(page: Page, credentials: AdminCredentials = 
   await emailField.fill(credentials.email)
   await passwordField.fill(credentials.password)
 
+  // These admin fixtures navigate across documents and read localStorage.
+  // Choose persistent login through the UI instead of relying on its default.
+  const rememberMe = page.getByRole('checkbox', { name: /记住我|Remember me/i })
+  const rememberMeLabel = page.locator('label').filter({ has: rememberMe })
+  await expect(rememberMeLabel).toBeVisible()
+  if (!(await rememberMe.isChecked())) {
+    await rememberMeLabel.click()
+  }
+  await expect(rememberMe).toBeChecked()
+
   // Click login button - use test ID with fallback
   const loginButton = page.getByTestId('sign-in-submit').or(page.getByRole('button', { name: /登录|Sign In|Sign in/i }))
   await expect(loginButton).toBeVisible()

@@ -16,6 +16,29 @@ pub struct AppConfig {
     pub oidc: OidcConfig,
     pub api_auth: ApiAuthConfig,
     pub retry: RetryConfig,
+    pub usage_recovery: UsageRecoveryConfig,
+}
+
+/// Local durable usage journal. Each instance needs its own persistent directory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageRecoveryConfig {
+    pub directory: String,
+    pub max_bytes: u64,
+    pub max_event_bytes: u64,
+    pub replay_interval_seconds: u64,
+    pub replay_batch_size: usize,
+}
+impl Default for UsageRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            directory: "data/usage-journal".into(),
+            max_bytes: 1_073_741_824,
+            max_event_bytes: 65_536,
+            replay_interval_seconds: 5,
+            replay_batch_size: 100,
+        }
+    }
 }
 
 // Mirrors Go `server.Config` (`conduit/internal/server/config.go`) field

@@ -4,7 +4,7 @@ This directory is Conduit API's only runtime migration catalog. The Rust databas
 crate embeds these files in version order and records applied versions in
 `schema_migrations`.
 
-The current catalog ends at `000034_credit_redemption_limits.sql`. The workspace is
+The current catalog ends at `000035_api_key_concurrency_leases.sql`. The workspace is
 still in its pre-release, rebuildable-database phase. The earlier `000028`
 money-unit contract still requires recreation for databases that recorded its
 superseded draft.
@@ -40,6 +40,9 @@ logged.
 `000034` adds a bounded redemption limit to each batch and changes receipt
 uniqueness to `(code_id, user_id)`. Existing batches default to one redemption,
 while new batches may explicitly allow up to 100,000 distinct users per code.
+
+`000035` adds expiring, idempotent API-key concurrency leases. Transaction-level
+advisory locking makes the configured request limit consistent across replicas.
 
 After this contract is released, schema changes must add the next numbered file
 and update the embedded catalog in `crates/conduit-db/src/migrate.rs`.

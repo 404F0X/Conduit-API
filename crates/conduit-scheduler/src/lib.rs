@@ -2,6 +2,8 @@
 
 pub mod jobs;
 pub mod runtime;
+pub mod tasks;
+pub use tasks::{TaskRuntime, TaskSupervisor};
 pub mod worker;
 pub mod worker_logic;
 

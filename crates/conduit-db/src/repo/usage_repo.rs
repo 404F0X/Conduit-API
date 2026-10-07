@@ -49,7 +49,8 @@ const COST_MICROS_PER_UNIT: f64 = 1_000_000.0;
 /// `UsageLogService.CreateUsageLog` builder inputs (usage_log.go:104-153).
 /// Token counts default to 0 when unset (matching Go's
 /// `field.Int64().Default(0)`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUsageLogInput {
     pub id: String,
     pub project_id: String,
@@ -155,7 +156,7 @@ fn parse_dt(s: &str) -> DateTime<Utc> {
 
 /// Build a `UsageLogRow` from creation input. Both timestamps start at
 /// `created_at` (Go `TimeMixin` defaults both to the creation instant).
-fn row_from_input(input: &CreateUsageLogInput) -> UsageLogRow {
+pub fn row_from_input(input: &CreateUsageLogInput) -> UsageLogRow {
     let now = parse_dt(&input.created_at);
     UsageLogRow {
         id: input.id.clone(),

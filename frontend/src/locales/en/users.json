@@ -94,5 +94,7 @@
   "users.messages.userNotFound": "User not found",
   "users.messages.addToProjectSuccess": "User added to project successfully",
   "users.messages.removeFromProjectSuccess": "User removed from project successfully",
-  "users.errors.insufficientPermissions": "You don't have sufficient permissions to edit this user"
+  "users.errors.insufficientPermissions": "You don't have sufficient permissions to edit this user",
+  "users.errors.duplicateEmail": "This email is already registered. Choose a different email.",
+  "users.errors.saveForbidden": "You cannot save these user permissions. Ask a platform owner for the required access or remove permissions you cannot grant."
 }

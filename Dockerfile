@@ -52,8 +52,9 @@ RUN apt-get update \
     # PostgreSQL data lives in its own service.
     && groupadd --system --gid 10001 conduit \
     && useradd --system --uid 10001 --gid conduit --home-dir /app --shell /usr/sbin/nologin conduit \
-    && mkdir -p /data /app \
-    && chown -R conduit:conduit /data /app
+    && mkdir -p /data/usage-journal /app \
+    && chown -R conduit:conduit /data /app \
+    && chmod 0700 /data/usage-journal
 
 COPY --from=rust-build --chown=conduit:conduit /workspace/target/release/conduit-api /app/conduit-api
 COPY --from=frontend-build --chown=conduit:conduit /workspace/frontend/dist /app/frontend/dist
@@ -76,8 +77,7 @@ EXPOSE 8090 9090
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${CONDUIT_SERVER_PORT:-8090}/health" >/dev/null \
-        && curl -fsS "http://127.0.0.1:${CONDUIT_SERVER_PORT:-8090}/admin/system/status" >/dev/null \
+    CMD curl -fsS "http://127.0.0.1:${CONDUIT_SERVER_PORT:-8090}${CONDUIT_SERVER_BASE_PATH:-}/ready" >/dev/null \
         || exit 1
 
 ENTRYPOINT ["/app/conduit-api"]

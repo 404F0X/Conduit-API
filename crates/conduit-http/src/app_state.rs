@@ -4,6 +4,7 @@ use std::time::Duration;
 use conduit_config::AppConfig;
 
 use crate::auth_handlers::{SigninService, SignupService};
+use crate::health::ReadinessService;
 use crate::middleware::api_key_auth::ApiKeyValidationService;
 use crate::middleware::metrics::MetricsState;
 pub use crate::middleware::{JwtIdentityResolution, JwtIdentityResolver, JwtUserIdentity};
@@ -38,6 +39,7 @@ pub struct AppServices {
     openapi_schema: Option<conduit_openapi_graphql::OpenApiSchema>,
     api_key_validation: Option<Arc<dyn ApiKeyValidationService>>,
     user_principal: Option<Arc<dyn JwtIdentityResolver>>,
+    readiness: Option<Arc<dyn ReadinessService>>,
 }
 
 impl AppServices {
@@ -212,6 +214,15 @@ impl AppServices {
     pub fn user_principal_service(&self) -> Option<&Arc<dyn JwtIdentityResolver>> {
         self.user_principal.as_ref()
     }
+
+    pub fn with_readiness_service(mut self, service: Arc<dyn ReadinessService>) -> Self {
+        self.readiness = Some(service);
+        self
+    }
+
+    pub fn readiness_service(&self) -> Option<&Arc<dyn ReadinessService>> {
+        self.readiness.as_ref()
+    }
 }
 
 // Manual Debug: trait objects carry no Debug bound; report wiring presence only.
@@ -231,6 +242,7 @@ impl std::fmt::Debug for AppServices {
             .field("openapi_schema", &self.openapi_schema.is_some())
             .field("api_key_validation", &self.api_key_validation.is_some())
             .field("user_principal", &self.user_principal.is_some())
+            .field("readiness", &self.readiness.is_some())
             .finish()
     }
 }

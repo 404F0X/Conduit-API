@@ -147,7 +147,9 @@ pub const PRICING_CHANGE_AUDITS_SCHEMA_VERSION: &str = "000031";
 pub const CHANGE_SETS_SCHEMA_VERSION: &str = "000032";
 pub const CREDIT_REDEMPTIONS_SCHEMA_VERSION: &str = "000033";
 pub const CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION: &str = "000034";
-pub const LATEST_SCHEMA_VERSION: &str = CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION;
+pub const API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION: &str = "000035";
+pub const RECOVERY_LIFECYCLE_SCHEMA_VERSION: &str = "000036";
+pub const LATEST_SCHEMA_VERSION: &str = RECOVERY_LIFECYCLE_SCHEMA_VERSION;
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
 
 // Keep this stable across releases: an instance running an older binary must
@@ -326,6 +328,14 @@ const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
     EmbeddedMigration {
         version: CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION,
         sql: include_str!("../../../migrations/postgres/000034_credit_redemption_limits.sql"),
+    },
+    EmbeddedMigration {
+        version: API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000035_api_key_concurrency_leases.sql"),
+    },
+    EmbeddedMigration {
+        version: RECOVERY_LIFECYCLE_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000036_recovery_lifecycle.sql"),
     },
 ];
 
@@ -681,7 +691,11 @@ mod tests {
             migrations.last().map(|migration| migration.version),
             Some(LATEST_SCHEMA_VERSION)
         );
-        assert_eq!(migrations.len(), 31);
+        assert_eq!(migrations.len(), 33);
+        let recovery = migration_sql(&migrations, RECOVERY_LIFECYCLE_SCHEMA_VERSION)?;
+        assert!(recovery.contains("CREATE TABLE usage_recovery_receipts"));
+        assert!(recovery.contains("CREATE TABLE maintenance_claims"));
+        assert!(recovery.contains("CREATE TABLE artifact_deletion_queue"));
         assert!(
             migrations
                 .iter()
@@ -737,6 +751,10 @@ mod tests {
             redemption_limits.contains("DROP CONSTRAINT credit_redemption_receipts_code_id_key")
         );
         assert!(redemption_limits.contains("UNIQUE (code_id, user_id)"));
+        let concurrency = migration_sql(&migrations, API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION)?;
+        assert!(concurrency.contains("CREATE TABLE api_key_concurrency_leases"));
+        assert!(concurrency.contains("UNIQUE (api_key_id, request_key)"));
+        assert!(concurrency.contains("api_key_concurrency_leases_key_expiry"));
         assert!(accounting.contains("customer_charge_events_station_credit_currency"));
         assert!(accounting.contains("project_commercial_profiles_station_credit_currency"));
         assert!(accounting.contains("channel_model_prices_currency_code_iso"));
@@ -880,12 +898,13 @@ mod tests {
         assert_eq!(prepared.len(), EMBEDDED_MIGRATIONS.len());
         assert_eq!(
             prepared.last().map(|migration| migration.version),
-            Some(CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION)
+            Some(RECOVERY_LIFECYCLE_SCHEMA_VERSION)
         );
 
         let redemption_limits = prepared
-            .last()
-            .expect("the embedded catalog always contains a latest migration");
+            .iter()
+            .find(|migration| migration.version == CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION)
+            .expect("the embedded catalog contains redemption limits");
         assert_eq!(redemption_limits.statements.len(), 3);
         assert!(redemption_limits.statements[0].contains("ADD COLUMN max_redemptions"));
         assert!(redemption_limits.statements[1].contains("DROP CONSTRAINT"));
