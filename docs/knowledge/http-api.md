@@ -420,3 +420,5 @@ flowchart TD
 ## 请求期限与计量持久化
 
 流从准入开始受完整llm_request_timeout约束，背压等待也在期限内；取消和deadline取消上游并一致记录request/execution。成功stream terminal在usage白名单WAL fsync接受后才发送，PG不可用时保留journal重放；journal失败不能以成功终结。完整步骤和失败恢复见[计量流程](backend.md#flow-durable-usage)，记录的body/chunks依storagePolicy，历史流事件与字节有有限预算。未新增不支持协议的出站能力。
+
+API credentials use the first nonempty source: case-insensitive Bearer scheme, X-Api-Key, X-Goog-Api-Key, then key query parameter. Gateway query parameters key/api_key/api-key are excluded from upstream query merging. Anthropic unified prompt tokens include ordinary input, cache reads and cache writes; cache details retain 5m/1h splits for existing billing.

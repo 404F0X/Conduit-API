@@ -52,6 +52,7 @@ use conduit_auth::scopes::{slug, supports_project_role};
 use std::sync::Arc;
 
 use crate::policy::{authorize_project_resolver, authorize_resolver};
+use crate::product_experience::{ProductExperienceServices, ProductMode};
 
 #[async_trait::async_trait]
 pub trait SettingsWritePermit: Send {
@@ -329,6 +330,9 @@ impl Extension for ScopeAuthExtension {
         {
             return Err(ServerError::new(message, None));
         }
+        if is_root && !info.is_for_introspection && enterprise_only_field(info.name) {
+            enforce_product_mode(ctx, info.name).await?;
+        }
         let feature = match info.name {
             "operationsLedger" | "operationsFlow" | "operationsModelSeries" => {
                 Some("operations_reports")
@@ -522,6 +526,78 @@ fn enforce_field(ctx: &ExtensionContext<'_>, field: &str) -> Result<(), String> 
 
 const NO_PRINCIPAL: &str = "authz: request carries no authenticated principal";
 
+/// GQ-13: root fields that only belong to enterprise mode. In SIMPLE mode the
+/// UI hides these pages, but without a server check anyone could call them
+/// directly. Fields that simple-mode pages or system settings still use
+/// (e.g. `dataStorages` for the storage settings tab) are deliberately left
+/// out; only roles, prompts, prompt protection, traces/threads and data
+/// storage writes are blocked.
+pub fn enterprise_only_field(field: &str) -> bool {
+    matches!(
+        field,
+        "roles"
+            | "createRole"
+            | "updateRole"
+            | "deleteRole"
+            | "bulkDeleteRoles"
+            | "prompts"
+            | "createPrompt"
+            | "updatePrompt"
+            | "deletePrompt"
+            | "updatePromptStatus"
+            | "bulkDeletePrompts"
+            | "bulkEnablePrompts"
+            | "bulkDisablePrompts"
+            | "promptProtectionRules"
+            | "previewPromptProtectionRule"
+            | "createPromptProtectionRule"
+            | "updatePromptProtectionRule"
+            | "deletePromptProtectionRule"
+            | "updatePromptProtectionRuleStatus"
+            | "bulkDeletePromptProtectionRules"
+            | "bulkEnablePromptProtectionRules"
+            | "bulkDisablePromptProtectionRules"
+            | "threads"
+            | "traces"
+            | "createDataStorage"
+            | "updateDataStorage"
+    )
+}
+
+/// Deny an enterprise-only field when the site runs in SIMPLE mode. The site
+/// owner (and system/test principals) keep access, because the owner is the
+/// one who can switch the mode back and must not lock themselves out. When no
+/// product-experience service is wired (crate tests), nothing is enforced.
+async fn enforce_product_mode(ctx: &ExtensionContext<'_>, field: &str) -> ServerResult<()> {
+    let principal = ctx
+        .data_opt::<RequestContext>()
+        .and_then(|rc| rc.principal.as_ref());
+    if principal.is_some_and(|p| {
+        p.is_owner
+            || matches!(
+                p.kind,
+                conduit_auth::PrincipalKind::System | conduit_auth::PrincipalKind::Test
+            )
+    }) {
+        return Ok(());
+    }
+    let Some(services) = ctx.data_opt::<Arc<dyn ProductExperienceServices>>() else {
+        return Ok(());
+    };
+    let mode = services
+        .settings()
+        .await
+        .map(|settings| settings.mode)
+        .map_err(|error| ServerError::new(error.to_string(), None))?;
+    if mode == ProductMode::Simple {
+        return Err(ServerError::new(
+            format!("authz: field `{field}` is only available in enterprise mode"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Factory registered on the production schema (`wiring.rs`).
 pub struct ScopeAuthExtensionFactory;
 
@@ -538,6 +614,35 @@ mod tests {
     use conduit_auth::Principal;
 
     // ---- pure table --------------------------------------------------------
+
+    /// GQ-13: every enterprise-only field must be a real, classified root
+    /// field (a typo would silently leave the field open in SIMPLE mode), and
+    /// the fields simple-mode pages rely on must stay open.
+    #[test]
+    fn enterprise_only_fields_are_classified_and_simple_fields_stay_open() {
+        for field in [
+            "roles",
+            "prompts",
+            "promptProtectionRules",
+            "threads",
+            "traces",
+            "createDataStorage",
+            "updateDataStorage",
+        ] {
+            assert!(enterprise_only_field(field), "{field}");
+            assert_ne!(field_authz(field), FieldAuthz::Deny, "{field}");
+        }
+        for field in [
+            "apiKeys",
+            "requests",
+            "usageLogs",
+            "dataStorages",
+            "me",
+            "channels",
+        ] {
+            assert!(!enterprise_only_field(field), "{field}");
+        }
+    }
 
     #[test]
     fn table_maps_entities_to_the_right_scopes() {
@@ -812,6 +917,104 @@ mod tests {
         async fn simple_groups(&self) -> i32 {
             10
         }
+    }
+
+    struct BrokenMode;
+    struct SimpleMode;
+
+    #[async_trait::async_trait]
+    impl ProductExperienceServices for SimpleMode {
+        async fn settings(
+            &self,
+        ) -> Result<
+            crate::product_experience::ProductExperienceSettings,
+            crate::product_experience::ProductExperienceError,
+        > {
+            Ok(crate::product_experience::ProductExperienceSettings {
+                mode: ProductMode::Simple,
+                ..Default::default()
+            })
+        }
+        async fn update_settings(
+            &self,
+            _: crate::product_experience::UpdateProductExperienceSettingsInput,
+        ) -> Result<
+            crate::product_experience::ProductExperienceSettings,
+            crate::product_experience::ProductExperienceError,
+        > {
+            self.settings().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProductExperienceServices for BrokenMode {
+        async fn settings(
+            &self,
+        ) -> Result<
+            crate::product_experience::ProductExperienceSettings,
+            crate::product_experience::ProductExperienceError,
+        > {
+            Err(crate::product_experience::ProductExperienceError::Read(
+                "mode-store-unavailable".into(),
+            ))
+        }
+        async fn update_settings(
+            &self,
+            _: crate::product_experience::UpdateProductExperienceSettingsInput,
+        ) -> Result<
+            crate::product_experience::ProductExperienceSettings,
+            crate::product_experience::ProductExperienceError,
+        > {
+            self.settings().await
+        }
+    }
+
+    #[tokio::test]
+    async fn enterprise_guard_preserves_settings_read_error() {
+        let service: Arc<dyn ProductExperienceServices> = Arc::new(BrokenMode);
+        let schema = crate::admin_schema_builder()
+            .extension(ScopeAuthExtensionFactory)
+            .data(service)
+            .finish();
+        let response = schema
+            .execute(Request::new("{ roles { totalCount } }").data(ctx(Some(
+                Principal::user("reader").with_scope(slug::READ_ROLES),
+            ))))
+            .await;
+        assert_eq!(response.errors.len(), 1);
+        assert!(
+            response.errors[0]
+                .message
+                .contains("mode-store-unavailable"),
+            "{:?}",
+            response.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_mode_blocks_scoped_reader_after_scope_check() {
+        let service: Arc<dyn ProductExperienceServices> = Arc::new(SimpleMode);
+        let schema = crate::admin_schema_builder()
+            .extension(ScopeAuthExtensionFactory)
+            .data(service)
+            .finish();
+        let allowed_scope = schema
+            .execute(Request::new("{ roles { totalCount } }").data(ctx(Some(
+                Principal::user("reader").with_scope(slug::READ_ROLES),
+            ))))
+            .await;
+        assert!(
+            allowed_scope.errors[0]
+                .message
+                .contains("only available in enterprise mode")
+        );
+        let no_scope = schema
+            .execute(
+                Request::new("{ roles { totalCount } }").data(ctx(Some(Principal::user("reader")))),
+            )
+            .await;
+        assert!(no_scope.errors[0].message.contains("read_roles"));
+        assert!(!no_scope.errors[0].message.contains("enterprise mode"));
     }
 
     fn guarded_schema() -> Schema<AuthzTestQuery, EmptyMutation, EmptySubscription> {

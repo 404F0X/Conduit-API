@@ -1893,6 +1893,16 @@ impl QueryRoot {
     /// [`node::NodeResolver`], and return `null` for missing rows.
     async fn node(&self, ctx: &Context<'_>, id: ID) -> Result<Option<channel::Node>, String> {
         if node::parse_guid(id.as_str()).is_ok_and(|guid| guid.typ == "APIKey") {
+            // GQ-1: `node`/`nodes` are only `Authenticated` in the authz
+            // extension, so the `apiKeys` field guard never ran here and any
+            // signed-in user could read another project's key by setting
+            // X-Project-ID. Check READ_API_KEYS against that project first,
+            // exactly as the list query does.
+            policy::AdminAccessScope::from_graphql_context(
+                ctx,
+                conduit_auth::scopes::slug::READ_API_KEYS,
+            )
+            .map_err(|error| error.to_string())?;
             let scope = apikey::api_key_access_scope(ctx)?;
             return apikey::apikey_query_services(ctx)?
                 .api_key(&scope, id.as_str())

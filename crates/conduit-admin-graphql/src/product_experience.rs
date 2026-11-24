@@ -1,8 +1,10 @@
 //! Conduit API product-experience mode.
 //!
 //! `simple` and `enterprise` are two projections over the same data and
-//! authorization model. They are not security boundaries; server-side scope
-//! checks remain authoritative for every operation.
+//! authorization model. Server-side scope checks remain authoritative for
+//! every operation; on top of them, the authz extension refuses a short list
+//! of enterprise-only root fields to non-owners while the site runs in SIMPLE
+//! mode (see `authz_extension::enterprise_only_field`).
 
 use std::sync::Arc;
 

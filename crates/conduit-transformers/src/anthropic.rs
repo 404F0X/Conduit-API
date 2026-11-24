@@ -3458,7 +3458,7 @@ fn convert_anthropic_usage(usage: &Value) -> Option<conduit_llm::Usage> {
     if usage.is_null() {
         return None;
     }
-    let prompt_tokens = usage
+    let input_tokens = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -3466,9 +3466,34 @@ fn convert_anthropic_usage(usage: &Value) -> Option<conduit_llm::Usage> {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let mut prompt_details = TokenDetails::default();
-    if let Some(cached) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
-        prompt_details.cached_tokens = cached;
+    // TR-1: Anthropic's `input_tokens` EXCLUDES cache reads and cache writes,
+    // while the unified usage (OpenAI shape) counts them inside
+    // `prompt_tokens`, and `billable_prompt_tokens` subtracts
+    // `cached_tokens` + `write_cached_tokens` again. Taking `input_tokens`
+    // alone made cache writes free and could bill ordinary input as 0.
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let prompt_tokens = input_tokens + cache_read + cache_creation;
+    let mut prompt_details = TokenDetails {
+        cached_tokens: cache_read,
+        write_cached_tokens: cache_creation,
+        ..TokenDetails::default()
+    };
+    if let Some(split) = usage.get("cache_creation") {
+        prompt_details.write_cached_tokens_5m = split
+            .get("ephemeral_5m_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        prompt_details.write_cached_tokens_1h = split
+            .get("ephemeral_1h_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
     }
     // The unified Usage carries provider-native fields via `extra` so the
     // platform-aware layer can reshape them later.
@@ -11821,6 +11846,36 @@ mod tests {
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("stream").is_none());
         Ok(())
+    }
+
+    /// TR-1: cache reads and cache writes are part of the unified prompt
+    /// tokens, so `billable_prompt_tokens` (prompt - read - write) leaves
+    /// exactly Anthropic's `input_tokens`, and the round trip back to the
+    /// Anthropic shape is lossless.
+    #[test]
+    fn anthropic_usage_counts_cache_tokens_in_prompt() {
+        let usage = convert_anthropic_usage(&json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 200,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 150,
+                "ephemeral_1h_input_tokens": 50
+            }
+        }))
+        .unwrap_or_default();
+        assert_eq!(usage.prompt_tokens, 510);
+        assert_eq!(usage.total_tokens, 515);
+        assert_eq!(usage.prompt_details.cached_tokens, 300);
+        assert_eq!(usage.prompt_details.write_cached_tokens, 200);
+        assert_eq!(usage.prompt_details.write_cached_tokens_5m, 150);
+        assert_eq!(usage.prompt_details.write_cached_tokens_1h, 50);
+
+        let back = convert_llm_usage_to_anthropic(&usage);
+        assert_eq!(back["input_tokens"], 10);
+        assert_eq!(back["cache_read_input_tokens"], 300);
+        assert_eq!(back["cache_creation_input_tokens"], 200);
     }
 
     #[test]

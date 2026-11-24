@@ -305,3 +305,5 @@ HTTP统一为部署base path下POST /admin/graphql，JWT必需（health/version�
 ## 平台Owner授予边界
 
 createUser/updateUser的isOwner=true必须由当前平台Owner调用，先于项目Owner scope豁免检查。拥有平台write_users且当前项目membership Owner的普通平台用户仍不能授予users.is_owner；项目角色与成员Owner操作不受此平台授予规则替代。此检查在resolver策略层执行，隐藏/禁用UI复选框只是反馈。字段数量/参数及JWT项目授权规则保持前文契约。
+
+SIMPLE mode checks scopes first, then blocks non-owner/system/test access to roles, prompts, protection, threads/traces and storage writes. Settings read errors propagate. Payment and group governance retain existing guards. Key node/nodes require read_api_keys in the requested project; list search supports case-insensitive name/key and creation date bounds. Rename/status updates preserve profiles and expiry; updateAPIKeyProfiles replaces the full profile value, so clients must preserve advanced settings.

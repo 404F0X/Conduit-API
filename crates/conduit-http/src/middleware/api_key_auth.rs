@@ -38,6 +38,9 @@ use crate::api_error::json_error;
 /// Header name for the Gemini API key (case-insensitive in `HeaderMap`).
 const GEMINI_API_KEY_HEADER: &str = "x-goog-api-key";
 
+/// Anthropic-native key header (official SDKs, Claude Code `ANTHROPIC_API_KEY`).
+const ANTHROPIC_API_KEY_HEADER: &str = "x-api-key";
+
 /// Public error message when no API key is found (matches Go `ErrAPIKeyRequired`
 /// surface: `AbortWithError(c, 401, ...)` with "Invalid API key").
 const MISSING_KEY_MESSAGE: &str = "Invalid API key";
@@ -51,6 +54,8 @@ const MISSING_KEY_MESSAGE: &str = "Invalid API key";
 pub enum ApiKeySource {
     /// `Authorization: Bearer <key>` header.
     Bearer,
+    /// `X-Api-Key` header (Anthropic-native clients).
+    AnthropicHeader,
     /// `X-Goog-Api-Key` header.
     GeminiHeader,
     /// `?key=<value>` URL query parameter.
@@ -200,9 +205,12 @@ pub mod api_key_meta_keys {
 /// Extract an API key from the request's headers and query string.
 ///
 /// Priority (mirrors Go):
-/// 1. `Authorization: Bearer <key>` — strips the `Bearer ` prefix, trims.
-/// 2. `X-Goog-Api-Key` header — raw value, trimmed.
-/// 3. `?key=<value>` query parameter — URL-decoded by the URI parser, trimmed.
+/// 1. `Authorization: Bearer <key>` — strips the `Bearer ` prefix
+///    (case-insensitive, per RFC 6750), trims.
+/// 2. `X-Api-Key` header — raw value, trimmed (I1: Anthropic SDKs and
+///    Claude Code send only this header and used to get a 401).
+/// 3. `X-Goog-Api-Key` header — raw value, trimmed.
+/// 4. `?key=<value>` query parameter — URL-decoded by the URI parser, trimmed.
 ///
 /// Returns `None` if no source yields a non-empty key.
 pub fn extract_api_key(headers: &HeaderMap, uri: &Uri) -> Option<RawApiKey> {
@@ -214,15 +222,23 @@ pub fn extract_api_key(headers: &HeaderMap, uri: &Uri) -> Option<RawApiKey> {
         });
     }
 
-    // 2) X-Goog-Api-Key header
-    if let Some(key) = extract_gemini_header_key(headers) {
+    // 2) X-Api-Key header
+    if let Some(key) = extract_header_key(headers, ANTHROPIC_API_KEY_HEADER) {
+        return Some(RawApiKey {
+            value: key,
+            source: ApiKeySource::AnthropicHeader,
+        });
+    }
+
+    // 3) X-Goog-Api-Key header
+    if let Some(key) = extract_header_key(headers, GEMINI_API_KEY_HEADER) {
         return Some(RawApiKey {
             value: key,
             source: ApiKeySource::GeminiHeader,
         });
     }
 
-    // 3) ?key=<value> query param
+    // 4) ?key=<value> query param
     if let Some(key) = extract_query_key(uri) {
         return Some(RawApiKey {
             value: key,
@@ -250,12 +266,17 @@ pub fn extract_api_key(headers: &HeaderMap, uri: &Uri) -> Option<RawApiKey> {
 fn extract_bearer_key(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
 
-    // Must have "Bearer " prefix for this source
-    if !raw.starts_with("Bearer ") {
+    // Must have a "Bearer " prefix for this source. The scheme name is
+    // case-insensitive (RFC 6750 / RFC 7235), so `bearer xxx` is accepted too.
+    const PREFIX: &str = "Bearer ";
+    if !raw
+        .get(..PREFIX.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PREFIX))
+    {
         return None;
     }
 
-    let key = raw.get("Bearer ".len()..)?.trim();
+    let key = raw.get(PREFIX.len()..)?.trim();
     if key.is_empty() {
         return None;
     }
@@ -263,9 +284,9 @@ fn extract_bearer_key(headers: &HeaderMap) -> Option<String> {
     Some(key.to_string())
 }
 
-/// Extract key from `X-Goog-Api-Key` header (Gemini-compatible).
-fn extract_gemini_header_key(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(GEMINI_API_KEY_HEADER)?.to_str().ok()?;
+/// Extract a raw key from a single-value header (`X-Api-Key`, `X-Goog-Api-Key`).
+fn extract_header_key(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(name)?.to_str().ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -797,6 +818,59 @@ mod tests {
             Some(RawApiKey {
                 value: "AIzaSy-test".to_string(),
                 source: ApiKeySource::GeminiHeader,
+            })
+        );
+    }
+
+    #[test]
+    fn bearer_takes_precedence_over_anthropic_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bEaReR gateway-key"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("other-key"));
+        let result = extract_api_key(&headers, &Uri::from_static("/v1/messages"));
+        assert_eq!(
+            result,
+            Some(RawApiKey {
+                value: "gateway-key".into(),
+                source: ApiKeySource::Bearer
+            })
+        );
+    }
+
+    #[test]
+    fn extract_api_key_anthropic_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("sk-ant-test"));
+        let uri: Uri = "/v1/messages".parse().unwrap_or_default();
+
+        let result = extract_api_key(&headers, &uri);
+        assert_eq!(
+            result,
+            Some(RawApiKey {
+                value: "sk-ant-test".to_string(),
+                source: ApiKeySource::AnthropicHeader,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_api_key_bearer_scheme_is_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer sk-lower"),
+        );
+        let uri: Uri = "/test".parse().unwrap_or_default();
+
+        let result = extract_api_key(&headers, &uri);
+        assert_eq!(
+            result,
+            Some(RawApiKey {
+                value: "sk-lower".to_string(),
+                source: ApiKeySource::Bearer,
             })
         );
     }
