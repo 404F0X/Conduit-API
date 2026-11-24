@@ -14,6 +14,7 @@ import {
   IconWallet,
 } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
+import { useAuthStore } from '@/stores/authStore';
 import { useSelectedProjectId } from '@/stores/projectStore';
 import { DEFAULT_CREDIT_DISPLAY_NAME } from '@/lib/accounting';
 import { cn } from '@/lib/utils';
@@ -21,6 +22,8 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Header } from '@/components/layout/header';
@@ -30,11 +33,13 @@ import {
   type SubscriptionAllowanceBucket,
   type UserSubscription,
   useMyProjectBalance,
+  useMyProjectFunds,
   useMySubscriptions,
 } from '@/features/billing/data';
 import { FundingOrderStrip } from '@/features/billing/funding-order-strip';
-import { bucketTotalsByClass, spendableAllowanceBuckets } from '@/features/billing/quota-buckets';
+import { spendableAllowanceBuckets } from '@/features/billing/quota-buckets';
 import { useGeneralSettings } from '@/features/system/data/system';
+import { PaymentTopupPanel } from './components/payment-topup-panel';
 import { RedeemCodeDialog } from './components/redeem-code-dialog';
 
 function amount(creditDisplayName: string, value?: string) {
@@ -105,10 +110,15 @@ function projectWalletStatus(value: string, t: ReturnType<typeof useTranslation>
 export default function WalletPage() {
   const { t, i18n } = useTranslation();
   const selectedProjectID = useSelectedProjectId();
+  const payerID = useAuthStore((state) => state.auth.user?.id);
   const generalSettingsQuery = useGeneralSettings();
   const creditDisplayName = generalSettingsQuery.data?.creditDisplayName?.trim() || DEFAULT_CREDIT_DISPLAY_NAME;
   const [redeemOpen, setRedeemOpen] = useState(false);
   const [expandedBuckets, setExpandedBuckets] = useState<Set<string>>(() => new Set());
+  const [selectedModel, setSelectedModel] = useState('');
+  const [modelDraft, setModelDraft] = useState('');
+  const fundsQuery = useMyProjectFunds(selectedModel || undefined);
+  const funds = fundsQuery.data;
   const balanceQuery = useMyProjectBalance();
   const subscriptionsQuery = useMySubscriptions();
   const balance = balanceQuery.data?.myProjectBalance;
@@ -119,9 +129,9 @@ export default function WalletPage() {
     .map((subscription) => ({ subscription, buckets: spendableAllowanceBuckets(subscription) }))
     .filter((group) => group.buckets.length > 0);
   const activeBuckets = bucketsBySubscription.flatMap((group) => group.buckets);
-  const bucketTotals = bucketTotalsByClass(activeBuckets);
-  const loading = balanceQuery.isLoading || subscriptionsQuery.isLoading;
-  const error = balanceQuery.error || subscriptionsQuery.error;
+
+  const loading = fundsQuery.isLoading || balanceQuery.isLoading || subscriptionsQuery.isLoading;
+  const error = fundsQuery.error || balanceQuery.error || subscriptionsQuery.error;
 
   return (
     <>
@@ -156,6 +166,7 @@ export default function WalletPage() {
                 variant='outline'
                 size='sm'
                 onClick={() => {
+                  fundsQuery.refetch();
                   balanceQuery.refetch();
                   subscriptionsQuery.refetch();
                 }}
@@ -170,26 +181,26 @@ export default function WalletPage() {
           {[
             {
               label: t('billing.summary.available'),
-              value: balance?.availableBalance,
+              value: funds?.admissionAvailable,
               Icon: IconWallet,
               tone: 'text-foreground',
               reserved: balance?.reservedBalance,
             },
             {
               label: t('billing.summary.stationCredit', { name: creditDisplayName }),
-              value: balance?.creditBalance,
+              value: funds?.projectCreditAvailable,
               Icon: IconCoins,
               tone: 'text-foreground',
             },
             {
               label: t('billing.summary.generalQuota'),
-              value: balance?.generalSubscriptionBalance ?? bucketTotals.GENERAL,
+              value: funds?.generalSubscriptionAvailable,
               Icon: IconCalendarRepeat,
               tone: 'text-foreground',
             },
             {
               label: t('billing.summary.dedicatedQuota'),
-              value: balance?.dedicatedSubscriptionBalance ?? bucketTotals.DEDICATED,
+              value: selectedModel ? funds?.dedicatedSubscriptionAvailable : undefined,
               Icon: IconStack2,
               tone: 'text-foreground',
             },
@@ -218,6 +229,110 @@ export default function WalletPage() {
           ))}
         </section>
 
+        <Card className='gap-3 py-4 shadow-none'>
+          <CardHeader className='px-4'>
+            <CardTitle className='text-base'>
+              {t(funds?.shared ? 'wallet.funds.shared' : 'wallet.funds.personal', {
+                defaultValue: funds?.shared ? 'Shared Project funds and your allowance' : 'Your personal Project funds',
+              })}
+            </CardTitle>
+            <CardDescription>
+              {t('wallet.funds.authority', {
+                defaultValue:
+                  'The Project wallet is the ledger. Only your subscriptions in this Project appear here; dedicated allowance depends on the selected model.',
+              })}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className='space-y-4 px-4'>
+            <form
+              className='flex flex-wrap items-end gap-3'
+              onSubmit={(e) => {
+                e.preventDefault();
+                setSelectedModel(modelDraft.trim());
+              }}
+            >
+              <div className='min-w-48 flex-1'>
+                <Label htmlFor='funds-model'>{t('wallet.funds.model', { defaultValue: 'Model' })}</Label>
+                <Input
+                  id='funds-model'
+                  list='funds-models'
+                  value={modelDraft}
+                  onChange={(e) => setModelDraft(e.target.value)}
+                  placeholder={t('wallet.funds.chooseModel', { defaultValue: 'Select a model to check dedicated allowance' })}
+                />
+                <datalist id='funds-models'>
+                  {[...new Set(funds?.dedicatedBuckets.flatMap((b) => b.modelIDs))].map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
+              </div>
+              <Button type='submit' variant='outline' disabled={fundsQuery.isFetching}>
+                {t('wallet.funds.check', { defaultValue: 'Check model' })}
+              </Button>
+            </form>
+            {selectedModel && funds && (!funds.selectedModelPriced || !funds.selectedModelAuthorized) && (
+              <p className='text-muted-foreground text-sm'>
+                {t('wallet.funds.noPrice', {
+                  defaultValue:
+                    'This model needs an active Project authorization and current retail price before funds can be used for it.',
+                })}
+              </p>
+            )}
+            <dl className='grid grid-cols-2 gap-3 text-sm lg:grid-cols-4'>
+              {[
+                [
+                  t('wallet.funds.limit', { defaultValue: 'Your cumulative limit' }),
+                  funds?.memberLimit === null
+                    ? t('wallet.funds.unlimited', { defaultValue: 'Unlimited' })
+                    : amount(creditDisplayName, funds?.memberLimit ?? undefined),
+                ],
+                [t('wallet.funds.spent', { defaultValue: 'Spent across your keys' }), amount(creditDisplayName, funds?.memberSpent)],
+                [
+                  t('wallet.funds.reserved', { defaultValue: 'Reserved across your keys' }),
+                  amount(creditDisplayName, funds?.memberReserved),
+                ],
+                [
+                  t('wallet.funds.remaining', { defaultValue: 'Remaining member budget' }),
+                  funds?.memberRemaining === null
+                    ? t('wallet.funds.unlimited', { defaultValue: 'Unlimited' })
+                    : amount(creditDisplayName, funds?.memberRemaining ?? undefined),
+                ],
+              ].map(([label, value]) => (
+                <div key={label}>
+                  <dt className='text-muted-foreground'>{label}</dt>
+                  <dd className='mt-1 tabular-nums'>{value}</dd>
+                </div>
+              ))}
+            </dl>
+            {!!funds?.dedicatedBuckets.length && (
+              <details>
+                <summary className='min-h-10 cursor-pointer py-2 text-sm'>
+                  {t('wallet.funds.dedicatedSeparate', { defaultValue: 'Dedicated buckets by model — separate from unrestricted funds' })}
+                </summary>
+                <div className='space-y-2'>
+                  {funds.dedicatedBuckets.map((bucket) => (
+                    <div key={bucket.id} className='rounded-md border p-3 text-sm'>
+                      <p>
+                        {bucket.name} · {amount(creditDisplayName, bucket.remainingAllowance)}
+                      </p>
+                      <p className='text-muted-foreground mt-1 break-words'>
+                        {bucket.modelIDs.join(', ') || t('wallet.funds.noModels', { defaultValue: 'No eligible models' })}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </CardContent>
+        </Card>
+        {selectedProjectID && payerID && (
+          <PaymentTopupPanel
+            key={`${payerID}:${selectedProjectID}`}
+            payerID={payerID}
+            projectID={selectedProjectID}
+            creditDisplayName={creditDisplayName}
+          />
+        )}
         <FundingOrderStrip creditDisplayName={creditDisplayName} />
 
         <div className='space-y-5'>

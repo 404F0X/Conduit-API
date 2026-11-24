@@ -1,13 +1,16 @@
 //! Conduit API product-experience mode.
 //!
 //! `simple` and `enterprise` are two projections over the same data and
-//! authorization model. They are not security boundaries; server-side scope
-//! checks remain authoritative for every operation.
+//! authorization model. Server-side scope checks remain authoritative for
+//! every operation; on top of them, the authz extension refuses a short list
+//! of enterprise-only root fields to non-owners while the site runs in SIMPLE
+//! mode (see `authz_extension::enterprise_only_field`).
 
 use std::sync::Arc;
 
 use async_graphql::{Context, Enum, InputObject, SimpleObject};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Product navigation and landing-page projection.
@@ -24,16 +27,46 @@ impl Default for ProductMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SimpleObject)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FeatureOverride {
+    #[default]
+    Inherit,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct ProductFeature {
+    pub id: String,
+    pub visibility: FeatureOverride,
+    pub execution: FeatureOverride,
+    pub visible: bool,
+    pub enabled: bool,
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, InputObject)]
+pub struct ProductFeatureOverrideInput {
+    pub id: String,
+    pub visibility: Option<FeatureOverride>,
+    pub execution: Option<FeatureOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, SimpleObject)]
 #[graphql(name = "ProductExperienceSettings")]
 pub struct ProductExperienceSettings {
     pub mode: ProductMode,
+    pub revision: String,
+    pub features: Vec<ProductFeature>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, InputObject)]
+#[derive(Debug, Clone, PartialEq, Eq, InputObject)]
 #[graphql(name = "UpdateProductExperienceSettingsInput")]
 pub struct UpdateProductExperienceSettingsInput {
     pub mode: ProductMode,
+    pub expected_revision: Option<String>,
+    pub overrides: Option<Vec<ProductFeatureOverrideInput>>,
 }
 
 #[derive(Debug, Error)]

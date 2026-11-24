@@ -1404,6 +1404,7 @@ mod tests {
             .create_api_key(
                 &ctx,
                 CreateApiKeyInput {
+                    model_group_id: None,
                     id: "ak-1".to_string(),
                     user_id: Some("user-1".to_string()),
                     project_id: project.id.clone(),

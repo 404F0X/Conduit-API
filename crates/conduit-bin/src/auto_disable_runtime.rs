@@ -455,6 +455,15 @@ async fn disable_channel(
     actual_count: i64,
 ) -> Result<Option<ChannelDisabledEvent>, String> {
     let reason = derive_error_message(status);
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| "health restriction transaction unavailable")?;
+    crate::wiring_governance::lock_policy(&mut tx).await?;
+    sqlx::query("SELECT set_config('conduit.health_restriction','authorized',true)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "health restriction authority unavailable")?;
     let row = sqlx::query_as::<_, (String, String, Option<String>)>(
         "UPDATE channels SET status='disabled',error_message=$2,updated_at=now() \
          WHERE id=$1 AND status='enabled' AND deleted_at=0 \
@@ -462,7 +471,7 @@ async fn disable_channel(
     )
     .bind(channel_id)
     .bind(&reason)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| error.to_string())?;
     let event = row.map(|(name, provider, base_url)| ChannelDisabledEvent {
@@ -479,6 +488,9 @@ async fn disable_channel(
     if event.is_some() {
         tracing::warn!(channel_id, status, "channel auto-disabled");
     }
+    tx.commit()
+        .await
+        .map_err(|_| "health restriction commit failed")?;
     Ok(event)
 }
 
@@ -491,6 +503,11 @@ async fn disable_credential(
     actual_count: i64,
 ) -> Result<Option<ChannelDisabledEvent>, String> {
     let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    crate::wiring_governance::lock_policy(&mut tx).await?;
+    sqlx::query("SELECT set_config('conduit.health_restriction','authorized',true)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| "health restriction authority unavailable")?;
     let row = sqlx::query_as::<
         _,
         (

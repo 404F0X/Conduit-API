@@ -70,120 +70,18 @@ pub(crate) async fn create_codes(
     actor: gql::CreditRedemptionActor,
     input: gql::CreateCreditRedemptionCodesInput,
 ) -> Result<gql::CreateCreditRedemptionCodesPayload, gql::BillingError> {
-    gql::validate_create_credit_redemption_codes_input(&input)?;
-    let amount_micros = parse_exact_amount_micros(&input.amount)?;
-    let expires_at = input.expires_at.as_deref().map(parse_expiry).transpose()?;
-    let description = input
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let quantity = input.quantity;
-    let max_redemptions = input.max_redemptions;
-    validate_batch_liability(amount_micros, quantity, max_redemptions)?;
-
-    // Generate outside the transaction so entropy acquisition never extends
-    // the duration of database locks. Only normalized digests enter SQL.
-    let generated = (0..quantity)
-        .map(|_| {
-            let plaintext = generate_code()?;
-            let normalized = gql::normalize_credit_redemption_code(&plaintext).map_err(|_| {
-                internal_storage_error(
-                    "create_codes.generate",
-                    "generated redemption code failed its own format contract",
-                )
-            })?;
-            Ok((plaintext, digest_code(&normalized), code_hint(&normalized)))
-        })
-        .collect::<Result<Vec<_>, gql::BillingError>>()?;
-
     let mut tx = pool
         .begin()
         .await
-        .map_err(|error| sanitized_db_error("create_codes.begin", error))?;
-    let created_at = transaction_time(&mut tx, "create_codes.time").await?;
-    // Expiry validation is repeated against the transaction clock so a value
-    // that elapsed while the request waited cannot create an already-expired
-    // batch.
-    if expires_at.is_some_and(|expiry| expiry <= created_at) {
-        return Err(gql::BillingError::Invalid(
-            "expiresAt must be in the future".to_string(),
-        ));
-    }
-    let batch_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO credit_redemption_batches \
-         (amount_micros,currency,quantity,max_redemptions,expires_at,description,created_by_actor_type,created_by_actor_id,created_at) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
-    )
-    .bind(amount_micros)
-    .bind(STATION_CREDIT_CODE)
-    .bind(quantity)
-    .bind(max_redemptions)
-    .bind(expires_at)
-    .bind(description.as_deref())
-    .bind(&actor.actor_type)
-    .bind(actor.actor_id.as_deref())
-    .bind(created_at)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|error| sanitized_db_error("create_codes.insert_batch", error))?;
-
-    let mut codes = Vec::with_capacity(generated.len());
-    for (plaintext, digest, hint) in generated {
-        let code_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO credit_redemption_codes \
-             (batch_id,code_digest,code_hint,status,created_at) \
-             VALUES($1,$2,$3,'active',$4) RETURNING id",
-        )
-        .bind(batch_id)
-        .bind(digest)
-        .bind(&hint)
-        .bind(created_at)
-        .fetch_one(&mut *tx)
+        .map_err(|e| sanitized_db_error("create_codes.begin", e))?;
+    crate::wiring_governance::lock_policy(&mut tx)
         .await
-        .map_err(|error| sanitized_db_error("create_codes.insert_code", error))?;
-        codes.push(gql::GeneratedCreditRedemptionCode {
-            id: id(code_id),
-            code: plaintext,
-            code_hint: hint,
-        });
-    }
-    insert_audit(
-        &mut tx,
-        &actor,
-        AuditRow {
-            operation: "create_codes",
-            batch_id,
-            code_id: None,
-            receipt_id: None,
-            project_id: None,
-            user_id: None,
-            outcome: "success",
-            detail: json!({
-                "amountMicros": amount_micros,
-                "currency": STATION_CREDIT_CODE,
-                "quantity": quantity,
-                "maxRedemptions": max_redemptions,
-                "expiresAt": expires_at.map(|value| value.to_rfc3339()),
-            }),
-            created_at,
-        },
-    )
-    .await?;
+        .map_err(gql::BillingError::Invalid)?;
+    let result = create_codes_in_tx(&mut tx, actor, input).await?;
     tx.commit()
         .await
-        .map_err(|error| sanitized_db_error("create_codes.commit", error))?;
-
-    Ok(gql::CreateCreditRedemptionCodesPayload {
-        batch_id: id(batch_id),
-        amount: amount(amount_micros),
-        currency: STATION_CREDIT_CODE.to_string(),
-        quantity,
-        max_redemptions,
-        expires_at: expires_at.map(wire_time),
-        codes,
-    })
+        .map_err(|e| sanitized_db_error("create_codes.commit", e))?;
+    Ok(result)
 }
 
 pub(crate) async fn revoke_code(
@@ -191,11 +89,28 @@ pub(crate) async fn revoke_code(
     actor: gql::CreditRedemptionActor,
     code_id: &str,
 ) -> Result<gql::CreditRedemptionCode, gql::BillingError> {
-    let code_id = parse_id(code_id, "redemption code ID")?;
     let mut tx = pool
         .begin()
         .await
-        .map_err(|error| sanitized_db_error("revoke_code.begin", error))?;
+        .map_err(|e| sanitized_db_error("revoke_code.begin", e))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::wiring_governance::LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitized_db_error("revoke_code.governance_lock", e))?;
+    let code = revoke_code_in_tx(&mut tx, actor, code_id).await?;
+    tx.commit()
+        .await
+        .map_err(|e| sanitized_db_error("revoke_code.commit", e))?;
+    Ok(code)
+}
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn revoke_code_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: gql::CreditRedemptionActor,
+    code_id: &str,
+) -> Result<gql::CreditRedemptionCode, gql::BillingError> {
+    let code_id = parse_id(code_id, "redemption code ID")?;
     let row = sqlx::query(
         "SELECT c.id,c.batch_id,c.code_hint,c.status,c.redeemed_at,c.revoked_at,c.created_at, \
                 b.amount_micros,b.currency,b.description,b.expires_at,b.max_redemptions, \
@@ -205,14 +120,14 @@ pub(crate) async fn revoke_code(
          WHERE c.id=$1 FOR UPDATE OF c",
     )
     .bind(code_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(|error| sanitized_db_error("revoke_code.lock", error))?
     .ok_or_else(|| gql::BillingError::NotFound("credit redemption code".to_string()))?;
     // Use the wall clock after any row-lock wait; transaction_timestamp()
     // would retain a pre-wait instant and could revive a code that expired
     // while a concurrent redemption held the lock.
-    let revoked_at = wall_clock_time(&mut tx, "revoke_code.time").await?;
+    let revoked_at = wall_clock_time(tx, "revoke_code.time").await?;
     let status = row.get::<String, _>("status");
     let expiry = row.get::<Option<DateTime<Utc>>, _>("expires_at");
     if status != "active" || expiry.is_some_and(|value| value <= revoked_at) {
@@ -226,12 +141,12 @@ pub(crate) async fn revoke_code(
     )
     .bind(code_id)
     .bind(revoked_at)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(|error| sanitized_db_error("revoke_code.update", error))?;
     let batch_id = row.get::<i64, _>("batch_id");
     insert_audit(
-        &mut tx,
+        tx,
         &actor,
         AuditRow {
             operation: "revoke_code",
@@ -246,9 +161,6 @@ pub(crate) async fn revoke_code(
         },
     )
     .await?;
-    tx.commit()
-        .await
-        .map_err(|error| sanitized_db_error("revoke_code.commit", error))?;
 
     Ok(gql::CreditRedemptionCode {
         id: id(code_id),
@@ -288,6 +200,13 @@ pub(crate) async fn redeem_code(
         .begin()
         .await
         .map_err(|error| sanitized_db_error("redeem_code.begin", error))?;
+    crate::wiring_governance::lock_policy(&mut tx)
+        .await
+        .map_err(gql::BillingError::Invalid)?;
+    sqlx::query("SELECT set_config('conduit.issued_redemption','authorized',true)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitized_db_error("redeem_code.authority", e))?;
     // Lock all three authorization records until commit. This prevents a
     // membership removal, user deactivation, or Project archive from racing
     // between authorization and the credit write.
@@ -1276,4 +1195,122 @@ mod tests {
         .await?;
         Ok(())
     }
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn create_codes_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: gql::CreditRedemptionActor,
+    input: gql::CreateCreditRedemptionCodesInput,
+) -> Result<gql::CreateCreditRedemptionCodesPayload, gql::BillingError> {
+    gql::validate_create_credit_redemption_codes_input(&input)?;
+    let amount_micros = parse_exact_amount_micros(&input.amount)?;
+    let expires_at = input.expires_at.as_deref().map(parse_expiry).transpose()?;
+    let description = input
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let quantity = input.quantity;
+    let max_redemptions = input.max_redemptions;
+    validate_batch_liability(amount_micros, quantity, max_redemptions)?;
+
+    // Generate outside the transaction so entropy acquisition never extends
+    // the duration of database locks. Only normalized digests enter SQL.
+    let generated = (0..quantity)
+        .map(|_| {
+            let plaintext = generate_code()?;
+            let normalized = gql::normalize_credit_redemption_code(&plaintext).map_err(|_| {
+                internal_storage_error(
+                    "create_codes.generate",
+                    "generated redemption code failed its own format contract",
+                )
+            })?;
+            Ok((plaintext, digest_code(&normalized), code_hint(&normalized)))
+        })
+        .collect::<Result<Vec<_>, gql::BillingError>>()?;
+
+    crate::wiring_product_experience::require_feature_in_tx(tx, "redemption_issuance")
+        .await
+        .map_err(gql::BillingError::Invalid)?;
+    let created_at = transaction_time(tx, "create_codes.time").await?;
+    // Expiry validation is repeated against the transaction clock so a value
+    // that elapsed while the request waited cannot create an already-expired
+    // batch.
+    if expires_at.is_some_and(|expiry| expiry <= created_at) {
+        return Err(gql::BillingError::Invalid(
+            "expiresAt must be in the future".to_string(),
+        ));
+    }
+    let batch_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO credit_redemption_batches \
+         (amount_micros,currency,quantity,max_redemptions,expires_at,description,created_by_actor_type,created_by_actor_id,created_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+    )
+    .bind(amount_micros)
+    .bind(STATION_CREDIT_CODE)
+    .bind(quantity)
+    .bind(max_redemptions)
+    .bind(expires_at)
+    .bind(description.as_deref())
+    .bind(&actor.actor_type)
+    .bind(actor.actor_id.as_deref())
+    .bind(created_at)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| sanitized_db_error("create_codes.insert_batch", error))?;
+
+    let mut codes = Vec::with_capacity(generated.len());
+    for (plaintext, digest, hint) in generated {
+        let code_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO credit_redemption_codes \
+             (batch_id,code_digest,code_hint,status,created_at) \
+             VALUES($1,$2,$3,'active',$4) RETURNING id",
+        )
+        .bind(batch_id)
+        .bind(digest)
+        .bind(&hint)
+        .bind(created_at)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|error| sanitized_db_error("create_codes.insert_code", error))?;
+        codes.push(gql::GeneratedCreditRedemptionCode {
+            id: id(code_id),
+            code: plaintext,
+            code_hint: hint,
+        });
+    }
+    insert_audit(
+        tx,
+        &actor,
+        AuditRow {
+            operation: "create_codes",
+            batch_id,
+            code_id: None,
+            receipt_id: None,
+            project_id: None,
+            user_id: None,
+            outcome: "success",
+            detail: json!({
+                "amountMicros": amount_micros,
+                "currency": STATION_CREDIT_CODE,
+                "quantity": quantity,
+                "maxRedemptions": max_redemptions,
+                "expiresAt": expires_at.map(|value| value.to_rfc3339()),
+            }),
+            created_at,
+        },
+    )
+    .await?;
+
+    Ok(gql::CreateCreditRedemptionCodesPayload {
+        batch_id: id(batch_id),
+        amount: amount(amount_micros),
+        currency: STATION_CREDIT_CODE.to_string(),
+        quantity,
+        max_redemptions,
+        expires_at: expires_at.map(wire_time),
+        codes,
+    })
 }

@@ -43,6 +43,7 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 clap = { workspace = true }
 jsonwebtoken = { workspace = true }
+md-5 = "0.10"
 percent-encoding = { workspace = true }
 regex = "1"
 reqwest = { workspace = true }

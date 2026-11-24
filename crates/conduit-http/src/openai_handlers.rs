@@ -2002,7 +2002,21 @@ fn build_openai_http_request(
     // `contexts.WithAPIKey(ctx, apiKey)` + `contexts.WithProjectID(ctx,
     // apiKey.Edges.Project.ID)` injected by `WithAPIKeyAuth`
     // (auth.go:54-58).
+    request.metadata.remove(api_key_meta_keys::MODEL_GROUP_ID);
+    request
+        .metadata
+        .remove(api_key_meta_keys::MODEL_GROUP_REVISION);
     if let Some(meta) = api_key_meta {
+        if !meta.model_group_id.is_empty() && meta.model_group_revision > 0 {
+            request.metadata.insert(
+                api_key_meta_keys::MODEL_GROUP_ID.into(),
+                meta.model_group_id.clone().into(),
+            );
+            request.metadata.insert(
+                api_key_meta_keys::MODEL_GROUP_REVISION.into(),
+                meta.model_group_revision.into(),
+            );
+        }
         request.metadata.insert(
             api_key_meta_keys::API_KEY_ID.to_string(),
             serde_json::Value::from(meta.api_key_id),
@@ -6702,6 +6716,8 @@ mod tests {
         use axum::http::Method;
 
         let meta = ValidatedApiKeyMetadata {
+            model_group_id: "trusted-group".into(),
+            model_group_revision: 7,
             api_key_id: 42,
             api_key_name: "prod-key".to_string(),
             allowed_models: "gpt-4o,claude-3-5-sonnet".to_string(),
@@ -6712,7 +6728,9 @@ mod tests {
 
         let uri: Uri = "/v1/chat/completions".parse()?;
         let headers = HeaderMap::new();
-        let body = Bytes::from(r#"{"model":"gpt-4o","messages":[]}"#);
+        let body = Bytes::from(
+            r#"{"model":"gpt-4o","messages":[],"metadata":{"model_group_id":"spoof","model_group_revision":999}}"#,
+        );
 
         let request = build_openai_http_request(
             OpenAiRoute::ChatCompletions,
@@ -6724,6 +6742,16 @@ mod tests {
             &TracingHeaderConfig::default(),
         );
 
+        assert_eq!(
+            request.metadata.get(api_key_meta_keys::MODEL_GROUP_ID),
+            Some(&serde_json::json!("trusted-group"))
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get(api_key_meta_keys::MODEL_GROUP_REVISION),
+            Some(&serde_json::json!(7))
+        );
         // API key id
         assert_eq!(
             request.metadata.get(api_key_meta_keys::API_KEY_ID),
@@ -6838,6 +6866,16 @@ mod tests {
         assert_eq!(
             request.metadata.get(api_key_meta_keys::API_KEY_PROJECT_ID),
             Some(&serde_json::Value::from(0_i64)),
+        );
+        assert!(
+            !request
+                .metadata
+                .contains_key(api_key_meta_keys::MODEL_GROUP_ID)
+        );
+        assert!(
+            !request
+                .metadata
+                .contains_key(api_key_meta_keys::MODEL_GROUP_REVISION)
         );
         Ok(())
     }

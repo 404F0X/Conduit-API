@@ -244,260 +244,13 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         actor_user_id: Option<i64>,
         input: CreateSimpleGroupInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
-        let name = validate_simple_group_name(&input.name)?;
-        let access_plan_id = input
-            .access_plan_id
-            .as_ref()
-            .map(|value| parse_simple_group_ref(value.as_str()))
-            .transpose()?;
-        let model_ids = input.model_ids.map(parse_simple_group_refs).transpose()?;
-        let route_ids = input
-            .route_ids
-            .map(parse_simple_group_refs)
-            .transpose()?
-            .unwrap_or_default();
-        if access_plan_id.is_some() == model_ids.is_some() {
-            return Err(SimpleGroupServiceError::Invalid(
-                "provide exactly one of accessPlanID or modelIDs".into(),
-            ));
-        }
-        if access_plan_id.is_some() && !route_ids.is_empty() {
-            return Err(SimpleGroupServiceError::Invalid(
-                "routeIDs belong to the linked Access Plan; omit them when accessPlanID is provided"
-                    .into(),
-            ));
-        }
-        let price_tier_id = input
-            .price_tier_id
-            .as_ref()
-            .map(|value| parse_simple_group_ref(value.as_str()))
-            .transpose()?;
-        if price_tier_id.is_some() == input.multiplier_ppm.is_some() {
-            return Err(SimpleGroupServiceError::Invalid(
-                "provide exactly one of priceTierID or multiplierPpm".into(),
-            ));
-        }
-        if input.multiplier_ppm.is_some_and(|value| value < 0) {
-            return Err(SimpleGroupServiceError::Invalid(
-                "multiplierPpm cannot be negative".into(),
-            ));
-        }
-        let default_subscription_plan_id = input
-            .default_subscription_plan_id
-            .as_ref()
-            .map(|value| parse_simple_group_ref(value.as_str()))
-            .transpose()?;
-        let is_default = input.is_default.unwrap_or(false);
-        let group_id = Uuid::now_v7().to_string();
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
             .await
             .map_err(simple_group_storage)?;
-        lock_simple_group_mutations(&mut tx).await?;
-        let audit_settings =
-            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
-                &mut tx,
-            )
-            .await
-            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
-        let before_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-
-        let duplicate_name =
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM simple_groups WHERE name = $1")
-                .bind(&name)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-        if duplicate_name != 0 {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "group name {name:?} already exists"
-            )));
-        }
-
-        let access_plan_id = if let Some(plan_id) = access_plan_id {
-            let status =
-                sqlx::query_scalar::<_, String>("SELECT status FROM access_plans WHERE id = $1")
-                    .bind(plan_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(simple_group_storage)?
-                    .ok_or_else(|| {
-                        SimpleGroupServiceError::NotFound(format!("access plan {plan_id}"))
-                    })?;
-            if status != "enabled" {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "access plan {plan_id} is not enabled"
-                )));
-            }
-            plan_id
-        } else {
-            let model_ids = model_ids.as_deref().ok_or_else(|| {
-                SimpleGroupServiceError::Invalid(
-                    "modelIDs are required when accessPlanID is omitted".into(),
-                )
-            })?;
-            for model_id in model_ids {
-                let exists = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM models \
-                     WHERE id = $1 AND status = 'enabled' AND deleted_at = 0",
-                )
-                .bind(model_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-                if exists == 0 {
-                    return Err(SimpleGroupServiceError::NotFound(format!(
-                        "enabled public model {model_id}"
-                    )));
-                }
-            }
-            validate_enabled_routes(&mut tx, &route_ids, model_ids).await?;
-            let plan_name = format!("{name} Access Plan");
-            let plan_name_exists =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM access_plans WHERE name = $1")
-                    .bind(&plan_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(simple_group_storage)?;
-            if plan_name_exists != 0 {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "generated access plan name {plan_name:?} already exists; link that plan explicitly"
-                )));
-            }
-            let description = format!("Managed by Simple Group {group_id}");
-            let plan_id =
-                crate::wiring_postgres_commercialization::create_access_plan_record_postgres(
-                    &mut tx,
-                    &plan_name,
-                    Some(&description),
-                    "enabled",
-                    false,
-                    now,
-                )
-                .await
-                .map_err(simple_group_storage)?;
-            crate::wiring_postgres_commercialization::publish_access_plan_version_postgres(
-                &mut tx, plan_id, model_ids, &route_ids, now,
-            )
-            .await
-            .map_err(simple_group_storage)?;
-            plan_id
-        };
-
-        let price_tier_id = if let Some(tier_id) = price_tier_id {
-            let status =
-                sqlx::query_scalar::<_, String>("SELECT status FROM price_tiers WHERE id = $1")
-                    .bind(tier_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(simple_group_storage)?
-                    .ok_or_else(|| {
-                        SimpleGroupServiceError::NotFound(format!("price tier {tier_id}"))
-                    })?;
-            if status != "enabled" {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "price tier {tier_id} is not enabled"
-                )));
-            }
-            tier_id
-        } else {
-            let tier_name = format!("{name} Price Tier");
-            let tier_name_exists =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM price_tiers WHERE name = $1")
-                    .bind(&tier_name)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(simple_group_storage)?;
-            if tier_name_exists != 0 {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "generated price tier name {tier_name:?} already exists; link that tier explicitly"
-                )));
-            }
-            crate::wiring_postgres_commercialization::create_price_tier_record_postgres(
-                &mut tx,
-                &tier_name,
-                input.multiplier_ppm.ok_or_else(|| {
-                    SimpleGroupServiceError::Invalid(
-                        "multiplierPpm is required when priceTierID is omitted".into(),
-                    )
-                })?,
-                "enabled",
-                false,
-                now,
-            )
-            .await
-            .map_err(simple_group_storage)?
-        };
-
-        if let Some(plan_id) = default_subscription_plan_id {
-            let status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM subscription_plans WHERE id = $1",
-            )
-            .bind(plan_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?
-            .ok_or_else(|| {
-                SimpleGroupServiceError::NotFound(format!("subscription plan {plan_id}"))
-            })?;
-            if status != "enabled" {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "subscription plan {plan_id} is not enabled"
-                )));
-            }
-        }
-        if is_default {
-            sqlx::query("UPDATE simple_groups SET is_default = FALSE WHERE is_default = TRUE")
-                .execute(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-        }
-        sqlx::query(
-            "INSERT INTO simple_groups \
-             (id, name, description, status, is_default, access_plan_id, \
-              price_tier_id, default_subscription_plan_id, created_at, updated_at) \
-             VALUES ($1, $2, $3, 'enabled', $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(&group_id)
-        .bind(&name)
-        .bind(input.description)
-        .bind(is_default)
-        .bind(access_plan_id)
-        .bind(price_tier_id)
-        .bind(default_subscription_plan_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?;
-        if let Some(user_ids) = input.user_ids {
-            let user_ids = parse_simple_group_refs(user_ids)?;
-            let project_ids = resolve_personal_project_ids(&mut tx, &user_ids).await?;
-            replace_simple_group_projects(
-                &mut tx,
-                &group_id,
-                is_default,
-                access_plan_id,
-                price_tier_id,
-                &project_ids,
-                &now,
-            )
-            .await?;
-        }
-        let after_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-        crate::wiring_postgres_commercialization::insert_pricing_audit(
-            &mut tx,
-            actor_user_id,
-            "create_simple_group_commercial_profile",
-            "simple_group",
-            &group_id,
-            Some(before_snapshot),
-            Some(after_snapshot),
-            &audit_settings,
-        )
-        .await
-        .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+        let group_id = create_simple_group_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
     }
@@ -507,243 +260,13 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         actor_user_id: Option<i64>,
         input: UpdateSimpleGroupInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
-        let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?.to_owned();
-        let route_ids = input.route_ids.map(parse_simple_group_refs).transpose()?;
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(simple_group_storage)?;
-        lock_simple_group_mutations(&mut tx).await?;
-        let audit_settings =
-            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
-                &mut tx,
-            )
-            .await
-            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
-        let before_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-        let current = sqlx::query(
-            "SELECT name, description, status, is_default, access_plan_id, price_tier_id, \
-                    default_subscription_plan_id FROM simple_groups WHERE id = $1",
-        )
-        .bind(&group_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?
-        .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.clone()))?;
-
-        let current_status: String = current.get("status");
-        if current_status == "archived" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} is archived"
-            )));
-        }
-        let status = match input.status {
-            Some(SimpleGroupStatus::Enabled) => "enabled",
-            Some(SimpleGroupStatus::Disabled) => "disabled",
-            Some(SimpleGroupStatus::Archived) => {
-                return Err(SimpleGroupServiceError::Invalid(
-                    "archive groups with deleteSimpleGroup".into(),
-                ));
-            }
-            None => current_status.as_str(),
-        };
-        let current_is_default = current.get::<bool, _>("is_default");
-        let is_default = input.is_default.unwrap_or(current_is_default);
-        if current_is_default && !is_default {
-            return Err(SimpleGroupServiceError::Invalid(
-                "replace the default by setting another simple group as default".into(),
-            ));
-        }
-        if is_default && status != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(
-                "the default simple group must remain enabled".into(),
-            ));
-        }
-
-        let name = match input.name {
-            Some(value) => validate_simple_group_name(&value)?,
-            None => current.get("name"),
-        };
-        let duplicate_name = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM simple_groups WHERE name = $1 AND id <> $2",
-        )
-        .bind(&name)
-        .bind(&group_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?;
-        if duplicate_name != 0 {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "group name {name:?} already exists"
-            )));
-        }
-        let description = if input.clear_description.unwrap_or(false) {
-            None
-        } else {
-            input
-                .description
-                .or_else(|| current.get::<Option<String>, _>("description"))
-                .filter(|value| !value.trim().is_empty())
-        };
-
-        if input.clear_default_subscription_plan.unwrap_or(false)
-            && input.default_subscription_plan_id.is_some()
-        {
-            return Err(SimpleGroupServiceError::Invalid(
-                "defaultSubscriptionPlanID conflicts with clearDefaultSubscriptionPlan".into(),
-            ));
-        }
-        let default_subscription_plan_id = if input.clear_default_subscription_plan.unwrap_or(false)
-        {
-            None
-        } else if let Some(value) = input.default_subscription_plan_id {
-            let plan_id = parse_simple_group_ref(value.as_str())?;
-            let enabled = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM subscription_plans WHERE id = $1 AND status = 'enabled'",
-            )
-            .bind(plan_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
-            if enabled == 0 {
-                return Err(SimpleGroupServiceError::NotFound(format!(
-                    "enabled subscription plan {plan_id}"
-                )));
-            }
-            Some(plan_id)
-        } else {
-            current.get("default_subscription_plan_id")
-        };
-
-        let access_plan_id: i64 = current.get("access_plan_id");
-        let model_ids = input.model_ids.map(parse_simple_group_refs).transpose()?;
-        if model_ids.is_some() || route_ids.is_some() {
-            let (current_model_ids, current_route_ids) =
-                load_published_access_plan_scope(&mut tx, access_plan_id).await?;
-            let model_ids = model_ids.as_deref().unwrap_or(&current_model_ids);
-            let route_ids = match route_ids.as_deref() {
-                Some(route_ids) => route_ids.to_vec(),
-                None if model_ids != current_model_ids.as_slice() => {
-                    retain_routes_for_models(&mut tx, &current_route_ids, model_ids).await?
-                }
-                None => current_route_ids,
-            };
-            for model_id in model_ids {
-                let exists = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM models WHERE id = $1 AND status = 'enabled' AND deleted_at = 0",
-                )
-                .bind(model_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-                if exists == 0 {
-                    return Err(SimpleGroupServiceError::NotFound(format!(
-                        "enabled public model {model_id}"
-                    )));
-                }
-            }
-            validate_enabled_routes(&mut tx, &route_ids, model_ids).await?;
-            let version_id =
-                crate::wiring_postgres_commercialization::publish_access_plan_version_postgres(
-                    &mut tx,
-                    access_plan_id,
-                    model_ids,
-                    &route_ids,
-                    now,
-                )
-                .await
-                .map_err(simple_group_storage)?;
-            rebind_active_access_grants(&mut tx, access_plan_id, version_id, &now).await?;
-            sqlx::query("UPDATE access_plans SET updated_at = $1 WHERE id = $2")
-                .bind(&now)
-                .bind(access_plan_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-        }
-
-        let price_tier_id: i64 = current.get("price_tier_id");
-        if let Some(multiplier_ppm) = input.multiplier_ppm {
-            if multiplier_ppm < 0 {
-                return Err(SimpleGroupServiceError::Invalid(
-                    "multiplierPpm cannot be negative".into(),
-                ));
-            }
-            sqlx::query(
-                "UPDATE price_tiers SET multiplier_ppm = $1, updated_at = $2 WHERE id = $3",
-            )
-            .bind(multiplier_ppm)
-            .bind(&now)
-            .bind(price_tier_id)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(simple_group_storage)?;
-        }
-
-        if is_default {
-            sqlx::query("UPDATE simple_groups SET is_default = FALSE WHERE id <> $1")
-                .bind(&group_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-        }
-        sqlx::query(
-            "UPDATE simple_groups SET name = $1, description = $2, status = $3, is_default = $4, \
-             default_subscription_plan_id = $5, updated_at = $6 WHERE id = $7",
-        )
-        .bind(name)
-        .bind(description)
-        .bind(status)
-        .bind(is_default)
-        .bind(default_subscription_plan_id)
-        .bind(&now)
-        .bind(&group_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?;
-
-        if let Some(user_ids) = input.user_ids {
-            if status != "enabled" {
-                return Err(SimpleGroupServiceError::Invalid(
-                    "members cannot be replaced while the simple group is disabled".into(),
-                ));
-            }
-            let user_ids = parse_simple_group_refs(user_ids)?;
-            let project_ids = resolve_personal_project_ids(&mut tx, &user_ids).await?;
-            replace_simple_group_projects(
-                &mut tx,
-                &group_id,
-                is_default,
-                access_plan_id,
-                price_tier_id,
-                &project_ids,
-                &now,
-            )
-            .await?;
-        }
-        if status != current_status {
-            sync_simple_group_project_profiles(
-                &mut tx,
-                &group_id,
-                (status == "enabled").then_some((access_plan_id, price_tier_id)),
-                &now,
-            )
-            .await?;
-        }
-        let after_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-        crate::wiring_postgres_commercialization::insert_pricing_audit(
-            &mut tx,
-            actor_user_id,
-            "update_simple_group_commercial_profile",
-            "simple_group",
-            &group_id,
-            Some(before_snapshot),
-            Some(after_snapshot),
-            &audit_settings,
-        )
-        .await
-        .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+        let group_id = update_simple_group_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
     }
@@ -753,216 +276,30 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         actor_user_id: Option<i64>,
         input: AssignSimpleGroupUsersInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
-        let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?;
-        let user_ids = parse_simple_group_refs(input.user_ids)?;
-        if user_ids.is_empty() {
-            return Err(SimpleGroupServiceError::Invalid(
-                "userIDs must contain at least one user".into(),
-            ));
-        }
-
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(simple_group_storage)?;
-        lock_simple_group_mutations(&mut tx).await?;
-        let audit_settings =
-            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
-                &mut tx,
-            )
-            .await
-            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
-        let before_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-        let bundle = sqlx::query(
-            "SELECT g.status AS group_status, g.access_plan_id, g.price_tier_id, \
-                    a.status AS access_plan_status, t.status AS price_tier_status \
-             FROM simple_groups g \
-             JOIN access_plans a ON a.id = g.access_plan_id \
-             JOIN price_tiers t ON t.id = g.price_tier_id \
-             WHERE g.id = $1",
-        )
-        .bind(group_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?
-        .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
-        if bundle.get::<String, _>("group_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} is not enabled"
-            )));
-        }
-        if bundle.get::<String, _>("access_plan_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} access plan is not enabled"
-            )));
-        }
-        if bundle.get::<String, _>("price_tier_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} price tier is not enabled"
-            )));
-        }
-        let access_plan_id: i64 = bundle.get("access_plan_id");
-        let price_tier_id: i64 = bundle.get("price_tier_id");
-
-        // Resolve the entire batch before writing anything. This prevents the
-        // first valid user from moving when a later user is ambiguous.
-        let mut project_ids = BTreeSet::new();
-        for user_id in user_ids {
-            let candidates = sqlx::query_scalar::<_, i64>(
-                "SELECT p.id FROM user_projects up \
-                 JOIN users u ON u.id = up.user_id \
-                 JOIN projects p ON p.id = up.project_id \
-                 JOIN project_commercial_profiles cp ON cp.project_id = p.id \
-                 WHERE up.user_id = $1 AND up.is_owner = TRUE \
-                   AND u.status = 'activated' AND u.deleted_at = 0 \
-                   AND p.status = 'active' AND p.deleted_at = 0 \
-                   AND cp.account_type = 'personal' AND cp.status = 'active' \
-                 ORDER BY p.id",
-            )
-            .bind(user_id)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
-            if candidates.len() != 1 {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "user {user_id} must resolve to exactly one active owned personal Project; found {}",
-                    candidates.len()
-                )));
-            }
-            project_ids.insert(candidates[0]);
-        }
-
-        for project_id in project_ids {
-            let updated = sqlx::query(
-                "UPDATE project_commercial_profiles \
-                 SET base_access_plan_id = $1, base_price_tier_id = $2, updated_at = $3 \
-                 WHERE project_id = $4 AND account_type = 'personal' AND status = 'active'",
-            )
-            .bind(access_plan_id)
-            .bind(price_tier_id)
-            .bind(&now)
-            .bind(project_id)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(simple_group_storage)?;
-            if updated.rows_affected() != 1 {
-                return Err(SimpleGroupServiceError::Invalid(format!(
-                    "project {project_id} no longer has an active personal commercial profile"
-                )));
-            }
-            sqlx::query("DELETE FROM simple_group_projects WHERE project_id = $1")
-                .bind(project_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(simple_group_storage)?;
-            sqlx::query(
-                "INSERT INTO simple_group_projects (simple_group_id, project_id, created_at) \
-                 VALUES ($1, $2, $3)",
-            )
-            .bind(group_id)
-            .bind(project_id)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
-        }
-        sqlx::query("UPDATE simple_groups SET updated_at = $1 WHERE id = $2")
-            .bind(&now)
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
-        let after_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-        crate::wiring_postgres_commercialization::insert_pricing_audit(
-            &mut tx,
-            actor_user_id,
-            "assign_simple_group_projects",
-            "simple_group",
-            group_id,
-            Some(before_snapshot),
-            Some(after_snapshot),
-            &audit_settings,
-        )
-        .await
-        .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+        let group_id = assign_simple_group_users_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
-        self.load_native_simple_group(group_id).await
+        self.load_native_simple_group(&group_id).await
     }
 
     async fn update_simple_group_models(
         &self,
         input: UpdateSimpleGroupModelsInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
-        let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?;
-        let model_ids = parse_simple_group_refs(input.model_ids)?;
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
-        lock_simple_group_mutations(&mut tx).await?;
-        let row = sqlx::query(
-            "SELECT g.status AS group_status, g.access_plan_id, a.status AS access_plan_status \
-             FROM simple_groups g JOIN access_plans a ON a.id = g.access_plan_id \
-             WHERE g.id = $1",
-        )
-        .bind(group_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?
-        .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
-        if row.get::<String, _>("group_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} is not enabled"
-            )));
-        }
-        if row.get::<String, _>("access_plan_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} access plan is not enabled"
-            )));
-        }
-        for model_id in &model_ids {
-            let exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM models \
-                 WHERE id = $1 AND status = 'enabled' AND deleted_at = 0",
-            )
-            .bind(model_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
-            if exists == 0 {
-                return Err(SimpleGroupServiceError::NotFound(format!(
-                    "enabled public model {model_id}"
-                )));
-            }
-        }
-        let access_plan_id: i64 = row.get("access_plan_id");
-        let (_, route_ids) = load_published_access_plan_scope(&mut tx, access_plan_id).await?;
-        let route_ids = retain_routes_for_models(&mut tx, &route_ids, &model_ids).await?;
-        validate_enabled_routes(&mut tx, &route_ids, &model_ids).await?;
-        let version_id =
-            crate::wiring_postgres_commercialization::publish_access_plan_version_postgres(
-                &mut tx,
-                access_plan_id,
-                &model_ids,
-                &route_ids,
-                now,
-            )
-            .await
-            .map_err(simple_group_storage)?;
-        rebind_active_access_grants(&mut tx, access_plan_id, version_id, &now).await?;
-        sqlx::query("UPDATE access_plans SET updated_at = $1 WHERE id = $2")
-            .bind(&now)
-            .bind(access_plan_id)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(simple_group_storage)?;
-        sqlx::query("UPDATE simple_groups SET updated_at = $1 WHERE id = $2")
-            .bind(&now)
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
+        let group_id = update_simple_group_models_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
-        self.load_native_simple_group(group_id).await
+        self.load_native_simple_group(&group_id).await
     }
 
     async fn update_simple_group_price(
@@ -970,88 +307,15 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         actor_user_id: Option<i64>,
         input: UpdateSimpleGroupPriceInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
-        let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?;
-        if input.multiplier_ppm < 0 {
-            return Err(SimpleGroupServiceError::Invalid(
-                "multiplierPpm cannot be negative".into(),
-            ));
-        }
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(simple_group_storage)?;
-        lock_simple_group_mutations(&mut tx).await?;
-        let audit_settings =
-            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
-                &mut tx,
-            )
-            .await
-            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
-        let row = sqlx::query(
-            "SELECT g.status AS group_status, g.price_tier_id, t.status AS price_tier_status \
-             FROM simple_groups g JOIN price_tiers t ON t.id = g.price_tier_id \
-             WHERE g.id = $1",
-        )
-        .bind(group_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?
-        .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
-        if row.get::<String, _>("group_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} is not enabled"
-            )));
-        }
-        if row.get::<String, _>("price_tier_status") != "enabled" {
-            return Err(SimpleGroupServiceError::Invalid(format!(
-                "simple group {group_id} price tier is not enabled"
-            )));
-        }
-        let price_tier_id: i64 = row.get("price_tier_id");
-        let before_snapshot = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
-            "SELECT to_jsonb(t) FROM price_tiers t WHERE t.id=$1",
-        )
-        .bind(price_tier_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?
-        .0;
-        sqlx::query("UPDATE price_tiers SET multiplier_ppm = $1, updated_at = $2 WHERE id = $3")
-            .bind(input.multiplier_ppm)
-            .bind(&now)
-            .bind(price_tier_id)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(simple_group_storage)?;
-        sqlx::query("UPDATE simple_groups SET updated_at = $1 WHERE id = $2")
-            .bind(&now)
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?;
-        let after_snapshot = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
-            "SELECT to_jsonb(t) FROM price_tiers t WHERE t.id=$1",
-        )
-        .bind(price_tier_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(simple_group_storage)?
-        .0;
-        crate::wiring_postgres_commercialization::insert_pricing_audit(
-            &mut tx,
-            actor_user_id,
-            "update_simple_group_price",
-            "price_tier",
-            &price_tier_id.to_string(),
-            Some(before_snapshot),
-            Some(after_snapshot),
-            &audit_settings,
-        )
-        .await
-        .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+        let group_id = update_simple_group_price_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
-        self.load_native_simple_group(group_id).await
+        self.load_native_simple_group(&group_id).await
     }
 
     async fn delete_simple_group(
@@ -1059,58 +323,15 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         actor_user_id: Option<i64>,
         group_id: &str,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
-        let group_id = validate_normalized_simple_group_id(group_id)?;
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(simple_group_storage)?;
-        lock_simple_group_mutations(&mut tx).await?;
-        let audit_settings =
-            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
-                &mut tx,
-            )
-            .await
-            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
-        let before_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-        let row = sqlx::query("SELECT status, is_default FROM simple_groups WHERE id = $1")
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(simple_group_storage)?
-            .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
-        if row.get::<bool, _>("is_default") {
-            return Err(SimpleGroupServiceError::Invalid(
-                "the default simple group cannot be archived; choose another default first".into(),
-            ));
-        }
-        if row.get::<String, _>("status") != "archived" {
-            sqlx::query(
-                "UPDATE simple_groups SET status = 'archived', is_default = FALSE, updated_at = $1 \
-                 WHERE id = $2",
-            )
-            .bind(&now)
-            .bind(group_id)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(simple_group_storage)?;
-            sync_simple_group_project_profiles(&mut tx, group_id, None, &now).await?;
-            let after_snapshot = simple_group_pricing_catalog_snapshot(&mut tx).await?;
-            crate::wiring_postgres_commercialization::insert_pricing_audit(
-                &mut tx,
-                actor_user_id,
-                "archive_simple_group_commercial_profile",
-                "simple_group",
-                group_id,
-                Some(before_snapshot),
-                Some(after_snapshot),
-                &audit_settings,
-            )
-            .await
-            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
-        }
+        let group_id = delete_simple_group_in_tx(&mut tx, actor_user_id, group_id).await?;
         tx.commit().await.map_err(simple_group_storage)?;
-        self.load_native_simple_group(group_id).await
+        self.load_native_simple_group(&group_id).await
     }
 }
 
@@ -1157,7 +378,7 @@ async fn resolve_personal_project_ids(
              WHERE up.user_id = $1 AND up.is_owner = TRUE \
                AND u.status = 'activated' AND u.deleted_at = 0 \
                AND p.status = 'active' AND p.deleted_at = 0 \
-               AND cp.account_type = 'personal' AND cp.status = 'active' \
+               AND cp.account_type = 'personal' AND cp.status = 'active' AND cp.owner_user_id=$1 \
              ORDER BY p.id",
         )
         .bind(user_id)
@@ -2165,4 +1386,879 @@ mod tests {
             .await?;
         Ok(())
     }
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn create_simple_group_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor_user_id: Option<i64>,
+    input: CreateSimpleGroupInput,
+) -> Result<String, SimpleGroupServiceError> {
+    let name = validate_simple_group_name(&input.name)?;
+    let access_plan_id = input
+        .access_plan_id
+        .as_ref()
+        .map(|value| parse_simple_group_ref(value.as_str()))
+        .transpose()?;
+    let model_ids = input.model_ids.map(parse_simple_group_refs).transpose()?;
+    let route_ids = input
+        .route_ids
+        .map(parse_simple_group_refs)
+        .transpose()?
+        .unwrap_or_default();
+    if access_plan_id.is_some() == model_ids.is_some() {
+        return Err(SimpleGroupServiceError::Invalid(
+            "provide exactly one of accessPlanID or modelIDs".into(),
+        ));
+    }
+    if access_plan_id.is_some() && !route_ids.is_empty() {
+        return Err(SimpleGroupServiceError::Invalid(
+            "routeIDs belong to the linked Access Plan; omit them when accessPlanID is provided"
+                .into(),
+        ));
+    }
+    let price_tier_id = input
+        .price_tier_id
+        .as_ref()
+        .map(|value| parse_simple_group_ref(value.as_str()))
+        .transpose()?;
+    if price_tier_id.is_some() == input.multiplier_ppm.is_some() {
+        return Err(SimpleGroupServiceError::Invalid(
+            "provide exactly one of priceTierID or multiplierPpm".into(),
+        ));
+    }
+    if input.multiplier_ppm.is_some_and(|value| value < 0) {
+        return Err(SimpleGroupServiceError::Invalid(
+            "multiplierPpm cannot be negative".into(),
+        ));
+    }
+    let default_subscription_plan_id = input
+        .default_subscription_plan_id
+        .as_ref()
+        .map(|value| parse_simple_group_ref(value.as_str()))
+        .transpose()?;
+    let is_default = input.is_default.unwrap_or(false);
+    let group_id = Uuid::now_v7().to_string();
+    let now = Utc::now();
+
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(simple_group_storage)?;
+    lock_simple_group_mutations(tx).await?;
+    let audit_settings =
+            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
+                tx,
+            )
+            .await
+            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+    let before_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+
+    let duplicate_name =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM simple_groups WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+    if duplicate_name != 0 {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "group name {name:?} already exists"
+        )));
+    }
+
+    let access_plan_id = if let Some(plan_id) = access_plan_id {
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM access_plans WHERE id = $1")
+                .bind(plan_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(simple_group_storage)?
+                .ok_or_else(|| {
+                    SimpleGroupServiceError::NotFound(format!("access plan {plan_id}"))
+                })?;
+        if status != "enabled" {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "access plan {plan_id} is not enabled"
+            )));
+        }
+        plan_id
+    } else {
+        let model_ids = model_ids.as_deref().ok_or_else(|| {
+            SimpleGroupServiceError::Invalid(
+                "modelIDs are required when accessPlanID is omitted".into(),
+            )
+        })?;
+        for model_id in model_ids {
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM models \
+                     WHERE id = $1 AND status = 'enabled' AND deleted_at = 0",
+            )
+            .bind(model_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+            if exists == 0 {
+                return Err(SimpleGroupServiceError::NotFound(format!(
+                    "enabled public model {model_id}"
+                )));
+            }
+        }
+        validate_enabled_routes(tx, &route_ids, model_ids).await?;
+        let plan_name = format!("{name} Access Plan");
+        let plan_name_exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM access_plans WHERE name = $1")
+                .bind(&plan_name)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(simple_group_storage)?;
+        if plan_name_exists != 0 {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "generated access plan name {plan_name:?} already exists; link that plan explicitly"
+            )));
+        }
+        let description = format!("Managed by Simple Group {group_id}");
+        let plan_id = crate::wiring_postgres_commercialization::create_access_plan_record_postgres(
+            tx,
+            &plan_name,
+            Some(&description),
+            "enabled",
+            false,
+            now,
+        )
+        .await
+        .map_err(simple_group_storage)?;
+        crate::wiring_postgres_commercialization::publish_access_plan_version_postgres(
+            tx, plan_id, model_ids, &route_ids, now,
+        )
+        .await
+        .map_err(simple_group_storage)?;
+        plan_id
+    };
+
+    let price_tier_id = if let Some(tier_id) = price_tier_id {
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM price_tiers WHERE id = $1")
+                .bind(tier_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(simple_group_storage)?
+                .ok_or_else(|| {
+                    SimpleGroupServiceError::NotFound(format!("price tier {tier_id}"))
+                })?;
+        if status != "enabled" {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "price tier {tier_id} is not enabled"
+            )));
+        }
+        tier_id
+    } else {
+        let tier_name = format!("{name} Price Tier");
+        let tier_name_exists =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM price_tiers WHERE name = $1")
+                .bind(&tier_name)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(simple_group_storage)?;
+        if tier_name_exists != 0 {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "generated price tier name {tier_name:?} already exists; link that tier explicitly"
+            )));
+        }
+        crate::wiring_postgres_commercialization::create_price_tier_record_postgres(
+            tx,
+            &tier_name,
+            input.multiplier_ppm.ok_or_else(|| {
+                SimpleGroupServiceError::Invalid(
+                    "multiplierPpm is required when priceTierID is omitted".into(),
+                )
+            })?,
+            "enabled",
+            false,
+            now,
+        )
+        .await
+        .map_err(simple_group_storage)?
+    };
+
+    if let Some(plan_id) = default_subscription_plan_id {
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT status FROM subscription_plans WHERE id = $1")
+                .bind(plan_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(simple_group_storage)?
+                .ok_or_else(|| {
+                    SimpleGroupServiceError::NotFound(format!("subscription plan {plan_id}"))
+                })?;
+        if status != "enabled" {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "subscription plan {plan_id} is not enabled"
+            )));
+        }
+    }
+    if is_default {
+        sqlx::query("UPDATE simple_groups SET is_default = FALSE WHERE is_default = TRUE")
+            .execute(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+    }
+    sqlx::query(
+        "INSERT INTO simple_groups \
+             (id, name, description, status, is_default, access_plan_id, \
+              price_tier_id, default_subscription_plan_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'enabled', $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(&group_id)
+    .bind(&name)
+    .bind(input.description)
+    .bind(is_default)
+    .bind(access_plan_id)
+    .bind(price_tier_id)
+    .bind(default_subscription_plan_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?;
+    if let Some(user_ids) = input.user_ids {
+        let user_ids = parse_simple_group_refs(user_ids)?;
+        let project_ids = resolve_personal_project_ids(tx, &user_ids).await?;
+        replace_simple_group_projects(
+            tx,
+            &group_id,
+            is_default,
+            access_plan_id,
+            price_tier_id,
+            &project_ids,
+            &now,
+        )
+        .await?;
+    }
+    let after_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+    crate::wiring_postgres_commercialization::insert_pricing_audit(
+        tx,
+        actor_user_id,
+        "create_simple_group_commercial_profile",
+        "simple_group",
+        &group_id,
+        Some(before_snapshot),
+        Some(after_snapshot),
+        &audit_settings,
+    )
+    .await
+    .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+
+    Ok(group_id.to_owned())
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn update_simple_group_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor_user_id: Option<i64>,
+    input: UpdateSimpleGroupInput,
+) -> Result<String, SimpleGroupServiceError> {
+    let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?.to_owned();
+    let route_ids = input.route_ids.map(parse_simple_group_refs).transpose()?;
+    let now = Utc::now();
+
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(simple_group_storage)?;
+    lock_simple_group_mutations(tx).await?;
+    let audit_settings =
+            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
+                tx,
+            )
+            .await
+            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+    let before_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+    let current = sqlx::query(
+        "SELECT name, description, status, is_default, access_plan_id, price_tier_id, \
+                    default_subscription_plan_id FROM simple_groups WHERE id = $1",
+    )
+    .bind(&group_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?
+    .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.clone()))?;
+
+    let current_status: String = current.get("status");
+    if current_status == "archived" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} is archived"
+        )));
+    }
+    let status = match input.status {
+        Some(SimpleGroupStatus::Enabled) => "enabled",
+        Some(SimpleGroupStatus::Disabled) => "disabled",
+        Some(SimpleGroupStatus::Archived) => {
+            return Err(SimpleGroupServiceError::Invalid(
+                "archive groups with deleteSimpleGroup".into(),
+            ));
+        }
+        None => current_status.as_str(),
+    };
+    let current_is_default = current.get::<bool, _>("is_default");
+    let is_default = input.is_default.unwrap_or(current_is_default);
+    if current_is_default && !is_default {
+        return Err(SimpleGroupServiceError::Invalid(
+            "replace the default by setting another simple group as default".into(),
+        ));
+    }
+    if is_default && status != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(
+            "the default simple group must remain enabled".into(),
+        ));
+    }
+
+    let name = match input.name {
+        Some(value) => validate_simple_group_name(&value)?,
+        None => current.get("name"),
+    };
+    let duplicate_name = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM simple_groups WHERE name = $1 AND id <> $2",
+    )
+    .bind(&name)
+    .bind(&group_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?;
+    if duplicate_name != 0 {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "group name {name:?} already exists"
+        )));
+    }
+    let description = if input.clear_description.unwrap_or(false) {
+        None
+    } else {
+        input
+            .description
+            .or_else(|| current.get::<Option<String>, _>("description"))
+            .filter(|value| !value.trim().is_empty())
+    };
+
+    if input.clear_default_subscription_plan.unwrap_or(false)
+        && input.default_subscription_plan_id.is_some()
+    {
+        return Err(SimpleGroupServiceError::Invalid(
+            "defaultSubscriptionPlanID conflicts with clearDefaultSubscriptionPlan".into(),
+        ));
+    }
+    let default_subscription_plan_id = if input.clear_default_subscription_plan.unwrap_or(false) {
+        None
+    } else if let Some(value) = input.default_subscription_plan_id {
+        let plan_id = parse_simple_group_ref(value.as_str())?;
+        let enabled = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM subscription_plans WHERE id = $1 AND status = 'enabled'",
+        )
+        .bind(plan_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+        if enabled == 0 {
+            return Err(SimpleGroupServiceError::NotFound(format!(
+                "enabled subscription plan {plan_id}"
+            )));
+        }
+        Some(plan_id)
+    } else {
+        current.get("default_subscription_plan_id")
+    };
+
+    let access_plan_id: i64 = current.get("access_plan_id");
+    let model_ids = input.model_ids.map(parse_simple_group_refs).transpose()?;
+    if model_ids.is_some() || route_ids.is_some() {
+        let (current_model_ids, current_route_ids) =
+            load_published_access_plan_scope(tx, access_plan_id).await?;
+        let model_ids = model_ids.as_deref().unwrap_or(&current_model_ids);
+        let route_ids = match route_ids.as_deref() {
+            Some(route_ids) => route_ids.to_vec(),
+            None if model_ids != current_model_ids.as_slice() => {
+                retain_routes_for_models(tx, &current_route_ids, model_ids).await?
+            }
+            None => current_route_ids,
+        };
+        for model_id in model_ids {
+            let exists = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM models WHERE id = $1 AND status = 'enabled' AND deleted_at = 0",
+                )
+                .bind(model_id)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(simple_group_storage)?;
+            if exists == 0 {
+                return Err(SimpleGroupServiceError::NotFound(format!(
+                    "enabled public model {model_id}"
+                )));
+            }
+        }
+        validate_enabled_routes(tx, &route_ids, model_ids).await?;
+        let version_id =
+            crate::wiring_postgres_commercialization::publish_access_plan_version_postgres(
+                tx,
+                access_plan_id,
+                model_ids,
+                &route_ids,
+                now,
+            )
+            .await
+            .map_err(simple_group_storage)?;
+        rebind_active_access_grants(tx, access_plan_id, version_id, &now).await?;
+        sqlx::query("UPDATE access_plans SET updated_at = $1 WHERE id = $2")
+            .bind(&now)
+            .bind(access_plan_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+    }
+
+    let price_tier_id: i64 = current.get("price_tier_id");
+    if let Some(multiplier_ppm) = input.multiplier_ppm {
+        if multiplier_ppm < 0 {
+            return Err(SimpleGroupServiceError::Invalid(
+                "multiplierPpm cannot be negative".into(),
+            ));
+        }
+        sqlx::query("UPDATE price_tiers SET multiplier_ppm = $1, updated_at = $2 WHERE id = $3")
+            .bind(multiplier_ppm)
+            .bind(&now)
+            .bind(price_tier_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+    }
+
+    if is_default {
+        sqlx::query("UPDATE simple_groups SET is_default = FALSE WHERE id <> $1")
+            .bind(&group_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+    }
+    sqlx::query(
+        "UPDATE simple_groups SET name = $1, description = $2, status = $3, is_default = $4, \
+             default_subscription_plan_id = $5, updated_at = $6 WHERE id = $7",
+    )
+    .bind(name)
+    .bind(description)
+    .bind(status)
+    .bind(is_default)
+    .bind(default_subscription_plan_id)
+    .bind(&now)
+    .bind(&group_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?;
+
+    if let Some(user_ids) = input.user_ids {
+        if status != "enabled" {
+            return Err(SimpleGroupServiceError::Invalid(
+                "members cannot be replaced while the simple group is disabled".into(),
+            ));
+        }
+        let user_ids = parse_simple_group_refs(user_ids)?;
+        let project_ids = resolve_personal_project_ids(tx, &user_ids).await?;
+        replace_simple_group_projects(
+            tx,
+            &group_id,
+            is_default,
+            access_plan_id,
+            price_tier_id,
+            &project_ids,
+            &now,
+        )
+        .await?;
+    }
+    if status != current_status {
+        sync_simple_group_project_profiles(
+            tx,
+            &group_id,
+            (status == "enabled").then_some((access_plan_id, price_tier_id)),
+            &now,
+        )
+        .await?;
+    }
+    let after_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+    crate::wiring_postgres_commercialization::insert_pricing_audit(
+        tx,
+        actor_user_id,
+        "update_simple_group_commercial_profile",
+        "simple_group",
+        &group_id,
+        Some(before_snapshot),
+        Some(after_snapshot),
+        &audit_settings,
+    )
+    .await
+    .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+
+    Ok(group_id.to_owned())
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn assign_simple_group_users_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor_user_id: Option<i64>,
+    input: AssignSimpleGroupUsersInput,
+) -> Result<String, SimpleGroupServiceError> {
+    let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?;
+    let user_ids = parse_simple_group_refs(input.user_ids)?;
+    if user_ids.is_empty() {
+        return Err(SimpleGroupServiceError::Invalid(
+            "userIDs must contain at least one user".into(),
+        ));
+    }
+
+    let now = Utc::now();
+
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(simple_group_storage)?;
+    lock_simple_group_mutations(tx).await?;
+    let audit_settings =
+            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
+                tx,
+            )
+            .await
+            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+    let before_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+    let bundle = sqlx::query(
+        "SELECT g.status AS group_status, g.access_plan_id, g.price_tier_id, \
+                    a.status AS access_plan_status, t.status AS price_tier_status \
+             FROM simple_groups g \
+             JOIN access_plans a ON a.id = g.access_plan_id \
+             JOIN price_tiers t ON t.id = g.price_tier_id \
+             WHERE g.id = $1",
+    )
+    .bind(group_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?
+    .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
+    if bundle.get::<String, _>("group_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} is not enabled"
+        )));
+    }
+    if bundle.get::<String, _>("access_plan_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} access plan is not enabled"
+        )));
+    }
+    if bundle.get::<String, _>("price_tier_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} price tier is not enabled"
+        )));
+    }
+    let access_plan_id: i64 = bundle.get("access_plan_id");
+    let price_tier_id: i64 = bundle.get("price_tier_id");
+
+    // Resolve the entire batch before writing anything. This prevents the
+    // first valid user from moving when a later user is ambiguous.
+    let mut project_ids = BTreeSet::new();
+    for user_id in user_ids {
+        let candidates = sqlx::query_scalar::<_, i64>(
+                "SELECT p.id FROM user_projects up \
+                 JOIN users u ON u.id = up.user_id \
+                 JOIN projects p ON p.id = up.project_id \
+                 JOIN project_commercial_profiles cp ON cp.project_id = p.id \
+                 WHERE up.user_id = $1 AND up.is_owner = TRUE \
+                   AND u.status = 'activated' AND u.deleted_at = 0 \
+                   AND p.status = 'active' AND p.deleted_at = 0 \
+                   AND cp.account_type = 'personal' AND cp.status = 'active' AND cp.owner_user_id=$1 \
+                 ORDER BY p.id",
+            )
+            .bind(user_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+        if candidates.len() != 1 {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "user {user_id} must resolve to exactly one active owned personal Project; found {}",
+                candidates.len()
+            )));
+        }
+        project_ids.insert(candidates[0]);
+    }
+
+    for project_id in project_ids {
+        let updated = sqlx::query(
+            "UPDATE project_commercial_profiles \
+                 SET base_access_plan_id = $1, base_price_tier_id = $2, updated_at = $3 \
+                 WHERE project_id = $4 AND account_type = 'personal' AND status = 'active'",
+        )
+        .bind(access_plan_id)
+        .bind(price_tier_id)
+        .bind(&now)
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+        if updated.rows_affected() != 1 {
+            return Err(SimpleGroupServiceError::Invalid(format!(
+                "project {project_id} no longer has an active personal commercial profile"
+            )));
+        }
+        sqlx::query("DELETE FROM simple_group_projects WHERE project_id = $1")
+            .bind(project_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(simple_group_storage)?;
+        sqlx::query(
+            "INSERT INTO simple_group_projects (simple_group_id, project_id, created_at) \
+                 VALUES ($1, $2, $3)",
+        )
+        .bind(group_id)
+        .bind(project_id)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+    }
+    sqlx::query("UPDATE simple_groups SET updated_at = $1 WHERE id = $2")
+        .bind(&now)
+        .bind(group_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+    let after_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+    crate::wiring_postgres_commercialization::insert_pricing_audit(
+        tx,
+        actor_user_id,
+        "assign_simple_group_projects",
+        "simple_group",
+        group_id,
+        Some(before_snapshot),
+        Some(after_snapshot),
+        &audit_settings,
+    )
+    .await
+    .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+
+    Ok(group_id.to_owned())
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn update_simple_group_models_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    input: UpdateSimpleGroupModelsInput,
+) -> Result<String, SimpleGroupServiceError> {
+    let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?;
+    let model_ids = parse_simple_group_refs(input.model_ids)?;
+    let now = Utc::now();
+
+    lock_simple_group_mutations(tx).await?;
+    let row = sqlx::query(
+        "SELECT g.status AS group_status, g.access_plan_id, a.status AS access_plan_status \
+             FROM simple_groups g JOIN access_plans a ON a.id = g.access_plan_id \
+             WHERE g.id = $1",
+    )
+    .bind(group_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?
+    .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
+    if row.get::<String, _>("group_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} is not enabled"
+        )));
+    }
+    if row.get::<String, _>("access_plan_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} access plan is not enabled"
+        )));
+    }
+    for model_id in &model_ids {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM models \
+                 WHERE id = $1 AND status = 'enabled' AND deleted_at = 0",
+        )
+        .bind(model_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+        if exists == 0 {
+            return Err(SimpleGroupServiceError::NotFound(format!(
+                "enabled public model {model_id}"
+            )));
+        }
+    }
+    let access_plan_id: i64 = row.get("access_plan_id");
+    let (_, route_ids) = load_published_access_plan_scope(tx, access_plan_id).await?;
+    let route_ids = retain_routes_for_models(tx, &route_ids, &model_ids).await?;
+    validate_enabled_routes(tx, &route_ids, &model_ids).await?;
+    let version_id =
+        crate::wiring_postgres_commercialization::publish_access_plan_version_postgres(
+            tx,
+            access_plan_id,
+            &model_ids,
+            &route_ids,
+            now,
+        )
+        .await
+        .map_err(simple_group_storage)?;
+    rebind_active_access_grants(tx, access_plan_id, version_id, &now).await?;
+    sqlx::query("UPDATE access_plans SET updated_at = $1 WHERE id = $2")
+        .bind(&now)
+        .bind(access_plan_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+    sqlx::query("UPDATE simple_groups SET updated_at = $1 WHERE id = $2")
+        .bind(&now)
+        .bind(group_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+
+    Ok(group_id.to_owned())
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn update_simple_group_price_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor_user_id: Option<i64>,
+    input: UpdateSimpleGroupPriceInput,
+) -> Result<String, SimpleGroupServiceError> {
+    let group_id = validate_normalized_simple_group_id(input.group_id.as_str())?;
+    if input.multiplier_ppm < 0 {
+        return Err(SimpleGroupServiceError::Invalid(
+            "multiplierPpm cannot be negative".into(),
+        ));
+    }
+    let now = Utc::now();
+
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(simple_group_storage)?;
+    lock_simple_group_mutations(tx).await?;
+    let audit_settings =
+            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
+                tx,
+            )
+            .await
+            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+    let row = sqlx::query(
+        "SELECT g.status AS group_status, g.price_tier_id, t.status AS price_tier_status \
+             FROM simple_groups g JOIN price_tiers t ON t.id = g.price_tier_id \
+             WHERE g.id = $1",
+    )
+    .bind(group_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?
+    .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
+    if row.get::<String, _>("group_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} is not enabled"
+        )));
+    }
+    if row.get::<String, _>("price_tier_status") != "enabled" {
+        return Err(SimpleGroupServiceError::Invalid(format!(
+            "simple group {group_id} price tier is not enabled"
+        )));
+    }
+    let price_tier_id: i64 = row.get("price_tier_id");
+    let before_snapshot = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+        "SELECT to_jsonb(t) FROM price_tiers t WHERE t.id=$1",
+    )
+    .bind(price_tier_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?
+    .0;
+    sqlx::query("UPDATE price_tiers SET multiplier_ppm = $1, updated_at = $2 WHERE id = $3")
+        .bind(input.multiplier_ppm)
+        .bind(&now)
+        .bind(price_tier_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+    sqlx::query("UPDATE simple_groups SET updated_at = $1 WHERE id = $2")
+        .bind(&now)
+        .bind(group_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+    let after_snapshot = sqlx::query_scalar::<_, sqlx::types::Json<serde_json::Value>>(
+        "SELECT to_jsonb(t) FROM price_tiers t WHERE t.id=$1",
+    )
+    .bind(price_tier_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(simple_group_storage)?
+    .0;
+    crate::wiring_postgres_commercialization::insert_pricing_audit(
+        tx,
+        actor_user_id,
+        "update_simple_group_price",
+        "price_tier",
+        &price_tier_id.to_string(),
+        Some(before_snapshot),
+        Some(after_snapshot),
+        &audit_settings,
+    )
+    .await
+    .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+
+    Ok(group_id.to_owned())
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn delete_simple_group_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor_user_id: Option<i64>,
+    group_id: &str,
+) -> Result<String, SimpleGroupServiceError> {
+    let group_id = validate_normalized_simple_group_id(group_id)?;
+    let now = Utc::now();
+
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(simple_group_storage)?;
+    lock_simple_group_mutations(tx).await?;
+    let audit_settings =
+            crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(
+                tx,
+            )
+            .await
+            .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+    let before_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+    let row = sqlx::query("SELECT status, is_default FROM simple_groups WHERE id = $1")
+        .bind(group_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?
+        .ok_or_else(|| SimpleGroupServiceError::NotFound(group_id.to_owned()))?;
+    if row.get::<bool, _>("is_default") {
+        return Err(SimpleGroupServiceError::Invalid(
+            "the default simple group cannot be archived; choose another default first".into(),
+        ));
+    }
+    if row.get::<String, _>("status") != "archived" {
+        sqlx::query(
+            "UPDATE simple_groups SET status = 'archived', is_default = FALSE, updated_at = $1 \
+                 WHERE id = $2",
+        )
+        .bind(&now)
+        .bind(group_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(simple_group_storage)?;
+        sync_simple_group_project_profiles(tx, group_id, None, &now).await?;
+        let after_snapshot = simple_group_pricing_catalog_snapshot(tx).await?;
+        crate::wiring_postgres_commercialization::insert_pricing_audit(
+            tx,
+            actor_user_id,
+            "archive_simple_group_commercial_profile",
+            "simple_group",
+            group_id,
+            Some(before_snapshot),
+            Some(after_snapshot),
+            &audit_settings,
+        )
+        .await
+        .map_err(|error| SimpleGroupServiceError::Storage(error.to_string()))?;
+    }
+
+    Ok(group_id.to_owned())
 }

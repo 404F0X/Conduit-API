@@ -255,7 +255,7 @@ impl OpenAiOrchestratorBridge {
         }
 
         // ---- 5. Candidates exist → full orchestrator command flow ----
-        let candidate_request = build_candidate_request(&llm_request);
+        let candidate_request = build_candidate_request(&llm_request)?;
         let mut ctx = OrchestratorContext::new();
         copy_route_affinity_metadata(&raw_inbound, &mut ctx);
         if let Some(sticky_channel_id) = sticky_channel_id {

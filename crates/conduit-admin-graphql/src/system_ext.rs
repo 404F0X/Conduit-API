@@ -301,6 +301,22 @@ pub fn all_scopes(level: Option<&str>) -> Vec<ScopeInfo> {
         ),
         ("write_billing", "Manage billing accounts", &[SYSTEM]),
         (
+            "review_changes",
+            "Review governed changes within the assigned domain",
+            &[SYSTEM],
+        ),
+        (
+            "publish_changes",
+            "Publish approved changes within the assigned domain",
+            &[SYSTEM],
+        ),
+        ("manage_governance", "Manage approval policy", &[SYSTEM]),
+        (
+            "emergency_revoke",
+            "Restrict access during an emergency",
+            &[SYSTEM],
+        ),
+        (
             "grant_credit",
             "Grant customer or project credit",
             &[SYSTEM],
@@ -804,8 +820,8 @@ mod tests {
         let scopes = all_scopes(None);
         assert_eq!(
             scopes.len(),
-            29,
-            "19 Go scopes, 9 commercialization scopes, and the internal-admin scope"
+            33,
+            "19 base scopes, 9 commercialization scopes, four governance duties, and internal admin"
         );
         // First entry mirrors Go's declaration order.
         assert_eq!(scopes[0].scope, "read_dashboard");
@@ -1025,7 +1041,17 @@ mod tests {
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let obj = as_object(&resp.data);
         match obj.get(&Name::new("allScopes")) {
-            Some(Value::List(items)) => assert_eq!(items.len(), 29),
+            Some(Value::List(items)) => {
+                assert_eq!(items.len(), 33);
+                for scope in [
+                    "review_changes",
+                    "publish_changes",
+                    "manage_governance",
+                    "emergency_revoke",
+                ] {
+                    assert!(items.iter().any(|item|matches!(item,Value::Object(row) if row.get(&Name::new("scope"))==Some(&Value::String(scope.into())) && row.get(&Name::new("levels"))==Some(&Value::List(vec![Value::String("system".into())])))),"missing system duty {scope}");
+                }
+            }
             other => panic!("expected list, got {other:?}"),
         }
     }

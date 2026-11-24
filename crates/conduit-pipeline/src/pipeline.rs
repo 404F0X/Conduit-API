@@ -3184,6 +3184,13 @@ fn merge_inbound(outbound: &mut HttpRequest, inbound: &HttpRequest) {
     }
     if !outbound.skip_inbound_query_merge {
         for (key, values) in &inbound.query {
+            // C2: the gateway accepts its own API key as `?key=` (Gemini SDK
+            // style). Like the auth headers above, it must never be copied
+            // onto the upstream URL, where it would land in the provider's
+            // access logs.
+            if is_inbound_credential_query_param(key) {
+                continue;
+            }
             outbound
                 .query
                 .entry(key.clone())
@@ -3193,6 +3200,13 @@ fn merge_inbound(outbound: &mut HttpRequest, inbound: &HttpRequest) {
     if outbound.content_type.is_none() {
         outbound.content_type = inbound.content_type.clone();
     }
+}
+
+/// Query parameters that carry the client's gateway credential.
+fn is_inbound_credential_query_param(key: &str) -> bool {
+    key.eq_ignore_ascii_case("key")
+        || key.eq_ignore_ascii_case("api_key")
+        || key.eq_ignore_ascii_case("api-key")
 }
 
 fn wire_compatible_openai_response(api_format: conduit_llm::ApiFormat) -> bool {
@@ -8185,6 +8199,23 @@ mod tests {
         merge_inbound(&mut outbound, &inbound);
 
         assert!(outbound.query.is_empty());
+    }
+
+    #[test]
+    fn merge_inbound_drops_gateway_key_from_query() {
+        let mut outbound = HttpRequest::default();
+        let mut inbound = HttpRequest::default();
+        inbound
+            .query
+            .insert("key".to_string(), vec!["gateway-secret".to_string()]);
+        inbound
+            .query
+            .insert("alt".to_string(), vec!["sse".to_string()]);
+
+        merge_inbound(&mut outbound, &inbound);
+
+        assert!(!outbound.query.contains_key("key"));
+        assert_eq!(outbound.query.get("alt"), Some(&vec!["sse".to_string()]));
     }
 
     #[test]

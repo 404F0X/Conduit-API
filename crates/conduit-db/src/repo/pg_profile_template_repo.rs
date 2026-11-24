@@ -75,18 +75,19 @@ impl ProfileTemplateRepo for PgProfileTemplateRepo {
         let project_id = parse_project_id(&input.project_id)?;
         let created_at = parse_timestamp(&input.created_at);
         let profile = input.profile.unwrap_or_else(default_profile);
-        let row = sqlx::query_as::<_, ApiKeyProfileTemplateRow>(&format!(
-            "INSERT INTO api_key_profile_templates \
+        let row =
+            sqlx::query_as::<_, ApiKeyProfileTemplateRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                "INSERT INTO api_key_profile_templates \
              (project_id, name, description, profile, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $5) RETURNING {COLUMNS}"
-        ))
-        .bind(project_id)
-        .bind(input.name)
-        .bind(input.description.unwrap_or_default())
-        .bind(sqlx::types::Json(profile))
-        .bind(created_at)
-        .fetch_one(&self.pool)
-        .await;
+            )))
+            .bind(project_id)
+            .bind(input.name)
+            .bind(input.description.unwrap_or_default())
+            .bind(sqlx::types::Json(profile))
+            .bind(created_at)
+            .fetch_one(&self.pool)
+            .await;
 
         match row {
             Ok(row) => Ok(row),
@@ -104,10 +105,10 @@ impl ProfileTemplateRepo for PgProfileTemplateRepo {
         let Ok(template_id) = template_id.parse::<i64>() else {
             return Ok(None);
         };
-        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(&format!(
+        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_key_profile_templates \
              WHERE project_id = $1 AND id = $2 AND deleted_at = 0"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .bind(template_id)
         .fetch_optional(&self.pool)
@@ -123,10 +124,10 @@ impl ProfileTemplateRepo for PgProfileTemplateRepo {
         let Ok(template_id) = template_id.parse::<i64>() else {
             return Ok(None);
         };
-        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(&format!(
+        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_key_profile_templates \
              WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(template_id)
         .fetch_optional(&self.pool)
         .await
@@ -142,10 +143,10 @@ impl ProfileTemplateRepo for PgProfileTemplateRepo {
         let Ok(template_id) = template_id.parse::<i64>() else {
             return Ok(None);
         };
-        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(&format!(
+        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_key_profile_templates \
              WHERE project_id = $1 AND id = $2"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .bind(template_id)
         .fetch_optional(&self.pool)
@@ -158,10 +159,10 @@ impl ProfileTemplateRepo for PgProfileTemplateRepo {
         _ctx: &RequestContext,
         project_id: &str,
     ) -> RepoResult<Vec<ApiKeyProfileTemplateRow>> {
-        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(&format!(
+        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_key_profile_templates \
              WHERE project_id = $1 AND deleted_at = 0 ORDER BY id"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .fetch_all(&self.pool)
         .await
@@ -172,10 +173,10 @@ impl ProfileTemplateRepo for PgProfileTemplateRepo {
         &self,
         _ctx: &RequestContext,
     ) -> RepoResult<Vec<ApiKeyProfileTemplateRow>> {
-        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(&format!(
+        sqlx::query_as::<_, ApiKeyProfileTemplateRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_key_profile_templates \
              WHERE deleted_at = 0 ORDER BY id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .map_err(|error| db_error("global list", error))

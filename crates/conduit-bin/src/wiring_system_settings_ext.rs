@@ -242,7 +242,7 @@ fn video_to_gql(s: DomainVideoStorageSettings) -> GqlVideoStorageSettings {
     }
 }
 
-fn video_to_domain(s: GqlVideoStorageSettings) -> DomainVideoStorageSettings {
+pub(crate) fn video_to_domain(s: GqlVideoStorageSettings) -> DomainVideoStorageSettings {
     DomainVideoStorageSettings {
         enabled: s.enabled,
         data_storage_id: i64::from(s.data_storage_id),
@@ -254,7 +254,9 @@ fn video_to_domain(s: GqlVideoStorageSettings) -> DomainVideoStorageSettings {
 /// Clamp non-positive scan fields to the Go defaults. Applied on BOTH the
 /// read and write paths, mirroring Go `VideoStorageSettings`
 /// (`system.go:1436-1441`) and `SetVideoStorageSettings` (`system.go:1447-1452`).
-fn clamp_video_settings(mut s: DomainVideoStorageSettings) -> DomainVideoStorageSettings {
+pub(crate) fn clamp_video_settings(
+    mut s: DomainVideoStorageSettings,
+) -> DomainVideoStorageSettings {
     if s.scan_interval_minutes <= 0 {
         s.scan_interval_minutes = DEFAULT_VIDEO_SCAN_INTERVAL_MINUTES;
     }
@@ -314,6 +316,37 @@ fn auto_backup_to_domain(s: GqlAutoBackupSettings) -> DomainAutoBackupSettings {
         // empty string is omitted on marshal, so it degrades to `None` here.
         last_backup_error: s.last_backup_error.filter(|e| !e.is_empty()),
     }
+}
+
+pub(crate) fn governed_backup_form(
+    input: conduit_admin_graphql::system_settings_ext::UpdateAutoBackupSettingsInput,
+    old: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let old: DomainAutoBackupSettings = if old.is_null() {
+        Default::default()
+    } else {
+        serde_json::from_value(old).map_err(|_| "invalid backup settings")?
+    };
+    let merged = conduit_admin_graphql::system_settings_ext::merge_auto_backup_settings(
+        auto_backup_to_gql(old),
+        &input,
+    );
+    serde_json::to_value(auto_backup_to_domain(merged))
+        .map_err(|_| "invalid backup settings".into())
+}
+pub(crate) fn governed_webhook_form(
+    input: conduit_admin_graphql::system_settings_ext::WebhookNotifierConfigInput,
+    old: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let old: DomainWebhookNotifierConfig = if old.is_null() {
+        Default::default()
+    } else {
+        serde_json::from_value(old).map_err(|_| "invalid webhook settings")?
+    };
+    let mut config = input.into();
+    preserve_webhook_proxy_passwords(&mut config, &old);
+    serde_json::to_value(webhook_config_to_domain(config).map_err(|_| "invalid webhook settings")?)
+        .map_err(|_| "invalid webhook settings".into())
 }
 
 fn webhook_target_to_gql(t: DomainWebhookTarget) -> GqlWebhookTarget {

@@ -12,6 +12,13 @@ pub enum ChangeSetKind {
     ProviderPrice,
     ModelMapping,
     RetailPrice,
+    ChannelConfiguration,
+    ModelSupply,
+    GroupAccess,
+    IdentityAccess,
+    ProjectConfiguration,
+    SystemConfiguration,
+    ProjectCredit,
 }
 
 impl ChangeSetKind {
@@ -20,6 +27,13 @@ impl ChangeSetKind {
             Self::ProviderPrice => "provider_price",
             Self::ModelMapping => "model_mapping",
             Self::RetailPrice => "retail_price",
+            Self::ChannelConfiguration => "channel_configuration",
+            Self::ModelSupply => "model_supply",
+            Self::GroupAccess => "group_access",
+            Self::IdentityAccess => "identity_access",
+            Self::ProjectConfiguration => "project_configuration",
+            Self::SystemConfiguration => "system_configuration",
+            Self::ProjectCredit => "project_credit",
         }
     }
 }
@@ -28,6 +42,7 @@ impl ChangeSetKind {
 pub enum ChangeSetStatus {
     Draft,
     PendingReview,
+    Approved,
     Applied,
     Rejected,
     Superseded,
@@ -39,6 +54,7 @@ impl ChangeSetStatus {
         match self {
             Self::Draft => "draft",
             Self::PendingReview => "pending_review",
+            Self::Approved => "approved",
             Self::Applied => "applied",
             Self::Rejected => "rejected",
             Self::Superseded => "superseded",
@@ -111,6 +127,7 @@ pub struct ChangeSet {
 
 #[derive(Debug, Clone, InputObject)]
 pub struct SaveRetailPriceChangeSetItemInput {
+    pub expected_revision: String,
     #[graphql(name = "changeSetID")]
     pub change_set_id: ID,
     #[graphql(name = "publicModelID")]

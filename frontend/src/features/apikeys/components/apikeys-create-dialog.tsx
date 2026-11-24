@@ -11,10 +11,9 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { ScopesSelect } from '@/components/scopes-select';
-import { useMyModelCatalog } from '@/features/model-market/data';
 import { useMyProjects } from '@/features/projects/data/projects';
 import { useApiKeysContext } from '../context/apikeys-context';
-import { useCreateApiKey } from '../data/apikeys';
+import { useApiKeyCreationCatalog, useAssignableModelGroups, useCreateApiKey } from '../data/apikeys';
 import { CreateApiKeyInput, createApiKeyInputSchemaFactory } from '../data/schema';
 
 type KeyType = 'user' | 'service_account';
@@ -27,9 +26,11 @@ export function ApiKeysCreateDialog() {
   const { t } = useTranslation();
   const { isDialogOpen, closeDialog, openDialog, setSelectedApiKey } = useApiKeysContext();
   const createApiKey = useCreateApiKey();
+  const groups = useAssignableModelGroups();
+  const [modelGroupID, setModelGroupID] = useState('');
   const selectedProjectId = useSelectedProjectId();
   const { data: projects } = useMyProjects();
-  const catalog = useMyModelCatalog();
+  const catalog = useApiKeyCreationCatalog(modelGroupID);
   const [keyType, setKeyType] = useState<KeyType>('user');
   const [accessMode, setAccessMode] = useState<AccessMode>('all');
   const [channelAccessMode, setChannelAccessMode] = useState<ChannelAccessMode>('all');
@@ -56,23 +57,24 @@ export function ApiKeysCreateDialog() {
   const projectLabel = projects?.find((project) => project.id === selectedProjectId)?.name || selectedProjectId || '—';
   const models = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    return (catalog.data?.models || []).filter(
-      (model) =>
-        !needle ||
-        `${model.name} ${model.modelId} ${model.routes.map((route) => route.channelName).join(' ')}`.toLowerCase().includes(needle)
-    );
+    return (catalog.data?.models || [])
+      .map((model) => ({
+        name: model.name,
+        modelId: model.id,
+        routes: model.channelIDs.map((id) => ({ channelID: id, channelName: catalog.data?.channels.find((c) => c.id === id)?.name || id })),
+      }))
+      .filter(
+        (model) =>
+          !needle ||
+          `${model.name} ${model.modelId} ${model.routes.map((route) => route.channelName).join(' ')}`.toLowerCase().includes(needle)
+      );
   }, [catalog.data, search]);
-  const channels = useMemo(() => {
-    const byID = new Map<string, string>();
-    for (const model of catalog.data?.models || []) {
-      for (const route of model.routes) byID.set(route.channelID, route.channelName);
-    }
-    return [...byID].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
-  }, [catalog.data]);
+  const channels = catalog.data?.channels || [];
 
   const reset = () => {
     form.reset({ name: '', type: 'user', scopes: undefined });
     setKeyType('user');
+    setModelGroupID('');
     setAccessMode('all');
     setChannelAccessMode('all');
     setSelectedModels([]);
@@ -131,8 +133,13 @@ export function ApiKeysCreateDialog() {
       quota,
     };
     try {
+      if (!modelGroupID || !catalog.data?.configured) {
+        setPolicyError(catalog.isError ? '模型组候选加载失败，请重试。' : '请先选择有效模型组并等待目录加载。');
+        return;
+      }
       const result = await createApiKey.mutateAsync({
         ...data,
+        modelGroupID,
         type: keyType,
         scopes: keyType === 'service_account' ? data.scopes || [] : undefined,
         profiles: { activeProfile: profile.name, profiles: [profile] },
@@ -189,6 +196,26 @@ export function ApiKeysCreateDialog() {
             <div className='grid min-h-0 flex-1 overflow-y-auto lg:grid-cols-[minmax(0,1fr)_280px]'>
               <div className='space-y-6 p-5 sm:p-6'>
                 <PolicySection icon={IconKey} title={t('apikeys.access.basics')}>
+                  <label className='block'>
+                    所属模型组
+                    <select
+                      required
+                      className='mt-1 block w-full rounded border p-2'
+                      value={modelGroupID}
+                      onChange={(e) => setModelGroupID(e.target.value)}
+                    >
+                      <option value=''>请选择模型组</option>
+                      {groups.data?.map((group) => (
+                        <option key={group.id} value={group.id}>
+                          {group.name}
+                        </option>
+                      ))}
+                    </select>
+                    {groups.isError && <span role='alert'>模型组加载失败</span>}
+                    {!groups.isPending && !groups.isError && !groups.data?.length && (
+                      <span>没有可用模型组，请联系管理员配置用户组授权。</span>
+                    )}
+                  </label>
                   <FormField
                     control={form.control}
                     name='name'

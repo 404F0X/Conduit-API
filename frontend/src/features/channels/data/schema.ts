@@ -359,6 +359,11 @@ export const channelQuotaProbeResultSchema = z.object({
 export type ChannelQuotaProbeResult = z.infer<typeof channelQuotaProbeResultSchema>;
 
 export const newApiModelPricingProbeSchema = z.object({
+  provenance: z
+    .object({
+      issues: z.array(z.object({ severity: z.string(), code: z.string(), message: z.string() })).optional(),
+    })
+    .passthrough(),
   modelId: z.string(),
   billingKind: z.enum(['token', 'per_request', 'tiered_expr', 'unknown', 'unsupported']),
   quality: z.enum(['exact', 'estimated', 'unavailable', 'unsupported']),
@@ -575,6 +580,7 @@ function validateOAuthCredentials(type: string, apiKey: string | undefined, ctx:
 export const createChannelInputSchema = z
   .object({
     type: channelTypeSchema,
+    operationID: z.string().uuid().optional(),
     baseURL: z.url('Please enter a valid URL'),
     websiteURL: z
       .union([z.literal(''), z.url('channels.dialogs.fields.websiteURL.errors.invalid')])
@@ -604,12 +610,14 @@ export const createChannelInputSchema = z
     autoSyncModelPattern: z.string().optional().default(''),
     manualModels: z.array(z.string()).optional().nullable(),
     tags: z.array(z.string()).optional().default([]),
-    defaultTestModel: z.string().min(1, 'Please select a default test model'),
+    defaultTestModel: z.string(),
     remark: z.string().optional(),
     orderingWeight: z.number().int().optional(),
     settings: channelSettingsSchema.optional(),
     endpoints: z.array(channelEndpointSchema).optional(),
     credentials: z.object({
+      newApiPat: z.string().optional(),
+      newApiUserID: z.string().optional(),
       // apiKey is used for OAuth credentials (JSON string with access_token, refresh_token)
       apiKey: z.string().optional(),
       // apiKeys is used for regular API keys (multiple keys for load balancing)
@@ -624,6 +632,9 @@ export const createChannelInputSchema = z
     }),
   })
   .superRefine((data, ctx) => {
+    if (data.settings?.managementAdapter !== 'new_api' && !data.defaultTestModel.trim()) {
+      ctx.addIssue({ code: 'custom', message: 'Please select a default test model', path: ['defaultTestModel'] });
+    }
     const isOAuthType =
       data.type === 'codex' || data.type === 'claudecode' || data.type === 'antigravity' || data.type === 'github_copilot';
     const hasApiKey = data.credentials.apiKey && data.credentials.apiKey.trim().length > 0;

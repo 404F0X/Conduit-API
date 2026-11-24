@@ -23,6 +23,7 @@ import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { useProductExperience, useUpdateProductExperienceSettings } from '@/features/product-experience';
+import { FeatureControls } from '@/features/product-experience/feature-controls';
 import { useSystemContext } from '../context/system-context';
 import { currencyCodes } from '../data/currencies';
 import {
@@ -226,6 +227,7 @@ export function GeneralSettings() {
               />
             </div>
             <div className='bg-muted/50 text-muted-foreground mt-4 rounded-lg px-3 py-2 text-sm'>{t('system.productMode.safetyNote')}</div>
+            <FeatureControls />
           </CardContent>
         </Card>
       )}

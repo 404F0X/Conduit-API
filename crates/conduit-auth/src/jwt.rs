@@ -47,7 +47,7 @@ pub fn encode_hs256(claims: &Claims, secret: impl AsRef<[u8]>) -> Result<String,
     Ok(jsonwebtoken::encode(
         &header,
         claims,
-        &EncodingKey::from_secret(secret.as_ref()),
+        &EncodingKey::from_secret(secret.as_ref())?,
     )?)
 }
 
@@ -56,7 +56,7 @@ pub fn decode_hs256(token: &str, secret: impl AsRef<[u8]>) -> Result<Claims, Jwt
     validation.validate_exp = true;
     let data = jsonwebtoken::decode::<Claims>(
         token,
-        &DecodingKey::from_secret(secret.as_ref()),
+        &DecodingKey::from_secret(secret.as_ref())?,
         &validation,
     )?;
     Ok(data.claims)
@@ -116,12 +116,67 @@ mod tests {
         let token = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &payload,
-            &EncodingKey::from_secret(b"go-style-secret"),
+            &EncodingKey::from_secret(b"go-style-secret")?,
         )?;
 
         let decoded = decode_hs256(&token, "go-style-secret")?;
         assert_eq!(decoded.user_id, 42);
         assert_eq!(decoded.session_scope, "user:42");
+        Ok(())
+    }
+    #[test]
+    fn fixed_pre_upgrade_hs256_token_remains_valid() -> Result<(), JwtError> {
+        let claims = decode_hs256(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjo0Miwic2Vzc2lvbl9zY29wZSI6InVzZXI6NDIiLCJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTYwMDAwMDAwMH0.r5VmP7_EsUYSQyFW3Kch69WwceGIV5fOjqVxIUVLYnM",
+            "pre-upgrade-secret",
+        )?;
+        assert_eq!(claims.user_id, 42);
+        assert_eq!(claims.session_scope, "user:42");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_hmac_keys_return_diagnostic_errors() {
+        let claims = Claims::new(1, "session:all");
+        let encode_error = encode_hs256(&claims, "").err();
+        let decode_error = decode_hs256("unused-token", "").err();
+        assert!(encode_error.is_some_and(|e| e.to_string().contains("InvalidKeyFormat")));
+        assert!(decode_error.is_some_and(|e| e.to_string().contains("InvalidKeyFormat")));
+    }
+
+    #[test]
+    fn expiration_signature_and_algorithm_restrictions_remain_enforced() -> Result<(), JwtError> {
+        let expired = encode_hs256(
+            &Claims::with_ttl(1, "session:all", Duration::days(-1)),
+            "secret",
+        )?;
+        assert!(decode_hs256(&expired, "secret").is_err());
+        let claims = Claims::new(1, "session:all");
+        let valid = encode_hs256(&claims, "secret")?;
+        assert!(decode_hs256(&valid, "different-secret").is_err());
+        let other_alg = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS384),
+            &claims,
+            &EncodingKey::from_secret(b"secret")?,
+        )?;
+        assert!(decode_hs256(&other_alg, "secret").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn session_validation_keeps_existing_audience_issuer_and_nbf_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let claims = Claims::new(1, "session:all");
+        let mut payload = serde_json::to_value(&claims)?;
+        payload["iss"] = serde_json::json!("session-issuer");
+        payload["nbf"] = serde_json::json!(claims.exp + 86400);
+        let key = EncodingKey::from_secret(b"secret")?;
+        let token = jsonwebtoken::encode(&Header::new(Algorithm::HS256), &payload, &key)?;
+        // Session tokens configure neither issuer restrictions nor nbf validation.
+        assert!(decode_hs256(&token, "secret").is_ok());
+        payload["aud"] = serde_json::json!("unconfigured-audience");
+        let token = jsonwebtoken::encode(&Header::new(Algorithm::HS256), &payload, &key)?;
+        assert!(decode_hs256(&token, "secret").is_err());
         Ok(())
     }
 }

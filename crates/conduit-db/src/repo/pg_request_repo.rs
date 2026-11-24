@@ -14,16 +14,24 @@ const C: &str = "expired_artifacts,CAST(id AS TEXT) AS id,CAST(project_id AS TEX
 pub struct PgRequestRepo {
     pool: PgPool,
     activity_timeout: std::time::Duration,
+    metering_pending_on_create: bool,
 }
 impl PgRequestRepo {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
             activity_timeout: std::time::Duration::from_secs(600),
+            metering_pending_on_create: false,
         }
     }
     pub fn with_activity_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.activity_timeout = timeout;
+        self
+    }
+    /// Runtime metering audits must survive a crash before durable usage acceptance.
+    /// Other repository consumers retain the ordinary unprotected default.
+    pub fn with_metering_protection(mut self) -> Self {
+        self.metering_pending_on_create = true;
         self
     }
     pub fn pool(&self) -> &PgPool {
@@ -96,7 +104,7 @@ impl RequestRepo for PgRequestRepo {
         ctx: &RequestContext,
         r: RequestRow,
     ) -> RepoResult<RequestRow> {
-        let n=sqlx::query_scalar::<_,i64>("INSERT INTO requests(project_id,api_key_id,trace_id,data_storage_id,\"source\",model_id,reasoning_effort,format,request_headers,request_body,response_body,response_chunks,channel_id,external_id,\"status\",stream,client_ip,metrics_latency_ms,metrics_first_token_latency_ms,metrics_reasoning_duration_ms,content_saved,content_storage_id,content_storage_key,content_saved_at,created_at,updated_at,activity_until)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)RETURNING id").bind(id(&r.project_id)?).bind(opt(&r.api_key_id)?).bind(opt(&r.trace_id)?).bind(opt(&r.data_storage_id)?).bind(r.source).bind(r.model_id).bind(r.reasoning_effort).bind(r.format).bind(r.request_headers.map(sqlx::types::Json)).bind(sqlx::types::Json(r.request_body)).bind(r.response_body.map(sqlx::types::Json)).bind(r.response_chunks.map(sqlx::types::Json)).bind(opt(&r.channel_id)?).bind(r.external_id).bind(r.status).bind(r.stream).bind(r.client_ip).bind(r.metrics_latency_ms).bind(r.metrics_first_token_latency_ms).bind(r.metrics_reasoning_duration_ms).bind(r.content_saved).bind(opt(&r.content_storage_id)?).bind(r.content_storage_key).bind(r.content_saved_at).bind(r.created_at).bind(r.updated_at).bind(Utc::now()+chrono::Duration::from_std(self.activity_timeout).unwrap_or(chrono::Duration::seconds(600))).fetch_one(&self.pool).await.map_err(|e|err("create",e))?;
+        let n=sqlx::query_scalar::<_,i64>("INSERT INTO requests(project_id,api_key_id,trace_id,data_storage_id,\"source\",model_id,reasoning_effort,format,request_headers,request_body,response_body,response_chunks,channel_id,external_id,\"status\",stream,client_ip,metrics_latency_ms,metrics_first_token_latency_ms,metrics_reasoning_duration_ms,content_saved,content_storage_id,content_storage_key,content_saved_at,created_at,updated_at,activity_until,metering_pending)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)RETURNING id").bind(id(&r.project_id)?).bind(opt(&r.api_key_id)?).bind(opt(&r.trace_id)?).bind(opt(&r.data_storage_id)?).bind(r.source).bind(r.model_id).bind(r.reasoning_effort).bind(r.format).bind(r.request_headers.map(sqlx::types::Json)).bind(sqlx::types::Json(r.request_body)).bind(r.response_body.map(sqlx::types::Json)).bind(r.response_chunks.map(sqlx::types::Json)).bind(opt(&r.channel_id)?).bind(r.external_id).bind(r.status).bind(r.stream).bind(r.client_ip).bind(r.metrics_latency_ms).bind(r.metrics_first_token_latency_ms).bind(r.metrics_reasoning_duration_ms).bind(r.content_saved).bind(opt(&r.content_storage_id)?).bind(r.content_storage_key).bind(r.content_saved_at).bind(r.created_at).bind(r.updated_at).bind(Utc::now()+chrono::Duration::from_std(self.activity_timeout).unwrap_or(chrono::Duration::seconds(600))).bind(self.metering_pending_on_create).fetch_one(&self.pool).await.map_err(|e|err("create",e))?;
         self.find_request_by_id_unchecked(ctx, &n.to_string())
             .await?
             .ok_or(RepoError::NotFound("request"))
@@ -106,11 +114,13 @@ impl RequestRepo for PgRequestRepo {
         _: &RequestContext,
         v: &str,
     ) -> RepoResult<Option<RequestRow>> {
-        sqlx::query_as::<_, RequestRow>(&format!("SELECT {C} FROM requests WHERE id=$1"))
-            .bind(id(v)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| err("find", e))
+        sqlx::query_as::<_, RequestRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {C} FROM requests WHERE id=$1"
+        )))
+        .bind(id(v)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| err("find", e))
     }
     async fn find_request_by_external_id_unchecked(
         &self,
@@ -118,7 +128,7 @@ impl RequestRepo for PgRequestRepo {
         p: &str,
         e: &str,
     ) -> RepoResult<Option<RequestRow>> {
-        sqlx::query_as::<_,RequestRow>(&format!("SELECT {C} FROM requests WHERE project_id=$1 AND external_id=$2 ORDER BY id DESC LIMIT 1")).bind(id(p)?).bind(e).fetch_optional(&self.pool).await.map_err(|e|err("find external",e))
+        sqlx::query_as::<_,RequestRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {C} FROM requests WHERE project_id=$1 AND external_id=$2 ORDER BY id DESC LIMIT 1"))).bind(id(p)?).bind(e).fetch_optional(&self.pool).await.map_err(|e|err("find external",e))
     }
     async fn find_last_successful_channel_id_by_trace_unchecked(
         &self,
@@ -400,6 +410,31 @@ mod tests {
             )
             .await?;
         assert!(other_project.rows.is_empty());
+
+        let default_pending: bool =
+            sqlx::query_scalar("SELECT metering_pending FROM requests WHERE id=$1")
+                .bind(row.id.parse::<i64>()?)
+                .fetch_one(&database.pool)
+                .await?;
+        assert!(
+            !default_pending,
+            "ordinary repository consumers keep the default"
+        );
+        let protected_repo = PgRequestRepo::new(database.pool.clone()).with_metering_protection();
+        let mut public_input = row.clone();
+        public_input.id = "ar-public-routing-key".into();
+        public_input.external_id = None;
+        let protected = protected_repo
+            .create_request_unchecked(&ctx, public_input)
+            .await?;
+        assert!(protected.id.parse::<i64>()? > 0);
+        assert_ne!(protected.id, "ar-public-routing-key");
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT metering_pending FROM requests WHERE id=$1")
+                .bind(protected.id.parse::<i64>()?)
+                .fetch_one(&database.pool)
+                .await?
+        );
 
         database.cleanup().await?;
         Ok(())

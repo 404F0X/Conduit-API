@@ -32,7 +32,7 @@ impl PgChannelOverrideTemplateRepo {
             "SELECT {SELECT_COLS} FROM channel_override_templates \
              WHERE id = $1 AND user_id = $2 AND deleted_at = 0"
         );
-        sqlx::query_as::<_, ChannelOverrideTemplateRow>(&sql)
+        sqlx::query_as::<_, ChannelOverrideTemplateRow>(sqlx::AssertSqlSafe::<&str>(&sql))
             .bind(id)
             .bind(user_id)
             .fetch_optional(&self.pool)
@@ -79,7 +79,7 @@ impl ChannelOverrideTemplateRepo for PgChannelOverrideTemplateRepo {
             "SELECT {SELECT_COLS} FROM channel_override_templates \
              WHERE user_id = $1 AND deleted_at = 0 ORDER BY id ASC"
         );
-        sqlx::query_as::<_, ChannelOverrideTemplateRow>(&sql)
+        sqlx::query_as::<_, ChannelOverrideTemplateRow>(sqlx::AssertSqlSafe::<&str>(&sql))
             .bind(user_id)
             .fetch_all(&self.pool)
             .await

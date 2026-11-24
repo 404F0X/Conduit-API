@@ -10,6 +10,8 @@ import { LanguageSwitch } from '@/components/language-switch';
 import { PermissionGuard } from '@/components/permission-guard';
 import { QuotaBadges } from '@/components/quota-badges';
 import { ThemeSwitch } from '@/components/theme-switch';
+import { useIsSimpleMode } from '@/features/product-experience';
+import { useMyProjects } from '@/features/projects/data/projects';
 import { checkProviderQuotas } from '@/features/system/data/quotas';
 import { useBrandSettings } from '@/features/system/data/system';
 import { ProjectSwitcher } from './project-switcher';
@@ -20,6 +22,10 @@ export function AppHeader() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const queryClient = useQueryClient();
   const { isMobile } = useSidebar();
+  const isSimpleMode = useIsSimpleMode();
+  const { data: myProjects } = useMyProjects();
+  // 简单模式里普通用户只有一个默认项目，不出现“项目”这个概念；有多个项目时才显示切换器
+  const showProjectSwitcher = !isSimpleMode || (myProjects?.length ?? 0) > 1;
   const displayName = brandSettings?.brandName || 'Conduit API';
 
   const { mutate: refreshQuotas } = useMutation({
@@ -71,11 +77,12 @@ export function AppHeader() {
             <span className='text-sm leading-none font-semibold'>{displayName}</span>
           </div>
 
-          {/* Separator */}
-          <div className='bg-border mx-0.5 h-3.5 w-px' />
-
-          {/* Project Switcher */}
-          <ProjectSwitcher />
+          {showProjectSwitcher && (
+            <>
+              <div className='bg-border mx-0.5 h-3.5 w-px' />
+              <ProjectSwitcher />
+            </>
+          )}
         </div>
 
         {/* 右侧控件 */}

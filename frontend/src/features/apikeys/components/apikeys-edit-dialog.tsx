@@ -9,13 +9,16 @@ import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '
 import { Input } from '@/components/ui/input';
 import { ScopesSelect } from '@/components/scopes-select';
 import { useApiKeysContext } from '../context/apikeys-context';
-import { useUpdateApiKey } from '../data/apikeys';
+import { useAssignableModelGroups, useAssignApiKeyModelGroup, useUpdateApiKey } from '../data/apikeys';
 import { UpdateApiKeyInput, updateApiKeyInputSchemaFactory } from '../data/schema';
 
 export function ApiKeysEditDialog() {
   const { t } = useTranslation();
   const { isDialogOpen, closeDialog, selectedApiKey } = useApiKeysContext();
   const updateApiKey = useUpdateApiKey();
+  const groups = useAssignableModelGroups(selectedApiKey?.id);
+  const assign = useAssignApiKeyModelGroup();
+  const [groupID, setGroupID] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [dialogContent, setDialogContent] = useState<HTMLDivElement | null>(null);
@@ -30,6 +33,7 @@ export function ApiKeysEditDialog() {
 
   useEffect(() => {
     if (selectedApiKey && isDialogOpen.edit) {
+      setGroupID(selectedApiKey.modelGroupID || '');
       form.reset({
         name: selectedApiKey.name,
         scopes: selectedApiKey.scopes || [],
@@ -55,6 +59,7 @@ export function ApiKeysEditDialog() {
         input,
       });
 
+      if (groupID && groupID !== selectedApiKey.modelGroupID) await assign.mutateAsync({ id: selectedApiKey.id, modelGroupID: groupID });
       closeDialog('edit');
     } catch (_error) {
       // Error is handled by the mutation.
@@ -79,6 +84,18 @@ export function ApiKeysEditDialog() {
         </DialogHeader>
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className='space-y-4'>
+            <label className='block'>
+              所属模型组
+              <select className='mt-1 block w-full rounded border p-2' value={groupID} onChange={(e) => setGroupID(e.target.value)}>
+                <option value=''>{selectedApiKey?.modelGroupID || '待配置（公开调用不可用）'}</option>
+                {groups.data?.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+              <span className='text-muted-foreground text-sm'>保存时服务端按 Key 实际计费用户校验授权。</span>
+            </label>
             <FormField
               control={form.control}
               name='name'

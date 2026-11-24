@@ -102,7 +102,7 @@ impl RouteHealthSource for PgRouteHealthSource {
                    AND status IN ('failed','canceled') AND created_at >= now() - interval '15 minutes' \
                  GROUP BY category"
             );
-            let errors: Vec<(String, i64)> = sqlx::query_as(&query)
+            let errors: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&query))
                 .bind(channel_id)
                 .bind(&target.actual_model)
                 .bind(&target.credential_identity)

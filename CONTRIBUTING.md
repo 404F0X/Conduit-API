@@ -18,6 +18,12 @@ can be agreed first.
 Do not commit credentials, production payloads, local databases, generated
 build output, or customer data. Real-provider tests must remain opt-in.
 
+PostgreSQL integration tests opt in with `CONDUIT_TEST_POSTGRES_DSN`. The test
+role needs `CREATEDB` for advisory-lock regression tests, which create and drop
+a unique private database to keep historical lock inversions isolated from
+parallel tests. A configured DSN without this permission fails these tests.
+Production roles do not need this permission.
+
 ## Pull Requests
 
 Describe the behavior change, compatibility impact, validation performed, and

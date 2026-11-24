@@ -1292,6 +1292,14 @@ impl SystemService {
             },
         )
         .await?;
+        self.set_system_value(
+            ctx,
+            system_key::PRODUCT_EXPERIENCE_SETTINGS,
+            serde_json::json!({"mode":"simple","revision":0,"overrides":{}}),
+        )
+        .await?;
+        self.set_system_value(ctx, "system_governance_settings",
+            serde_json::json!({"revision":0,"enabled":false,"reviewKinds":[],"allowSelfReview":false,"legacyReviewScopes":false})).await?;
         self.set_system_value(ctx, SYSTEM_INITIALIZED, Value::from(true))
             .await?;
         Ok(())

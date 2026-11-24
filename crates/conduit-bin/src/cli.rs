@@ -435,7 +435,7 @@ async fn bootstrap_postgres_database(
             quote_postgres_identifier(&target.owner),
             quote_postgres_literal(password)?
         );
-        sqlx::query(&create_role)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&create_role))
             .execute(&mut connection)
             .await
             .map_err(|error| {
@@ -452,7 +452,7 @@ async fn bootstrap_postgres_database(
         quote_postgres_identifier(&target.database),
         quote_postgres_identifier(&target.owner)
     );
-    sqlx::query(&create_database)
+    sqlx::query(sqlx::AssertSqlSafe::<&str>(&create_database))
         .execute(&mut connection)
         .await
         .map_err(|error| {
@@ -883,10 +883,23 @@ mod tests {
         snapshot_output_with_server(cli, |_| Ok(()))
     }
 
-    fn snapshot_output_with_server<F>(cli: Cli, start_server: F) -> Result<String, CliError>
+    fn snapshot_output_with_server<F>(mut cli: Cli, start_server: F) -> Result<String, CliError>
     where
         F: FnOnce(AppConfig) -> Result<(), String>,
     {
+        // Startup tests exercise the supplied server callback with a deterministic
+        // external database configuration, independently of installed Windows bundles.
+        let directory =
+            tempfile::tempdir().map_err(|err| CliError::ServerStart(err.to_string()))?;
+        if cli.command.is_none() {
+            let mut config = AppConfig::default();
+            config.db.dsn = "postgresql://conduit_test@127.0.0.1:1/fixture".into();
+            cli.config = directory.path().join("config.yml");
+            let yaml = serde_yaml::to_string(&config)
+                .map_err(|err| CliError::ServerStart(err.to_string()))?;
+            std::fs::write(&cli.config, yaml)
+                .map_err(|err| CliError::ServerStart(err.to_string()))?;
+        }
         let mut output = Vec::new();
         run_with_writer_and_server(cli, &mut output, start_server)?;
         String::from_utf8(output).map_err(|err| CliError::ServerStart(err.to_string()))

@@ -25,6 +25,44 @@ impl Error for ValidationError {}
 
 pub fn validate(config: &AppConfig) -> Result<(), ValidationError> {
     let mut errors = Vec::new();
+    let payment = &config.payments;
+    if payment.enabled {
+        let valid_url = |raw: &str| {
+            url::Url::parse(raw).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            })
+        };
+        if payment.profile != "epay-classic-md5-reference-a4d0f042"
+            || !valid_url(&payment.gateway_base_url)
+            || !payment.gateway_base_url.ends_with('/')
+            || !valid_url(&payment.notify_url)
+            || url::Url::parse(&payment.notify_url).is_ok_and(|u| {
+                u.path()
+                    != format!(
+                        "{}/api/payments/epay/notify",
+                        config.server.base_path.trim_end_matches('/')
+                    )
+            })
+            || !valid_url(&payment.return_url)
+            || payment.merchant_id.is_empty()
+            || payment.merchant_id.starts_with('0')
+            || !payment.merchant_id.bytes().all(|b| b.is_ascii_digit())
+            || payment.merchant_key.is_empty()
+            || payment.merchant_key.len() > 512
+            || payment.merchant_identity.is_empty()
+            || payment.merchant_identity.len() > 128
+            || payment.min_amount_minor < 1
+            || payment.max_amount_minor < payment.min_amount_minor
+            || !(60..=86400).contains(&payment.order_ttl_seconds)
+        {
+            errors.push("payments enabled requires the explicit reference profile, complete HTTPS gateway/notify/return configuration, merchant identity/key, valid integer-fen limits and TTL".into());
+        }
+    }
     let recovery = &config.usage_recovery;
     if recovery.directory.trim().is_empty()
         || recovery.max_event_bytes == 0
@@ -521,6 +559,32 @@ mod tests {
 
         config.oidc.redirect_base_url = Some("https://login.example.test/conduit".to_string());
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn payments_require_complete_tls_profile_and_hide_secret() {
+        let mut config = AppConfig::default();
+        assert!(!config.payments.enabled);
+        config.payments.enabled = true;
+        config.payments.merchant_key = "fixture-secret-must-not-leak".into();
+        let error = validate(&config).unwrap_err();
+        assert!(!error.to_string().contains("fixture-secret"));
+        assert!(!format!("{:?}", config).contains("fixture-secret"));
+        assert!(!crate::export::render_masked_config_preview(&config).contains("fixture-secret"));
+        config.payments.gateway_base_url = "https://gateway.example.test/".into();
+        config.payments.merchant_id = "7".into();
+        config.payments.merchant_identity = "fixture-v1".into();
+        config.payments.notify_url = "https://app.example.test/api/payments/epay/notify".into();
+        config.payments.return_url = "https://app.example.test/wallet".into();
+        assert!(validate(&config).is_ok());
+        for bad in [
+            "http://127.0.0.1/",
+            "https://user:fixture-secret@gateway.example.test/",
+            "https://gateway.example.test/?key=fixture-secret",
+        ] {
+            config.payments.gateway_base_url = bad.into();
+            assert!(validate(&config).is_err());
+        }
     }
 
     #[test]

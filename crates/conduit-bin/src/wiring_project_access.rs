@@ -43,13 +43,22 @@ pub async fn resolve_effective_project_access_postgres(
     pool: &PgPool,
     project_id: i64,
 ) -> Result<EffectiveProjectAccess, ModelCatalogError> {
+    let mut tx = pool.begin().await.map_err(query)?;
+    let result = resolve_effective_project_access_in_tx(&mut tx, project_id).await?;
+    tx.commit().await.map_err(query)?;
+    Ok(result)
+}
+pub(crate) async fn resolve_effective_project_access_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    project_id: i64,
+) -> Result<EffectiveProjectAccess, ModelCatalogError> {
     let now = Utc::now();
     let mut versions = Vec::new();
     if let Some(plan_id) = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT base_access_plan_id FROM project_commercial_profiles WHERE project_id=$1 AND status='active'",
     )
     .bind(project_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(query)?
     .flatten()
@@ -62,7 +71,7 @@ pub async fn resolve_effective_project_access_postgres(
         )
         .bind(plan_id)
         .bind(now)
-        .fetch_optional(pool)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(query)?
         {
@@ -81,7 +90,7 @@ pub async fn resolve_effective_project_access_postgres(
         )
         .bind(project_id)
         .bind(now)
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .map_err(query)?,
     );
@@ -95,14 +104,14 @@ pub async fn resolve_effective_project_access_postgres(
             "SELECT public_model_id FROM access_plan_items WHERE access_plan_version_id=$1",
         )
         .bind(version_id)
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .map_err(query)?;
         let selected = sqlx::query_scalar::<_, i64>(
             "SELECT model_route_id FROM access_plan_route_items WHERE access_plan_version_id=$1",
         )
         .bind(version_id)
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .map_err(query)?
         .into_iter()
@@ -115,7 +124,7 @@ pub async fn resolve_effective_project_access_postgres(
                  AND c.status='enabled' AND c.deleted_at=0 ORDER BY d.channel_id,r.id",
             )
             .bind(model_id)
-            .fetch_all(pool)
+            .fetch_all(&mut **tx)
             .await
             .map_err(query)?;
             for row in rows {
@@ -134,6 +143,7 @@ pub async fn resolve_effective_project_access_postgres(
         }
     }
 
+    let mut blocked = BTreeSet::new();
     for row in sqlx::query(
         "SELECT public_model_id,effect FROM project_entitlement_overrides WHERE project_id=$1 \
          AND status='active' AND (valid_from IS NULL OR valid_from<=$2) \
@@ -141,12 +151,13 @@ pub async fn resolve_effective_project_access_postgres(
     )
     .bind(project_id)
     .bind(now)
-    .fetch_all(pool)
+    .fetch_all(&mut **tx)
     .await
     .map_err(query)?
     {
         let model_id: i64 = row.get("public_model_id");
         if row.get::<String, _>("effect") == "block" {
+            blocked.insert(model_id);
             route_ids.remove(&model_id);
             upstream_ids.remove(&model_id);
             continue;
@@ -158,7 +169,7 @@ pub async fn resolve_effective_project_access_postgres(
              AND c.status='enabled' AND c.deleted_at=0 ORDER BY d.channel_id,r.id",
         )
         .bind(model_id)
-        .fetch_all(pool)
+        .fetch_all(&mut **tx)
         .await
         .map_err(query)?
         {
@@ -168,9 +179,13 @@ pub async fn resolve_effective_project_access_postgres(
                 .or_insert_with(|| route.get("upstream_model_id"));
         }
     }
+    for model in blocked {
+        route_ids.remove(&model);
+        upstream_ids.remove(&model);
+    }
     let models =
         sqlx::query("SELECT id,model_id FROM models WHERE status='enabled' AND deleted_at=0")
-            .fetch_all(pool)
+            .fetch_all(&mut **tx)
             .await
             .map_err(query)?
             .into_iter()

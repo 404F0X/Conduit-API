@@ -26,10 +26,10 @@ impl PgChannelModelPriceRepo {
         tx: &mut Transaction<'_, Postgres>,
         channel_id: i64,
     ) -> RepoResult<Vec<ChannelModelPriceRow>> {
-        sqlx::query_as::<_, ChannelModelPriceRow>(&format!(
+        sqlx::query_as::<_, ChannelModelPriceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {HEAD} FROM channel_model_prices \
              WHERE channel_id=$1 AND deleted_at=0 ORDER BY id"
-        ))
+        )))
         .bind(channel_id)
         .fetch_all(&mut **tx)
         .await
@@ -179,9 +179,9 @@ impl PgChannelModelPriceRepo {
         .fetch_one(&mut **tx)
         .await
         .map_err(|e| err("version in transaction", e))?;
-        sqlx::query_as::<_, ChannelModelPriceVersionRow>(&format!(
+        sqlx::query_as::<_, ChannelModelPriceVersionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {VERSION} FROM channel_model_price_versions WHERE id=$1"
-        ))
+        )))
         .bind(id)
         .fetch_one(&mut **tx)
         .await
@@ -192,9 +192,9 @@ impl PgChannelModelPriceRepo {
         tx: &mut Transaction<'_, Postgres>,
         id: i64,
     ) -> RepoResult<Option<ChannelModelPriceRow>> {
-        sqlx::query_as::<_, ChannelModelPriceRow>(&format!(
+        sqlx::query_as::<_, ChannelModelPriceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {HEAD} FROM channel_model_prices WHERE id=$1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&mut **tx)
         .await
@@ -202,9 +202,9 @@ impl PgChannelModelPriceRepo {
     }
 
     async fn head(&self, id: i64) -> RepoResult<Option<ChannelModelPriceRow>> {
-        sqlx::query_as::<_, ChannelModelPriceRow>(&format!(
+        sqlx::query_as::<_, ChannelModelPriceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {HEAD} FROM channel_model_prices WHERE id=$1"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -233,7 +233,7 @@ impl ChannelModelPriceRepo for PgChannelModelPriceRepo {
         _: &RequestContext,
         channel_id: i64,
     ) -> RepoResult<Vec<ChannelModelPriceRow>> {
-        sqlx::query_as::<_,ChannelModelPriceRow>(&format!("SELECT {HEAD} FROM channel_model_prices WHERE channel_id=$1 AND deleted_at=0 ORDER BY id")).bind(channel_id).fetch_all(&self.pool).await.map_err(|e|err("list",e))
+        sqlx::query_as::<_,ChannelModelPriceRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {HEAD} FROM channel_model_prices WHERE channel_id=$1 AND deleted_at=0 ORDER BY id"))).bind(channel_id).fetch_all(&self.pool).await.map_err(|e|err("list",e))
     }
     async fn create_price_unchecked(
         &self,
@@ -305,9 +305,9 @@ impl ChannelModelPriceRepo for PgChannelModelPriceRepo {
         now: &str,
     ) -> RepoResult<ChannelModelPriceVersionRow> {
         let id=sqlx::query_scalar::<_,i64>("INSERT INTO channel_model_price_versions(channel_id,model_id,channel_model_price_id,currency_code,price,status,effective_start_at,reference_id,created_at,updated_at)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)RETURNING id").bind(channel_id).bind(model_id).bind(head_id).bind(currency_code).bind(sqlx::types::Json(price)).bind(status).bind(ts(start)).bind(reference_id).bind(ts(now)).fetch_one(&self.pool).await.map_err(|e|err("version",e))?;
-        sqlx::query_as::<_, ChannelModelPriceVersionRow>(&format!(
+        sqlx::query_as::<_, ChannelModelPriceVersionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {VERSION} FROM channel_model_price_versions WHERE id=$1"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await

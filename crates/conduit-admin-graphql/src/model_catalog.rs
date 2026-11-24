@@ -2,7 +2,43 @@
 
 use std::sync::Arc;
 
-use async_graphql::{Context, ID, SimpleObject};
+use async_graphql::{Context, Enum, ID, SimpleObject};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum MyCatalogPriceStatus {
+    Priced,
+    Unpriced,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct MyCatalogPriceTier {
+    /// Exclusive lower and inclusive upper token bounds, encoded exactly.
+    pub above: String,
+    pub up_to: Option<String>,
+    pub price_per_million: String,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct MyCatalogPricing {
+    pub mode: String,
+    /// Station credits per request for flat_fee, per million tokens otherwise.
+    pub amount: Option<String>,
+    pub tiers: Vec<MyCatalogPriceTier>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct MyCatalogPriceVariant {
+    pub variant_code: String,
+    pub pricing: MyCatalogPricing,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct MyCatalogPriceItem {
+    pub item_code: String,
+    pub pricing: MyCatalogPricing,
+    pub prompt_write_cache_variants: Vec<MyCatalogPriceVariant>,
+}
 
 #[derive(Debug, Clone, SimpleObject)]
 pub struct MyCatalogHealth {
@@ -14,7 +50,32 @@ pub struct MyCatalogHealth {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+pub struct MyCatalogPriceBranch {
+    pub source: String,
+    pub label: String,
+    /// JSON encoded canonical condition input; never evaluated by the client.
+    pub condition: Option<String>,
+    pub items: Vec<MyCatalogPriceItem>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct MyCatalogPriceScope {
+    pub id: ID,
+    pub label: String,
+    #[graphql(name = "modelGroupID")]
+    pub model_group_id: ID,
+    pub model_group_revision: i64,
+    #[graphql(name = "apiKeyID")]
+    pub api_key_id: Option<ID>,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
 pub struct MyCatalogPrice {
+    pub status: MyCatalogPriceStatus,
+    pub items: Vec<MyCatalogPriceItem>,
+    pub branches: Vec<MyCatalogPriceBranch>,
+    pub source: String,
+    pub price_book_version: Option<String>,
     pub currency: String,
     pub display_name: String,
     pub input_per_million: Option<String>,
@@ -22,6 +83,7 @@ pub struct MyCatalogPrice {
     pub cache_read_per_million: Option<String>,
     pub cache_write_per_million: Option<String>,
     pub effective_multiplier: String,
+    /// A valid published price projection exists; not a request admission verdict.
     pub billable: bool,
 }
 
@@ -56,6 +118,8 @@ pub struct MyCatalogModel {
 pub struct MyModelCatalog {
     pub models: Vec<MyCatalogModel>,
     pub health_visible: bool,
+    pub price_scopes: Vec<MyCatalogPriceScope>,
+    pub selected_price_scope: Option<ID>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +134,8 @@ pub enum ModelCatalogError {
     ProjectRequired,
     #[error("user does not have access to the selected project")]
     ProjectAccessDenied,
+    #[error("select one authorized model group or owned API key for price display")]
+    InvalidPriceScope,
 }
 
 #[async_trait::async_trait]
@@ -78,6 +144,8 @@ pub trait ModelCatalogServices: Send + Sync {
         &self,
         user_id: i64,
         project_id: i64,
+        model_group_id: Option<String>,
+        api_key_id: Option<String>,
     ) -> Result<MyModelCatalog, ModelCatalogError>;
 }
 
@@ -101,6 +169,27 @@ mod tests {
                 .message
                 .contains("authentication required")
         );
+    }
+
+    #[test]
+    fn market_price_contract_preserves_structured_rates()
+    -> Result<(), crate::sdl_parity::ParityError> {
+        let sdl = crate::admin_schema_builder().finish().sdl();
+        let snapshot = crate::sdl_parity::snapshot_text()?;
+        for header in [
+            "enum MyCatalogPriceStatus",
+            "type MyCatalogPriceTier",
+            "type MyCatalogPricing",
+            "type MyCatalogPriceVariant",
+            "type MyCatalogPriceItem",
+            "type MyCatalogPrice",
+            "type MyCatalogPriceBranch",
+            "type MyCatalogPriceScope",
+            "type MyModelCatalog",
+        ] {
+            crate::sdl_parity::assert_block_parity(&sdl, &snapshot, header, header, &[])?;
+        }
+        Ok(())
     }
 
     #[test]

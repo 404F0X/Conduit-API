@@ -1212,7 +1212,7 @@ fn rule_db_id(raw: &str) -> Option<String> {
 
 /// GraphQL `PromptProtectionRuleStatus` → the `status` column literal (Go ent
 /// enum `enabled | disabled | archived`, `prompt_protection_rule.go:44-47`).
-fn rule_status_to_wire(status: PromptProtectionRuleStatus) -> &'static str {
+pub(crate) fn rule_status_to_wire(status: PromptProtectionRuleStatus) -> &'static str {
     match status {
         PromptProtectionRuleStatus::Enabled => "enabled",
         PromptProtectionRuleStatus::Disabled => "disabled",
@@ -1289,7 +1289,7 @@ fn protection_scope_from_wire(scope: &str) -> Option<PromptProtectionScope> {
 /// GraphQL settings input → the typed core object. Go's `replacement` is a
 /// plain `string` with `omitempty`, so an empty string and an absent field are
 /// the same wire state — normalized to `None` here.
-fn protection_settings_input_to_core(
+pub(crate) fn protection_settings_input_to_core(
     input: PromptProtectionSettingsInput,
 ) -> core_protection::PromptProtectionSettings {
     core_protection::PromptProtectionSettings {
@@ -1356,7 +1356,7 @@ pub(crate) fn rule_row_to_gql(row: PromptProtectionRuleRow) -> PromptProtectionR
 /// (lookarounds/backreferences); the `regex` crate rejects those, so such
 /// patterns surface the Go "invalid regex pattern" wording here even though
 /// regexp2 would accept them.
-fn validate_rule_settings(
+pub(crate) fn validate_rule_settings(
     pattern: &str,
     settings: &core_protection::PromptProtectionSettings,
 ) -> Result<regex::Regex, PromptServiceError> {

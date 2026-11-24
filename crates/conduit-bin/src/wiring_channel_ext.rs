@@ -524,7 +524,7 @@ impl ChannelExtMutationAdapter {
     /// Lower a GraphQL `CreateChannelInput` for the transactional duplicate
     /// path (mirrors `ChannelCrudAdapter::create_channel` / Go
     /// `biz.createChannel`).
-    fn prepare_create_from_gql_input(
+    pub(crate) fn prepare_create_from_gql_input(
         input: CreateChannelInput,
     ) -> Result<(String, RepoCreateChannelInput), ChannelServiceError> {
         // Retained for the duplicate-name error (repo `NameConflict` maps to Go
@@ -705,9 +705,6 @@ impl ChannelExtMutationServices for ChannelExtMutationAdapter {
         crate::wiring::lock_accounting_currency_price_writes(&mut tx)
             .await
             .map_err(|e| ChannelServiceError::Create(e.to_string()))?;
-        let accounting_settings = crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(&mut tx)
-            .await
-            .map_err(|e| ChannelServiceError::Create(e.to_string()))?;
 
         // "failed to get source channel" — a missing source aborts before any
         // write, inside the same snapshot used for the price copy.
@@ -722,15 +719,6 @@ impl ChannelExtMutationServices for ChannelExtMutationAdapter {
         // `ChannelModelPrice.Query().Where(ChannelID(sourceID)).All`). Resolve
         // them before creating the destination channel and preserve each
         // row's currency: copying must never relabel a numeric amount.
-        let now_at = chrono::Utc::now();
-        let source_prices = conduit_db::PgChannelModelPriceRepo::list_prices_by_channel_in_tx(
-            &mut tx,
-            source_db_id,
-        )
-        .await
-        .map_err(|e| {
-            ChannelServiceError::Query(format!("failed to query source channel model prices: {e}"))
-        })?;
         let row = conduit_db::PgChannelRepo::create_channel_in_tx(&mut tx, repo_input)
             .await
             .map_err(|e| match e {
@@ -740,19 +728,18 @@ impl ChannelExtMutationServices for ChannelExtMutationAdapter {
         let new_db_id = row.id.parse::<i64>().map_err(|_| {
             ChannelServiceError::Create("created channel id is not an integer".to_string())
         })?;
-        crate::wiring_postgres_change_sets::stage_duplicated_provider_prices(
+        let actor = actor_user_id
+            .ok_or_else(|| ChannelServiceError::Create("authentication required".into()))?;
+        crate::wiring_postgres_change_sets::publish_copied_provider_prices(
             &mut tx,
-            actor_user_id,
+            actor,
+            None,
             source_db_id,
             new_db_id,
             &row.name,
-            &source_prices,
-            &accounting_settings.currency,
-            accounting_settings.version,
-            now_at,
         )
         .await
-        .map_err(|e| ChannelServiceError::Create(e.to_string()))?;
+        .map_err(ChannelServiceError::Create)?;
 
         tx.commit()
             .await
@@ -1642,7 +1629,7 @@ fn disabled_keys_to_value(keys: &[core_ch::DisabledAPIKey]) -> Value {
 /// restriction reference the Go `llm` API-format constants, which have no Rust
 /// port yet — copying the list by hand would risk synthesizing it, so those
 /// two checks are deferred until the constants are ported.
-fn validate_endpoints(endpoints: &[ChannelEndpointInput]) -> Result<(), String> {
+pub(crate) fn validate_endpoints(endpoints: &[ChannelEndpointInput]) -> Result<(), String> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (i, ep) in endpoints.iter().enumerate() {
         if ep.api_format.is_empty() {
@@ -1745,7 +1732,7 @@ fn channel_type_to_wire(t: ChannelType) -> &'static str {
 
 /// Whether a raw import `type` string is a valid channel type (Go
 /// `channel.TypeValidator`). Same literal set as [`channel_type_to_wire`].
-fn is_valid_channel_type(s: &str) -> bool {
+pub(crate) fn is_valid_channel_type(s: &str) -> bool {
     matches!(
         s,
         "openai"
@@ -1847,7 +1834,7 @@ fn policies_input_to_json(p: ChannelPoliciesInput) -> Value {
     serde_json::to_value(core).unwrap_or_else(|_| Value::Object(JsonMap::new()))
 }
 
-fn endpoint_input_to_json(e: ChannelEndpointInput) -> Value {
+pub(crate) fn endpoint_input_to_json(e: ChannelEndpointInput) -> Value {
     let core = core_ch::ChannelEndpoint {
         api_format: e.api_format,
         path: e.path.unwrap_or_default(),
@@ -2067,6 +2054,7 @@ mod tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[77, 78]).await?;
         let source_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO channels \
              (\"type\",name,status,credentials,supported_models,default_test_model,settings) \
@@ -2078,6 +2066,15 @@ mod tests {
         let source_price = serde_json::json!({
             "items": [{
                 "itemCode": "prompt_tokens",
+                "pricing": {"mode": "usage_per_unit", "usagePerUnit": "1"}
+            }, {
+                "itemCode": "completion_tokens",
+                "pricing": {"mode": "usage_per_unit", "usagePerUnit": "2"}
+            }, {
+                "itemCode": "prompt_cached_tokens",
+                "pricing": {"mode": "usage_per_unit", "usagePerUnit": "0"}
+            }, {
+                "itemCode": "prompt_write_cached_tokens",
                 "pricing": {"mode": "usage_per_unit", "usagePerUnit": "1"}
             }]
         });
@@ -2100,6 +2097,7 @@ mod tests {
                 Some(77),
                 &source_id.to_string(),
                 CreateChannelInput {
+                    operation_id: None,
                     channel_type: ChannelType::Openai,
                     base_url: None,
                     website_url: None,
@@ -2157,7 +2155,7 @@ mod tests {
                 .as_ref()
                 .and_then(|value| value.0.get("origin"))
                 .and_then(Value::as_str),
-            Some("channel_duplicate")
+            Some("CHANNEL_IMPORT")
         );
 
         let submitted = change_sets
@@ -2166,7 +2164,28 @@ mod tests {
         let applied = change_sets
             .approve_change_set(78, submitted.id, Some("copied price verified".into()))
             .await?;
-        assert_eq!(applied.status, ChangeSetStatus::Applied);
+        assert_eq!(applied.status, ChangeSetStatus::Approved);
+        use conduit_admin_graphql::change_package::ChangePackageServices;
+        let detail = change_sets
+            .get_detail(
+                conduit_admin_graphql::change_package::PackageViewer {
+                    actor_user_id: 78,
+                    can_write: true,
+                },
+                applied.id.clone(),
+            )
+            .await?
+            .ok_or("missing approved package")?;
+        let applied = change_sets
+            .transition(
+                78,
+                applied.id,
+                detail.summary.revision,
+                conduit_admin_graphql::change_package::ChangeSetAvailableAction::Publish,
+                None,
+            )
+            .await?;
+        assert_eq!(applied.summary.status, ChangeSetStatus::Applied);
 
         let copied_price = sqlx::query_as::<_, (i64, String, sqlx::types::Json<Value>)>(
             "SELECT id,currency_code,price FROM channel_model_prices \
@@ -2220,7 +2239,7 @@ mod tests {
                 "CNY".into(),
                 1,
                 "success".into(),
-                applied.id.as_str().parse::<i64>()?,
+                applied.summary.id.as_str().parse::<i64>()?,
             )
         );
 

@@ -1,9 +1,9 @@
+import { enterFixtureProject } from './project-fixture'
 import { expect, test } from '@playwright/test'
-import { gotoAndEnsureAuth } from './auth.utils'
 
 test.describe('Project Requests Management', () => {
   test.beforeEach(async ({ page }) => {
-    await gotoAndEnsureAuth(page, '/project/requests')
+    await enterFixtureProject(page, '/project/requests')
     await page.getByTestId('requests-table').waitFor({ state: 'visible', timeout: 20000 })
   })
 
@@ -19,7 +19,12 @@ test.describe('Project Requests Management', () => {
   })
 
   test('is reachable from project navigation', async ({ page }) => {
-    const requestsLink = page.getByRole('link', { name: /Requests|请求/i, exact: true })
+    const requestsLink = page.getByRole('link', { name: 'Request logs', exact: true })
+    await expect(requestsLink).toBeVisible()
     await expect(requestsLink).toHaveAttribute('href', '/project/requests')
+    await page.goto('/project/models')
+    await page.getByRole('link', {name: 'Request logs', exact:true}).click()
+    await expect(page).toHaveURL(/\/project\/requests(?:\?.*)?$/)
+    await expect(page.getByTestId('requests-table')).toBeVisible()
   })
 })

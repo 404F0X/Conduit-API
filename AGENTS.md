@@ -5,6 +5,25 @@ use `Conduit API`, `conduit-*`, `conduit_*`, or `CONDUIT_*` as appropriate.
 Do not introduce names, paths, URLs, or compatibility shims from predecessor
 projects.
 
+## Project Knowledge and Code Discovery
+
+Start with [the project knowledge index](docs/knowledge/index.md). Prefer the
+codebase-memory-mcp graph for symbols and relationships: `search_graph`,
+`trace_path`, `get_code_snippet`, then `query_graph` or `get_architecture`.
+Verify index identity, freshness and relevant coverage before relying on it.
+When MCP tools are unavailable, the equivalent CLI is available through
+`python -X utf8 scripts/knowledge.py query <tool> --args-file <json>`.
+Use `rg` for literals/configuration/non-code files or documented graph gaps;
+an empty graph result does not prove that a symbol or call is absent.
+
+Root coordinates shared index maintenance through an explicitly authorized
+Agent with index write ownership; that Agent refreshes and reports identity,
+freshness and coverage, and delegated acceptance checks the result. Root only
+records the reports. Other leaves reuse supplied knowledge references and
+report stale or missing coverage; they do not each rebuild the repository.
+Graph caches exclude research clones, task worktrees, generated dependencies,
+runtime state and credentials. Task state remains in the workflow ledger.
+
 ## Architecture
 
 - `crates/conduit-bin`: executable and production dependency wiring.

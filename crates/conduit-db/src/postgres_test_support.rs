@@ -27,9 +27,11 @@ impl IsolatedPostgres {
             std::process::id(),
             NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
         );
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-            .execute(&admin_pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "CREATE SCHEMA \"{schema}\""
+        )))
+        .execute(&admin_pool)
+        .await?;
 
         let search_path = format!("SET search_path TO \"{schema}\"");
         let pool = PgPoolOptions::new()
@@ -37,7 +39,9 @@ impl IsolatedPostgres {
             .after_connect(move |connection, _| {
                 let search_path = search_path.clone();
                 Box::pin(async move {
-                    sqlx::query(&search_path).execute(connection).await?;
+                    sqlx::query(sqlx::AssertSqlSafe::<&str>(&search_path))
+                        .execute(connection)
+                        .await?;
                     Ok(())
                 })
             })
@@ -53,9 +57,12 @@ impl IsolatedPostgres {
 
     pub(crate) async fn cleanup(self) -> Result<(), sqlx::Error> {
         self.pool.close().await;
-        sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
-            .execute(&self.admin_pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "DROP SCHEMA \"{}\" CASCADE",
+            self.schema
+        )))
+        .execute(&self.admin_pool)
+        .await?;
         self.admin_pool.close().await;
         Ok(())
     }

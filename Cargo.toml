@@ -74,7 +74,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 flate2 = "1"
 futures-core = "0.3"
 hmac = "0.12"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"] }
 moka = { version = "0.12", features = ["future"] }
 opentelemetry = "0.27"
 percent-encoding = "2"
@@ -87,7 +87,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "uuid", "json", "rust_decimal"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "macros", "chrono", "uuid", "json", "rust_decimal"] }
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

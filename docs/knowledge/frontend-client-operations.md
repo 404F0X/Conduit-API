@@ -1,4 +1,18 @@
-# 前端GraphQL：268个模板文档
+# 前端 GraphQL 操作文档
+
+## 当前 Lite / Full 增量（2026-10-09）
+
+当前产品设置读取 `productExperienceSettings { mode revision features { id visibility execution visible enabled dependencies } }`，更新使用 `expectedRevision`。运行开关受 SystemConfiguration 审批时，原生表单转为 `system.product_experience_form` 提案；呈现设置可直接保存，Owner 权限保持。
+
+治理 UI 使用 `governanceSettings`／`governanceCapabilities`、`governedChangeBase`、`proposeGovernedChange`、`validateChangeSet`、`reviewChangeSet`、`publishChangeSet` 和 `claimGovernedChangeSecrets`。通用 mutation adapter 保留原生表单类型、目标与稳定 operation ID，要求审批时打开原因输入；公开包查询只读脱敏摘要。`APPROVE` 与 `approveChangeSet` 返回 Approved；`PUBLISH` 才正式写入，`APPROVE_APPLY` 是同事务两步且需要两项职责。
+
+成员钱包读取 `myProjectFunds(projectID, publicModelID?, apiKeyID?)`，不会把他人订阅或不匹配模型的专属权益计入准入金额；没有选择模型时专属栏为“—”。`projectMemberSpendLimits`／`setProjectMemberSpendLimit` 使用 Credits 和本人跨 key 累计消耗／预留，保留 NULL 不限、0 拦截语义。公共字段与全部 161 个 mutation 分类见 [SDL](../../tests/contracts/admin_graphql_schema.graphql) 和 [治理矩阵](../../tests/contracts/governance_mutations.json)。下方全量表是历史探索入口，当前变量和原生表单以源文件为准。
+
+## 当前 r3 文档增量
+
+本轮商业/发现接口的19个实际前端文档与变量收录在[公共fixture](../../tests/contracts/change-package-operations.json)。前端回归对照实际请求，Rust真实完整schema逐文档验证selection/变量/输入，并验证无scope账户在service前拒绝。摘要分页、revision、稳定操作身份与未知结果步骤见[当前使用流程](frontend.md#event-packages-r3)。
+
+下方268文档/119Q149M、254根匹配与旧源码行号是原探索历史，不作为当前模板计数。商业包旧Get/Submit/Approve等操作签名已被新接口替代；以当前源与fixture为准，不复制旧变量。未使用user/signIn旧常量仍不支持；登录仍是REST。
 
 119query/149mutation；同名不同源保留独立ID。提取当前TS/TSX backtick内操作声明，有限词法root提取（含alias/多根），不是通用GraphQL parser；所有根已与当前254 schema交叉核对。266文档匹配schema，User/user和SignIn/signIn是未使用旧常量。实际登录REST；不要发送两旧常量。参数/变量类型使用当前源模板，不能由表中root名称推断。
 

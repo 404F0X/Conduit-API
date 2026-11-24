@@ -1,4 +1,5 @@
 import { AuthUser } from '@/stores/authStore';
+import { userHoldsScope } from '@/lib/permission-core';
 
 /**
  * 获取用户的所有权限范围（包括直接权限和角色权限）
@@ -26,11 +27,8 @@ export function getUserScopes(user: AuthUser | null, projectId?: string | null):
  * 检查用户是否拥有指定的权限
  */
 export function hasScope(user: AuthUser | null, scope: string, projectId?: string): boolean {
-  if (!user) return false;
-  if (user.isOwner) return true; // Owner 拥有所有权限
-
-  const userScopes = getUserScopes(user, projectId);
-  return userScopes.includes(scope);
+  // 规则统一在 lib/permission-core.ts：站长全权、'*' 全权、其余完全相等
+  return userHoldsScope(user, scope, projectId);
 }
 
 /**

@@ -528,6 +528,70 @@
       },
       "type": "object"
     },
+    "PaymentConfig": {
+      "additionalProperties": false,
+      "description": "Single explicitly selected classic-MD5 reference gateway. Disabled by default.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "gateway_base_url": {
+          "default": "",
+          "type": "string"
+        },
+        "gateway_ca_certificate": {
+          "default": null,
+          "description": "Optional additional PEM CA, scoped to this payment client's TLS trust.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_amount_minor": {
+          "default": 10000000,
+          "format": "int64",
+          "type": "integer"
+        },
+        "merchant_id": {
+          "default": "",
+          "type": "string"
+        },
+        "merchant_identity": {
+          "default": "",
+          "description": "Change whenever merchant credentials or endpoint change; retain old identity/credentials until every existing order has been reconciled.",
+          "type": "string"
+        },
+        "merchant_key": {
+          "default": "",
+          "type": "string"
+        },
+        "min_amount_minor": {
+          "default": 1,
+          "format": "int64",
+          "type": "integer"
+        },
+        "notify_url": {
+          "default": "",
+          "type": "string"
+        },
+        "order_ttl_seconds": {
+          "default": 900,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "profile": {
+          "default": "epay-classic-md5-reference-a4d0f042",
+          "type": "string"
+        },
+        "return_url": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "ProviderQuotaConfig": {
       "additionalProperties": false,
       "description": "Provider quota polling configuration.\n\n`enabled` and `check_interval` drive the production quota worker. The provider-specific `providers` allowlist is retained for compatibility but is not consumed; all supported checkers are registered. `warning_ratio` currently remains fixed to Go's canonical 0.8 threshold.",
@@ -1089,6 +1153,27 @@
         "providers": [],
         "redirect_base_url": null,
         "state_ttl": "10m"
+      }
+    },
+    "payments": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PaymentConfig"
+        }
+      ],
+      "default": {
+        "enabled": false,
+        "gateway_base_url": "",
+        "gateway_ca_certificate": null,
+        "max_amount_minor": 10000000,
+        "merchant_id": "",
+        "merchant_identity": "",
+        "merchant_key": "",
+        "min_amount_minor": 1,
+        "notify_url": "",
+        "order_ttl_seconds": 900,
+        "profile": "epay-classic-md5-reference-a4d0f042",
+        "return_url": ""
       }
     },
     "provider_quota": {

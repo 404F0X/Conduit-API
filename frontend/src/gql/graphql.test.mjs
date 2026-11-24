@@ -13,7 +13,11 @@ const transpiled = ts
       target: ts.ScriptTarget.ES2023,
     },
   })
-  .outputText.replaceAll("import { toast } from 'sonner';", 'const toast = { error() {} };')
+  .outputText.replaceAll(
+    "import { requestGovernedMutation } from '@/features/change-sets/mutation-adapter';",
+    'const requestGovernedMutation=(...args)=>{globalThis.__governedRequest=args;};'
+  )
+  .replaceAll("import { toast } from 'sonner';", 'const toast = { error() {} };')
   .replaceAll(
     "import { getTokenFromStorage, removeTokenFromStorage } from '@/stores/authStore';",
     'const getTokenFromStorage = () => ""; const removeTokenFromStorage = () => {};'

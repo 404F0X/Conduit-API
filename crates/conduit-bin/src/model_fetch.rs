@@ -81,10 +81,9 @@ fn models_endpoint(channel_type: &str, base_url: &str) -> String {
         }
     } else {
         // OpenAI-compatible default (model_fetcher.go default branch).
-        if base.contains("/v1") {
-            format!("{base}/models")
-        } else {
-            format!("{base}/v1/models")
+        match crate::wiring_postgres_provider_quota::new_api_root(base) {
+            Ok(root) => format!("{root}/v1/models"),
+            Err(_) => format!("{base}/v1/models"),
         }
     }
 }
@@ -196,7 +195,7 @@ pub async fn fetch_models(
     let mut cursor = None;
     let mut seen_cursors = HashSet::new();
     for page in 0..MAX_MODEL_PAGES {
-        let mut req = client.get(&url).timeout(Duration::from_secs(15));
+        let mut req = client.get(&url).timeout(Duration::from_secs(10));
         if is_anthropic(channel_type) {
             req = req
                 .header("x-api-key", api_key)

@@ -217,6 +217,7 @@ fn is_sensitive_header(name: &str) -> bool {
 pub struct PersistRequestMiddleware {
     repo: Arc<dyn RequestRepo>,
     storage: Option<Arc<dyn RequestArtifactStorage>>,
+    required_persistence: bool,
 }
 
 impl PersistRequestMiddleware {
@@ -224,7 +225,14 @@ impl PersistRequestMiddleware {
         Self {
             repo,
             storage: None,
+            required_persistence: false,
         }
+    }
+
+    /// Production metering cannot send upstream without a protected audit row.
+    pub fn with_required_persistence(mut self) -> Self {
+        self.required_persistence = true;
+        self
     }
 
     pub fn with_artifact_storage(mut self, storage: Arc<dyn RequestArtifactStorage>) -> Self {
@@ -356,6 +364,11 @@ impl PipelineMiddleware for PersistRequestMiddleware {
                 )));
             }
             Err(bridge) => {
+                if self.required_persistence {
+                    return Err(ConduitError::internal(format!(
+                        "persist-request: required audit persistence failed: {bridge}"
+                    )));
+                }
                 // Runtime bridge failure is infrastructure, not a data error:
                 // log and continue so a transient resource shortage does not
                 // fail the user's request (P-26). The request row is simply not
@@ -1146,9 +1159,9 @@ where
 
 /// Failure to bridge the sync middleware trait onto the async repo runtime.
 ///
-/// Kept intentionally simple (a message string): callers only ever log it and
-/// continue — a persistence bridge failure must never fail the business request
-/// (Go persists on a detached context for the same reason). See P-26.
+/// Best-effort consumers log and continue (P-26). Production metering requires
+/// the initial request audit: that middleware returns an error before upstream
+/// when this bridge fails.
 #[derive(Debug)]
 struct RuntimeBridgeError(String);
 

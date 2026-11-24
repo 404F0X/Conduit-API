@@ -138,6 +138,8 @@ pub enum RepoError {
     /// indexes — a soft-deleted row frees its key for re-registration.
     #[error("name already in use")]
     NameConflict,
+    #[error("model display name is ambiguous; use the unique model key or id")]
+    AmbiguousModelName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

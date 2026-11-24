@@ -96,5 +96,10 @@
   "users.messages.removeFromProjectSuccess": "User removed from project successfully",
   "users.errors.insufficientPermissions": "You don't have sufficient permissions to edit this user",
   "users.errors.duplicateEmail": "This email is already registered. Choose a different email.",
-  "users.errors.saveForbidden": "You cannot save these user permissions. Ask a platform owner for the required access or remove permissions you cannot grant."
+  "users.errors.saveForbidden": "You cannot save these user permissions. Ask a platform owner for the required access or remove permissions you cannot grant.",
+  "users.groups.recharge.description": "Each user belongs to at most one UserGroup. Groups grant model access and set the multiplier for new payment top-ups.",
+  "users.groups.recharge.label": "Recharge multiplier (×)",
+  "users.groups.recharge.hint": "Default 1×; greater than zero and at most 1000×, with up to six decimal places. It is frozen when an order is created; existing orders are unchanged. Concurrent changes require a reload before saving.",
+  "users.groups.recharge.invalid": "Enter a positive multiplier up to 1000 with at most six decimal places, then reload if the group changed.",
+  "users.groups.recharge.summary": "Recharge {{multiplier}}× · {{ppm}} PPM"
 }

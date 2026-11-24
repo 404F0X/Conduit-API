@@ -25,16 +25,18 @@ impl PgThreadRepo {
 
     /// Global admin listing used by `Query.threads`.
     pub async fn list_all(&self) -> RepoResult<Vec<ThreadRow>> {
-        sqlx::query_as::<_, ThreadRow>(&format!("SELECT {COLUMNS} FROM threads ORDER BY id ASC"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| database_error("list all", error))
+        sqlx::query_as::<_, ThreadRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM threads ORDER BY id ASC"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| database_error("list all", error))
     }
 
     pub async fn list_by_project(&self, project_id: &str) -> RepoResult<Vec<ThreadRow>> {
-        sqlx::query_as::<_, ThreadRow>(&format!(
+        sqlx::query_as::<_, ThreadRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM threads WHERE project_id = $1 ORDER BY id ASC"
-        ))
+        )))
         .bind(parse_id(
             project_id,
             "thread project id not a valid integer",
@@ -46,11 +48,13 @@ impl PgThreadRepo {
 
     /// Primary-key lookup used by the Relay `node(id:)` resolver.
     pub async fn find_by_row_id(&self, id: i64) -> RepoResult<Option<ThreadRow>> {
-        sqlx::query_as::<_, ThreadRow>(&format!("SELECT {COLUMNS} FROM threads WHERE id = $1"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|error| database_error("find by row id", error))
+        sqlx::query_as::<_, ThreadRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM threads WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error("find by row id", error))
     }
 }
 
@@ -85,9 +89,9 @@ async fn fetch_by_pair(
     project_id: i64,
     thread_id: &str,
 ) -> RepoResult<Option<ThreadRow>> {
-    sqlx::query_as::<_, ThreadRow>(&format!(
+    sqlx::query_as::<_, ThreadRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {COLUMNS} FROM threads WHERE project_id = $1 AND thread_id = $2"
-    ))
+    )))
     .bind(project_id)
     .bind(thread_id)
     .fetch_optional(pool)

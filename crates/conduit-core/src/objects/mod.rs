@@ -13,11 +13,13 @@ pub mod model;
 pub mod model_association;
 pub mod money;
 pub mod overrides;
+pub mod price_formula;
 pub mod pricing;
 pub mod project;
 pub mod prompt;
 pub mod prompt_protection;
 pub mod response;
+pub mod retail_price_plan;
 pub mod storage;
 pub mod user;
 

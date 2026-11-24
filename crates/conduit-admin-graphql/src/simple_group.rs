@@ -10,7 +10,7 @@ use async_graphql::{Context, Enum, ID, InputObject, SimpleObject};
 
 use crate::scalars::TimeScalar;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, serde::Serialize, serde::Deserialize)]
 pub enum SimpleGroupStatus {
     Enabled,
     Disabled,
@@ -68,7 +68,8 @@ pub struct APIKeyAssignableGroup {
 /// one of `priceTierID` and `multiplierPpm` must be provided. Supplying IDs
 /// links existing enterprise objects; supplying values creates them in the
 /// same transaction as the Group.
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSimpleGroupInput {
     pub name: String,
     pub description: Option<String>,
@@ -90,7 +91,8 @@ pub struct CreateSimpleGroupInput {
 
 /// Atomically update the simple-mode bundle and, when supplied, replace its
 /// complete user set. Omitted fields retain their current value.
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSimpleGroupInput {
     #[graphql(name = "groupID")]
     pub group_id: ID,
@@ -114,7 +116,8 @@ pub struct UpdateSimpleGroupInput {
 /// Assign users to a Simple Group through their strictly resolved personal
 /// Projects. User IDs are accepted only as an admin-facing selection input;
 /// the Group contract and persisted membership remain Project-scoped.
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssignSimpleGroupUsersInput {
     #[graphql(name = "groupID")]
     pub group_id: ID,
@@ -122,7 +125,8 @@ pub struct AssignSimpleGroupUsersInput {
     pub user_ids: Vec<ID>,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSimpleGroupModelsInput {
     #[graphql(name = "groupID")]
     pub group_id: ID,
@@ -130,7 +134,8 @@ pub struct UpdateSimpleGroupModelsInput {
     pub model_ids: Vec<ID>,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSimpleGroupPriceInput {
     #[graphql(name = "groupID")]
     pub group_id: ID,

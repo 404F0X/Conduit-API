@@ -58,9 +58,9 @@ impl RequestExecutionRepo for PgRequestExecutionRepo {
         _: &RequestContext,
         v: &str,
     ) -> RepoResult<Option<RequestExecutionRow>> {
-        sqlx::query_as::<_, RequestExecutionRow>(&format!(
+        sqlx::query_as::<_, RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {C} FROM request_executions WHERE id=$1"
-        ))
+        )))
         .bind(id(v)?)
         .fetch_optional(&self.pool)
         .await
@@ -72,7 +72,7 @@ impl RequestExecutionRepo for PgRequestExecutionRepo {
         p: &str,
         r: &str,
     ) -> RepoResult<Vec<RequestExecutionRow>> {
-        sqlx::query_as::<_,RequestExecutionRow>(&format!("SELECT {C} FROM request_executions WHERE project_id=$1 AND request_id=$2 ORDER BY created_at,id")).bind(id(p)?).bind(id(r)?).fetch_all(&self.pool).await.map_err(|e|err("list",e))
+        sqlx::query_as::<_,RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {C} FROM request_executions WHERE project_id=$1 AND request_id=$2 ORDER BY created_at,id"))).bind(id(p)?).bind(id(r)?).fetch_all(&self.pool).await.map_err(|e|err("list",e))
     }
 
     async fn list_all_request_executions_unchecked(
@@ -80,9 +80,9 @@ impl RequestExecutionRepo for PgRequestExecutionRepo {
         _ctx: &RequestContext,
         limit: u32,
     ) -> RepoResult<Vec<RequestExecutionRow>> {
-        sqlx::query_as::<_, RequestExecutionRow>(&format!(
+        sqlx::query_as::<_, RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {C} FROM request_executions ORDER BY created_at,id LIMIT $1"
-        ))
+        )))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
@@ -97,23 +97,27 @@ impl RequestExecutionRepo for PgRequestExecutionRepo {
     ) -> RepoResult<Vec<RequestExecutionRow>> {
         let channel_id = id(channel_id)?;
         match authorized_project_id {
-            Some(project_id) => sqlx::query_as::<_, RequestExecutionRow>(&format!(
-                "SELECT {C} FROM request_executions \
+            Some(project_id) => {
+                sqlx::query_as::<_, RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT {C} FROM request_executions \
                  WHERE project_id=$1 AND channel_id=$2 ORDER BY created_at,id"
-            ))
-            .bind(id(project_id)?)
-            .bind(channel_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| err("list by channel and project", e)),
-            None => sqlx::query_as::<_, RequestExecutionRow>(&format!(
-                "SELECT {C} FROM request_executions \
+                )))
+                .bind(id(project_id)?)
+                .bind(channel_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| err("list by channel and project", e))
+            }
+            None => {
+                sqlx::query_as::<_, RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT {C} FROM request_executions \
                  WHERE channel_id=$1 ORDER BY created_at,id"
-            ))
-            .bind(channel_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| err("list by channel", e)),
+                )))
+                .bind(channel_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| err("list by channel", e))
+            }
         }
     }
 
@@ -125,23 +129,27 @@ impl RequestExecutionRepo for PgRequestExecutionRepo {
     ) -> RepoResult<Vec<RequestExecutionRow>> {
         let data_storage_id = id(data_storage_id)?;
         match authorized_project_id {
-            Some(project_id) => sqlx::query_as::<_, RequestExecutionRow>(&format!(
-                "SELECT {C} FROM request_executions \
+            Some(project_id) => {
+                sqlx::query_as::<_, RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT {C} FROM request_executions \
                  WHERE project_id=$1 AND data_storage_id=$2 ORDER BY created_at,id"
-            ))
-            .bind(id(project_id)?)
-            .bind(data_storage_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| err("list by data storage and project", e)),
-            None => sqlx::query_as::<_, RequestExecutionRow>(&format!(
-                "SELECT {C} FROM request_executions \
+                )))
+                .bind(id(project_id)?)
+                .bind(data_storage_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| err("list by data storage and project", e))
+            }
+            None => {
+                sqlx::query_as::<_, RequestExecutionRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT {C} FROM request_executions \
                  WHERE data_storage_id=$1 ORDER BY created_at,id"
-            ))
-            .bind(data_storage_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| err("list by data storage", e)),
+                )))
+                .bind(data_storage_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| err("list by data storage", e))
+            }
         }
     }
     async fn update_request_execution_unchecked(

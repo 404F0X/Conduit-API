@@ -66,7 +66,7 @@ impl PgSystemOperationsAdapter {
         // `table` is always one of the two literals below; it is never sourced
         // from GraphQL input.
         let sql = format!("SELECT COUNT(*)::BIGINT FROM {table} WHERE created_at < $1");
-        let count: i64 = sqlx::query_scalar(&sql)
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&sql))
             .bind(cutoff)
             .fetch_one(&self.pool)
             .await
@@ -355,10 +355,10 @@ async fn erase_request_content(
             "project_id::text||'/requests/'||request_id::text||'/executions/'||id::text"
         };
         if column != "request_headers" {
-            sqlx::query(&format!("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT data_storage_id,{prefix}||'/{column}.json' FROM {table} WHERE created_at<$1 AND data_storage_id IS NOT NULL AND status NOT IN ('pending','processing') ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()"))
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT data_storage_id,{prefix}||'/{column}.json' FROM {table} WHERE created_at<$1 AND data_storage_id IS NOT NULL AND status NOT IN ('pending','processing') ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()")))
                 .bind(cutoff).execute(&mut *tx).await?;
         }
-        affected += sqlx::query(&format!("UPDATE {table} SET {column}={replacement},expired_artifacts=array_append(expired_artifacts,$2),updated_at=now() WHERE created_at<$1 AND status NOT IN ('pending','processing') AND NOT($2=ANY(expired_artifacts))"))
+        affected += sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("UPDATE {table} SET {column}={replacement},expired_artifacts=array_append(expired_artifacts,$2),updated_at=now() WHERE created_at<$1 AND status NOT IN ('pending','processing') AND NOT($2=ANY(expired_artifacts))")))
             .bind(cutoff).bind(column).execute(&mut *tx).await?.rows_affected();
     }
     if column == "response_body" {
@@ -391,7 +391,7 @@ async fn delete_created_at_in_batches(
     );
     let mut total = 0_u64;
     for _ in 0..100_000 {
-        let deleted = sqlx::query(&sql)
+        let deleted = sqlx::query(sqlx::AssertSqlSafe::<&str>(&sql))
             .bind(cutoff)
             .bind(i64::from(DEFAULT_GC_BATCH_SIZE))
             .execute(pool)
@@ -466,7 +466,7 @@ async fn request_cascade_before(
             ),
         ] {
             for column in ["request_body", "response_body", "response_chunks"] {
-                sqlx::query(&format!("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT data_storage_id,{prefix}||'/{column}.json' FROM {table} WHERE {predicate} AND data_storage_id IS NOT NULL ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()"))
+                sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("INSERT INTO artifact_deletion_queue(data_storage_id,object_key) SELECT data_storage_id,{prefix}||'/{column}.json' FROM {table} WHERE {predicate} AND data_storage_id IS NOT NULL ON CONFLICT(data_storage_id,object_key) DO UPDATE SET delete_requested=TRUE,next_attempt_at=now()")))
                     .bind(&ids).execute(&mut *transaction).await?;
             }
         }
@@ -495,7 +495,9 @@ async fn request_cascade_before(
 /// pooled connection and issuing exactly one statement preserves autocommit.
 async fn execute_postgres_vacuum_sql(pool: &PgPool, sql: &str) -> Result<(), sqlx::Error> {
     let mut connection = pool.acquire().await?;
-    sqlx::query(sql).execute(&mut *connection).await?;
+    sqlx::query(sqlx::AssertSqlSafe::<&str>(sql))
+        .execute(&mut *connection)
+        .await?;
     Ok(())
 }
 
@@ -730,10 +732,12 @@ mod tests {
     }
 
     async fn row_exists(pool: &PgPool, table: &str, id: i64) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar::<_, bool>(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=$1)"))
-            .bind(id)
-            .fetch_one(pool)
-            .await
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE id=$1)"
+        )))
+        .bind(id)
+        .fetch_one(pool)
+        .await
     }
 
     fn policy(requests: bool, usage_logs: bool) -> StoragePolicy {
@@ -818,16 +822,20 @@ mod tests {
         };
         let admin_pool = PgPool::connect(&dsn).await?;
         let schema = format!("system_operations_test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-            .execute(&admin_pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "CREATE SCHEMA \"{schema}\""
+        )))
+        .execute(&admin_pool)
+        .await?;
         let search_path = format!("SET search_path TO \"{schema}\"");
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .after_connect(move |connection, _| {
                 let search_path = search_path.clone();
                 Box::pin(async move {
-                    sqlx::query(&search_path).execute(connection).await?;
+                    sqlx::query(sqlx::AssertSqlSafe::<&str>(&search_path))
+                        .execute(connection)
+                        .await?;
                     Ok(())
                 })
             })
@@ -1127,9 +1135,11 @@ mod tests {
         .await;
 
         pool.close().await;
-        let cleanup = sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .execute(&admin_pool)
-            .await;
+        let cleanup = sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "DROP SCHEMA \"{schema}\" CASCADE"
+        )))
+        .execute(&admin_pool)
+        .await;
         admin_pool.close().await;
         outcome?;
         cleanup?;

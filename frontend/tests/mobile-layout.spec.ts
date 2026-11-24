@@ -89,8 +89,9 @@ test.describe('Mobile Header Layout', () => {
       }
 
       // MobileHeaderControls should be visible in sidebar footer
-      const sidebarSettings = page.getByRole('link', { name: /system/i }).first();
+      const sidebarSettings = page.locator("a[href='/system']:visible");
       await expect(sidebarSettings).toBeVisible();
+      await expect(sidebarSettings).toHaveAttribute('href', '/system');
 
       // Language switch should be visible in sidebar
       const sidebarLanguageSwitch = page.getByRole('button').filter({ has: page.locator('svg').first() }).first();
@@ -127,14 +128,17 @@ test.describe('Mobile Header Layout', () => {
       }
 
       // Click settings link
-      const settingsLink = page.getByRole('link', { name: /system/i }).first();
+      const settingsLink = page.locator("a[href='/system']:visible");
+      await expect(settingsLink).toBeVisible();
+      await expect(settingsLink).toHaveAttribute('href', '/system');
       await settingsLink.click();
 
       // Wait for navigation to complete
-      await page.waitForURL(/.*\/system.*/, { timeout: 5000 });
+      await page.waitForURL(/\/system(?:\?.*)?$/, { timeout: 5000 });
 
       // Verify we're on the system page
-      await expect(page).toHaveURL(/.*\/system.*/);
+      await expect(page).toHaveURL(/\/system(?:\?.*)?$/);
+      await expect(page.locator('#system-title')).toBeVisible();
     });
 
     test('language switch is clickable in sidebar', async ({ page }) => {

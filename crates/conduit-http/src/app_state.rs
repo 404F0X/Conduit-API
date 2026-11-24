@@ -25,6 +25,7 @@ use crate::system_handlers::SystemService;
 /// degrade to the Go 5xx error branches when a service is absent.
 #[derive(Default)]
 pub struct AppServices {
+    payment_notification: Option<Arc<dyn crate::payment_handlers::PaymentNotificationService>>,
     system: Option<Arc<dyn SystemService>>,
     signin: Option<Arc<dyn SigninService>>,
     signup: Option<Arc<dyn SignupService>>,
@@ -43,6 +44,18 @@ pub struct AppServices {
 }
 
 impl AppServices {
+    pub fn with_payment_notification_service(
+        mut self,
+        service: Arc<dyn crate::payment_handlers::PaymentNotificationService>,
+    ) -> Self {
+        self.payment_notification = Some(service);
+        self
+    }
+    pub fn payment_notification_service(
+        &self,
+    ) -> Option<&Arc<dyn crate::payment_handlers::PaymentNotificationService>> {
+        self.payment_notification.as_ref()
+    }
     pub fn new() -> Self {
         Self::default()
     }

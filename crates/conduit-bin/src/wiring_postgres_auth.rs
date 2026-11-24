@@ -173,6 +173,22 @@ impl ApiKeyValidationService for PgApiKeyValidationService {
         )
         .await
         .map_err(|_| ApiKeyValidationError::Internal)?;
+        let group = crate::wiring_postgres_groups::trusted_key_group(
+            &self.pool,
+            row.id
+                .parse::<i64>()
+                .map_err(|_| ApiKeyValidationError::Internal)?,
+            row.user_id
+                .as_deref()
+                .and_then(|id| id.parse::<i64>().ok())
+                .ok_or(ApiKeyValidationError::Invalid)?,
+            project_id,
+        )
+        .await
+        .map_err(|_| ApiKeyValidationError::Internal)?;
+        let (model_group_id, model_group_revision, group_models) =
+            group.ok_or(ApiKeyValidationError::Invalid)?;
+        let group_models = group_models.into_iter().collect::<BTreeSet<_>>();
         let key_models = active
             .filter(|p| !p.model_ids.is_empty())
             .map(|p| p.model_ids.iter().cloned().collect::<BTreeSet<_>>());
@@ -182,6 +198,9 @@ impl ApiKeyValidationService for PgApiKeyValidationService {
         let mut channels_by_model = std::collections::BTreeMap::new();
         let mut upstreams_by_model = std::collections::BTreeMap::new();
         for (model, channels) in &access.routes_by_model {
+            if !group_models.contains(model) {
+                continue;
+            }
             if key_models
                 .as_ref()
                 .is_some_and(|allowed| !allowed.contains(model))
@@ -242,6 +261,8 @@ impl ApiKeyValidationService for PgApiKeyValidationService {
             .and_then(|m| serde_json::to_string(&m).ok())
             .unwrap_or_default();
         Ok(ValidatedApiKeyMetadata {
+            model_group_id,
+            model_group_revision,
             api_key_id: row
                 .id
                 .parse()
@@ -582,10 +603,14 @@ impl SignupService for PgSignupService {
             .begin()
             .await
             .map_err(|e| SignupError::Internal(e.to_string()))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(4850181378862437889),set_config('conduit.auth_registration','authorized',true)")
+            .execute(&mut *tx).await.map_err(|_|SignupError::Internal("signup authority failed".into()))?;
         let user_id=sqlx::query_scalar::<_,i64>("INSERT INTO users(email,status,prefer_language,password,first_name,last_name,is_owner,scopes) VALUES($1,'activated','en',$2,$3,$4,FALSE,'[]'::jsonb) RETURNING id")
             .bind(&email).bind(password).bind(&first_name).bind(&last_name).fetch_one(&mut *tx).await.map_err(|e|if e.as_database_error().and_then(|e|e.code()).is_some_and(|v|v=="23505"){SignupError::EmailTaken}else{SignupError::Internal(e.to_string())})?;
         let project_id=sqlx::query_scalar::<_,i64>("INSERT INTO projects(name,description,status,profiles) VALUES($1,'Private workspace created during signup','active','{}'::jsonb) RETURNING id")
-            .bind(format!("Personal Workspace #{user_id}")).fetch_one(&mut *tx).await.map_err(|e|SignupError::Internal(e.to_string()))?;
+              .bind(format!("Personal Workspace #{user_id}")).fetch_one(&mut *tx).await.map_err(|e|SignupError::Internal(e.to_string()))?;
+        sqlx::query("SELECT set_config('conduit.registration_user',$1,true),set_config('conduit.registration_project',$2,true)").bind(user_id.to_string()).bind(project_id.to_string())
+            .execute(&mut *tx).await.map_err(|_|SignupError::Internal("personal workspace authority failed".into()))?;
         sqlx::query("INSERT INTO project_commercial_profiles(project_id,account_type,billing_currency,status,created_at,updated_at) VALUES($1,'personal','STATION_CREDIT','active',now(),now())")
             .bind(project_id).execute(&mut *tx).await.map_err(|e|SignupError::Internal(e.to_string()))?;
         let owner_scopes = vec![

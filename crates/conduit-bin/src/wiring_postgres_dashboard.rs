@@ -640,12 +640,14 @@ impl DashboardServices for PgDashboardQueryAdapter {
         let tail = " GROUP BY a.id,a.name \
             ORDER BY (SUM(u.prompt_tokens)+SUM(u.completion_tokens)) DESC LIMIT 10";
         let rows: Vec<(i64, String, i64, i64, i64, i64, i64)> = if let Some(since) = since {
-            sqlx::query_as(&format!("{base} AND u.created_at >= $1{tail}"))
-                .bind(since)
-                .fetch_all(&self.pool)
-                .await
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!(
+                "{base} AND u.created_at >= $1{tail}"
+            )))
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
         } else {
-            sqlx::query_as(&format!("{base}{tail}"))
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!("{base}{tail}")))
                 .fetch_all(&self.pool)
                 .await
         }
@@ -738,7 +740,7 @@ impl DashboardServices for PgDashboardQueryAdapter {
              FROM usage_logs WHERE created_at >= $1 AND created_at < $2 \
              GROUP BY day ORDER BY day"
         );
-        let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(&sql)
+        let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&sql))
             .bind(start)
             .bind(now)
             .fetch_all(&self.pool)
@@ -787,7 +789,7 @@ impl DashboardServices for PgDashboardQueryAdapter {
             "SELECT {hour} AS hour,COUNT(*)::BIGINT FROM usage_logs \
              WHERE created_at >= $1 AND created_at < $2 GROUP BY hour ORDER BY hour"
         );
-        let rows: Vec<(i64, i64)> = sqlx::query_as(&sql)
+        let rows: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&sql))
             .bind(start)
             .bind(start + Duration::days(1))
             .fetch_all(&self.pool)
@@ -930,11 +932,12 @@ impl DashboardServices for PgDashboardQueryAdapter {
             "se.channel_id,c.name,c.\"type\"",
             (limit as i64 * 4).max(20),
         );
-        let rows: Vec<(i64, String, String, i64, i64, i64, f64)> = sqlx::query_as(&sql)
-            .bind(since)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| token_error("failed to query fastest channels", error))?;
+        let rows: Vec<(i64, String, String, i64, i64, i64, f64)> =
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&sql))
+                .bind(since)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|error| token_error("failed to query fastest channels", error))?;
         Ok(confidence_top_n(rows, |row| row.5, |row| row.6, limit)
             .into_iter()
             .map(
@@ -966,11 +969,12 @@ impl DashboardServices for PgDashboardQueryAdapter {
             "r.model_id,m.name",
             (limit as i64 * 4).max(20),
         );
-        let rows: Vec<(String, String, i64, i64, i64, f64)> = sqlx::query_as(&sql)
-            .bind(since)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| token_error("failed to query fastest models", error))?;
+        let rows: Vec<(String, String, i64, i64, i64, f64)> =
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&sql))
+                .bind(since)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|error| token_error("failed to query fastest models", error))?;
         Ok(confidence_top_n(rows, |row| row.4, |row| row.5, limit)
             .into_iter()
             .map(
@@ -998,7 +1002,7 @@ impl DashboardServices for PgDashboardQueryAdapter {
             "JOIN requests r ON r.id=se.request_id",
         );
         let rows: Vec<(String, String, i64, i64, Option<f64>, i64, Option<f64>)> =
-            sqlx::query_as(&sql)
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&sql))
                 .bind(start)
                 .fetch_all(&self.pool)
                 .await
@@ -1058,7 +1062,7 @@ impl DashboardServices for PgDashboardQueryAdapter {
              GROUP BY day,channel_id ORDER BY day,channel_id"
         );
         let probe_rows: Vec<(String, i64, i64, Option<f64>, Option<f64>)> =
-            sqlx::query_as(&probe_sql)
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&probe_sql))
                 .bind(start.timestamp())
                 .fetch_all(&self.pool)
                 .await
@@ -1073,7 +1077,7 @@ impl DashboardServices for PgDashboardQueryAdapter {
         }
         let sql = self.build_daily_perf_stats_sql("se.channel_id", "channel_id", "");
         let rows: Vec<(String, Option<i64>, i64, i64, Option<f64>, i64, Option<f64>)> =
-            sqlx::query_as(&sql)
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&sql))
                 .bind(start)
                 .fetch_all(&self.pool)
                 .await
@@ -1112,12 +1116,14 @@ impl DashboardServices for PgDashboardQueryAdapter {
         let tail = " GROUP BY c.id,c.name \
             ORDER BY (SUM(u.prompt_tokens)+SUM(u.completion_tokens)) DESC LIMIT 10";
         let rows: Vec<(i64, String, i64, i64, i64, i64, i64)> = if let Some(since) = since {
-            sqlx::query_as(&format!("{base} AND u.created_at >= $1{tail}"))
-                .bind(since)
-                .fetch_all(&self.pool)
-                .await
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!(
+                "{base} AND u.created_at >= $1{tail}"
+            )))
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
         } else {
-            sqlx::query_as(&format!("{base}{tail}"))
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!("{base}{tail}")))
                 .fetch_all(&self.pool)
                 .await
         }
@@ -1153,12 +1159,14 @@ impl DashboardServices for PgDashboardQueryAdapter {
         let tail = " GROUP BY model_id \
             ORDER BY (SUM(prompt_tokens)+SUM(completion_tokens)) DESC LIMIT 10";
         let rows: Vec<(String, i64, i64, i64, i64, i64)> = if let Some(since) = since {
-            sqlx::query_as(&format!("{base} AND created_at >= $1{tail}"))
-                .bind(since)
-                .fetch_all(&self.pool)
-                .await
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!(
+                "{base} AND created_at >= $1{tail}"
+            )))
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
         } else {
-            sqlx::query_as(&format!("{base}{tail}"))
+            sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!("{base}{tail}")))
                 .fetch_all(&self.pool)
                 .await
         }
@@ -1581,16 +1589,20 @@ mod tests {
         // database contains data from other opt-in integration tests.
         let admin_pool = PgPool::connect(&dsn).await?;
         let schema = format!("dashboard_test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-            .execute(&admin_pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "CREATE SCHEMA \"{schema}\""
+        )))
+        .execute(&admin_pool)
+        .await?;
         let search_path = format!("SET search_path TO \"{schema}\"");
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .after_connect(move |connection, _| {
                 let search_path = search_path.clone();
                 Box::pin(async move {
-                    sqlx::query(&search_path).execute(connection).await?;
+                    sqlx::query(sqlx::AssertSqlSafe::<&str>(&search_path))
+                        .execute(connection)
+                        .await?;
                     Ok(())
                 })
             })
@@ -2085,9 +2097,11 @@ mod tests {
         .await;
 
         pool.close().await;
-        let cleanup = sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
-            .execute(&admin_pool)
-            .await;
+        let cleanup = sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "DROP SCHEMA \"{schema}\" CASCADE"
+        )))
+        .execute(&admin_pool)
+        .await;
         admin_pool.close().await;
         outcome?;
         cleanup?;

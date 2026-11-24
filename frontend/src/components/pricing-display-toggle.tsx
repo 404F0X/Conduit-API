@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { usePricingDisplayStore, type PricingDisplayMode } from '@/stores/pricingDisplayStore';
 import { cn } from '@/lib/utils';
 import { usePermissions } from '@/hooks/usePermissions';
+import { useMode } from '@/features/product-experience';
 import { useGeneralSettings } from '@/features/system/data/system';
 
 export function PricingDisplayToggle() {
@@ -11,6 +12,7 @@ export function PricingDisplayToggle() {
   const { hasSystemScope } = usePermissions();
   const mode = usePricingDisplayStore((state) => state.mode);
   const setMode = usePricingDisplayStore((state) => state.setMode);
+  const uiMode = useMode();
   const options: Array<{ value: PricingDisplayMode; label: string; icon: typeof IconCash }> = [
     {
       value: 'accounting',
@@ -24,6 +26,8 @@ export function PricingDisplayToggle() {
     },
   ];
 
+  // 简单模式只有一种货币显示（站长设定的展示单位），不出现这个切换
+  if (uiMode === 'simple') return null;
   if (!hasSystemScope('read_commercialization')) return null;
 
   return (

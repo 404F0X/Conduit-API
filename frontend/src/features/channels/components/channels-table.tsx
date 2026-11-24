@@ -43,6 +43,7 @@ import { ChannelExpandedRow } from './channel-expanded-row';
 import { ChannelManagementAdapterBadge } from './channel-management-adapter-badge';
 import { ChannelOverflowMenu } from './channel-overflow-menu';
 import { DataTableToolbar } from './data-table-toolbar';
+import { NewApiChannelActions } from './new-api-discovery';
 
 const MotionTableRow = motion.create(TableRow);
 const MotionExpandedRow = motion.create(TableRow);
@@ -91,10 +92,13 @@ interface DataTableProps {
   onRetry?: () => void;
 }
 
+// 默认只显示 7 列以内：名称、类型、状态、模型、健康度、操作；其余列在“列设置”里可以打开
 const DEFAULT_COLUMN_VISIBILITY: VisibilityState = {
   tags: false,
   proxy: false,
   model: false,
+  orderingWeight: false,
+  createdAt: false,
 };
 
 export function ChannelsTable({
@@ -366,6 +370,11 @@ export function ChannelsTable({
                   <Badge variant='destructive'>{t(`channels.operations.failureKinds.${channel.operationalIssue.category}`)}</Badge>
                 )}
               </div>
+              {channel.settings?.managementAdapter === 'new_api' && (
+                <div className='mt-4 border-t pt-3'>
+                  <NewApiChannelActions channel={channel} />
+                </div>
+              )}
               <div className='mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3'>
                 <Button
                   size='sm'

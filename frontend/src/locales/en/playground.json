@@ -21,5 +21,12 @@
   "playground.errors.noChannelsAvailable": "No channels available",
   "playground.errors.noModelsAvailable": "No models available",
   "playground.modelsAvailable": "{{count}} models available across {{channels}} channels",
-  "playground.modelPageModelsAvailable": "{{count}} model gateway models available"
+  "playground.modelPageModelsAvailable": "{{count}} model gateway models available",
+  "playground.settings.apiKey": "API key",
+  "playground.settings.keyNotice": "Paste a key copied when creating it. Kept only on this page; changing project or leaving clears it. The key’s project controls access and billing.",
+  "playground.settings.createKey": "Create or manage API keys",
+  "playground.settings.loadModels": "Load available models",
+  "playground.errors.http": "Request failed (HTTP {{status}}). Check the key, access and balance.",
+  "playground.errors.request": "Request failed or the stream ended unexpectedly. Check your connection and settings. Retrying sends a new billable request.",
+  "playground.chat.retryNotice": "Retry sends a new request with normal usage charges."
 }

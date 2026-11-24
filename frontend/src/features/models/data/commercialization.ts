@@ -29,7 +29,7 @@ export type PriceBookItem = {
   id: string;
   publicModelID: string;
   publicModelKey: string;
-  price: { items: Array<{ itemCode: string; pricing: { mode: string; usagePerUnit?: string; flatFee?: string } }> };
+  price: unknown;
 };
 
 export type PriceBookVersion = {
@@ -185,4 +185,15 @@ export function useCreatePriceBook() {
       graphqlRequest<{ createPriceBook: { id: string } }>(CREATE_BOOK, { input }),
     true
   );
+}
+
+// Reuse the authorized group directory used by group management.
+export function usePricingModelGroups(enabled: boolean) {
+  return useQuery({
+    queryKey: ['pricingModelGroups'],
+    queryFn: async () =>
+      (await graphqlRequest<{ modelGroups: Array<{ id: string; name: string; status: string }> }>('{ modelGroups { id name status } }'))
+        .modelGroups,
+    enabled,
+  });
 }

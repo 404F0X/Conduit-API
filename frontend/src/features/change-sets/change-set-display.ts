@@ -1,6 +1,6 @@
 import type { ChangeSet } from './data/change-sets';
 
-export const ACTIONABLE_CHANGE_SET_STATUSES = ['DRAFT', 'PENDING_REVIEW', 'INVALID'] as const;
+export const ACTIONABLE_CHANGE_SET_STATUSES = ['DRAFT', 'PENDING_REVIEW', 'APPROVED', 'INVALID'] as const;
 
 export function getLastRelevantTime(changeSet: ChangeSet): string {
   return changeSet.appliedAt ?? changeSet.reviewedAt ?? changeSet.submittedAt ?? changeSet.updatedAt ?? changeSet.createdAt;

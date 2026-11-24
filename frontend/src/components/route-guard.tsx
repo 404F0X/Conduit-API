@@ -1,8 +1,9 @@
 import { useEffect } from 'react';
 import { useLocation, useRouter } from '@tanstack/react-router';
 import { IconShieldX, IconArrowLeft } from '@tabler/icons-react';
-import { getRouteConfig } from '@/config/route-permission';
+import { findAppRoute, requiredScopesFor } from '@/config/app-routes';
 import { useTranslation } from 'react-i18next';
+import { satisfiesScopes } from '@/lib/permission-core';
 import { useRoutePermissions } from '@/hooks/useRoutePermissions';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -10,34 +11,34 @@ import { useProductExperience, isProductModeAllowed, type ProductMode } from '@/
 
 interface RouteGuardProps {
   children: React.ReactNode;
+  /** 不传时按路由注册表（config/app-routes.ts）里当前模式的要求判断 */
   requiredScopes?: string[];
+  /** 不传时按路由注册表的 scopeMatch 判断 */
   requireAll?: boolean;
   fallbackPath?: string;
   showForbidden?: boolean;
   productModes?: ProductMode[];
 }
 
-export function RouteGuard({
-  children,
-  requiredScopes = [],
-  requireAll = false,
-  fallbackPath,
-  showForbidden = true,
-  productModes,
-}: RouteGuardProps) {
+export function RouteGuard({ children, requiredScopes, requireAll, fallbackPath, showForbidden = true, productModes }: RouteGuardProps) {
   const router = useRouter();
   const location = useLocation();
-  const { userScopes, isOwner } = useRoutePermissions();
+  const { scopeSets } = useRoutePermissions();
   const { mode: productMode, isLoading: isProductModeLoading, homePath } = useProductExperience();
-  const configuredProductModes = productModes ?? getRouteConfig(location.pathname)?.productModes;
+  const appRoute = findAppRoute(location.pathname);
+  const configuredProductModes = productModes ?? appRoute?.modes;
   const isModeAllowed = isProductModeAllowed(productMode, configuredProductModes);
   const resolvedFallbackPath = fallbackPath ?? homePath;
 
-  // 检查用户是否有所需权限
-  const hasRequiredScopes = requireAll
-    ? requiredScopes.every((scope) => userScopes.includes(scope))
-    : requiredScopes.some((scope) => userScopes.includes(scope));
-  const hasAccess = isOwner || userScopes.includes('*') || requiredScopes.length === 0 || hasRequiredScopes;
+  // 检查用户是否有所需权限（规则统一在 lib/permission-core.ts）
+  const effectiveScopes = requiredScopes ?? (appRoute ? requiredScopesFor(appRoute, productMode) : undefined);
+  const effectiveMatch = requireAll === undefined ? (appRoute?.scopeMatch ?? 'any') : requireAll ? 'all' : 'any';
+  const hasAccess = satisfiesScopes(
+    scopeSets,
+    effectiveScopes,
+    effectiveMatch,
+    requiredScopes === undefined ? (appRoute?.scopeLevel ?? 'any') : 'any'
+  );
 
   useEffect(() => {
     if (!isProductModeLoading && !isModeAllowed) {

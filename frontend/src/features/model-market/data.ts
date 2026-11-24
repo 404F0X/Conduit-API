@@ -19,6 +19,16 @@ const routeSchema = z.object({
   routeType: z.string(),
   health: healthSchema.nullable(),
 });
+const pricingSchema = z.object({
+  mode: z.enum(['flat_fee', 'usage_per_unit', 'usage_tiered', 'usage_volume']),
+  amount: z.string().nullable(),
+  tiers: z.array(z.object({ above: z.string(), upTo: z.string().nullable(), pricePerMillion: z.string() })),
+});
+const priceItemSchema = z.object({
+  itemCode: z.string(),
+  pricing: pricingSchema,
+  promptWriteCacheVariants: z.array(z.object({ variantCode: z.string(), pricing: pricingSchema })),
+});
 const modelSchema = z.object({
   id: z.string(),
   modelId: z.string(),
@@ -30,6 +40,13 @@ const modelSchema = z.object({
   contextLimit: z.number().nullable(),
   outputLimit: z.number().nullable(),
   price: z.object({
+    status: z.enum(['PRICED', 'UNPRICED', 'UNAVAILABLE']),
+    items: z.array(priceItemSchema),
+    branches: z.array(
+      z.object({ source: z.string(), label: z.string(), condition: z.string().nullable(), items: z.array(priceItemSchema) })
+    ),
+    source: z.string(),
+    priceBookVersion: z.string().nullable(),
     currency: z.string(),
     displayName: z.string(),
     inputPerMillion: z.string().nullable(),
@@ -43,17 +60,40 @@ const modelSchema = z.object({
   health: healthSchema.nullable(),
 });
 
-const responseSchema = z.object({ myModelCatalog: z.object({ models: z.array(modelSchema), healthVisible: z.boolean() }) });
+const responseSchema = z.object({
+  myModelCatalog: z.object({
+    models: z.array(modelSchema),
+    healthVisible: z.boolean(),
+    priceScopes: z.array(
+      z.object({
+        id: z.string(),
+        label: z.string(),
+        modelGroupID: z.string(),
+        modelGroupRevision: z.number(),
+        apiKeyID: z.string().nullable(),
+      })
+    ),
+    selectedPriceScope: z.string().nullable(),
+  }),
+});
 export type CatalogModel = z.infer<typeof modelSchema>;
 export type CatalogRoute = z.infer<typeof routeSchema>;
 
 const QUERY = `
-  query MyModelCatalog {
-    myModelCatalog {
-      healthVisible
+  query MyModelCatalog($modelGroupID: ID, $apiKeyID: ID) {
+    myModelCatalog(modelGroupID: $modelGroupID, apiKeyID: $apiKeyID) {
+      healthVisible selectedPriceScope
+      priceScopes { id label modelGroupID modelGroupRevision apiKeyID }
       models {
         id modelId name group developer modelType capabilities contextLimit outputLimit
         price {
+          status source priceBookVersion
+          branches { source label condition items { itemCode pricing { mode amount tiers { above upTo pricePerMillion } } promptWriteCacheVariants { variantCode pricing { mode amount tiers { above upTo pricePerMillion } } } } }
+          items {
+            itemCode
+            pricing { mode amount tiers { above upTo pricePerMillion } }
+            promptWriteCacheVariants { variantCode pricing { mode amount tiers { above upTo pricePerMillion } } }
+          }
           currency displayName inputPerMillion outputPerMillion
           cacheReadPerMillion cacheWritePerMillion effectiveMultiplier billable
         }
@@ -67,13 +107,13 @@ const QUERY = `
   }
 `;
 
-export function useMyModelCatalog() {
+export function useMyModelCatalog(scope?: { modelGroupID?: string; apiKeyID?: string }) {
   const selectedProjectId = useSelectedProjectId();
   return useQuery({
-    queryKey: ['myModelCatalog', selectedProjectId],
+    queryKey: ['myModelCatalog', selectedProjectId, scope],
     queryFn: async () =>
       responseSchema.parse(
-        await graphqlRequest<unknown>(QUERY, undefined, {
+        await graphqlRequest<unknown>(QUERY, scope, {
           'X-Project-ID': selectedProjectId!,
         })
       ).myModelCatalog,

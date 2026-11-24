@@ -149,7 +149,13 @@ pub const CREDIT_REDEMPTIONS_SCHEMA_VERSION: &str = "000033";
 pub const CREDIT_REDEMPTION_LIMITS_SCHEMA_VERSION: &str = "000034";
 pub const API_KEY_CONCURRENCY_LEASES_SCHEMA_VERSION: &str = "000035";
 pub const RECOVERY_LIFECYCLE_SCHEMA_VERSION: &str = "000036";
-pub const LATEST_SCHEMA_VERSION: &str = RECOVERY_LIFECYCLE_SCHEMA_VERSION;
+pub const CHANGE_OPERATION_DISCOVERY_SCHEMA_VERSION: &str = "000037";
+pub const PRODUCT_GOVERNANCE_SCHEMA_VERSION: &str = "000038";
+pub const MODEL_PRICE_FORMULAS_SCHEMA_VERSION: &str = "000039";
+pub const USER_MODEL_GROUPS_SCHEMA_VERSION: &str = "000040";
+pub const PAYMENT_TOPUPS_SCHEMA_VERSION: &str = "000041";
+pub const GOVERNANCE_ACCOUNTING_LOCK_ORDER_SCHEMA_VERSION: &str = "000042";
+pub const LATEST_SCHEMA_VERSION: &str = GOVERNANCE_ACCOUNTING_LOCK_ORDER_SCHEMA_VERSION;
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
 
 // Keep this stable across releases: an instance running an older binary must
@@ -337,6 +343,32 @@ const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
         version: RECOVERY_LIFECYCLE_SCHEMA_VERSION,
         sql: include_str!("../../../migrations/postgres/000036_recovery_lifecycle.sql"),
     },
+    EmbeddedMigration {
+        version: CHANGE_OPERATION_DISCOVERY_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000037_change_operation_discovery.sql"),
+    },
+    EmbeddedMigration {
+        version: PRODUCT_GOVERNANCE_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000038_product_governance.sql"),
+    },
+    EmbeddedMigration {
+        version: MODEL_PRICE_FORMULAS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000039_model_price_formulas.sql"),
+    },
+    EmbeddedMigration {
+        version: USER_MODEL_GROUPS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000040_user_model_groups.sql"),
+    },
+    EmbeddedMigration {
+        version: PAYMENT_TOPUPS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000041_payment_topups.sql"),
+    },
+    EmbeddedMigration {
+        version: GOVERNANCE_ACCOUNTING_LOCK_ORDER_SCHEMA_VERSION,
+        sql: include_str!(
+            "../../../migrations/postgres/000042_governance_accounting_lock_order.sql"
+        ),
+    },
 ];
 
 pub(crate) fn required_postgres_schema_versions() -> impl Iterator<Item = &'static str> {
@@ -418,11 +450,11 @@ async fn run_postgres_migration_catalog(
     let migrations = prepare_postgres_migration_catalog(migrations)?;
     let mut transaction = conn.begin().await?;
     let result: Result<Option<&'static str>, MigrationRunnerError> = async {
-        sqlx::query(POSTGRES_MIGRATION_LOCK_SQL)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(POSTGRES_MIGRATION_LOCK_SQL))
             .bind(POSTGRES_MIGRATION_LOCK_KEY)
             .execute(&mut *transaction)
             .await?;
-        sqlx::query(CREATE_TRACKING_TABLE_SQL)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(CREATE_TRACKING_TABLE_SQL))
             .execute(&mut *transaction)
             .await?;
 
@@ -439,10 +471,12 @@ async fn run_postgres_migration_catalog(
             }
 
             for statement in &migration.statements {
-                sqlx::raw_sql(statement).execute(&mut *transaction).await?;
+                sqlx::raw_sql(sqlx::AssertSqlSafe::<&str>(statement))
+                    .execute(&mut *transaction)
+                    .await?;
             }
 
-            sqlx::query(MIGRATION_APPLIED_SQL)
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(MIGRATION_APPLIED_SQL))
                 .bind(migration.version)
                 .bind(rfc3339_utc_now())
                 .execute(&mut *transaction)
@@ -691,7 +725,38 @@ mod tests {
             migrations.last().map(|migration| migration.version),
             Some(LATEST_SCHEMA_VERSION)
         );
-        assert_eq!(migrations.len(), 33);
+        assert_eq!(migrations.len(), 39);
+        assert_eq!(
+            migrations[36..]
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            vec!["000040", "000041", "000042"]
+        );
+        for version in ["000040", "000041", "000042"] {
+            assert_eq!(
+                migrations
+                    .iter()
+                    .filter(|migration| migration.version == version)
+                    .count(),
+                1
+            );
+        }
+        let groups = migration_sql(&migrations, USER_MODEL_GROUPS_SCHEMA_VERSION)?;
+        assert!(groups.contains("CREATE TABLE model_groups"));
+        assert!(groups.contains("CREATE TABLE user_groups"));
+        let payments = migration_sql(&migrations, PAYMENT_TOPUPS_SCHEMA_VERSION)?;
+        assert!(payments.contains("CREATE TABLE payment_orders"));
+        assert!(payments.contains("payment_topup_one_ledger_per_order"));
+        let governance = migration_sql(&migrations, PRODUCT_GOVERNANCE_SCHEMA_VERSION)?;
+        assert!(governance.contains("CREATE TABLE project_member_spend_state"));
+        assert!(governance.contains("MEMBER_SPEND_LIMIT_EXCEEDED"));
+        assert!(governance.contains("CREATE TABLE governed_change_commands"));
+        let operation_discovery =
+            migration_sql(&migrations, CHANGE_OPERATION_DISCOVERY_SCHEMA_VERSION)?;
+        assert!(operation_discovery.contains("CREATE TABLE channel_operation_receipts"));
+        assert!(operation_discovery.contains("change_sets_operation_scope"));
+        assert!(operation_discovery.contains("ADD COLUMN operation_id UUID"));
         let recovery = migration_sql(&migrations, RECOVERY_LIFECYCLE_SCHEMA_VERSION)?;
         assert!(recovery.contains("CREATE TABLE usage_recovery_receipts"));
         assert!(recovery.contains("CREATE TABLE maintenance_claims"));
@@ -898,7 +963,7 @@ mod tests {
         assert_eq!(prepared.len(), EMBEDDED_MIGRATIONS.len());
         assert_eq!(
             prepared.last().map(|migration| migration.version),
-            Some(RECOVERY_LIFECYCLE_SCHEMA_VERSION)
+            Some(LATEST_SCHEMA_VERSION)
         );
 
         let redemption_limits = prepared

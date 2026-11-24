@@ -534,6 +534,10 @@ impl PgBillingAdapter {
         _force_initial: bool,
     ) -> Result<(), gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(gql::BillingError::Invalid)?;
+        require_subscription_management(&mut tx).await?;
         refresh_locked(&mut tx, subscription_id).await?;
         tx.commit().await.map_err(storage)
     }
@@ -546,6 +550,10 @@ impl PgBillingAdapter {
         disable_auto_renew: bool,
     ) -> Result<(), gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(gql::BillingError::Invalid)?;
+        require_subscription_management(&mut tx).await?;
         set_inactive_locked(
             &mut tx,
             subscription_id,
@@ -564,111 +572,12 @@ impl PgBillingAdapter {
         reset_period: bool,
     ) -> Result<(), gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let row = sqlx::query(
-            "SELECT s.plan_id,s.status,s.current_period_start,s.current_period_end, \
-                    s.assigned_interval_unit AS interval_unit, \
-                    s.assigned_interval_count AS interval_count,p.status AS plan_status \
-             FROM user_subscriptions s JOIN subscription_plans p ON p.id=s.plan_id \
-             WHERE s.id=$1 FOR UPDATE OF s",
-        )
-        .bind(subscription_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        .ok_or_else(|| gql::BillingError::NotFound(format!("subscription {subscription_id}")))?;
-        if row.get::<String, _>("plan_status") != "enabled" {
-            return Err(gql::BillingError::Invalid(
-                "subscription plan is not enabled".into(),
-            ));
-        }
-        let current: String = row.get("status");
-        if current == "active" {
-            tx.commit().await.map_err(storage)?;
-            return Ok(());
-        }
-        if current != source_status {
-            return Err(gql::BillingError::Invalid(format!(
-                "subscription cannot transition from {current} to active"
-            )));
-        }
-
-        let now = Utc::now();
-        let old_start: DateTime<Utc> = row.get("current_period_start");
-        let old_end: DateTime<Utc> = row.get("current_period_end");
-        let needs_new_period = reset_period || old_end <= now;
-        let (start, end) = if needs_new_period {
-            let interval_count = positive_interval_count(row.get("interval_count"))?;
-            (
-                now,
-                next_period(
-                    now,
-                    row.get::<String, _>("interval_unit").as_str(),
-                    interval_count,
-                )?,
-            )
-        } else {
-            (old_start, old_end)
-        };
-        lock_live_model_group_versions(&mut tx).await?;
-        let access_versions = subscription_access_versions(&mut tx, subscription_id).await?;
-        sync_subscription_access_grants(
-            &mut tx,
-            subscription_id,
-            &access_versions,
-            start,
-            end,
-            now,
-        )
-        .await?;
-        if needs_new_period {
-            issue_period_buckets(
-                &mut tx,
-                subscription_id,
-                start,
-                end,
-                "active",
-                if source_status == "paused" && !reset_period {
-                    Some(old_start)
-                } else {
-                    None
-                },
-                now,
-            )
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(gql::BillingError::Invalid)?;
+        require_subscription_management(&mut tx).await?;
+        reactivate_subscription_in_tx(&mut tx, subscription_id, source_status, reset_period)
             .await?;
-        } else {
-            sqlx::query(
-                "UPDATE subscription_allowance_buckets SET status='active',updated_at=$1 \
-                 WHERE subscription_id=$2 AND status=$3 AND expires_at>$1",
-            )
-            .bind(now)
-            .bind(subscription_id)
-            .bind(source_status)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            sqlx::query(
-                "UPDATE subscription_allowance_buckets SET \
-                 status=CASE WHEN reserved_micros>0 THEN 'draining' ELSE 'expired' END,updated_at=$1 \
-                 WHERE subscription_id=$2 AND status=$3 AND expires_at<=$1",
-            )
-            .bind(now)
-            .bind(subscription_id)
-            .bind(source_status)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        }
-        sqlx::query(
-            "UPDATE user_subscriptions SET status='active',current_period_start=$1, \
-             current_period_end=$2,updated_at=$3 WHERE id=$4",
-        )
-        .bind(start)
-        .bind(end)
-        .bind(now)
-        .bind(subscription_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
         tx.commit().await.map_err(storage)
     }
 
@@ -679,6 +588,13 @@ impl PgBillingAdapter {
         let mut processed = 0;
         loop {
             let mut tx = self.pool.begin().await.map_err(storage)?;
+            crate::wiring_governance::lock_policy(&mut tx)
+                .await
+                .map_err(gql::BillingError::Invalid)?;
+            sqlx::query("SELECT set_config('conduit.issued_entitlement','authorized',true)")
+                .execute(&mut *tx)
+                .await
+                .map_err(storage)?;
             let due = sqlx::query(
                 "SELECT s.id,s.status,s.auto_renew,p.status AS plan_status \
                  FROM user_subscriptions s JOIN subscription_plans p ON p.id=s.plan_id \
@@ -1686,10 +1602,202 @@ fn subscription_grant_source_id(subscription_id: i64, access_plan_id: i64) -> St
 
 #[async_trait::async_trait]
 impl gql::BillingServices for PgBillingAdapter {
+    async fn my_project_funds(
+        &self,
+        user: &str,
+        project: &str,
+        model: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<gql::MyProjectFunds, gql::BillingError> {
+        let user_id = parse_id(user)?;
+        let project_id = parse_id(project)?;
+        let mut tx = self.begin_read_snapshot().await?;
+        let member:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_projects up JOIN users u ON u.id=up.user_id JOIN projects p ON p.id=up.project_id WHERE up.user_id=$1 AND up.project_id=$2 AND u.deleted_at=0 AND u.status='activated' AND p.deleted_at=0 AND p.status='active')").bind(user_id).bind(project_id).fetch_one(&mut *tx).await.map_err(storage)?;
+        if !member {
+            return Err(gql::BillingError::Invalid(
+                "current Project membership is required".into(),
+            ));
+        }
+        let model = if let Some(model) = model {
+            if let Ok(id) = parse_id(model) {
+                Some(id)
+            } else {
+                Some(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT id FROM models WHERE model_id=$1 AND deleted_at=0",
+                    )
+                    .bind(model)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        gql::BillingError::Invalid("selected model does not exist".into())
+                    })?,
+                )
+            }
+        } else {
+            None
+        };
+        let authorized = if let Some(model) = model {
+            let key: Option<String> = sqlx::query_scalar(
+                "SELECT model_id FROM models WHERE id=$1 AND deleted_at=0 AND status='enabled'",
+            )
+            .bind(model)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?;
+            let access = crate::wiring_project_access::resolve_effective_project_access_in_tx(
+                &mut tx, project_id,
+            )
+            .await
+            .map_err(|_| gql::BillingError::Invalid("model authorization unavailable".into()))?;
+            key.is_some_and(|key| !access.channels_for_model(&key).is_empty())
+        } else {
+            false
+        };
+        let profile: Option<String> = sqlx::query_scalar("SELECT CASE WHEN account_type='personal' AND owner_user_id=$2 THEN 'personal' ELSE 'shared' END FROM project_commercial_profiles WHERE project_id=$1").bind(project_id).bind(user_id).fetch_optional(&mut *tx).await.map_err(storage)?;
+        let credit: i64 = sqlx::query_scalar("SELECT GREATEST(credit_balance_micros-credit_reserved_micros,0) FROM project_wallets WHERE project_id=$1 AND currency=$2 AND status='active'").bind(project_id).bind(STATION_CREDIT_CODE).fetch_optional(&mut *tx).await.map_err(storage)?.unwrap_or(0);
+        let buckets = sqlx::query("SELECT b.*,qr.rule_name,qr.access_plan_versions,ARRAY(SELECT m.model_id FROM subscription_entitlement_snapshot_items esi JOIN models m ON m.id=esi.public_model_id WHERE esi.snapshot_id=b.entitlement_snapshot_id AND esi.quota_rule_snapshot_id=b.quota_rule_snapshot_id ORDER BY m.model_id) AS model_ids, EXISTS(SELECT 1 FROM subscription_entitlement_snapshot_items esi WHERE esi.snapshot_id=b.entitlement_snapshot_id AND esi.quota_rule_snapshot_id=b.quota_rule_snapshot_id AND esi.public_model_id=$4) AS selected_model FROM subscription_allowance_buckets b JOIN user_subscriptions s ON s.id=b.subscription_id JOIN subscription_plans p ON p.id=s.plan_id JOIN user_subscription_projects sp ON sp.subscription_id=s.id JOIN user_subscription_quota_rule_snapshots qr ON qr.id=b.quota_rule_snapshot_id WHERE s.user_id=$1 AND sp.project_id=$2 AND s.status IN ('active','cancel_pending') AND b.status='active' AND b.period_start<=now() AND b.expires_at>now() AND p.currency=$3 ORDER BY b.expires_at,b.id")
+            .bind(user_id).bind(project_id).bind(STATION_CREDIT_CODE).bind(model).fetch_all(&mut *tx).await.map_err(storage)?;
+        let mut general = 0_i64;
+        let mut dedicated = 0_i64;
+        let mut dedicated_buckets = Vec::new();
+        for b in buckets {
+            let granted: i64 = b.get("granted_micros");
+            let consumed: i64 = b.get("consumed_micros");
+            let reserved: i64 = b.get("reserved_micros");
+            let remaining = granted
+                .saturating_sub(consumed)
+                .saturating_sub(reserved)
+                .max(0);
+            if b.get::<String, _>("quota_class") == "GENERAL" {
+                general = general.saturating_add(remaining);
+            } else {
+                if model.is_some() && b.get::<bool, _>("selected_model") {
+                    dedicated = dedicated.saturating_add(remaining);
+                }
+                dedicated_buckets.push(gql::SubscriptionAllowanceBucket {
+                    id: id(b.get("id")),
+                    name: b.get("rule_name"),
+                    quota_class: gql::QuotaClass::Dedicated,
+                    source_type: "SUBSCRIPTION".into(),
+                    period_start: wire_time(b.get("period_start")),
+                    period_end: wire_time(b.get("period_end")),
+                    expires_at: wire_time(b.get("expires_at")),
+                    granted_allowance: amount(granted),
+                    consumed_allowance: amount(consumed),
+                    reserved_allowance: amount(reserved),
+                    remaining_allowance: amount(remaining),
+                    status: "active".into(),
+                    access_plans: parse_access_version_snapshot(
+                        b.get::<Value, _>("access_plan_versions"),
+                    )?
+                    .into_iter()
+                    .map(|v| gql::SubscriptionAccessPlan {
+                        id: id(v.access_plan_id),
+                        name: v.name,
+                    })
+                    .collect(),
+                    model_ids: b.get("model_ids"),
+                    source_bucket_id: b.get::<Option<i64>, _>("source_bucket_id").map(id),
+                });
+            }
+        }
+        let state = sqlx::query_as::<_,(Option<i64>,i64,i64)>("SELECT s.limit_micros,s.spent_micros,(SELECT COALESCE(SUM(r.amount_micros),0)::BIGINT FROM project_wallet_reservations r JOIN project_wallets w ON w.id=r.wallet_id WHERE w.project_id=s.project_id AND r.user_id=s.user_id AND r.status IN ('reserved','shadow_reserved','capturing','soft_insufficient') AND (r.expires_at>now() OR r.status='capturing')) FROM project_member_spend_state s WHERE s.project_id=$1 AND s.user_id=$2").bind(project_id).bind(user_id).fetch_optional(&mut *tx).await.map_err(storage)?.unwrap_or((None,0,0));
+        let key_limits = if let Some(key) = key {
+            let key = parse_id(key)?;
+            let value: Option<Value> = sqlx::query_scalar("SELECT COALESCE(profiles,'{}'::jsonb) FROM api_keys WHERE id=$1 AND user_id=$2 AND project_id=$3 AND deleted_at=0").bind(key).bind(user_id).bind(project_id).fetch_optional(&mut *tx).await.map_err(storage)?;
+            let value = value.ok_or_else(|| {
+                gql::BillingError::Invalid(
+                    "API key does not belong to this member and Project".into(),
+                )
+            })?;
+            Some(async_graphql::Json(
+                json!({"profiles":value,"creditsUnit":"STATION_CREDIT","costUnit":"ACCOUNTING_CURRENCY","tokensUnit":"TOKENS","requestLimitEnforcement":"ATOMIC_ADMISSION","costAndTokenEnforcement":"HISTORICAL_THRESHOLD"}),
+            ))
+        } else {
+            None
+        };
+        let priced: bool = if let Some(model) = model {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM price_book_items i JOIN price_book_versions v ON v.id=i.price_book_version_id JOIN price_books b ON b.id=v.price_book_id WHERE i.public_model_id=$1 AND b.is_default=true AND b.status='enabled' AND v.status='published' AND (v.effective_start_at IS NULL OR v.effective_start_at<=now()) AND (v.effective_end_at IS NULL OR v.effective_end_at>now()))").bind(model).fetch_one(&mut *tx).await.map_err(storage)?
+        } else {
+            false
+        };
+        tx.commit().await.map_err(storage)?;
+        Ok(gql::MyProjectFunds {
+            project_id: project_node_id(project_id),
+            account_type: profile.clone().unwrap_or_else(|| "shared".into()),
+            shared: profile.as_deref() != Some("personal"),
+            currency: STATION_CREDIT_CODE.into(),
+            project_credit_available: amount(credit),
+            general_subscription_available: amount(general),
+            dedicated_subscription_available: amount(dedicated),
+            dedicated_buckets,
+            member_reserved: amount(state.2),
+            member_spent: amount(state.1),
+            member_limit: state.0.map(amount),
+            member_remaining: state
+                .0
+                .map(|v| amount(v.saturating_sub(state.1).saturating_sub(state.2).max(0))),
+            admission_available: amount({
+                let funding = credit.saturating_add(general).saturating_add(dedicated);
+                if model.is_some() && (!priced || !authorized) {
+                    0
+                } else {
+                    state
+                        .0
+                        .map(|limit| {
+                            funding
+                                .min(limit.saturating_sub(state.1).saturating_sub(state.2).max(0))
+                        })
+                        .unwrap_or(funding)
+                }
+            }),
+            key_limits,
+            selected_model_priced: priced,
+            selected_model_authorized: authorized,
+        })
+    }
+
+    async fn project_member_spend_limit(
+        &self,
+        project: &str,
+        user: &str,
+    ) -> Result<gql::ProjectMemberSpendLimit, gql::BillingError> {
+        let funds = self.my_project_funds(user, project, None, None).await?;
+        Ok(gql::ProjectMemberSpendLimit {
+            project_id: funds.project_id,
+            user_id: user_node_id(parse_id(user)?),
+            limit: funds.member_limit,
+            spent: funds.member_spent,
+            reserved: funds.member_reserved,
+            remaining: funds.member_remaining,
+        })
+    }
     async fn user_balance(&self, user_id: &str) -> Result<gql::UserBalance, gql::BillingError> {
         self.user_balance_value(parse_id(user_id)?).await
     }
 
+    async fn set_project_member_spend_limit(
+        &self,
+        actor: i64,
+        project: &str,
+        user: &str,
+        limit: Option<String>,
+    ) -> Result<gql::ProjectMemberSpendLimit, gql::BillingError> {
+        let project_id = parse_id(project)?;
+        let user_id = parse_id(user)?;
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(gql::BillingError::Invalid)?;
+        crate::wiring_governance::authorize_project(&mut tx, actor, "write_billing", project_id)
+            .await
+            .map_err(gql::BillingError::Invalid)?;
+        set_member_limit_in_tx(&mut tx, project_id, user_id, limit).await?;
+        tx.commit().await.map_err(storage)?;
+        self.project_member_spend_limit(project, user).await
+    }
     async fn project_balance(
         &self,
         project_id: &str,
@@ -1770,7 +1878,18 @@ impl gql::BillingServices for PgBillingAdapter {
         let project_id = parse_id(project_id)?;
         ensure_user(&self.pool, user_id).await?;
         ensure_project_membership(&self.pool, user_id, project_id).await?;
-        self.project_balance_value(project_id).await
+        let funds = self
+            .my_project_funds(&user_id.to_string(), &project_id.to_string(), None, None)
+            .await?;
+        let mut balance = self.project_balance_value(project_id).await?;
+        balance.general_subscription_balance = funds.general_subscription_available.clone();
+        balance.dedicated_subscription_balance = "0".into();
+        balance.subscription_balance = funds.general_subscription_available;
+        balance.available_balance = amount(
+            parse_signed_amount(&funds.project_credit_available)?
+                + parse_signed_amount(&balance.subscription_balance)?,
+        );
+        Ok(balance)
     }
 
     async fn user_project_wallet_comparison(
@@ -1885,73 +2004,11 @@ impl gql::BillingServices for PgBillingAdapter {
         &self,
         input: gql::GrantProjectCreditInput,
     ) -> Result<gql::ProjectBalance, gql::BillingError> {
-        let project_id = parse_id(input.project_id.as_str())?;
-        ensure_project(&self.pool, project_id).await?;
-        let micros = parse_positive_amount(&input.amount)?;
-        let key = nonempty(input.idempotency_key, "idempotencyKey")?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        // The advisory lock makes same-key retries deterministic even if they
-        // target different wallets and race before the unique insert.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-            .bind(&key)
-            .execute(&mut *tx)
+        crate::wiring_governance::lock_policy(&mut tx)
             .await
-            .map_err(storage)?;
-        if let Some(existing) = sqlx::query(
-            "SELECT w.project_id,w.currency,e.amount_micros \
-             FROM project_credit_ledger_entries e \
-             JOIN project_wallets w ON w.id=e.wallet_id WHERE e.idempotency_key=$1",
-        )
-        .bind(&key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        {
-            if existing.get::<i64, _>("project_id") != project_id
-                || existing.get::<String, _>("currency") != STATION_CREDIT_CODE
-                || existing.get::<i64, _>("amount_micros") != micros
-            {
-                return Err(gql::BillingError::Invalid(
-                    "idempotencyKey was already used for a different Project credit grant".into(),
-                ));
-            }
-            tx.commit().await.map_err(storage)?;
-            return self.project_balance_value(project_id).await;
-        }
-        let now = Utc::now();
-        sqlx::query(
-            "INSERT INTO project_wallets(project_id,currency,status,created_at,updated_at) \
-             VALUES($1,$2,'active',$3,$3) ON CONFLICT(project_id,currency) DO NOTHING",
-        )
-        .bind(project_id)
-        .bind(STATION_CREDIT_CODE)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
-        let wallet_id = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM project_wallets WHERE project_id=$1 AND currency=$2 FOR UPDATE",
-        )
-        .bind(project_id)
-        .bind(STATION_CREDIT_CODE)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        sqlx::query(
-            "INSERT INTO project_credit_ledger_entries \
-             (wallet_id,amount_micros,entry_type,reference_type,reference_id, \
-              idempotency_key,description,metadata,created_at) \
-             VALUES($1,$2,'admin_grant','project',$3,$4,$5,'{}',$6)",
-        )
-        .bind(wallet_id)
-        .bind(micros)
-        .bind(project_id.to_string())
-        .bind(key)
-        .bind(input.description)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
+            .map_err(gql::BillingError::Invalid)?;
+        let project_id = grant_project_credit_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.project_balance_value(project_id).await
     }
@@ -1995,55 +2052,13 @@ impl gql::BillingServices for PgBillingAdapter {
         &self,
         input: gql::CreateSubscriptionPlanInput,
     ) -> Result<gql::SubscriptionPlan, gql::BillingError> {
-        let name = nonempty(input.name, "name")?;
-        let interval_count = input.interval_count.unwrap_or(1);
-        if interval_count <= 0 {
-            return Err(gql::BillingError::Invalid(
-                "intervalCount must be positive".into(),
-            ));
-        }
-        let quota_rules = validate_quota_rules(input.quota_rules)?;
-        if quota_rules.iter().any(|rule| rule.id.is_some()) {
-            return Err(gql::BillingError::Invalid(
-                "quota rule IDs cannot be supplied when creating a plan".into(),
-            ));
-        }
-        let access_plan_ids = parse_access_plan_ids(input.access_plan_ids)?;
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let referenced_access_plan_ids = referenced_access_plan_ids(&access_plan_ids, &quota_rules);
-        for access_plan_id in referenced_access_plan_ids {
-            ensure_access_plan_tx(&mut tx, *access_plan_id).await?;
-        }
-        let plan_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO subscription_plans \
-             (name,currency,interval_unit,interval_count,status,created_at,updated_at) \
-             VALUES($1,$2,$3,$4,'enabled',$5,$5) RETURNING id",
-        )
-        .bind(name)
-        .bind(STATION_CREDIT_CODE)
-        .bind(interval_to_wire(input.interval_unit))
-        .bind(interval_count)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        for access_plan_id in access_plan_ids {
-            sqlx::query(
-                "INSERT INTO subscription_plan_access_plans \
-                 (subscription_plan_id,access_plan_id,created_at,updated_at) \
-                 VALUES($1,$2,$3,$3)",
-            )
-            .bind(plan_id)
-            .bind(access_plan_id)
-            .bind(now)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-        }
-        for rule in quota_rules {
-            insert_quota_rule(&mut tx, plan_id, rule, now).await?;
-        }
+        let plan_id = create_subscription_plan_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.plan(plan_id).await
     }
@@ -2052,104 +2067,13 @@ impl gql::BillingServices for PgBillingAdapter {
         &self,
         input: gql::UpdateSubscriptionPlanInput,
     ) -> Result<gql::SubscriptionPlan, gql::BillingError> {
-        let plan_id = parse_id(input.id.as_str())?;
-        let name = nonempty(input.name, "name")?;
-        if input.interval_count <= 0 {
-            return Err(gql::BillingError::Invalid(
-                "intervalCount must be positive".into(),
-            ));
-        }
-        let quota_rules = validate_quota_rules(input.quota_rules)?;
-        let access_plan_ids = parse_access_plan_ids(input.access_plan_ids)?;
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        if sqlx::query_scalar::<_, i64>("SELECT id FROM subscription_plans WHERE id=$1 FOR UPDATE")
-            .bind(plan_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?
-            .is_none()
-        {
-            return Err(gql::BillingError::NotFound(format!(
-                "subscription plan {plan_id}"
-            )));
-        }
-        let referenced_access_plan_ids = referenced_access_plan_ids(&access_plan_ids, &quota_rules);
-        for access_plan_id in referenced_access_plan_ids {
-            ensure_access_plan_tx(&mut tx, *access_plan_id).await?;
-        }
-        sqlx::query(
-            "UPDATE subscription_plans SET name=$1,currency=$2,interval_unit=$3, \
-             interval_count=$4,status=$5,updated_at=$6 WHERE id=$7",
-        )
-        .bind(name)
-        .bind(STATION_CREDIT_CODE)
-        .bind(interval_to_wire(input.interval_unit))
-        .bind(input.interval_count)
-        .bind(status_to_wire(input.status))
-        .bind(now)
-        .bind(plan_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
-        sqlx::query("DELETE FROM subscription_plan_access_plans WHERE subscription_plan_id=$1")
-            .bind(plan_id)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-        for access_plan_id in access_plan_ids {
-            sqlx::query(
-                "INSERT INTO subscription_plan_access_plans \
-                 (subscription_plan_id,access_plan_id,created_at,updated_at) \
-                 VALUES($1,$2,$3,$3)",
-            )
-            .bind(plan_id)
-            .bind(access_plan_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        }
-        let existing_rule_ids = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM subscription_quota_rules WHERE subscription_plan_id=$1 FOR UPDATE",
-        )
-        .bind(plan_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(storage)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        let mut retained_rule_ids = BTreeSet::new();
-        for rule in quota_rules {
-            if let Some(rule_id) = rule.id {
-                if !existing_rule_ids.contains(&rule_id) {
-                    return Err(gql::BillingError::Invalid(format!(
-                        "quota rule {rule_id} does not belong to subscription plan {plan_id}"
-                    )));
-                }
-                if !retained_rule_ids.insert(rule_id) {
-                    return Err(gql::BillingError::Invalid(format!(
-                        "quota rule {rule_id} was supplied more than once"
-                    )));
-                }
-                update_quota_rule(&mut tx, rule_id, rule, now).await?;
-            } else {
-                let rule_id = insert_quota_rule(&mut tx, plan_id, rule, now).await?;
-                retained_rule_ids.insert(rule_id);
-            }
-        }
-        let retained_rule_ids = retained_rule_ids.into_iter().collect::<Vec<_>>();
-        sqlx::query(
-            "DELETE FROM subscription_quota_rules \
-             WHERE subscription_plan_id=$1 AND NOT (id=ANY($2))",
-        )
-        .bind(plan_id)
-        .bind(&retained_rule_ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
-        // Assignment terms and the selected model-group IDs are snapshots.
-        // Existing subscriptions are not rewritten by plan edits.
+        let plan_id = update_subscription_plan_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.plan(plan_id).await
     }
@@ -2158,134 +2082,13 @@ impl gql::BillingServices for PgBillingAdapter {
         &self,
         input: gql::AssignUserSubscriptionInput,
     ) -> Result<gql::UserSubscription, gql::BillingError> {
-        let user_id = parse_id(input.user_id.as_str())?;
-        let plan_id = parse_id(input.plan_id.as_str())?;
-        let project_id = parse_id(input.project_id.as_str())?;
-        let assignment_key = nonempty(input.idempotency_key, "idempotencyKey")?;
-        let initial_auto_renew = input.auto_renew.unwrap_or(true);
-        let assignment_request_snapshot = json!({
-            "schemaVersion": 1,
-            "userID": user_id,
-            "planID": plan_id,
-            "projectID": project_id,
-            "autoRenew": initial_auto_renew,
-            "intervalUnit": input.interval_unit.map(interval_to_wire),
-            "intervalCount": input.interval_count,
-        });
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        // Assignment keys are global, but the lock namespace is operation-specific
-        // so an unrelated idempotent operation may reuse the same caller key.
-        sqlx::query(
-            "SELECT pg_advisory_xact_lock(\
-             hashtextextended('conduit.billing.assign_user_subscription:' || $1::text,0))",
-        )
-        .bind(&assignment_key)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
-        if let Some(existing) = sqlx::query(
-            "SELECT id,assignment_request_snapshot FROM user_subscriptions \
-             WHERE assignment_key=$1",
-        )
-        .bind(&assignment_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        {
-            if existing.get::<Value, _>("assignment_request_snapshot")
-                != assignment_request_snapshot
-            {
-                return Err(gql::BillingError::Invalid(
-                    "idempotencyKey was already used for a different subscription assignment"
-                        .into(),
-                ));
-            }
-            let subscription_id = existing.get::<i64, _>("id");
-            tx.commit().await.map_err(storage)?;
-            return self.subscription(subscription_id).await;
-        }
-        ensure_user_tx(&mut tx, user_id).await?;
-        if sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM user_projects up JOIN projects p ON p.id=up.project_id \
-             WHERE up.user_id=$1 AND up.project_id=$2 AND p.status='active' AND p.deleted_at=0)",
-        )
-        .bind(user_id)
-        .bind(project_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?
-            == false
-        {
-            return Err(gql::BillingError::Invalid(format!(
-                "user {user_id} is not a member of active project {project_id}"
-            )));
-        }
-        let plan = sqlx::query(
-            "SELECT name,status,interval_unit,interval_count \
-             FROM subscription_plans WHERE id=$1 FOR SHARE",
-        )
-        .bind(plan_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        .ok_or_else(|| gql::BillingError::NotFound(format!("subscription plan {plan_id}")))?;
-        if plan.get::<String, _>("status") != "enabled" {
-            return Err(gql::BillingError::Invalid(
-                "subscription plan is not enabled".into(),
-            ));
-        }
-        let interval_unit = input
-            .interval_unit
-            .unwrap_or_else(|| interval_from_wire(plan.get::<String, _>("interval_unit").as_str()));
-        let interval_count = input
-            .interval_count
-            .unwrap_or_else(|| plan.get("interval_count"));
-        if interval_count <= 0 {
-            return Err(gql::BillingError::Invalid(
-                "intervalCount must be positive".into(),
-            ));
-        }
-        let now = Utc::now();
-        let end = next_period(
-            now,
-            interval_to_wire(interval_unit),
-            positive_interval_count(interval_count)?,
-        )?;
-        lock_live_model_group_versions(&mut tx).await?;
-        let versions = subscription_plan_access_versions(&mut tx, plan_id, now).await?;
-        let subscription_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO user_subscriptions \
-             (user_id,plan_id,assignment_key,assignment_request_snapshot,status, \
-              current_period_start,current_period_end,assigned_interval_unit, \
-              assigned_interval_count,auto_renew,created_at,updated_at) \
-             VALUES($1,$2,$3,$4,'active',$5,$6,$7,$8,$9,$5,$5) RETURNING id",
-        )
-        .bind(user_id)
-        .bind(plan_id)
-        .bind(assignment_key)
-        .bind(assignment_request_snapshot)
-        .bind(now)
-        .bind(end)
-        .bind(interval_to_wire(interval_unit))
-        .bind(interval_count)
-        .bind(initial_auto_renew)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        sqlx::query(
-            "INSERT INTO user_subscription_projects(subscription_id,project_id,created_at) \
-             VALUES($1,$2,$3)",
-        )
-        .bind(subscription_id)
-        .bind(project_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
-        snapshot_subscription_quota_rules(&mut tx, subscription_id, plan_id, now).await?;
-        issue_period_buckets(&mut tx, subscription_id, now, end, "active", None, now).await?;
-        snapshot_subscription_access_versions(&mut tx, subscription_id, &versions, now).await?;
-        sync_subscription_access_grants(&mut tx, subscription_id, &versions, now, end, now).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let subscription_id = assign_user_subscription_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.subscription(subscription_id).await
     }
@@ -2323,9 +2126,13 @@ impl gql::BillingServices for PgBillingAdapter {
         &self,
         subscription_id: &str,
     ) -> Result<gql::UserSubscription, gql::BillingError> {
-        let subscription_id = parse_id(subscription_id)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        cancel_pending_locked(&mut tx, subscription_id).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let subscription_id = cancel_user_subscription_in_tx(&mut tx, subscription_id).await?;
         tx.commit().await.map_err(storage)?;
         self.subscription(subscription_id).await
     }
@@ -2345,21 +2152,18 @@ impl gql::BillingServices for PgBillingAdapter {
         input: gql::SetSubscriptionAutoRenewInput,
     ) -> Result<gql::UserSubscription, gql::BillingError> {
         let subscription_id = parse_id(input.subscription_id.as_str())?;
-        let result = sqlx::query(
-            "UPDATE user_subscriptions SET auto_renew=$1,updated_at=$2 \
-             WHERE id=$3 AND status IN ('active','paused')",
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(gql::BillingError::Invalid)?;
+        subscription_action_in_tx(
+            &mut tx,
+            "auto_renew",
+            subscription_id,
+            Some(input.auto_renew),
         )
-        .bind(input.auto_renew)
-        .bind(Utc::now())
-        .bind(subscription_id)
-        .execute(&self.pool)
-        .await
-        .map_err(storage)?;
-        if result.rows_affected() == 0 {
-            return Err(gql::BillingError::Invalid(
-                "auto renewal can only be changed for an active or paused subscription".into(),
-            ));
-        }
+        .await?;
+        tx.commit().await.map_err(storage)?;
         self.subscription(subscription_id).await
     }
 
@@ -3832,4 +3636,769 @@ mod tests {
         );
         Ok(())
     }
+    #[tokio::test]
+    async fn lite_complete_funds_are_user_model_and_membership_scoped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_admin_graphql::governance::GovernanceServices as _;
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let pool = &db.pool;
+        let administrator:i64=sqlx::query_scalar("INSERT INTO users(email,password,status,is_owner) VALUES('funds-owner@contract.test','hash','activated',true) RETURNING id").fetch_one(pool).await?;
+        crate::wiring_governance::PgGovernanceAdapter::new(pool.clone())
+            .update_settings(
+                administrator,
+                conduit_admin_graphql::governance::UpdateGovernanceSettingsInput {
+                    enabled: false,
+                    review_kinds: vec![],
+                    allow_self_review: Some(true),
+                },
+                "0".into(),
+            )
+            .await?;
+        let mut users = Vec::new();
+        for email in ["funds-own@contract.test", "funds-other@contract.test"] {
+            users.push(sqlx::query_scalar::<_,i64>("INSERT INTO users(email,password,status) VALUES($1,'hash','activated') RETURNING id").bind(email).fetch_one(pool).await?);
+        }
+        let project:i64=sqlx::query_scalar("INSERT INTO projects(name,status,description,profiles) VALUES('funds shared','active','','{}') RETURNING id").fetch_one(pool).await?;
+        for user in &users {
+            sqlx::query("INSERT INTO user_projects(user_id,project_id,is_owner,scopes) VALUES($1,$2,false,'[]')").bind(user).bind(project).execute(pool).await?;
+        }
+        let (a, ma) = access_plan_with_model(pool, "own-funds", "a").await?;
+        let (b, mb) = access_plan_with_model(pool, "own-funds", "b").await?;
+        let (_, mc) = access_plan_with_model(pool, "own-funds", "c").await?;
+        let channel:i64=sqlx::query_scalar("INSERT INTO channels(type,name,status,credentials,supported_models,default_test_model) VALUES('openai','funds provider','enabled','{}','[\"upstream-a\",\"upstream-b\"]','') RETURNING id").fetch_one(pool).await?;
+        for (model, upstream) in [(ma, "upstream-a"), (mb, "upstream-b")] {
+            let deployment:i64=sqlx::query_scalar("INSERT INTO upstream_model_deployments(channel_id,upstream_model_id,internal_name,variant,source,status) VALUES($1,$2,$2,'default','manual','enabled') RETURNING id").bind(channel).bind(upstream).fetch_one(pool).await?;
+            sqlx::query("INSERT INTO model_routes(public_model_id,deployment_id,status) VALUES($1,$2,'enabled')").bind(model).bind(deployment).execute(pool).await?;
+        }
+        let adapter = PgBillingAdapter::new(pool.clone());
+        let mut plans = Vec::new();
+        for (label, plan, general, dedicated) in
+            [("own", a, "20", "30"), ("other", b, "100", "200")]
+        {
+            plans.push(
+                adapter
+                    .create_subscription_plan(gql::CreateSubscriptionPlanInput {
+                        name: label.into(),
+                        interval_unit: gql::SubscriptionIntervalUnit::Month,
+                        interval_count: Some(1),
+                        access_plan_ids: vec![id(plan)],
+                        quota_rules: vec![
+                            gql::SubscriptionQuotaRuleInput {
+                                id: None,
+                                name: "General".into(),
+                                quota_class: gql::QuotaClass::General,
+                                allowance: general.into(),
+                                rollover_mode: Some(gql::RolloverMode::None),
+                                rollover_cap: None,
+                                carryover_days: None,
+                                access_plan_ids: vec![],
+                            },
+                            gql::SubscriptionQuotaRuleInput {
+                                id: None,
+                                name: "Dedicated".into(),
+                                quota_class: gql::QuotaClass::Dedicated,
+                                allowance: dedicated.into(),
+                                rollover_mode: Some(gql::RolloverMode::None),
+                                rollover_cap: None,
+                                carryover_days: None,
+                                access_plan_ids: vec![id(plan)],
+                            },
+                        ],
+                    })
+                    .await?,
+            );
+        }
+        for (user, plan) in users.iter().zip(plans) {
+            adapter
+                .assign_user_subscription(gql::AssignUserSubscriptionInput {
+                    user_id: id(*user),
+                    plan_id: plan.id,
+                    project_id: id(project),
+                    idempotency_key: format!("own-funds-{user}"),
+                    auto_renew: Some(false),
+                    interval_unit: None,
+                    interval_count: None,
+                })
+                .await?;
+        }
+        sqlx::query("INSERT INTO project_wallets(project_id,currency,credit_balance_micros,credit_reserved_micros,status,created_at,updated_at) VALUES($1,$2,10000000,0,'active',now(),now()) ON CONFLICT(project_id,currency) DO UPDATE SET credit_balance_micros=10000000").bind(project).bind(STATION_CREDIT_CODE).execute(pool).await?;
+        let book:i64=sqlx::query_scalar("INSERT INTO price_books(name,currency,status,is_default) VALUES('funds catalog','CNY','enabled',true) RETURNING id").fetch_one(pool).await?;
+        let version:i64=sqlx::query_scalar("INSERT INTO price_book_versions(price_book_id,version,status,reference_id) VALUES($1,1,'published','funds catalog') RETURNING id").bind(book).fetch_one(pool).await?;
+        for model in [ma, mb] {
+            sqlx::query("INSERT INTO price_book_items(price_book_version_id,public_model_id,price) VALUES($1,$2,'{}')").bind(version).bind(model).execute(pool).await?;
+        }
+        let summary = adapter
+            .my_project_funds(&users[0].to_string(), &project.to_string(), None, None)
+            .await?;
+        assert_eq!(summary.general_subscription_available, "20");
+        assert_eq!(summary.dedicated_subscription_available, "0");
+        assert_eq!(summary.admission_available, "30");
+        assert!(summary.shared);
+        assert_eq!(summary.dedicated_buckets.len(), 1);
+        let selected = adapter
+            .my_project_funds(
+                &users[0].to_string(),
+                &project.to_string(),
+                Some(&ma.to_string()),
+                None,
+            )
+            .await?;
+        assert_eq!(selected.dedicated_subscription_available, "30");
+        assert_eq!(selected.admission_available, "60");
+        assert!(selected.selected_model_authorized && selected.selected_model_priced);
+        let other_model = adapter
+            .my_project_funds(
+                &users[0].to_string(),
+                &project.to_string(),
+                Some(&mb.to_string()),
+                None,
+            )
+            .await?;
+        assert_eq!(other_model.dedicated_subscription_available, "0");
+        assert_eq!(other_model.admission_available, "30");
+        assert_eq!(
+            adapter
+                .my_project_funds(
+                    &users[0].to_string(),
+                    &project.to_string(),
+                    Some(&mc.to_string()),
+                    None
+                )
+                .await?
+                .admission_available,
+            "0"
+        );
+        sqlx::query("INSERT INTO project_member_spend_state(project_id,user_id,limit_micros,spent_micros) VALUES($1,$2,45000000,5000000)").bind(project).bind(users[0]).execute(pool).await?;
+        assert_eq!(
+            adapter
+                .my_project_funds(
+                    &users[0].to_string(),
+                    &project.to_string(),
+                    Some(&ma.to_string()),
+                    None
+                )
+                .await?
+                .admission_available,
+            "40"
+        );
+        let foreign:i64=sqlx::query_scalar("INSERT INTO api_keys(user_id,project_id,name,key,type,status,scopes) VALUES($1,$2,'foreign','funds-key','user','enabled','[]') RETURNING id").bind(users[1]).bind(project).fetch_one(pool).await?;
+        assert!(
+            adapter
+                .my_project_funds(
+                    &users[0].to_string(),
+                    &project.to_string(),
+                    None,
+                    Some(&foreign.to_string())
+                )
+                .await
+                .is_err()
+        );
+        // A later allow cannot reopen a blocked model, independent of insertion order.
+        for effect in ["block", "allow"] {
+            sqlx::query("INSERT INTO project_entitlement_overrides(project_id,public_model_id,effect,status,source_type,created_at,updated_at) VALUES($1,$2,$3,'active','manual',now(),now())").bind(project).bind(ma).bind(effect).execute(pool).await?;
+        }
+        assert_eq!(
+            adapter
+                .my_project_funds(
+                    &users[0].to_string(),
+                    &project.to_string(),
+                    Some(&ma.to_string()),
+                    None
+                )
+                .await?
+                .admission_available,
+            "0"
+        );
+        sqlx::query("DELETE FROM user_projects WHERE project_id=$1 AND user_id=$2")
+            .bind(project)
+            .bind(users[0])
+            .execute(pool)
+            .await?;
+        assert!(
+            adapter
+                .my_project_funds(&users[0].to_string(), &project.to_string(), None, None)
+                .await
+                .is_err()
+        );
+        db.cleanup().await?;
+        Ok(())
+    }
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn grant_project_credit_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::GrantProjectCreditInput,
+) -> Result<i64, gql::BillingError> {
+    let project_id = parse_id(input.project_id.as_str())?;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1 AND deleted_at=0)")
+            .bind(project_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(storage)?;
+    if !exists {
+        return Err(gql::BillingError::Invalid("Project is unavailable".into()));
+    }
+    let micros = parse_positive_amount(&input.amount)?;
+    let key = nonempty(input.idempotency_key, "idempotencyKey")?;
+
+    // The advisory lock makes same-key retries deterministic even if they
+    // target different wallets and race before the unique insert.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(&key)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    if let Some(existing) = sqlx::query(
+        "SELECT w.project_id,w.currency,e.amount_micros \
+             FROM project_credit_ledger_entries e \
+             JOIN project_wallets w ON w.id=e.wallet_id WHERE e.idempotency_key=$1",
+    )
+    .bind(&key)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    {
+        if existing.get::<i64, _>("project_id") != project_id
+            || existing.get::<String, _>("currency") != STATION_CREDIT_CODE
+            || existing.get::<i64, _>("amount_micros") != micros
+        {
+            return Err(gql::BillingError::Invalid(
+                "idempotencyKey was already used for a different Project credit grant".into(),
+            ));
+        }
+
+        return Ok(project_id);
+    }
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO project_wallets(project_id,currency,status,created_at,updated_at) \
+             VALUES($1,$2,'active',$3,$3) ON CONFLICT(project_id,currency) DO NOTHING",
+    )
+    .bind(project_id)
+    .bind(STATION_CREDIT_CODE)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let wallet_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM project_wallets WHERE project_id=$1 AND currency=$2 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(STATION_CREDIT_CODE)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    sqlx::query(
+        "INSERT INTO project_credit_ledger_entries \
+             (wallet_id,amount_micros,entry_type,reference_type,reference_id, \
+              idempotency_key,description,metadata,created_at) \
+             VALUES($1,$2,'admin_grant','project',$3,$4,$5,'{}',$6)",
+    )
+    .bind(wallet_id)
+    .bind(micros)
+    .bind(project_id.to_string())
+    .bind(key)
+    .bind(input.description)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+
+    Ok(project_id)
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn create_subscription_plan_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::CreateSubscriptionPlanInput,
+) -> Result<i64, gql::BillingError> {
+    require_subscription_management(tx).await?;
+
+    let name = nonempty(input.name, "name")?;
+    let interval_count = input.interval_count.unwrap_or(1);
+    if interval_count <= 0 {
+        return Err(gql::BillingError::Invalid(
+            "intervalCount must be positive".into(),
+        ));
+    }
+    let quota_rules = validate_quota_rules(input.quota_rules)?;
+    if quota_rules.iter().any(|rule| rule.id.is_some()) {
+        return Err(gql::BillingError::Invalid(
+            "quota rule IDs cannot be supplied when creating a plan".into(),
+        ));
+    }
+    let access_plan_ids = parse_access_plan_ids(input.access_plan_ids)?;
+    let now = Utc::now();
+
+    let referenced_access_plan_ids = referenced_access_plan_ids(&access_plan_ids, &quota_rules);
+    for access_plan_id in referenced_access_plan_ids {
+        ensure_access_plan_tx(tx, *access_plan_id).await?;
+    }
+    let plan_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO subscription_plans \
+             (name,currency,interval_unit,interval_count,status,created_at,updated_at) \
+             VALUES($1,$2,$3,$4,'enabled',$5,$5) RETURNING id",
+    )
+    .bind(name)
+    .bind(STATION_CREDIT_CODE)
+    .bind(interval_to_wire(input.interval_unit))
+    .bind(interval_count)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    for access_plan_id in access_plan_ids {
+        sqlx::query(
+            "INSERT INTO subscription_plan_access_plans \
+                 (subscription_plan_id,access_plan_id,created_at,updated_at) \
+                 VALUES($1,$2,$3,$3)",
+        )
+        .bind(plan_id)
+        .bind(access_plan_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    }
+    for rule in quota_rules {
+        insert_quota_rule(tx, plan_id, rule, now).await?;
+    }
+
+    Ok(plan_id)
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn update_subscription_plan_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::UpdateSubscriptionPlanInput,
+) -> Result<i64, gql::BillingError> {
+    require_subscription_management(tx).await?;
+
+    let plan_id = parse_id(input.id.as_str())?;
+    let name = nonempty(input.name, "name")?;
+    if input.interval_count <= 0 {
+        return Err(gql::BillingError::Invalid(
+            "intervalCount must be positive".into(),
+        ));
+    }
+    let quota_rules = validate_quota_rules(input.quota_rules)?;
+    let access_plan_ids = parse_access_plan_ids(input.access_plan_ids)?;
+    let now = Utc::now();
+
+    if sqlx::query_scalar::<_, i64>("SELECT id FROM subscription_plans WHERE id=$1 FOR UPDATE")
+        .bind(plan_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .is_none()
+    {
+        return Err(gql::BillingError::NotFound(format!(
+            "subscription plan {plan_id}"
+        )));
+    }
+    let referenced_access_plan_ids = referenced_access_plan_ids(&access_plan_ids, &quota_rules);
+    for access_plan_id in referenced_access_plan_ids {
+        ensure_access_plan_tx(tx, *access_plan_id).await?;
+    }
+    sqlx::query(
+        "UPDATE subscription_plans SET name=$1,currency=$2,interval_unit=$3, \
+             interval_count=$4,status=$5,updated_at=$6 WHERE id=$7",
+    )
+    .bind(name)
+    .bind(STATION_CREDIT_CODE)
+    .bind(interval_to_wire(input.interval_unit))
+    .bind(input.interval_count)
+    .bind(status_to_wire(input.status))
+    .bind(now)
+    .bind(plan_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    sqlx::query("DELETE FROM subscription_plan_access_plans WHERE subscription_plan_id=$1")
+        .bind(plan_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    for access_plan_id in access_plan_ids {
+        sqlx::query(
+            "INSERT INTO subscription_plan_access_plans \
+                 (subscription_plan_id,access_plan_id,created_at,updated_at) \
+                 VALUES($1,$2,$3,$3)",
+        )
+        .bind(plan_id)
+        .bind(access_plan_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    }
+    let existing_rule_ids = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM subscription_quota_rules WHERE subscription_plan_id=$1 FOR UPDATE",
+    )
+    .bind(plan_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(storage)?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let mut retained_rule_ids = BTreeSet::new();
+    for rule in quota_rules {
+        if let Some(rule_id) = rule.id {
+            if !existing_rule_ids.contains(&rule_id) {
+                return Err(gql::BillingError::Invalid(format!(
+                    "quota rule {rule_id} does not belong to subscription plan {plan_id}"
+                )));
+            }
+            if !retained_rule_ids.insert(rule_id) {
+                return Err(gql::BillingError::Invalid(format!(
+                    "quota rule {rule_id} was supplied more than once"
+                )));
+            }
+            update_quota_rule(tx, rule_id, rule, now).await?;
+        } else {
+            let rule_id = insert_quota_rule(tx, plan_id, rule, now).await?;
+            retained_rule_ids.insert(rule_id);
+        }
+    }
+    let retained_rule_ids = retained_rule_ids.into_iter().collect::<Vec<_>>();
+    sqlx::query(
+        "DELETE FROM subscription_quota_rules \
+             WHERE subscription_plan_id=$1 AND NOT (id=ANY($2))",
+    )
+    .bind(plan_id)
+    .bind(&retained_rule_ids)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    // Assignment terms and the selected model-group IDs are snapshots.
+    // Existing subscriptions are not rewritten by plan edits.
+
+    Ok(plan_id)
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn assign_user_subscription_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::AssignUserSubscriptionInput,
+) -> Result<i64, gql::BillingError> {
+    require_subscription_management(tx).await?;
+
+    let user_id = parse_id(input.user_id.as_str())?;
+    let plan_id = parse_id(input.plan_id.as_str())?;
+    let project_id = parse_id(input.project_id.as_str())?;
+    let assignment_key = nonempty(input.idempotency_key, "idempotencyKey")?;
+    let initial_auto_renew = input.auto_renew.unwrap_or(true);
+    let assignment_request_snapshot = json!({
+        "schemaVersion": 1,
+        "userID": user_id,
+        "planID": plan_id,
+        "projectID": project_id,
+        "autoRenew": initial_auto_renew,
+        "intervalUnit": input.interval_unit.map(interval_to_wire),
+        "intervalCount": input.interval_count,
+    });
+
+    // Assignment keys are global, but the lock namespace is operation-specific
+    // so an unrelated idempotent operation may reuse the same caller key.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             hashtextextended('conduit.billing.assign_user_subscription:' || $1::text,0))",
+    )
+    .bind(&assignment_key)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if let Some(existing) = sqlx::query(
+        "SELECT id,assignment_request_snapshot FROM user_subscriptions \
+             WHERE assignment_key=$1",
+    )
+    .bind(&assignment_key)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    {
+        if existing.get::<Value, _>("assignment_request_snapshot") != assignment_request_snapshot {
+            return Err(gql::BillingError::Invalid(
+                "idempotencyKey was already used for a different subscription assignment".into(),
+            ));
+        }
+        let subscription_id = existing.get::<i64, _>("id");
+
+        return Ok(subscription_id);
+    }
+    ensure_user_tx(tx, user_id).await?;
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM user_projects up JOIN projects p ON p.id=up.project_id \
+             WHERE up.user_id=$1 AND up.project_id=$2 AND p.status='active' AND p.deleted_at=0)",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?
+        == false
+    {
+        return Err(gql::BillingError::Invalid(format!(
+            "user {user_id} is not a member of active project {project_id}"
+        )));
+    }
+    let plan = sqlx::query(
+        "SELECT name,status,interval_unit,interval_count \
+             FROM subscription_plans WHERE id=$1 FOR SHARE",
+    )
+    .bind(plan_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| gql::BillingError::NotFound(format!("subscription plan {plan_id}")))?;
+    if plan.get::<String, _>("status") != "enabled" {
+        return Err(gql::BillingError::Invalid(
+            "subscription plan is not enabled".into(),
+        ));
+    }
+    let interval_unit = input
+        .interval_unit
+        .unwrap_or_else(|| interval_from_wire(plan.get::<String, _>("interval_unit").as_str()));
+    let interval_count = input
+        .interval_count
+        .unwrap_or_else(|| plan.get("interval_count"));
+    if interval_count <= 0 {
+        return Err(gql::BillingError::Invalid(
+            "intervalCount must be positive".into(),
+        ));
+    }
+    let now = Utc::now();
+    let end = next_period(
+        now,
+        interval_to_wire(interval_unit),
+        positive_interval_count(interval_count)?,
+    )?;
+    lock_live_model_group_versions(tx).await?;
+    let versions = subscription_plan_access_versions(tx, plan_id, now).await?;
+    let subscription_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO user_subscriptions \
+             (user_id,plan_id,assignment_key,assignment_request_snapshot,status, \
+              current_period_start,current_period_end,assigned_interval_unit, \
+              assigned_interval_count,auto_renew,created_at,updated_at) \
+             VALUES($1,$2,$3,$4,'active',$5,$6,$7,$8,$9,$5,$5) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(plan_id)
+    .bind(assignment_key)
+    .bind(assignment_request_snapshot)
+    .bind(now)
+    .bind(end)
+    .bind(interval_to_wire(interval_unit))
+    .bind(interval_count)
+    .bind(initial_auto_renew)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    sqlx::query(
+        "INSERT INTO user_subscription_projects(subscription_id,project_id,created_at) \
+             VALUES($1,$2,$3)",
+    )
+    .bind(subscription_id)
+    .bind(project_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    snapshot_subscription_quota_rules(tx, subscription_id, plan_id, now).await?;
+    issue_period_buckets(tx, subscription_id, now, end, "active", None, now).await?;
+    snapshot_subscription_access_versions(tx, subscription_id, &versions, now).await?;
+    sync_subscription_access_grants(tx, subscription_id, &versions, now, end, now).await?;
+
+    Ok(subscription_id)
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn cancel_user_subscription_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+) -> Result<i64, gql::BillingError> {
+    require_subscription_management(tx).await?;
+
+    let subscription_id = parse_id(subscription_id)?;
+
+    cancel_pending_locked(tx, subscription_id).await?;
+
+    Ok(subscription_id)
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn reactivate_subscription_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: i64,
+    source_status: &str,
+    reset_period: bool,
+) -> Result<(), gql::BillingError> {
+    let row = sqlx::query(
+        "SELECT s.plan_id,s.status,s.current_period_start,s.current_period_end, \
+                    s.assigned_interval_unit AS interval_unit, \
+                    s.assigned_interval_count AS interval_count,p.status AS plan_status \
+             FROM user_subscriptions s JOIN subscription_plans p ON p.id=s.plan_id \
+             WHERE s.id=$1 FOR UPDATE OF s",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| gql::BillingError::NotFound(format!("subscription {subscription_id}")))?;
+    if row.get::<String, _>("plan_status") != "enabled" {
+        return Err(gql::BillingError::Invalid(
+            "subscription plan is not enabled".into(),
+        ));
+    }
+    let current: String = row.get("status");
+    if current == "active" {
+        return Ok(());
+    }
+    if current != source_status {
+        return Err(gql::BillingError::Invalid(format!(
+            "subscription cannot transition from {current} to active"
+        )));
+    }
+
+    let now = Utc::now();
+    let old_start: DateTime<Utc> = row.get("current_period_start");
+    let old_end: DateTime<Utc> = row.get("current_period_end");
+    let needs_new_period = reset_period || old_end <= now;
+    let (start, end) = if needs_new_period {
+        let interval_count = positive_interval_count(row.get("interval_count"))?;
+        (
+            now,
+            next_period(
+                now,
+                row.get::<String, _>("interval_unit").as_str(),
+                interval_count,
+            )?,
+        )
+    } else {
+        (old_start, old_end)
+    };
+    lock_live_model_group_versions(tx).await?;
+    let access_versions = subscription_access_versions(tx, subscription_id).await?;
+    sync_subscription_access_grants(tx, subscription_id, &access_versions, start, end, now).await?;
+    if needs_new_period {
+        issue_period_buckets(
+            tx,
+            subscription_id,
+            start,
+            end,
+            "active",
+            if source_status == "paused" && !reset_period {
+                Some(old_start)
+            } else {
+                None
+            },
+            now,
+        )
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE subscription_allowance_buckets SET status='active',updated_at=$1 \
+                 WHERE subscription_id=$2 AND status=$3 AND expires_at>$1",
+        )
+        .bind(now)
+        .bind(subscription_id)
+        .bind(source_status)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        sqlx::query(
+                "UPDATE subscription_allowance_buckets SET \
+                 status=CASE WHEN reserved_micros>0 THEN 'draining' ELSE 'expired' END,updated_at=$1 \
+                 WHERE subscription_id=$2 AND status=$3 AND expires_at<=$1",
+            )
+            .bind(now)
+            .bind(subscription_id)
+            .bind(source_status)
+            .execute(&mut **tx)
+            .await
+            .map_err(storage)?;
+    }
+    sqlx::query(
+        "UPDATE user_subscriptions SET status='active',current_period_start=$1, \
+             current_period_end=$2,updated_at=$3 WHERE id=$4",
+    )
+    .bind(start)
+    .bind(end)
+    .bind(now)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(storage)?;
+    Ok(())
+}
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn subscription_action_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    action: &str,
+    id: i64,
+    auto_renew: Option<bool>,
+) -> Result<i64, gql::BillingError> {
+    require_subscription_management(tx).await?;
+    match action {
+        "refresh" => refresh_locked(tx, id).await?,
+        "pause" => set_inactive_locked(tx, id, &["active"], "paused", false).await?,
+        "resume" => reactivate_subscription_in_tx(tx, id, "paused", false).await?,
+        "renew" => reactivate_subscription_in_tx(tx, id, "expired", true).await?,
+        "auto_renew" => {
+            let result=sqlx::query("UPDATE user_subscriptions SET auto_renew=$1,updated_at=now() WHERE id=$2 AND status IN ('active','paused')").bind(auto_renew.ok_or_else(||gql::BillingError::Invalid("auto_renew is required".into()))?).bind(id).execute(&mut **tx).await.map_err(storage)?;
+            if result.rows_affected() == 0 {
+                return Err(gql::BillingError::Invalid(
+                    "subscription is not active or paused".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(gql::BillingError::Invalid(
+                "unsupported subscription action".into(),
+            ));
+        }
+    }
+    Ok(id)
+}
+async fn require_subscription_management(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), gql::BillingError> {
+    crate::wiring_product_experience::require_feature_in_tx(tx, "subscription_management")
+        .await
+        .map_err(gql::BillingError::Invalid)
+}
+
+/// Caller must hold governance G from transaction entry, before any business lock.
+pub(crate) async fn set_member_limit_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project: i64,
+    user: i64,
+    limit: Option<String>,
+) -> Result<(), gql::BillingError> {
+    let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users u JOIN user_projects up ON up.user_id=u.id JOIN projects p ON p.id=up.project_id WHERE u.id=$1 AND p.id=$2 AND u.status='activated' AND u.deleted_at=0 AND p.status='active' AND p.deleted_at=0)").bind(user).bind(project).fetch_one(&mut **tx).await.map_err(storage)?;
+    if !active {
+        return Err(gql::BillingError::Invalid(
+            "active Project membership is required".into(),
+        ));
+    }
+    let limit = limit
+        .map(|v| {
+            let value = Decimal::from_str(&v)
+                .map_err(|_| gql::BillingError::Invalid("invalid Credits limit".into()))?;
+            if value < Decimal::ZERO || value.scale() > 6 {
+                return Err(gql::BillingError::Invalid(
+                    "limit must be nonnegative Credits with at most six decimal places".into(),
+                ));
+            }
+            decimal_to_micros(value)
+                .map_err(|_| gql::BillingError::Invalid("limit is too large".into()))
+        })
+        .transpose()?;
+    sqlx::query("INSERT INTO project_member_spend_state(project_id,user_id,limit_micros) VALUES($1,$2,$3) ON CONFLICT(project_id,user_id) DO UPDATE SET limit_micros=EXCLUDED.limit_micros,updated_at=now()").bind(project).bind(user).bind(limit).execute(&mut **tx).await.map_err(storage)?;
+    Ok(())
 }

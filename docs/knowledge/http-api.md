@@ -1,5 +1,9 @@
 # HTTP公共操作、协议和生产边界
 
+## 分组聊天与支付回调
+
+Playground 使用普通 API Key 的 `GET /v1/models`、`POST /v1/chat/completions`；身份绑定 Key 的 ModelGroup，并与 Project/profile 交集校验。`GET /api/payments/epay/notify` 是固定 reference 支付通知入口（加 server.base_path），只接受服务器验签/查询确认；浏览器 return 不入账，POST 不代替该 GET 协议。支付默认关闭，固定 HTTPS gateway/notify/return 配置；provider client 可显式附加 CA，但保持证书链及 hostname 校验。管理订单和运营查询仍经 JWT GraphQL 及各自权限，不是公开强制入账接口。
+
 # HTTP入口完整清单
 
 公共HTTP清单源自静态探索；本轮执行本地mock与隔离PG修复回归，真实上游未运行。原探索行号是符号定位线索，当前源码与内容清单为准。路由事实入口crates/conduit-http/src/router.rs::build_router_with_asset_source:441。所有路径加server.base_path；非空base_path时根/health不额外暴露。
@@ -416,3 +420,5 @@ flowchart TD
 ## 请求期限与计量持久化
 
 流从准入开始受完整llm_request_timeout约束，背压等待也在期限内；取消和deadline取消上游并一致记录request/execution。成功stream terminal在usage白名单WAL fsync接受后才发送，PG不可用时保留journal重放；journal失败不能以成功终结。完整步骤和失败恢复见[计量流程](backend.md#flow-durable-usage)，记录的body/chunks依storagePolicy，历史流事件与字节有有限预算。未新增不支持协议的出站能力。
+
+API credentials use the first nonempty source: case-insensitive Bearer scheme, X-Api-Key, X-Goog-Api-Key, then key query parameter. Gateway query parameters key/api_key/api-key are excluded from upstream query merging. Anthropic unified prompt tokens include ordinary input, cache reads and cache writes; cache details retain 5m/1h splits for existing billing.

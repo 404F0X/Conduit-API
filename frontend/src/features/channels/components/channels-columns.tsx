@@ -1,5 +1,6 @@
 import { useCallback, useState, memo, useRef, useEffect } from 'react';
 import { format } from 'date-fns';
+import { Link } from '@tanstack/react-router';
 import { ColumnDef, Row, Table } from '@tanstack/react-table';
 import {
   IconPlayerPlay,
@@ -29,6 +30,7 @@ import { ChannelLimiterCell } from './channel-limiter-cell';
 import { ChannelManagementAdapterBadge } from './channel-management-adapter-badge';
 import { ChannelOverflowMenu } from './channel-overflow-menu';
 import { ChannelsStatusDialog } from './channels-status-dialog';
+import { NewApiChannelActions } from './new-api-discovery';
 
 const WEIGHT_PRECISION = 4;
 const MIN_WEIGHT = 0;
@@ -84,7 +86,8 @@ const ActionCell = memo(({ row }: { row: Row<Channel> }) => {
   }, [channel, setCurrentRow, setOpen]);
 
   return (
-    <div className='flex items-center justify-center gap-1'>
+    <div className='flex flex-wrap items-center justify-center gap-1'>
+      {channel.settings?.managementAdapter === 'new_api' && <NewApiChannelActions channel={channel} />}
       <Button size='sm' variant='outline' className='h-8 w-8 p-0' onClick={handleEdit}>
         <IconEdit className='h-3 w-3' />
       </Button>
@@ -149,7 +152,14 @@ const NameCell = memo(({ row }: { row: Row<Channel> }) => {
       {row.getValue('name')}
     </a>
   ) : (
-    <div className={cn('min-w-0 truncate font-medium', hasError && 'text-destructive')}>{row.getValue('name')}</div>
+    <Link
+      to='/channels/$channelId'
+      params={{ channelId: channel.id }}
+      className={cn('min-w-0 truncate font-medium hover:underline', hasError && 'text-destructive')}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {row.getValue('name')}
+    </Link>
   );
 
   const content = (

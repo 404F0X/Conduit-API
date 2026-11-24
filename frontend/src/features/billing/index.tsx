@@ -45,6 +45,7 @@ import { useGeneralSettings } from '@/features/system/data/system';
 import type { User } from '@/features/users/data/schema';
 import { useUsers } from '@/features/users/data/users';
 import { accessPlanIDsForEdit, mergeAccessPlanOptions, normalizeAccessPlanIDs, toggleAccessPlanID } from './access-plan-selection';
+import { MemberBudgetEditor } from './components/member-budget-editor';
 import { RedemptionCodeSection } from './components/redemption-code-section';
 import {
   type ProjectBalance,
@@ -390,6 +391,7 @@ export default function BillingPage() {
             </>
           ))}
 
+        {hasSystemScope('write_billing') && projectID && userID && <MemberBudgetEditor projectID={projectID} userID={userID} />}
         {canReadSubscriptions && !plansQuery.isLoading && (
           <PlansSection
             plans={plansQuery.data?.subscriptionPlans || []}
@@ -836,7 +838,9 @@ function Ledger({
                 {balance.ledgerEntries.map((entry) => (
                   <TableRow key={entry.id}>
                     <TableCell className='pl-5'>
-                      <Badge variant='outline'>{entry.entryType}</Badge>
+                      <Badge variant='outline'>
+                        {entry.entryType === 'payment_topup' ? t('billing.ledger.paymentTopup') : entry.entryType}
+                      </Badge>
                     </TableCell>
                     <TableCell className='text-muted-foreground max-w-[260px] truncate'>{entry.description || '—'}</TableCell>
                     <TableCell className='text-muted-foreground text-xs'>{displayDate(entry.createdAt, locale)}</TableCell>

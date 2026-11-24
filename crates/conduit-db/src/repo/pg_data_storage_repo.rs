@@ -72,9 +72,9 @@ impl DataStorageRepo for PgDataStorageRepo {
         _ctx: &RequestContext,
         storage_id: &str,
     ) -> RepoResult<Option<DataStorageRow>> {
-        sqlx::query_as::<_, DataStorageRow>(&format!(
+        sqlx::query_as::<_, DataStorageRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM data_storages WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(id(storage_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -85,9 +85,9 @@ impl DataStorageRepo for PgDataStorageRepo {
         _ctx: &RequestContext,
         storage_id: &str,
     ) -> RepoResult<Option<DataStorageRow>> {
-        sqlx::query_as::<_, DataStorageRow>(&format!(
+        sqlx::query_as::<_, DataStorageRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM data_storages WHERE id = $1"
-        ))
+        )))
         .bind(id(storage_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -98,9 +98,9 @@ impl DataStorageRepo for PgDataStorageRepo {
         _ctx: &RequestContext,
         name: &str,
     ) -> RepoResult<Option<DataStorageRow>> {
-        sqlx::query_as::<_, DataStorageRow>(&format!(
+        sqlx::query_as::<_, DataStorageRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM data_storages WHERE name = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(name)
         .fetch_optional(&self.pool)
         .await
@@ -110,7 +110,7 @@ impl DataStorageRepo for PgDataStorageRepo {
         &self,
         _ctx: &RequestContext,
     ) -> RepoResult<Option<DataStorageRow>> {
-        sqlx::query_as::<_, DataStorageRow>(&format!("SELECT {COLUMNS} FROM data_storages WHERE \"primary\" = TRUE AND deleted_at = 0 ORDER BY id LIMIT 1"))
+        sqlx::query_as::<_, DataStorageRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM data_storages WHERE \"primary\" = TRUE AND deleted_at = 0 ORDER BY id LIMIT 1")))
             .fetch_optional(&self.pool).await.map_err(|e| error("find primary", e))
     }
     async fn list_data_storages_unchecked(

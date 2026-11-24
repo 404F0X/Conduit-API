@@ -98,8 +98,120 @@ fn unique(error: &sqlx::Error) -> bool {
         .is_some_and(|v| v == "23505")
 }
 
+async fn self_key_permit(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    ctx: &RequestContext,
+    user: Option<i64>,
+    project: i64,
+    key_type: &str,
+    scopes: &[String],
+) -> RepoResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(4850181378862437889)")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| db_error("governance lock", e))?;
+    let actor = ctx
+        .policy
+        .principal
+        .as_ref()
+        .and_then(|p| p.subject_id.parse::<i64>().ok());
+    if actor.is_none()
+        || actor != user
+        || key_type != "user"
+        || scopes
+            .iter()
+            .any(|s| !matches!(s.as_str(), "read_channels" | "write_requests"))
+    {
+        return Ok(());
+    }
+    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users u JOIN user_projects up ON up.user_id=u.id JOIN projects p ON p.id=up.project_id WHERE u.id=$1 AND p.id=$2 AND u.status='activated' AND u.deleted_at=0 AND p.status='active' AND p.deleted_at=0)").bind(actor).bind(project).fetch_one(&mut **tx).await.map_err(|e|db_error("self key ownership",e))?;
+    if allowed {
+        sqlx::query("SELECT set_config('conduit.restricted_self_key','authorized',true)")
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| db_error("self key authority", e))?;
+    }
+    Ok(())
+}
+async fn existing_self_key_permit(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    ctx: &RequestContext,
+    id: i64,
+    mutating_scopes: bool,
+) -> RepoResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(4850181378862437889)")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| db_error("governance lock", e))?;
+    if mutating_scopes {
+        return Ok(());
+    }
+    let row:Option<(Option<i64>,i64,String,sqlx::types::Json<Vec<String>>)>=sqlx::query_as("SELECT user_id,project_id,\"type\",COALESCE(scopes,'[]'::jsonb) FROM api_keys WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut **tx).await.map_err(|e|db_error("key ownership",e))?;
+    if let Some((user, project, kind, scopes)) = row {
+        self_key_permit(tx, ctx, user, project, &kind, &scopes.0).await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ApiKeyRepo for PgApiKeyRepo {
+    async fn update_api_key_status_batch(
+        &self,
+        ctx: &RequestContext,
+        project_id: &str,
+        ids: &[String],
+        status: &str,
+    ) -> RepoResult<()> {
+        crate::repo::guard_project_access(ctx, project_id, crate::policy::ProjectAccess::Write)?;
+        if !matches!(status, "enabled" | "disabled" | "archived") {
+            return Err(RepoError::Database("invalid API-key status".into()));
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let project = parse_id(project_id)?;
+        let keys = ids
+            .iter()
+            .map(|id| parse_id(id))
+            .collect::<RepoResult<Vec<_>>>()?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| db_error("batch begin", e))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(4850181378862437889)")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_error("batch policy", e))?;
+        let rows:Vec<ApiKeyRow>=sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM api_keys WHERE id=ANY($1) AND project_id=$2 AND deleted_at=0 ORDER BY id FOR UPDATE"))).bind(&keys).bind(project).fetch_all(&mut *tx).await.map_err(|e|db_error("batch selection",e))?;
+        if rows.len() != ids.len() || rows.iter().any(|r| r.key_type == "noauth") {
+            return Err(RepoError::NotFound("api_key batch"));
+        }
+        let actor = ctx
+            .policy
+            .principal
+            .as_ref()
+            .and_then(|p| p.subject_id.parse::<i64>().ok());
+        let self_only = actor.is_some()
+            && rows.iter().all(|r| {
+                r.user_id.as_deref().and_then(|s| s.parse::<i64>().ok()) == actor
+                    && r.key_type == "user"
+                    && r.scopes
+                        .iter()
+                        .all(|s| matches!(s.as_str(), "read_channels" | "write_requests"))
+            });
+        if self_only {
+            self_key_permit(&mut tx, ctx, actor, project, "user", &[]).await?;
+        } else {
+            sqlx::query("SELECT conduit_require_governance('identity_access')")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| db_error("batch governance", e))?;
+        }
+        sqlx::query("UPDATE api_keys SET status=$1,updated_at=now() WHERE id=ANY($2) AND project_id=$3 AND deleted_at=0").bind(status).bind(keys).bind(project).execute(&mut *tx).await.map_err(|e|db_error("batch update",e))?;
+        tx.commit().await.map_err(|e| db_error("batch commit", e))?;
+        Ok(())
+    }
     async fn create_api_key_unchecked(
         &self,
         _ctx: &RequestContext,
@@ -116,6 +228,15 @@ impl ApiKeyRepo for PgApiKeyRepo {
             .transpose()
             .map_err(|_| RepoError::NotFound("user"))?;
         let mut tx = self.pool.begin().await.map_err(|e| db_error("begin", e))?;
+        self_key_permit(
+            &mut tx,
+            _ctx,
+            user_id,
+            project_id,
+            &input.key_type,
+            &input.scopes,
+        )
+        .await?;
         let key_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM api_keys WHERE key = $1)")
                 .bind(&input.key)
@@ -137,13 +258,32 @@ impl ApiKeyRepo for PgApiKeyRepo {
             }
             return Err(db_error("create", error));
         }
-        let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
+        let row = sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_keys WHERE key = $1"
-        ))
+        )))
         .bind(&input.key)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| db_error("create readback", e))?;
+        if let Some(group) = input.model_group_id {
+            let user = user_id.ok_or(RepoError::NotFound("billing member"))?;
+            let permitted:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM model_groups m JOIN user_group_model_groups g ON g.model_group_id=m.id JOIN user_groups u ON u.id=g.user_group_id JOIN user_group_users member ON member.user_group_id=u.id WHERE m.id=$1 AND member.user_id=$2 AND m.status='enabled' AND u.status='enabled' AND EXISTS(SELECT 1 FROM model_group_models mm WHERE mm.model_group_id=m.id))").bind(&group).bind(user).fetch_one(&mut *tx).await.map_err(|e|db_error("model group permission",e))?;
+            if !permitted {
+                return Err(RepoError::NotFound("permitted model group"));
+            }
+            sqlx::query(
+                "INSERT INTO api_key_model_groups(api_key_id,model_group_id) VALUES($1,$2)",
+            )
+            .bind(
+                row.id
+                    .parse::<i64>()
+                    .map_err(|_| RepoError::NotFound("key"))?,
+            )
+            .bind(group)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| db_error("key group assignment", e))?;
+        }
         tx.commit().await.map_err(|e| db_error("commit", e))?;
         Ok(row)
     }
@@ -153,9 +293,9 @@ impl ApiKeyRepo for PgApiKeyRepo {
         _ctx: &RequestContext,
         id: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!(
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_keys WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(parse_id(id)?)
         .fetch_optional(&self.pool)
         .await
@@ -166,20 +306,22 @@ impl ApiKeyRepo for PgApiKeyRepo {
         _ctx: &RequestContext,
         id: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!("SELECT {COLUMNS} FROM api_keys WHERE id = $1"))
-            .bind(parse_id(id)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| db_error("find id with deleted", e))
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM api_keys WHERE id = $1"
+        )))
+        .bind(parse_id(id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| db_error("find id with deleted", e))
     }
     async fn find_api_key_by_key_unchecked(
         &self,
         _ctx: &RequestContext,
         key: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!(
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_keys WHERE key = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(key)
         .fetch_optional(&self.pool)
         .await
@@ -190,11 +332,13 @@ impl ApiKeyRepo for PgApiKeyRepo {
         _ctx: &RequestContext,
         key: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!("SELECT {COLUMNS} FROM api_keys WHERE key = $1"))
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| db_error("find key with deleted", e))
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM api_keys WHERE key = $1"
+        )))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| db_error("find key with deleted", e))
     }
     async fn list_api_keys_by_user_unchecked(
         &self,
@@ -229,6 +373,14 @@ impl ApiKeyRepo for PgApiKeyRepo {
         input: UpdateApiKeyInput,
     ) -> RepoResult<ApiKeyRow> {
         let id = parse_id(id)?;
+        let mut tx = self.pool.begin().await.map_err(|e| db_error("begin", e))?;
+        existing_self_key_permit(
+            &mut tx,
+            _ctx,
+            id,
+            input.key_type.is_some() || input.scopes.is_some(),
+        )
+        .await?;
         let mut builder = QueryBuilder::<Postgres>::new("UPDATE api_keys SET ");
         let mut set = builder.separated(", ");
         if let Some(v) = input.name {
@@ -256,16 +408,22 @@ impl ApiKeyRepo for PgApiKeyRepo {
             .push(" AND deleted_at = 0");
         let affected = builder
             .build()
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| db_error("update", e))?
             .rows_affected();
         if affected == 0 {
             return Err(RepoError::NotFound("api_key"));
         }
-        self.find_api_key_by_id_unchecked(_ctx, &id.to_string())
-            .await?
-            .ok_or(RepoError::NotFound("api_key"))
+        let row = sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM api_keys WHERE id=$1"
+        )))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_error("update readback", e))?;
+        tx.commit().await.map_err(|e| db_error("commit", e))?;
+        Ok(row)
     }
 
     async fn rotate_api_key_unchecked(
@@ -274,8 +432,11 @@ impl ApiKeyRepo for PgApiKeyRepo {
         api_key_id: &str,
         new_key: &str,
     ) -> RepoResult<ApiKeyRow> {
-        let row=sqlx::query_as::<_,ApiKeyRow>(&format!("UPDATE api_keys SET key=$1,updated_at=now() WHERE id=$2 AND deleted_at=0 RETURNING {COLUMNS}"))
-            .bind(new_key).bind(parse_id(api_key_id)?).fetch_optional(&self.pool).await.map_err(|e|db_error("rotate",e))?;
+        let mut tx = self.pool.begin().await.map_err(|e| db_error("begin", e))?;
+        existing_self_key_permit(&mut tx, _ctx, parse_id(api_key_id)?, false).await?;
+        let row=sqlx::query_as::<_,ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!("UPDATE api_keys SET key=$1,updated_at=now() WHERE id=$2 AND deleted_at=0 RETURNING {COLUMNS}")))
+            .bind(new_key).bind(parse_id(api_key_id)?).fetch_optional(&mut *tx).await.map_err(|e|db_error("rotate",e))?;
+        tx.commit().await.map_err(|e| db_error("commit", e))?;
         row.ok_or(RepoError::NotFound("api_key"))
     }
 
@@ -355,6 +516,7 @@ mod tests {
             .create_api_key(
                 &ctx,
                 CreateApiKeyInput {
+                    model_group_id: None,
                     id: "ignored".into(),
                     user_id: Some("19301".into()),
                     project_id: "1".into(),

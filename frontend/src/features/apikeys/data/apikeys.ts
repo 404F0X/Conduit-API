@@ -79,6 +79,7 @@ function buildApiKeysQuery(permissions: { canViewUsers: boolean }) {
         edges {
           node {
             id
+            modelGroupID
             createdAt
             updatedAt${userFields}
             key
@@ -115,6 +116,7 @@ function buildApiKeyQuery(permissions: { canViewUsers: boolean }) {
     query GetApiKey($id: ID!) {
       node(id: $id) {
         ... on APIKey {
+        modelGroupID
         id
         createdAt
         updatedAt${userFields}
@@ -888,6 +890,83 @@ export function useLoadApiKeyProfileTemplate() {
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['apiKeys'] });
       queryClient.invalidateQueries({ queryKey: ['apiKey', variables.apiKeyID] });
+    },
+  });
+}
+
+export type AssignableModelGroup = { id: string; name: string; modelIDs: string[] };
+export function useAssignableModelGroups(keyID?: string) {
+  const project = useSelectedProjectId();
+  return useQuery({
+    queryKey: ['api-key-assignable-model-groups', project, keyID],
+    enabled: !!project,
+    queryFn: async () => {
+      const data = await graphqlRequest<{ apiKeyAssignableModelGroups: AssignableModelGroup[] }>(
+        `query($keyID:ID) { apiKeyAssignableModelGroups(keyID:$keyID) { id name modelIDs } }`,
+        { keyID },
+        project ? { 'X-Project-ID': project } : undefined
+      );
+      return data.apiKeyAssignableModelGroups;
+    },
+  });
+}
+export function useAssignApiKeyModelGroup() {
+  const project = useSelectedProjectId();
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, modelGroupID }: { id: string; modelGroupID: string }) =>
+      graphqlRequest(
+        `mutation AssignKeyGroup($id:ID!,$modelGroupID:ID!){assignApiKeyModelGroup(id:$id,modelGroupID:$modelGroupID)}`,
+        { id, modelGroupID },
+        project ? { 'X-Project-ID': project } : undefined
+      ),
+    onSuccess: async (_, variables) => {
+      await client.invalidateQueries({ queryKey: ['apiKeys'] });
+      await client.invalidateQueries({ queryKey: ['apiKey', variables.id] });
+      await client.invalidateQueries({ queryKey: ['api-key-profile-catalog'] });
+    },
+    onError: (error) => toast.error(error instanceof Error ? error.message : '模型组配置失败'),
+  });
+}
+
+export type ApiKeyProfileCatalog = {
+  keyID: string | null;
+  projectID: string;
+  billingUserID: string | null;
+  modelGroupID: string | null;
+  configured: boolean;
+  modelIDs: string[];
+  channels: { id: string; name: string }[];
+  models: { id: string; name: string; channelIDs: string[] }[];
+};
+export function useApiKeyProfileCatalog(keyID?: string) {
+  const project = useSelectedProjectId();
+  return useQuery({
+    queryKey: ['api-key-profile-catalog', project, keyID],
+    enabled: !!project && !!keyID,
+    queryFn: async () => {
+      const data = await graphqlRequest<{ apiKeyProfileCatalog: ApiKeyProfileCatalog }>(
+        `query ProfileCatalog($keyID:ID!){apiKeyProfileCatalog(keyID:$keyID){keyID projectID billingUserID modelGroupID configured modelIDs channels{id name} models{id name channelIDs}}}`,
+        { keyID },
+        project ? { 'X-Project-ID': project } : undefined
+      );
+      return data.apiKeyProfileCatalog;
+    },
+  });
+}
+
+export function useApiKeyCreationCatalog(modelGroupID?: string) {
+  const project = useSelectedProjectId();
+  return useQuery({
+    queryKey: ['api-key-creation-catalog', project, modelGroupID],
+    enabled: !!project && !!modelGroupID,
+    queryFn: async () => {
+      const data = await graphqlRequest<{ apiKeyCreationCatalog: ApiKeyProfileCatalog }>(
+        `query CreationCatalog($modelGroupID:ID!){apiKeyCreationCatalog(modelGroupID:$modelGroupID){keyID projectID billingUserID modelGroupID configured modelIDs channels{id name} models{id name channelIDs}}}`,
+        { modelGroupID },
+        project ? { 'X-Project-ID': project } : undefined
+      );
+      return data.apiKeyCreationCatalog;
     },
   });
 }

@@ -1,29 +1,45 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { IconRocket } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { DEFAULT_ACCOUNTING_CURRENCY_CODE } from '@/lib/accounting';
+import { extractNumberID } from '@/lib/utils';
 import { usePermissions } from '@/hooks/usePermissions';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
-  useChangeSets,
+  getRetailBase,
+  getItemPage,
+  getItem,
+  getPackageByOperation,
+  getPackage,
+  type PackageDetail,
   useCreateRetailPriceChangeSet,
   useSaveRetailPriceChangeSetItem,
   useSubmitChangeSet,
 } from '@/features/change-sets/data/change-sets';
 import { useGeneralSettings } from '@/features/system/data/system';
-import { type ModelRoute, useCommercializationCatalog, useCreatePriceBook, useUpsertModelRoute } from '../data/commercialization';
+import {
+  type ModelRoute,
+  useCommercializationCatalog,
+  useCreatePriceBook,
+  useUpsertModelRoute,
+  usePricingModelGroups,
+} from '../data/commercialization';
 import type { Model } from '../data/schema';
+import { GroupRetailPriceEditor } from './group-retail-price-editor';
+import { RetailPriceFormulaEditor } from './retail-price-formula-editor';
+import { validateEditorDocument } from './simple-retail-price';
 
 export type CommercializationAction =
-  { kind: 'add-route'; publicModelID: string } | { kind: 'edit-route'; route: ModelRoute } | { kind: 'price'; publicModelID: string };
+  | { kind: 'add-route'; publicModelID: string }
+  | { kind: 'edit-route'; route: ModelRoute }
+  | { kind: 'price' | 'formula'; publicModelID: string };
 
 type Props = {
   models: Model[];
@@ -37,15 +53,7 @@ type RouteForm = {
   status: 'ENABLED' | 'DISABLED';
   confirmCompatibility: boolean;
 };
-type PriceForm = {
-  publicModelID: string;
-  mode: 'tokens' | 'request';
-  prompt: string;
-  completion: string;
-  cacheRead: string;
-  cacheWrite: string;
-  flatFee: string;
-};
+type PriceForm = { publicModelID: string };
 
 const emptyRoute = (): RouteForm => ({
   publicModelID: '',
@@ -53,36 +61,11 @@ const emptyRoute = (): RouteForm => ({
   status: 'ENABLED',
   confirmCompatibility: false,
 });
-const emptyPrice = (): PriceForm => ({
-  publicModelID: '',
-  mode: 'tokens',
-  prompt: '',
-  completion: '',
-  cacheRead: '',
-  cacheWrite: '',
-  flatFee: '',
-});
-const DECIMAL_PATTERN = /^\d+(?:\.\d{1,12})?$/;
-
-function itemPrices(item?: {
-  price: { items: Array<{ itemCode: string; pricing: { mode: string; usagePerUnit?: string; flatFee?: string } }> };
-}) {
-  const find = (code: string) => item?.price.items.find((entry) => entry.itemCode === code)?.pricing.usagePerUnit || '';
-  const flatFee = item?.price.items.find((entry) => entry.pricing.mode === 'flat_fee')?.pricing.flatFee || '';
-  return {
-    mode: flatFee ? ('request' as const) : ('tokens' as const),
-    prompt: find('prompt_tokens'),
-    completion: find('completion_tokens'),
-    cacheRead: find('prompt_cached_tokens'),
-    cacheWrite: find('prompt_write_cached_tokens'),
-    flatFee,
-  };
-}
-
+const emptyPrice = (): PriceForm => ({ publicModelID: '' });
 export function CommercializationPanel({ models, action, onActionHandled }: Props) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { hasSystemScope } = usePermissions();
+  const { hasSystemScope, user } = usePermissions();
   const { data: generalSettings } = useGeneralSettings();
   const accountingCurrencyCode = generalSettings?.accountingCurrencyCode?.trim() || DEFAULT_ACCOUNTING_CURRENCY_CODE;
   const canWriteCommercialization = hasSystemScope('write_commercialization');
@@ -94,22 +77,21 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
   const submitChangeSet = useSubmitChangeSet();
   const [routeOpen, setRouteOpen] = useState(false);
   const [priceOpen, setPriceOpen] = useState(false);
+  const [formulaModelID, setFormulaModelID] = useState('');
   const [editingDraftID, setEditingDraftID] = useState('');
+  const [retailChangeSet, setRetailChangeSet] = useState<PackageDetail | null>(null);
   const [priceModelLocked, setPriceModelLocked] = useState(false);
   const [route, setRoute] = useState<RouteForm>(emptyRoute());
+  const [basePrices, setBasePrices] = useState<Array<{ publicModelID: string; price: unknown }>>([]);
+  const [priceDocument, setPriceDocument] = useState<unknown>({ items: [] });
+  const pricingGroups = usePricingModelGroups(canWriteCommercialization && priceOpen);
   const [price, setPrice] = useState<PriceForm>(emptyPrice());
+  const pendingRetailIntent = useRef<{ modelID: string; bookID: string; operationID: string; baseRevision: string } | null>(null);
 
   // Settlement only reads the explicitly designated default book. Falling
   // back to an arbitrary book here would let the UI edit prices that runtime
   // billing can never see.
   const defaultBook = catalog.data?.priceBooks.find((book) => book.isDefault);
-  const retailChangeSets = useChangeSets({
-    kind: 'RETAIL_PRICE',
-    scopeType: 'price_book',
-    scopeID: defaultBook?.id,
-    enabled: Boolean(defaultBook),
-  });
-  const retailChangeSet = retailChangeSets.data?.find((item) => item.status === 'DRAFT' || item.status === 'PENDING_REVIEW');
   const selectedPublicModelHasRoutes = (catalog.data?.modelRoutes || []).some(
     (item) => item.publicModelID === route.publicModelID && item.id !== route.id && item.status !== 'ARCHIVED'
   );
@@ -155,22 +137,52 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
         const fresh = await catalog.refetch();
         const book = fresh.data?.priceBooks.find((item) => item.isDefault);
         if (!book) throw new Error('无法创建默认价格簿');
-        const editable = await createRetailChangeSet.mutateAsync(book.id);
-        const changed = editable.items.find((item) => item.itemKey === publicModelID)?.afterSnapshot as
-          { items: Array<{ itemCode: string; pricing: { mode: string; usagePerUnit?: string; flatFee?: string } }> } | undefined;
-        const published = book.versions
-          .find((version) => version.status === 'published')
-          ?.items.find((item) => item.publicModelID === publicModelID);
-        const existing = changed ? { price: changed } : published;
-        setEditingDraftID(editable.id);
+        if (pendingRetailIntent.current && pendingRetailIntent.current.modelID !== publicModelID)
+          throw new Error(t('eventPackages.pendingIntent'));
+        const base = await getRetailBase(book.id);
+        setBasePrices(base.prices);
+        const existing = base.prices.find((item) => extractNumberID(item.publicModelID) === extractNumberID(publicModelID));
+        setPriceDocument(existing ? existing.price : { items: [] });
         setPriceModelLocked(Boolean(publicModelID));
-        setPrice({ publicModelID, ...itemPrices(existing) });
+        setPrice({ ...emptyPrice(), publicModelID });
+        const storageKey = `retail-price-draft:${user?.id ?? 'current'}:${book.id}:${publicModelID}`;
+        const storedOperation = typeof window === 'undefined' ? null : window.sessionStorage.getItem(storageKey);
+        let intent = pendingRetailIntent.current ?? {
+          modelID: publicModelID,
+          bookID: book.id,
+          operationID: storedOperation || crypto.randomUUID(),
+          baseRevision: base.revision,
+        };
+        pendingRetailIntent.current = intent;
+        let editable = await getPackageByOperation(intent.operationID, 'RETAIL_PRICE', 'price_book', intent.bookID);
+        if (editable && editable.summary.status !== 'DRAFT') {
+          intent = { ...intent, operationID: crypto.randomUUID(), baseRevision: base.revision };
+          pendingRetailIntent.current = intent;
+          editable = null;
+        }
+        if (!editable)
+          editable = await createRetailChangeSet.mutateAsync({
+            priceBookID: intent.bookID,
+            operationID: intent.operationID,
+            expectedBaseRevision: intent.baseRevision,
+          });
+        if (!editable.currentBaseRevision || editable.currentBaseRevision !== base.revision) throw new Error(t('eventPackages.conflict'));
+        if (typeof window !== 'undefined') window.sessionStorage.setItem(storageKey, intent.operationID);
+        if (publicModelID) {
+          const savedPrice = await readDraftModelPrice(editable.summary.id, publicModelID);
+          if (savedPrice !== undefined) setPriceDocument(savedPrice);
+        }
+        pendingRetailIntent.current = null;
+        setRetailChangeSet(editable);
+        setEditingDraftID(editable.summary.id);
+        setPriceModelLocked(Boolean(publicModelID));
+
         setPriceOpen(true);
       } catch (error) {
         toast.error(error instanceof Error ? error.message : '无法准备价格编辑器');
       }
     },
-    [accountingCurrencyCode, catalog, createBook, createRetailChangeSet, defaultBook]
+    [accountingCurrencyCode, catalog, createBook, createRetailChangeSet, defaultBook, t, user?.id]
   );
 
   useEffect(() => {
@@ -180,6 +192,8 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
       setRouteOpen(true);
     } else if (action.kind === 'edit-route') {
       editRoute(action.route);
+    } else if (action.kind === 'formula') {
+      setFormulaModelID(action.publicModelID);
     } else {
       void openPriceEditor(action.publicModelID);
     }
@@ -187,28 +201,20 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
   }, [action, editRoute, onActionHandled, openPriceEditor]);
 
   const savePrice = async () => {
-    if (!editingDraftID || !price.publicModelID) return toast.error('请选择模型');
-    const values =
-      price.mode === 'request' ? [price.flatFee] : [price.prompt, price.completion, price.cacheRead, price.cacheWrite].filter(Boolean);
-    if (!values.length || values.some((value) => !DECIMAL_PATTERN.test(value)))
-      return toast.error(price.mode === 'request' ? '请填写有效的单次价格，最多 12 位小数' : '至少填写一项有效非负价格，最多 12 位小数');
-    const items =
-      price.mode === 'request'
-        ? [{ itemCode: 'request', pricing: { mode: 'flat_fee', flatFee: price.flatFee } }]
-        : [
-            ...(price.prompt ? [{ itemCode: 'prompt_tokens', pricing: { mode: 'usage_per_unit', usagePerUnit: price.prompt } }] : []),
-            ...(price.completion
-              ? [{ itemCode: 'completion_tokens', pricing: { mode: 'usage_per_unit', usagePerUnit: price.completion } }]
-              : []),
-            ...(price.cacheRead
-              ? [{ itemCode: 'prompt_cached_tokens', pricing: { mode: 'usage_per_unit', usagePerUnit: price.cacheRead } }]
-              : []),
-            ...(price.cacheWrite
-              ? [{ itemCode: 'prompt_write_cached_tokens', pricing: { mode: 'usage_per_unit', usagePerUnit: price.cacheWrite } }]
-              : []),
-          ];
+    const invalid = validateEditorDocument(priceDocument);
+    if (invalid) return toast.error(t(invalid));
+    if (!editingDraftID || !price.publicModelID) return toast.error(t('models.groupPrice.selectModel'));
     try {
-      await saveItem.mutateAsync({ changeSetID: editingDraftID, publicModelID: price.publicModelID, price: { items } });
+      const fresh = await getPackage(editingDraftID);
+      if (!fresh || fresh.summary.status !== 'DRAFT') throw new Error(t('eventPackages.conflict'));
+      const saved = await saveItem.mutateAsync({
+        changeSetID: editingDraftID,
+        expectedRevision: fresh.summary.revision,
+        publicModelID: price.publicModelID,
+        price: priceDocument,
+      });
+      setRetailChangeSet(await getPackage(editingDraftID));
+      if (saved.item.validationError) throw new Error(saved.item.validationError);
       toast.success('零售价变更已保存');
       setPriceOpen(false);
       setPrice(emptyPrice());
@@ -218,9 +224,13 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
   };
 
   const submitRetailChangeSet = async () => {
-    if (!retailChangeSet || retailChangeSet.status !== 'DRAFT') return;
+    if (!retailChangeSet || retailChangeSet.summary.status !== 'DRAFT') return;
     try {
-      await submitChangeSet.mutateAsync(retailChangeSet.id);
+      const updated = await submitChangeSet.mutateAsync({
+        id: retailChangeSet.summary.id,
+        expectedRevision: retailChangeSet.summary.revision,
+      });
+      setRetailChangeSet(updated);
       toast.success('零售价变更已提交审核');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '提交零售价变更失败');
@@ -251,21 +261,51 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
 
   return (
     <>
+      <Dialog
+        open={Boolean(formulaModelID)}
+        onOpenChange={(open) => {
+          if (!open) setFormulaModelID('');
+        }}
+      >
+        <DialogContent className='max-h-[90vh] overflow-y-auto sm:max-w-2xl'>
+          <DialogHeader>
+            <DialogTitle>自动零售价公式</DialogTitle>
+            <DialogDescription>来源保持固定，价格变化经过治理发布后才用于客户收费。</DialogDescription>
+          </DialogHeader>
+          {defaultBook && models.find((model) => model.id === formulaModelID) ? (
+            <RetailPriceFormulaEditor
+              bookID={defaultBook.id}
+              model={models.find((model) => model.id === formulaModelID)!}
+              routes={catalog.data?.modelRoutes ?? []}
+              canWrite={canWriteCommercialization}
+            />
+          ) : (
+            <Button
+              onClick={() =>
+                void createBook.mutateAsync({ name: 'Default retail pricing', currency: accountingCurrencyCode, isDefault: true })
+              }
+              disabled={createBook.isPending || !canWriteCommercialization}
+            >
+              创建默认价格簿
+            </Button>
+          )}
+        </DialogContent>
+      </Dialog>
       {retailChangeSet && (
         <div className='bg-card flex flex-col gap-2 rounded-lg border border-dashed p-3 sm:flex-row sm:items-center sm:justify-between'>
           <div>
-            <div className='text-sm font-medium'>零售价变更 · {retailChangeSet.status === 'DRAFT' ? '编辑中' : '待审核'}</div>
-            <div className='text-muted-foreground text-xs'>{retailChangeSet.items.length} 个模型已定价；批准前不会用于应收计算。</div>
+            <div className='text-sm font-medium'>零售价变更 · {retailChangeSet.summary.status === 'DRAFT' ? '编辑中' : '待审核'}</div>
+            <div className='text-muted-foreground text-xs'>{retailChangeSet.summary.itemCount} 个模型已定价；批准前不会用于应收计算。</div>
           </div>
           <Button
-            onClick={() => (retailChangeSet.status === 'DRAFT' ? void submitRetailChangeSet() : openRetailReview())}
+            onClick={() => (retailChangeSet.summary.status === 'DRAFT' ? void submitRetailChangeSet() : openRetailReview())}
             disabled={
-              retailChangeSet.status === 'DRAFT' &&
-              (!canWriteCommercialization || !retailChangeSet.items.length || submitChangeSet.isPending)
+              retailChangeSet.summary.status === 'DRAFT' &&
+              (!canWriteCommercialization || !retailChangeSet.summary.itemCount || submitChangeSet.isPending)
             }
           >
             <IconRocket className='size-4' />
-            {retailChangeSet.status === 'DRAFT' ? '提交审核' : '前往审批工作台'}
+            {retailChangeSet.summary.status === 'DRAFT' ? '提交审核' : '前往审批工作台'}
           </Button>
         </div>
       )}
@@ -291,7 +331,7 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
                 <SelectContent>
                   {models.map((model) => (
                     <SelectItem key={model.id} value={model.id}>
-                      {model.modelID}
+                      {model.name} · {model.modelID}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -351,7 +391,7 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
       </Dialog>
 
       <Dialog open={priceOpen} onOpenChange={setPriceOpen}>
-        <DialogContent>
+        <DialogContent className='max-h-[90vh] overflow-y-auto sm:max-w-3xl'>
           <DialogHeader>
             <DialogTitle>编辑零售价变更</DialogTitle>
             <DialogDescription>Token 模型按每 1,000,000 Tokens 计价；图片、音频、视频等也可按每次成功请求收取固定价格。</DialogDescription>
@@ -366,81 +406,53 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
                   <div className='text-muted-foreground mt-0.5 text-xs'>正在编辑此对外模型的零售价</div>
                 </div>
               ) : (
-                <Select value={price.publicModelID} onValueChange={(value) => setPrice({ ...price, publicModelID: value })}>
+                <Select
+                  value={price.publicModelID}
+                  onValueChange={async (value) => {
+                    try {
+                      const existing = basePrices.find((item) => extractNumberID(item.publicModelID) === extractNumberID(value));
+                      const savedPrice = editingDraftID ? await readDraftModelPrice(editingDraftID, value) : undefined;
+                      setPriceDocument(savedPrice ?? (existing ? existing.price : { items: [] }));
+                      setPrice({ ...emptyPrice(), publicModelID: value });
+                    } catch (error) {
+                      toast.error(error instanceof Error ? error.message : t('eventPackages.conflict'));
+                    }
+                  }}
+                >
                   <SelectTrigger>
                     <SelectValue placeholder='选择模型' />
                   </SelectTrigger>
                   <SelectContent>
                     {models.map((model) => (
                       <SelectItem key={model.id} value={model.id}>
-                        {model.modelID}
+                        {model.name} · {model.modelID}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               )}
             </Field>
-            <Field label='计费方式'>
-              <Select value={price.mode} onValueChange={(mode: 'tokens' | 'request') => setPrice({ ...price, mode })}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value='tokens'>按 Token 用量</SelectItem>
-                  <SelectItem value='request'>按成功请求次数</SelectItem>
-                </SelectContent>
-              </Select>
-            </Field>
-            {price.mode === 'tokens' ? (
-              <div className='grid gap-4 sm:grid-cols-2'>
-                <Field label={t('models.catalog.retailEditorInput', { currency: accountingCurrencyCode })}>
-                  <Input
-                    value={price.prompt}
-                    onChange={(event) => setPrice({ ...price, prompt: event.target.value })}
-                    placeholder='例如 2.50'
-                    inputMode='decimal'
-                  />
-                </Field>
-                <Field label={t('models.catalog.retailEditorOutput', { currency: accountingCurrencyCode })}>
-                  <Input
-                    value={price.completion}
-                    onChange={(event) => setPrice({ ...price, completion: event.target.value })}
-                    placeholder='例如 10.00'
-                    inputMode='decimal'
-                  />
-                </Field>
-                <Field label={t('models.catalog.retailEditorCacheRead', { currency: accountingCurrencyCode })}>
-                  <Input
-                    value={price.cacheRead}
-                    onChange={(event) => setPrice({ ...price, cacheRead: event.target.value })}
-                    placeholder='例如 0.25'
-                    inputMode='decimal'
-                  />
-                </Field>
-                <Field label={t('models.catalog.retailEditorCacheWrite', { currency: accountingCurrencyCode })}>
-                  <Input
-                    value={price.cacheWrite}
-                    onChange={(event) => setPrice({ ...price, cacheWrite: event.target.value })}
-                    placeholder='例如 3.00'
-                    inputMode='decimal'
-                  />
-                </Field>
-              </div>
-            ) : (
-              <Field label={`单次价格 (${accountingCurrencyCode} / 次)`}>
-                <Input
-                  value={price.flatFee}
-                  onChange={(event) => setPrice({ ...price, flatFee: event.target.value })}
-                  placeholder='例如 0.05'
-                />
-              </Field>
+            {pricingGroups.isError && (
+              <Alert variant='destructive'>
+                <AlertDescription>{pricingGroups.error.message}</AlertDescription>
+              </Alert>
             )}
+            <GroupRetailPriceEditor
+              key={price.publicModelID}
+              value={priceDocument}
+              onChange={setPriceDocument}
+              currency={accountingCurrencyCode}
+              groups={pricingGroups.data ?? []}
+            />
           </div>
           <DialogFooter>
             <Button variant='outline' onClick={() => setPriceOpen(false)}>
               取消
             </Button>
-            <Button onClick={() => void savePrice()} disabled={saveItem.isPending}>
+            <Button
+              onClick={() => void savePrice()}
+              disabled={!canWriteCommercialization || !!validateEditorDocument(priceDocument) || saveItem.isPending}
+            >
               保存变更
             </Button>
           </DialogFooter>
@@ -449,6 +461,21 @@ export function CommercializationPanel({ models, action, onActionHandled }: Prop
     </>
   );
 }
+async function readDraftModelPrice(draftID: string, modelID: string): Promise<unknown | undefined> {
+  const key = modelID.split('/').at(-1)!;
+  let after: string | undefined;
+  do {
+    const page = await getItemPage(draftID, after, key);
+    const item = page.edges.find(({ node }) => node.itemKey === key)?.node;
+    if (item) return (await getItem(draftID, item.id))?.item.afterSnapshot ?? undefined;
+    if (!page.pageInfo.hasNextPage) return undefined;
+    const cursor = page.pageInfo.endCursor;
+    if (!cursor || cursor === after) throw new Error('Invalid draft item pagination');
+    after = cursor;
+  } while (after);
+  return undefined;
+}
+
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className='grid gap-1.5'>

@@ -1,10 +1,11 @@
+import { enterFixtureProject } from './project-fixture'
 import { test, expect } from '@playwright/test'
-import { gotoAndEnsureAuth, waitForGraphQLOperation } from './auth.utils'
+import { waitForGraphQLOperation } from './auth.utils'
 
 test.describe('Project Roles Management', () => {
   test.beforeEach(async ({ page }) => {
     // Navigate directly to project roles page
-    await gotoAndEnsureAuth(page, '/project/roles')
+    await enterFixtureProject(page, '/project/roles')
     
     // Wait for roles table to be visible
     const rolesTable = page.locator('[data-testid="roles-table"]')

@@ -161,7 +161,7 @@ fn map_project_profiles(raw: Value) -> Option<GqlProjectProfiles> {
 /// value (the exact shape `map_project_profiles` reads back). Go binds the
 /// profile input and output types to the SAME `objects.ProjectProfiles` struct
 /// (`@goModel`), so an input round-trips into the stored object unchanged.
-fn profiles_input_to_json(input: &UpdateProjectProfilesInput) -> Value {
+pub(crate) fn profiles_input_to_json(input: &UpdateProjectProfilesInput) -> Value {
     let profiles: Vec<Value> = input
         .profiles
         .iter()
@@ -196,7 +196,7 @@ fn profiles_input_to_json(input: &UpdateProjectProfilesInput) -> Value {
 /// (case-insensitive); the active profile (if set) must exist in the list. The
 /// Go `channelTagsMatchMode.IsValid()` check is unconditionally satisfied here
 /// because the GraphQL enum can only carry valid values.
-fn validate_project_profiles(input: &UpdateProjectProfilesInput) -> Result<(), String> {
+pub(crate) fn validate_project_profiles(input: &UpdateProjectProfilesInput) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for p in input.profiles.iter().flatten() {
         let lower = p.name.trim().to_lowercase();
@@ -233,7 +233,7 @@ fn project_profile_has_channel_selectors(
 /// Preserve legacy Project Channel selectors as a read-only compatibility
 /// payload. New profiles cannot add them, and profiles carrying them cannot be
 /// renamed, removed, or changed through the customer-facing mutation.
-fn preserve_project_channel_selectors(
+pub(crate) fn preserve_project_channel_selectors(
     input: &mut UpdateProjectProfilesInput,
     previous: &CoreProjectProfiles,
 ) -> Result<(), String> {
@@ -834,42 +834,7 @@ impl ProjectMutationServices for PgProjectAdapter {
             .begin()
             .await
             .map_err(|e| ProjectServiceError::Create(e.to_string()))?;
-        let project_id = match sqlx::query_scalar::<_, i64>(
-            "INSERT INTO projects (name, status, description, profiles) \
-             VALUES ($1, 'active', $2, '{}'::jsonb) RETURNING id",
-        )
-        .bind(&input.name)
-        .bind(input.description.unwrap_or_default())
-        .fetch_one(&mut *tx)
-        .await
-        {
-            Ok(id) => id,
-            Err(error)
-                if error
-                    .as_database_error()
-                    .and_then(|value| value.code())
-                    .is_some_and(|code| code == "23505") =>
-            {
-                return Err(ProjectServiceError::DuplicateName(input.name));
-            }
-            Err(error) => return Err(ProjectServiceError::Create(error.to_string())),
-        };
-        for (name, scopes) in default_project_roles() {
-            let scopes = scopes
-                .iter()
-                .map(|scope| (*scope).to_string())
-                .collect::<Vec<_>>();
-            sqlx::query(
-                "INSERT INTO roles (name, level, project_id, scopes) \
-                 VALUES ($1, 'project', $2, $3)",
-            )
-            .bind(name)
-            .bind(project_id)
-            .bind(sqlx::types::Json(scopes))
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| ProjectServiceError::Create(e.to_string()))?;
-        }
+        let project_id = create_project_in_tx(&mut tx, input).await?;
         tx.commit()
             .await
             .map_err(|e| ProjectServiceError::Create(e.to_string()))?;
@@ -1950,4 +1915,47 @@ mod tests {
             .await?;
         Ok(())
     }
+}
+
+pub(crate) async fn create_project_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    input: GqlCreateProjectInput,
+) -> Result<i64, ProjectServiceError> {
+    let project_id = match sqlx::query_scalar::<_, i64>(
+        "INSERT INTO projects (name, status, description, profiles) \
+             VALUES ($1, 'active', $2, '{}'::jsonb) RETURNING id",
+    )
+    .bind(&input.name)
+    .bind(input.description.unwrap_or_default())
+    .fetch_one(&mut **tx)
+    .await
+    {
+        Ok(id) => id,
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|value| value.code())
+                .is_some_and(|code| code == "23505") =>
+        {
+            return Err(ProjectServiceError::DuplicateName(input.name));
+        }
+        Err(error) => return Err(ProjectServiceError::Create(error.to_string())),
+    };
+    for (name, scopes) in default_project_roles() {
+        let scopes = scopes
+            .iter()
+            .map(|scope| (*scope).to_string())
+            .collect::<Vec<_>>();
+        sqlx::query(
+            "INSERT INTO roles (name, level, project_id, scopes) \
+                 VALUES ($1, 'project', $2, $3)",
+        )
+        .bind(name)
+        .bind(project_id)
+        .bind(sqlx::types::Json(scopes))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| ProjectServiceError::Create(e.to_string()))?;
+    }
+    Ok(project_id)
 }

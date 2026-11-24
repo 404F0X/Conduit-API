@@ -70,9 +70,9 @@ impl ModelRepo for PgModelRepo {
         _ctx: &RequestContext,
         model_id: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!(
+        sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM models WHERE id=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(id(model_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -83,33 +83,39 @@ impl ModelRepo for PgModelRepo {
         _ctx: &RequestContext,
         model_id: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!("SELECT {COLUMNS} FROM models WHERE id=$1"))
-            .bind(id(model_id)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| error("find with deleted", e))
+        sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM models WHERE id=$1"
+        )))
+        .bind(id(model_id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| error("find with deleted", e))
     }
     async fn find_model_by_name_unchecked(
         &self,
         _ctx: &RequestContext,
         name: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!(
-            "SELECT {COLUMNS} FROM models WHERE name=$1 AND deleted_at=0"
-        ))
+        let mut rows = sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM models WHERE name=$1 AND deleted_at=0 ORDER BY id LIMIT 2"
+        )))
         .bind(name)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
-        .map_err(|e| error("find name", e))
+        .map_err(|e| error("find name", e))?;
+        if rows.len() > 1 {
+            return Err(RepoError::AmbiguousModelName);
+        }
+        Ok(rows.pop())
     }
     async fn find_model_by_model_id_unchecked(
         &self,
         _ctx: &RequestContext,
         model_id: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!(
+        sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM models WHERE model_id=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(model_id)
         .fetch_optional(&self.pool)
         .await
@@ -294,6 +300,31 @@ mod tests {
             .await?
             .ok_or("created model was not found")?;
         assert_eq!(found.id, row.id);
+        let sibling_input = CreateModelInput {
+            id: String::new(),
+            developer: "mock".into(),
+            model_id: "channel2.mock-chat".into(),
+            name: row.name.clone(),
+            model_type: Some("chat".into()),
+            icon: None,
+            group: "mock".into(),
+            model_card: Some(serde_json::json!({})),
+            settings: Some(serde_json::json!({})),
+            remark: None,
+            created_at: String::new(),
+        };
+        let sibling = repo.create_model(&ctx, sibling_input.clone()).await?;
+        assert!(matches!(
+            repo.find_model_by_name(&ctx, &row.name).await,
+            Err(RepoError::AmbiguousModelName)
+        ));
+        assert!(
+            matches!(
+                repo.create_model(&ctx, sibling_input).await,
+                Err(RepoError::NameConflict)
+            ),
+            "same display is allowed but same key is rejected"
+        );
         let updated = repo
             .update_model(
                 &ctx,
@@ -306,6 +337,19 @@ mod tests {
             )
             .await?;
         assert_eq!(updated.status, "enabled");
+        repo.update_model(
+            &ctx,
+            &sibling.id,
+            UpdateModelInput {
+                name: Some(updated.name.clone()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(matches!(
+            repo.find_model_by_name(&ctx, &updated.name).await,
+            Err(RepoError::AmbiguousModelName)
+        ));
         assert_eq!(
             repo.soft_delete_model(&ctx, &row.id, "2026-08-15T00:00:00Z")
                 .await?

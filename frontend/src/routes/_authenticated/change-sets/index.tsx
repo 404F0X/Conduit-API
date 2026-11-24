@@ -1,4 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
+import { GOVERNANCE_ROUTE_SCOPES } from '@/config/route-permission';
 import { RouteGuard } from '@/components/route-guard';
 import { validateChangeSetSearch } from '@/features/change-sets/change-set-search';
 import { ChangeSetWorkbenchPage } from '@/features/change-sets/workbench-page';
@@ -7,7 +8,7 @@ function ProtectedChangeSets() {
   const search = Route.useSearch();
 
   return (
-    <RouteGuard requiredScopes={['read_commercialization']}>
+    <RouteGuard requiredScopes={GOVERNANCE_ROUTE_SCOPES}>
       <ChangeSetWorkbenchPage key={JSON.stringify(search)} initialFilters={search} />
     </RouteGuard>
   );

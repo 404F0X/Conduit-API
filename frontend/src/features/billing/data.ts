@@ -396,3 +396,38 @@ export function useSetSubscriptionAutoRenew() {
     onSuccess: (_data, input) => invalidate(input.userID),
   });
 }
+
+export type MyProjectFunds = {
+  projectID: string;
+  accountType: string;
+  shared: boolean;
+  currency: string;
+  projectCreditAvailable: string;
+  generalSubscriptionAvailable: string;
+  dedicatedSubscriptionAvailable: string;
+  dedicatedBuckets: SubscriptionAllowanceBucket[];
+  memberReserved: string;
+  memberSpent: string;
+  memberLimit: string | null;
+  memberRemaining: string | null;
+  admissionAvailable: string;
+  keyLimits: { creditsUnit: string; costUnit: string; tokensUnit: string; profiles: unknown } | null;
+  selectedModelPriced: boolean;
+  selectedModelAuthorized: boolean;
+};
+export function useMyProjectFunds(publicModelID?: string, apiKeyID?: string) {
+  const projectID = useSelectedProjectId();
+  return useQuery({
+    queryKey: ['billing', 'my-project-funds', projectID, publicModelID, apiKeyID],
+    enabled: !!projectID,
+    queryFn: () =>
+      graphqlRequest<{ myProjectFunds: MyProjectFunds }>(
+        `query MyFunds($projectID: ID!, $publicModelID: ID, $apiKeyID: ID) { myProjectFunds(projectID: $projectID, publicModelID: $publicModelID, apiKeyID: $apiKeyID) {
+      projectID accountType shared currency projectCreditAvailable generalSubscriptionAvailable dedicatedSubscriptionAvailable
+      memberReserved memberSpent memberLimit memberRemaining admissionAvailable keyLimits selectedModelPriced selectedModelAuthorized
+      dedicatedBuckets { id name quotaClass sourceType periodStart periodEnd expiresAt grantedAllowance consumedAllowance reservedAllowance remainingAllowance status modelIDs sourceBucketID accessPlans { id name } }
+    } }`,
+        { projectID, publicModelID, apiKeyID }
+      ).then((d) => d.myProjectFunds),
+  });
+}

@@ -17,6 +17,55 @@ pub struct AppConfig {
     pub api_auth: ApiAuthConfig,
     pub retry: RetryConfig,
     pub usage_recovery: UsageRecoveryConfig,
+    pub payments: PaymentConfig,
+}
+
+/// Single explicitly selected classic-MD5 reference gateway. Disabled by default.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct PaymentConfig {
+    pub enabled: bool,
+    pub profile: String,
+    pub gateway_base_url: String,
+    /// Optional additional PEM CA, scoped to this payment client's TLS trust.
+    pub gateway_ca_certificate: Option<String>,
+    pub merchant_id: String,
+    pub merchant_key: String,
+    /// Change whenever merchant credentials or endpoint change; retain old
+    /// identity/credentials until every existing order has been reconciled.
+    pub merchant_identity: String,
+    pub notify_url: String,
+    pub return_url: String,
+    pub min_amount_minor: i64,
+    pub max_amount_minor: i64,
+    pub order_ttl_seconds: u64,
+}
+impl Default for PaymentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: "epay-classic-md5-reference-a4d0f042".into(),
+            gateway_base_url: String::new(),
+            gateway_ca_certificate: None,
+            merchant_id: String::new(),
+            merchant_key: String::new(),
+            merchant_identity: String::new(),
+            notify_url: String::new(),
+            return_url: String::new(),
+            min_amount_minor: 1,
+            max_amount_minor: 10_000_000,
+            order_ttl_seconds: 900,
+        }
+    }
+}
+impl std::fmt::Debug for PaymentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaymentConfig")
+            .field("enabled", &self.enabled)
+            .field("profile", &self.profile)
+            .field("merchant_key", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Local durable usage journal. Each instance needs its own persistent directory.

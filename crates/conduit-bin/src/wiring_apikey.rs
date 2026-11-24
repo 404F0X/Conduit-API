@@ -51,9 +51,10 @@
 //!
 //!   - **`Query.apiKeys` `where`**: filtered in memory over the loaded rows
 //!     (mirrors `ModelCrudAdapter`). Covered predicates: `and`/`or`/`not`,
-//!     `projectID`/`userID` (+ `isNil`/`notNil`), `status`, `type`, and the
-//!     `name`/`key` string families. Time/id and `has<Edge>` predicates are not
-//!     lowered (they are absent from the admin api-keys list UI).
+//!     `projectID`/`userID` (+ `isNil`/`notNil`), `status`, `type`, the
+//!     `name`/`key` string families (including `EqualFold`/`ContainsFold`) and
+//!     the `createdAt` range (`GT`/`GTE`/`LT`/`LTE`). Other time/id and
+//!     `has<Edge>` predicates are not lowered.
 
 use std::sync::Arc;
 
@@ -100,6 +101,15 @@ pub struct ApiKeyServiceAdapter {
 }
 
 impl ApiKeyServiceAdapter {
+    fn scope_ctx(scope: &APIKeyAccessScope) -> RequestContext {
+        let mut ctx = Self::ctx();
+        if let (Some(principal), Some(actor)) = (ctx.policy.principal.as_mut(), scope.actor_user_id)
+        {
+            principal.subject_id = actor.to_string();
+        }
+        ctx.project_id = Some(scope.project_id.clone());
+        ctx
+    }
     pub fn new(repo: Arc<dyn ApiKeyRepo>, key_prefix: String) -> Self {
         Self { repo, key_prefix }
     }
@@ -117,7 +127,7 @@ impl ApiKeyServiceAdapter {
         &self,
         scope: &APIKeyAccessScope,
     ) -> Result<Vec<ApiKeyRow>, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let project_id = decode_gql_id(&scope.project_id)
             .ok_or_else(|| APIKeyServiceError::Query("invalid selected project id".to_string()))?;
         let mut rows = Vec::new();
@@ -171,7 +181,7 @@ impl ApiKeyServiceAdapter {
         if ids.is_empty() {
             return Ok(());
         }
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
 
         // Distinct decoded ids — an undecodable id contributes no row, so it
         // fails the count check below exactly like a missing row (Go IN(...) also
@@ -225,21 +235,17 @@ impl ApiKeyServiceAdapter {
             ));
         }
 
-        let now = chrono::Utc::now().to_rfc3339();
-        for row in &rows {
-            self.repo
-                .update_api_key(
-                    &ctx,
-                    &row.id,
-                    RepoUpdateApiKeyInput {
-                        status: Some(status_wire.to_owned()),
-                        updated_at: now.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| APIKeyServiceError::BulkUpdate(action.to_owned(), e.to_string()))?;
-        }
+        self.repo
+            .update_api_key_status_batch(
+                &ctx,
+                &decode_gql_id(&scope.project_id).ok_or_else(|| {
+                    APIKeyServiceError::BulkUpdate(action.into(), "invalid Project".into())
+                })?,
+                &distinct,
+                status_wire,
+            )
+            .await
+            .map_err(|e| APIKeyServiceError::BulkUpdate(action.into(), e.to_string()))?;
         Ok(())
     }
 }
@@ -355,7 +361,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         current_user_id: Option<i64>,
         input: CreateAPIKeyInput,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let mut ctx = Self::scope_ctx(scope);
 
         // Go api_key.go:316-319: an explicit `noauth` type is reserved.
         if matches!(input.key_type, Some(APIKeyType::Noauth)) {
@@ -419,10 +425,47 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
             .transpose()
             .map_err(|error| APIKeyServiceError::Create(error.to_string()))?;
 
+        let billing_member = if let Some(user) = current_user_id {
+            Some(user.to_string())
+        } else if let Some(parent) = &scope.actor_api_key_id {
+            let parent = self
+                .repo
+                .find_api_key_by_id(&ctx, parent)
+                .await
+                .map_err(|_| APIKeyServiceError::Create("calling API key is unavailable".into()))?
+                .ok_or_else(|| {
+                    APIKeyServiceError::Create("calling API key is unavailable".into())
+                })?;
+            if parent.project_id != project_db {
+                return Err(APIKeyServiceError::Create(
+                    "calling API key is outside the selected Project".into(),
+                ));
+            }
+            Some(parent.user_id.ok_or_else(|| {
+                APIKeyServiceError::Create(
+                    "a billing member must be assigned before key delegation".into(),
+                )
+            })?)
+        } else {
+            return Err(APIKeyServiceError::Create(
+                "billing member is required".into(),
+            ));
+        };
+        if let (Some(actor), Some(principal)) = (&billing_member, ctx.policy.principal.as_mut()) {
+            principal.subject_id = actor.clone();
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let repo_input = RepoCreateApiKeyInput {
+            model_group_id: Some(
+                input
+                    .model_group_id
+                    .ok_or_else(|| {
+                        APIKeyServiceError::Create("ModelGroup must be configured".into())
+                    })?
+                    .to_string(),
+            ),
             id: String::new(), // the database owns the generated PK
-            user_id: current_user_id.map(|id| id.to_string()),
+            user_id: billing_member,
             project_id: project_db,
             name: input.name.clone(),
             key: generated,
@@ -450,7 +493,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         id: &str,
         input: UpdateAPIKeyInput,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id)
             .ok_or_else(|| APIKeyServiceError::Update(APIKeyServiceError::NotFound.to_string()))?;
 
@@ -538,7 +581,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         id: &str,
         status: APIKeyStatus,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id).ok_or_else(|| {
             APIKeyServiceError::UpdateStatus(APIKeyServiceError::NotFound.to_string())
         })?;
@@ -586,7 +629,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         scope: &APIKeyAccessScope,
         id: &str,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id)
             .ok_or_else(|| APIKeyServiceError::Rotate(APIKeyServiceError::NotFound.to_string()))?;
 
@@ -628,7 +671,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         id: &str,
         input: UpdateAPIKeyProfilesInput,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id).ok_or_else(|| {
             APIKeyServiceError::UpdateProfiles(APIKeyServiceError::NotFound.to_string())
         })?;
@@ -835,7 +878,7 @@ fn core_quota_to_gql(q: CoreApiKeyQuota) -> APIKeyQuota {
 /// Lower the GraphQL profiles input into the Go on-disk JSON shape by building
 /// the canonical `conduit_core` objects and serializing them (guarantees the
 /// exact camelCase + omitempty layout Go persists and the read path parses).
-fn profiles_input_to_core(
+pub(crate) fn profiles_input_to_core(
     input: UpdateAPIKeyProfilesInput,
 ) -> Result<CoreApiKeyProfiles, APIKeyServiceError> {
     let profiles = input.profiles.unwrap_or_default();
@@ -1235,5 +1278,97 @@ fn api_key_row_matches_where(row: &ApiKeyRow, w: &APIKeyWhereInput) -> bool {
         return false;
     }
 
+    // Case-insensitive search: the admin api-keys list searches with
+    // `nameContainsFold` / `keyContainsFold` (inside an `or`), and these were
+    // silently ignored, so the search box returned every key.
+    if !fold_field_matches(&row.name, &w.name_equal_fold, &w.name_contains_fold) {
+        return false;
+    }
+    if !fold_field_matches(&row.key, &w.key_equal_fold, &w.key_contains_fold) {
+        return false;
+    }
+
+    // created_at range: the list's date filter sends `createdAtGTE` / `createdAtLTE`.
+    if let Some(v) = &w.created_at_gte
+        && row.created_at < v.0
+    {
+        return false;
+    }
+    if let Some(v) = &w.created_at_gt
+        && row.created_at <= v.0
+    {
+        return false;
+    }
+    if let Some(v) = &w.created_at_lte
+        && row.created_at > v.0
+    {
+        return false;
+    }
+    if let Some(v) = &w.created_at_lt
+        && row.created_at >= v.0
+    {
+        return false;
+    }
+
     true
+}
+
+/// `EqualFold` / `ContainsFold` (ent semantics: Unicode case-insensitive).
+fn fold_field_matches(
+    value: &str,
+    equal_fold: &Option<String>,
+    contains_fold: &Option<String>,
+) -> bool {
+    if let Some(v) = equal_fold
+        && value.to_lowercase() != v.to_lowercase()
+    {
+        return false;
+    }
+    if let Some(v) = contains_fold
+        && !value.to_lowercase().contains(&v.to_lowercase())
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod filter_regression_tests {
+    use super::*;
+
+    #[test]
+    fn key_search_and_creation_time_boundaries() {
+        let now = chrono::Utc::now();
+        let row = ApiKeyRow {
+            id: "1".into(),
+            name: "Release KEY".into(),
+            status: "enabled".into(),
+            project_id: "1".into(),
+            user_id: None,
+            key: "Secret-ABC".into(),
+            key_type: "user".into(),
+            scopes: vec![],
+            profiles: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        };
+        let mut filter = APIKeyWhereInput {
+            name_contains_fold: Some("release".into()),
+            key_equal_fold: Some("secret-abc".into()),
+            ..Default::default()
+        };
+        assert!(api_key_row_matches_where(&row, &filter));
+        filter.created_at_gte = Some(conduit_admin_graphql::scalars::TimeScalar(now));
+        filter.created_at_lte = Some(conduit_admin_graphql::scalars::TimeScalar(now));
+        assert!(api_key_row_matches_where(&row, &filter));
+        filter.created_at_gt = Some(conduit_admin_graphql::scalars::TimeScalar(now));
+        assert!(!api_key_row_matches_where(&row, &filter));
+        filter.created_at_gt = None;
+        filter.created_at_lt = Some(conduit_admin_graphql::scalars::TimeScalar(now));
+        assert!(!api_key_row_matches_where(&row, &filter));
+        filter.created_at_lt = None;
+        filter.name_contains_fold = Some("absent".into());
+        assert!(!api_key_row_matches_where(&row, &filter));
+    }
 }

@@ -15,10 +15,23 @@ console.
 > Conduit API is currently alpha software. Back up PostgreSQL before upgrades
 > and evaluate new versions before using them for production traffic.
 
+[Current project knowledge, operations and implementation limits](docs/knowledge/index.md)
+
+Lite (`SIMPLE`) and Full (`ENTERPRISE`) share the same capabilities. New setup uses
+Lite with approval disabled. Existing mode, explicit feature overrides, approval
+choices, and package history survive upgrades. Optional approval uses separate
+review and publication duties; Project wallets remain the only Credits ledger.
+See the [current operation guide](docs/knowledge/frontend.md#lite-full-current)
+for feature controls, proposals, personal model funding and member budgets.
+
 ## Features
 
-- OpenAI-compatible, Anthropic, Gemini, Jina, Doubao, and AI SDK protocol
-  translation.
+- OpenAI chat/Responses (including compact), Anthropic messages, and Gemini
+  content translation through the production chat pipeline, subject to channel support.
+- Embedding, rerank, image, audio, video, legacy-completion, and provider-specific
+  helpers have [documented production wiring limits](docs/knowledge/http-api.md).
+  Jina and Doubao dedicated outbound formats are not registered; AI SDK has
+  conversion helpers but no dedicated inference route.
 - Health-aware provider routing, retries, concurrency limits, and prompt-cache
   affinity.
 - Provider model discovery, mapping rules, and reviewable pricing updates.

@@ -798,29 +798,9 @@ impl RequestRecorder for UsageLogRecorder {
             armed: true,
         };
         self.reserve_request(ctx, input).await?;
-        if let Some(pool) = self.postgres_pool().filter(|_| self.journal.is_some()) {
-            let request_id = input
-                .request_key
-                .parse::<i64>()
-                .map_err(|_| ConduitError::internal("invalid metering request id"))?;
-            let affected = sqlx::query(
-                "UPDATE requests SET metering_pending=TRUE WHERE id=$1 AND project_id=$2",
-            )
-            .bind(request_id)
-            .bind(
-                input
-                    .project_id
-                    .parse::<i64>()
-                    .map_err(|_| ConduitError::internal("invalid metering project id"))?,
-            )
-            .execute(pool)
-            .await
-            .map_err(|e| ConduitError::internal(format!("metering audit protection failed: {e}")))?
-            .rows_affected();
-            if affected != 1 {
-                return Err(ConduitError::internal("metering request audit is missing"));
-            }
-        }
+        // request_key is the public routing/reservation/journal identity. The
+        // numeric audit row does not exist until the persistence middleware;
+        // the production repo protects that row atomically when it is inserted.
         cleanup.armed = false;
         Ok(())
     }
@@ -1056,12 +1036,34 @@ impl RequestRecorder for UsageLogRecorder {
         // upstream fee. Feed an all-zero Usage into the existing cost engine;
         // `flat_fee` deliberately ignores token quantity. If neither condition
         // applies, retain the old behavior and avoid empty accounting rows.
+        let retail_flat_fee = if response.usage.as_ref().is_none_or(|usage| usage.is_zero()) {
+            if let (Some(pool), Some(key)) = (
+                self.postgres_pool(),
+                ctx.metadata.get("billing_reservation_key"),
+            ) {
+                crate::usage_charge_settler_postgres::reservation_has_request_flat_fee(
+                    pool,
+                    key,
+                    request_id_i64,
+                    project_id_i64,
+                )
+                .await
+                .map_err(|error| {
+                    ConduitError::internal(format!("retail terminal pricing failed: {error}"))
+                })?
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let default_usage = conduit_llm::Usage::default();
         let usage = match response.usage.as_ref() {
             Some(usage) if !usage.is_zero() => usage,
-            _ if resolved_price
-                .as_ref()
-                .is_some_and(|resolved| Self::has_request_flat_fee(&resolved.price)) =>
+            _ if retail_flat_fee
+                || resolved_price
+                    .as_ref()
+                    .is_some_and(|resolved| Self::has_request_flat_fee(&resolved.price)) =>
             {
                 &default_usage
             }
@@ -2425,6 +2427,279 @@ mod tests {
             .acquire_postgres_api_key_slot(api_key_id, "request-two", 1)
             .await?;
         database.cleanup().await?;
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct IdentityChargeSettler {
+        admissions: Mutex<Vec<String>>,
+        captures: Mutex<Vec<(String, String)>>,
+        releases: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl crate::usage_charge_settler::UsageChargeSettler for IdentityChargeSettler {
+        async fn reserve_request(
+            &self,
+            input: &BillingAdmissionInput,
+        ) -> Result<Option<String>, String> {
+            self.admissions
+                .lock()
+                .unwrap()
+                .push(input.request_key.clone());
+            Ok(Some(input.request_key.clone()))
+        }
+        async fn settle_usage(
+            &self,
+            usage: &UsageLogRow,
+            _tokens: &Usage,
+            key: Option<&str>,
+        ) -> Result<(), String> {
+            self.captures
+                .lock()
+                .unwrap()
+                .push((usage.request_id.clone(), key.unwrap().into()));
+            Ok(())
+        }
+        async fn release_request(&self, key: &str, _reason: &str) -> Result<(), String> {
+            self.releases.lock().unwrap().push(key.into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn metering_identity_public_key_and_numeric_audit_pending_lifecycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_db::repo::request_repo::{CreateRequestInput, RequestRepo};
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let key_id: i64 = sqlx::query_scalar("INSERT INTO api_keys(key,name) VALUES('identity-fixture','identity fixture') RETURNING id").fetch_one(&db.pool).await?;
+        let root = std::env::var_os("CONDUIT_TEST_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("metering-identity-{}", uuid::Uuid::new_v4()));
+        for case in [
+            "normal",
+            "ready_failure",
+            "put_failure",
+            "zero",
+            "failure",
+            "no_ready",
+        ] {
+            let public_key = format!("ar-metering-identity-{case}");
+            let path = root.join(case);
+            let journal = Arc::new(crate::usage_recovery::UsageJournal::open(
+                conduit_config::model::UsageRecoveryConfig {
+                    directory: path.to_string_lossy().into(),
+                    max_event_bytes: if case == "put_failure" { 128 } else { 65536 },
+                    ..Default::default()
+                },
+            )?);
+            let settler = Arc::new(IdentityChargeSettler::default());
+            let recorder =
+                UsageLogRecorder::new(Arc::new(conduit_db::PgUsageRepo::new(db.pool.clone())))
+                    .with_usage_journal(journal.clone())
+                    .with_charge_settler(settler.clone())
+                    .with_postgres_stream_persistence(db.pool.clone());
+            let mut ctx = OrchestratorContext::new();
+            ctx.metadata.insert("api_key_id".into(), key_id.to_string());
+            ctx.metadata.insert("model".into(), "metered".into());
+            recorder
+                .admit_request(
+                    &mut ctx,
+                    &BillingAdmissionInput {
+                        request_key: public_key.clone(),
+                        project_id: "1".into(),
+                        api_key_id: Some(key_id.to_string()),
+                        model_group_id: None,
+                        model_group_revision: None,
+                        public_model: "metered".into(),
+                        estimated_input_tokens: 1,
+                        max_output_tokens: 1,
+                    },
+                    Some(1),
+                )
+                .await?;
+            assert_eq!(
+                ctx.metadata.get(BILLING_ADMISSION_REQUEST_KEY_METADATA),
+                Some(&public_key)
+            );
+            assert_eq!(
+                ctx.metadata.get("billing_reservation_key"),
+                Some(&public_key)
+            );
+            let repo = conduit_db::PgRequestRepo::new(db.pool.clone()).with_metering_protection();
+            let row = repo
+                .create_request(
+                    &RequestContext::new(PolicyContext::new(Principal::system())),
+                    CreateRequestInput {
+                        id: public_key.clone(),
+                        project_id: "1".into(),
+                        api_key_id: Some(key_id.to_string()),
+                        trace_id: None,
+                        data_storage_id: None,
+                        source: "api".into(),
+                        model_id: "metered".into(),
+                        reasoning_effort: None,
+                        format: "openai/chat_completions".into(),
+                        request_headers: None,
+                        request_body: serde_json::json!({}),
+                        channel_id: None,
+                        external_id: None,
+                        stream: false,
+                        client_ip: String::new(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                )
+                .await?;
+            let numeric_id = row.id.parse::<i64>()?;
+            assert_ne!(row.id, public_key);
+            assert!(
+                sqlx::query_scalar::<_, bool>("SELECT metering_pending FROM requests WHERE id=$1")
+                    .bind(numeric_id)
+                    .fetch_one(&db.pool)
+                    .await?
+            );
+            if case == "ready_failure" {
+                sqlx::query("CREATE FUNCTION fail_identity_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected identity handoff failure'; END $$").execute(&db.pool).await?;
+                sqlx::query("CREATE TRIGGER fail_identity_usage BEFORE INSERT ON usage_logs FOR EACH ROW EXECUTE FUNCTION fail_identity_usage()").execute(&db.pool).await?;
+            }
+            if case == "no_ready" {
+                recorder.abandon_request(&ctx, "interrupted before terminal acceptance");
+                assert_eq!(journal.replay(&db.pool).await?, 0);
+                sqlx::query("UPDATE requests SET status='canceled',created_at=now()-interval '2 days',updated_at=now()-interval '2 days',activity_until=NULL WHERE id=$1").bind(numeric_id).execute(&db.pool).await?;
+                crate::wiring_postgres_system_operations::execute_postgres_gc_plan(
+                    &db.pool,
+                    &conduit_services::GcConfig {
+                        cron: String::new(),
+                        vacuum_enabled: false,
+                        vacuum_full: false,
+                    },
+                    &conduit_services::GcRunPlan {
+                        steps: vec![conduit_services::GcRunStep {
+                            resource: conduit_services::GcRunResource::Requests,
+                            cutoff_at: chrono::Utc::now() - chrono::Duration::days(1),
+                            retention_days: 1,
+                        }],
+                        run_vacuum: false,
+                        unknown_resources: vec![],
+                    },
+                )
+                .await;
+            } else if case == "failure" {
+                recorder
+                    .record_failure(
+                        &ctx,
+                        &row.id,
+                        "1",
+                        &ConduitError::upstream("explicit upstream failure"),
+                    )
+                    .await?;
+            } else {
+                let result = recorder
+                    .record_success(
+                        &ctx,
+                        &row.id,
+                        "1",
+                        &succeeded_attempt(1, "internal"),
+                        &response_with_usage(
+                            if case == "zero" { 0 } else { 1 },
+                            if case == "zero" { 0 } else { 1 },
+                        ),
+                    )
+                    .await;
+                if case == "put_failure" {
+                    let error = result.expect_err("durable acceptance must fail");
+                    assert!(error.message.contains("durable metering acceptance failed"));
+                    recorder.record_failure(&ctx, &row.id, "1", &error).await?;
+                } else {
+                    result?;
+                }
+            }
+            let pending: bool =
+                sqlx::query_scalar("SELECT metering_pending FROM requests WHERE id=$1")
+                    .bind(numeric_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            assert_eq!(
+                pending,
+                matches!(case, "ready_failure" | "put_failure" | "no_ready"),
+                "{case}"
+            );
+            if case == "ready_failure" {
+                let ready_path = path.join(format!(
+                    "{}.ready",
+                    crate::usage_recovery::event_key(&public_key)
+                ));
+                let event: crate::usage_recovery::MeteredEvent =
+                    serde_json::from_slice(&std::fs::read(&ready_path)?)?;
+                assert_eq!(event.reservation_key.as_deref(), Some(public_key.as_str()));
+                assert_eq!(event.usage.request_id, row.id);
+                sqlx::query("DROP TRIGGER fail_identity_usage ON usage_logs")
+                    .execute(&db.pool)
+                    .await?;
+                assert_eq!(journal.replay(&db.pool).await?, 1);
+                assert_eq!(journal.replay(&db.pool).await?, 0);
+                crate::usage_recovery::handoff(&db.pool, &event).await?;
+                assert!(
+                    !sqlx::query_scalar::<_, bool>(
+                        "SELECT metering_pending FROM requests WHERE id=$1"
+                    )
+                    .bind(numeric_id)
+                    .fetch_one(&db.pool)
+                    .await?
+                );
+            }
+            let usage_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM usage_logs WHERE request_id=$1")
+                    .bind(numeric_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            assert_eq!(
+                usage_count,
+                i64::from(matches!(case, "normal" | "ready_failure")),
+                "{case}"
+            );
+            if usage_count == 1 {
+                let reservation_key: String = sqlx::query_scalar("SELECT o.reservation_key FROM usage_charge_outbox o JOIN usage_logs u ON u.id=o.usage_log_id WHERE u.request_id=$1").bind(numeric_id).fetch_one(&db.pool).await?;
+                assert_eq!(reservation_key, public_key);
+            }
+            assert_eq!(
+                settler.admissions.lock().unwrap().as_slice(),
+                &[public_key.clone()]
+            );
+            if case == "normal" {
+                assert_eq!(
+                    settler.captures.lock().unwrap().as_slice(),
+                    &[(row.id.clone(), public_key.clone())]
+                );
+            }
+            // Drop cleanup is scheduled on the runtime, so assert eventual release
+            // within a wall-clock deadline rather than a count of scheduler yields.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let leases: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM api_key_concurrency_leases WHERE request_key=$1",
+                    )
+                    .bind(&public_key)
+                    .fetch_one(&db.pool)
+                    .await?;
+                    if leases == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok::<_, sqlx::Error>(())
+            })
+            .await
+            .map_err(|_| format!("{case}: scheduled lease release timed out"))??;
+            drop(recorder);
+            drop(journal);
+        }
+        db.cleanup().await?;
+        // Only this UUID task directory is removed; journal locks are closed above.
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 }

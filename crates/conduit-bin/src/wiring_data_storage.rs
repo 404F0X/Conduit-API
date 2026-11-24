@@ -72,7 +72,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use conduit_admin_graphql::data_storage::{
     CreateDataStorageInput, DataStorage as GqlDataStorage, DataStorageConnection,
@@ -344,6 +344,32 @@ fn settings_input_to_wire(input: DataStorageSettingsInput) -> WireSettings {
         gcs: input.gcs.map(gcs_input_to_wire),
         webdav: input.webdav.map(webdav_input_to_wire),
     }
+}
+
+pub(crate) fn governed_create(input: CreateDataStorageInput) -> Value {
+    json!({"name":input.name,"description":input.description,"type":storage_type_to_wire(input.storage_type),"primary":false,"status":"active","settings":wire_settings_to_json(&settings_input_to_wire(input.settings))})
+}
+pub(crate) fn governed_update(input: UpdateDataStorageInput, existing: &Value) -> Value {
+    let mut patch = serde_json::Map::new();
+    if let Some(v) = input.name {
+        patch.insert("name".into(), json!(v));
+    }
+    if let Some(v) = input.description {
+        patch.insert("description".into(), json!(v));
+    }
+    if let Some(v) = input.status {
+        patch.insert("status".into(), json!(status_to_wire(v)));
+    }
+    if let Some(v) = input.settings {
+        patch.insert(
+            "settings".into(),
+            wire_settings_to_json(&merge_settings(
+                &settings_from_row(existing),
+                &settings_input_to_wire(v),
+            )),
+        );
+    }
+    Value::Object(patch)
 }
 
 // ---------------------------------------------------------------------------

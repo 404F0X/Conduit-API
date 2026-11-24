@@ -55,11 +55,135 @@ function healthFreshness(value: string | null | undefined, locale: string) {
   return new Intl.DateTimeFormat(locale, { dateStyle: 'short', timeStyle: 'short' }).format(date);
 }
 
-function Price({ model, large = false }: { model: CatalogModel; large?: boolean }) {
+function PricingDetail({ pricing, currency }: { pricing: CatalogModel['price']['items'][number]['pricing']; currency: string }) {
   const { t } = useTranslation();
-  if (!model.price.billable) return <span className='text-muted-foreground text-sm'>{t('modelMarket.price.unpriced')}</span>;
   return (
-    <div className={large ? 'grid gap-3 sm:grid-cols-2' : 'grid grid-cols-2 gap-3'}>
+    <div className='space-y-1 text-sm'>
+      <div className='font-medium'>{t(`modelMarket.price.mode.${pricing.mode}`)}</div>
+      {pricing.amount !== null && (
+        <div className='font-mono tabular-nums'>
+          {currency} {pricing.amount}{' '}
+          <span className='font-sans text-xs'>
+            {t(pricing.mode === 'flat_fee' ? 'modelMarket.price.perRequest' : 'modelMarket.price.perMillion')}
+          </span>
+        </div>
+      )}
+      {pricing.tiers.length > 0 && (
+        <>
+          <p className='text-muted-foreground text-xs'>{t(`modelMarket.price.rule.${pricing.mode}`)}</p>
+          <ul className='space-y-1'>
+            {pricing.tiers.map((tier, index) => (
+              <li key={index} className='flex flex-wrap justify-between gap-x-3 gap-y-1 text-xs'>
+                <span>
+                  {t(tier.upTo === null ? 'modelMarket.price.rangeOpen' : 'modelMarket.price.range', {
+                    above: tier.above,
+                    upTo: tier.upTo,
+                  })}
+                </span>
+                <span className='font-mono tabular-nums'>
+                  {currency} {tier.pricePerMillion} {t('modelMarket.price.perMillion')}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+export function Price({ model, large = false }: { model: CatalogModel; large?: boolean }) {
+  const { t } = useTranslation();
+  if (model.price.status !== 'PRICED') {
+    return (
+      <span className='text-muted-foreground text-sm'>
+        {t(model.price.status === 'UNAVAILABLE' ? 'modelMarket.price.unavailable' : 'modelMarket.price.unpriced')}
+      </span>
+    );
+  }
+  if (model.price.branches?.length) {
+    return (
+      <div className='space-y-3'>
+        <Badge variant='secondary'>{t('modelMarket.price.conditional')}</Badge>
+        <p className='text-muted-foreground text-xs'>{t('modelMarket.price.conditionHint')}</p>
+        {large ? (
+          model.price.branches.map((branch, index) => (
+            <div key={index} className='space-y-2 rounded-md border p-3'>
+              <div className='text-sm font-semibold'>{branch.label || t(`modelMarket.price.source.${branch.source}`)}</div>
+              {branch.condition && <pre className='text-muted-foreground text-xs break-all whitespace-pre-wrap'>{branch.condition}</pre>}
+              <Price model={{ ...model, price: { ...model.price, items: branch.items, branches: [] } }} large />
+            </div>
+          ))
+        ) : (
+          <p className='text-sm'>
+            {t('modelMarket.price.ruleCount', { count: model.price.branches.filter((branch) => branch.source === 'rule').length })}
+          </p>
+        )}
+      </div>
+    );
+  }
+  const simple = [
+    model.price.inputPerMillion,
+    model.price.outputPerMillion,
+    model.price.cacheReadPerMillion,
+    model.price.cacheWritePerMillion,
+  ].some((value) => value !== null);
+  if (large) {
+    const labels: Record<string, string> = {
+      prompt_tokens: 'modelMarket.price.input',
+      completion_tokens: 'modelMarket.price.output',
+      prompt_cached_tokens: 'modelMarket.price.cacheRead',
+      prompt_write_cached_tokens: 'modelMarket.price.cacheWrite',
+      request: 'modelMarket.price.request',
+    };
+    return (
+      <div className='space-y-4'>
+        <p className='text-muted-foreground text-xs'>{t('modelMarket.price.itemsHint')}</p>
+        {model.price.items.map((item, index) => (
+          <div key={index} className='space-y-2 rounded-md border p-3'>
+            <div className='text-sm font-semibold'>{labels[item.itemCode] ? t(labels[item.itemCode]).split(' / ')[0] : item.itemCode}</div>
+            <PricingDetail pricing={item.pricing} currency={model.price.displayName} />
+            {item.promptWriteCacheVariants.length > 0 && (
+              <p className='text-muted-foreground text-xs'>{t('modelMarket.price.variantsHint')}</p>
+            )}
+            {item.promptWriteCacheVariants.map((variant, variantIndex) => (
+              <div key={variantIndex} className='space-y-1 border-l-2 pl-3'>
+                <div className='text-sm font-medium'>{t('modelMarket.price.variant', { code: variant.variantCode })}</div>
+                <PricingDetail pricing={variant.pricing} currency={model.price.displayName} />
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  if (!simple) {
+    const modes = [
+      ...new Set(
+        model.price.items.flatMap((item) => [item.pricing.mode, ...item.promptWriteCacheVariants.map((variant) => variant.pricing.mode)])
+      ),
+    ];
+    return (
+      <div className='space-y-2'>
+        <div className='flex flex-wrap gap-1.5'>
+          {modes.map((mode) => (
+            <Badge key={mode} variant='secondary'>
+              {t(`modelMarket.price.mode.${mode}`)}
+            </Badge>
+          ))}
+        </div>
+        {model.price.items.slice(0, 2).map((item, index) => (
+          <div key={index} className='space-y-1 text-xs'>
+            <div className='text-muted-foreground font-mono break-all'>{item.itemCode}</div>
+            <PricingDetail pricing={item.pricing} currency={model.price.displayName} />
+          </div>
+        ))}
+        <p className='text-muted-foreground text-xs'>{t('modelMarket.price.structured', { count: model.price.items.length })}</p>
+      </div>
+    );
+  }
+  return (
+    <div className='grid grid-cols-2 gap-3'>
       {[
         [t('modelMarket.price.input'), model.price.inputPerMillion],
         [t('modelMarket.price.output'), model.price.outputPerMillion],
@@ -68,9 +192,7 @@ function Price({ model, large = false }: { model: CatalogModel; large?: boolean 
       ].map(([label, value]) => (
         <div key={label}>
           <div className='text-muted-foreground text-[11px] font-medium tracking-wide uppercase'>{label}</div>
-          <div className={`font-mono font-semibold tabular-nums ${large ? 'text-xl' : 'text-sm'}`}>
-            {value ? `${model.price.displayName} ${value}` : '—'}
-          </div>
+          <div className='font-mono text-sm font-semibold tabular-nums'>{value !== null ? `${model.price.displayName} ${value}` : '�'}</div>
         </div>
       ))}
     </div>
@@ -113,6 +235,10 @@ function ModelDetail({ model, healthVisible, onBack }: { model: CatalogModel; he
           </div>
           <div className='border-t pt-5 xl:border-t-0 xl:border-l xl:pt-0 xl:pl-7'>
             <Price model={model} large />
+            <p className='text-muted-foreground mt-2 text-xs'>
+              {t('modelMarket.price.publishedSource', { version: model.price.priceBookVersion ?? '—' })} ·{' '}
+              {t(`modelMarket.price.source.${model.price.source}`)}
+            </p>
             <p className='text-muted-foreground mt-3 text-xs'>
               {t('modelMarket.price.effectiveHint', { multiplier: model.price.effectiveMultiplier })}
             </p>
@@ -164,8 +290,10 @@ function ModelDetail({ model, healthVisible, onBack }: { model: CatalogModel; he
 
 export default function ModelMarket() {
   const { t, i18n } = useTranslation();
-  const query = useMyModelCatalog();
-  const [selected, setSelected] = useState<CatalogModel | null>(null);
+  const [scope, setScope] = useState<{ modelGroupID?: string; apiKeyID?: string }>();
+  const query = useMyModelCatalog(scope);
+  const [selectedId, setSelected] = useState<string | null>(null);
+  const selected = query.isError ? undefined : query.data?.models.find((model) => model.id === selectedId);
   const [search, setSearch] = useState('');
   const [type, setType] = useState('all');
   const [sort, setSort] = useState('name');
@@ -178,7 +306,7 @@ export default function ModelMarket() {
     );
     return filtered.sort((a, b) =>
       sort === 'price'
-        ? Number(a.price.inputPerMillion || Infinity) - Number(b.price.inputPerMillion || Infinity)
+        ? Number(a.price.inputPerMillion ?? Infinity) - Number(b.price.inputPerMillion ?? Infinity)
         : a.name.localeCompare(b.name)
     );
   }, [query.data?.models, search, sort, type]);
@@ -196,6 +324,46 @@ export default function ModelMarket() {
         </div>
       </Header>
       <Main className='space-y-5 pb-10'>
+        <section className='bg-card space-y-2 rounded-lg border p-4'>
+          <label className='grid gap-2 text-sm font-medium'>
+            {t('modelMarket.scope.label')}
+            <select
+              className='bg-background h-9 max-w-full rounded-md border px-2'
+              value={query.data?.selectedPriceScope ?? ''}
+              onChange={(event) => {
+                const selectedScope = query.data?.priceScopes.find((item) => item.id === event.target.value);
+                setSelected(null);
+                setScope(
+                  selectedScope
+                    ? selectedScope.apiKeyID
+                      ? { apiKeyID: selectedScope.apiKeyID }
+                      : { modelGroupID: selectedScope.modelGroupID }
+                    : undefined
+                );
+              }}
+            >
+              <option value=''>{t('modelMarket.scope.select')}</option>
+              {(query.data?.priceScopes ?? []).map((item) => (
+                <option key={item.id} value={item.id}>
+                  {t(item.apiKeyID ? 'modelMarket.scope.key' : 'modelMarket.scope.group')} · {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className='text-muted-foreground text-xs'>{t('modelMarket.scope.hint')}</p>
+          {scope && (
+            <Button
+              variant='ghost'
+              size='sm'
+              onClick={() => {
+                setScope(undefined);
+                setSelected(null);
+              }}
+            >
+              {t('modelMarket.scope.clear')}
+            </Button>
+          )}
+        </section>
         {selected && query.data ? (
           <ModelDetail model={selected} healthVisible={query.data.healthVisible} onBack={() => setSelected(null)} />
         ) : (
@@ -276,11 +444,11 @@ export default function ModelMarket() {
                         tabIndex={0}
                         aria-label={t('modelMarket.openModel', { name: model.name })}
                         className='focus-visible:ring-ring group gap-4 py-5 shadow-none transition-all hover:-translate-y-0.5 hover:border-sky-500/40 hover:shadow-md focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none'
-                        onClick={() => setSelected(model)}
+                        onClick={() => setSelected(model.id)}
                         onKeyDown={(event) => {
                           if (event.key === 'Enter' || event.key === ' ') {
                             event.preventDefault();
-                            setSelected(model);
+                            setSelected(model.id);
                           }
                         }}
                       >

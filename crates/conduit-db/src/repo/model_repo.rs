@@ -10,9 +10,9 @@
 //! columns (developer, model_id, name, type, icon, group, model_card, settings,
 //! remark, timestamps, deleted_at).
 //!
-//! ## Uniqueness (mirrors Go `Model.Indexes`)
-//! - `models_by_name`     -> `(name, deleted_at)`
-//! - `models_by_model_id` -> `(model_id, deleted_at)`
+//! ## Identity
+//! Display names may repeat; name lookup rejects ambiguity. Public model keys
+//! retain their unique `(model_id, deleted_at)` index.
 //!
 //! ## Status semantics
 //! Go enum: `enabled | disabled | archived`; default on create is `disabled`.
@@ -343,16 +343,6 @@ impl InMemoryModelRepo {
         Ok(self.len()? == 0)
     }
 
-    fn name_in_use_locked(
-        guard: &BTreeMap<String, ModelRow>,
-        name: &str,
-        exclude_id: Option<&str>,
-    ) -> bool {
-        guard
-            .values()
-            .any(|row| is_live(row) && row.name == name && Some(row.id.as_str()) != exclude_id)
-    }
-
     fn model_id_in_use_locked(
         guard: &BTreeMap<String, ModelRow>,
         model_id: &str,
@@ -375,9 +365,6 @@ impl ModelRepo for InMemoryModelRepo {
             .rows
             .lock()
             .map_err(|_| RepoError::LockPoisoned("model repo"))?;
-        if Self::name_in_use_locked(&guard, &input.name, None) {
-            return Err(RepoError::NameConflict);
-        }
         if Self::model_id_in_use_locked(&guard, &input.model_id, None) {
             return Err(RepoError::NameConflict);
         }
@@ -421,13 +408,16 @@ impl ModelRepo for InMemoryModelRepo {
         _ctx: &RequestContext,
         name: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        Ok(self
+        let guard = self
             .rows
             .lock()
-            .map_err(|_| RepoError::LockPoisoned("model repo"))?
-            .values()
-            .find(|r| is_live(r) && r.name == name)
-            .cloned())
+            .map_err(|_| RepoError::LockPoisoned("model repo"))?;
+        let mut matches = guard.values().filter(|r| is_live(r) && r.name == name);
+        let first = matches.next().cloned();
+        if matches.next().is_some() {
+            return Err(RepoError::AmbiguousModelName);
+        }
+        Ok(first)
     }
 
     async fn find_model_by_model_id_unchecked(
@@ -494,11 +484,6 @@ impl ModelRepo for InMemoryModelRepo {
             .lock()
             .map_err(|_| RepoError::LockPoisoned("model repo"))?;
 
-        if let Some(new_name) = &input.name
-            && Self::name_in_use_locked(&guard, new_name, Some(model_id))
-        {
-            return Err(RepoError::NameConflict);
-        }
         if let Some(new_model_id) = &input.model_id
             && Self::model_id_in_use_locked(&guard, new_model_id, Some(model_id))
         {
@@ -544,15 +529,13 @@ impl ModelRepo for InMemoryModelRepo {
             .lock()
             .map_err(|_| RepoError::LockPoisoned("model repo"))?;
 
-        let (name, mid, is_deleted) = guard
+        let (mid, is_deleted) = guard
             .get(model_id)
-            .map(|r| (r.name.clone(), r.model_id.clone(), r.deleted_at.is_some()))
+            .map(|r| (r.model_id.clone(), r.deleted_at.is_some()))
             .ok_or(RepoError::NotFound("model"))?;
 
         if is_deleted {
-            if Self::name_in_use_locked(&guard, &name, Some(model_id))
-                || Self::model_id_in_use_locked(&guard, &mid, Some(model_id))
-            {
+            if Self::model_id_in_use_locked(&guard, &mid, Some(model_id)) {
                 return Err(RepoError::NameConflict);
             }
             let row = guard
@@ -664,7 +647,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn name_and_model_id_conflict_on_create_and_update() -> RepoResult<()> {
+    async fn repeated_display_names_and_unique_model_keys() -> RepoResult<()> {
         let repo = InMemoryModelRepo::new();
         let ctx = ctx_allowed();
         repo.create_model(
@@ -681,7 +664,11 @@ mod tests {
                 input("m-3", "Alpha", "gamma-1", "2024-01-03T00:00:00Z"),
             )
             .await;
-        assert!(matches!(dup_name, Err(RepoError::NameConflict)));
+        assert!(dup_name.is_ok());
+        assert!(matches!(
+            repo.find_model_by_name(&ctx, "Alpha").await,
+            Err(RepoError::AmbiguousModelName)
+        ));
 
         let dup_mid = repo
             .create_model(
@@ -702,7 +689,7 @@ mod tests {
                 },
             )
             .await;
-        assert!(matches!(rename, Err(RepoError::NameConflict)));
+        assert!(rename.is_ok());
 
         let re_mid = repo
             .update_model(

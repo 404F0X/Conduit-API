@@ -1,5 +1,3 @@
-'use client';
-
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react';
 import { z } from 'zod';
 import { useForm } from 'react-hook-form';
@@ -19,7 +17,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { TagsAutocompleteInput } from '@/components/ui/tags-autocomplete-input';
 import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -54,13 +52,20 @@ import {
   getApiFormatsForProvider,
   getChannelTypeForApiFormat,
 } from '../data/config_providers';
+import { canonicalNewApiURL } from '../data/discovery';
 import { Channel, ChannelType, ApiFormat, RetryableErrorPattern, createChannelInputSchema, updateChannelInputSchema } from '../data/schema';
 import { ProxyConfig, useOAuthFlow } from '../hooks/use-oauth-flow';
+import {
+  ConfigurationCategory,
+  getChannelConfigurationTarget,
+  getFirstChannelConfigurationErrorPath,
+} from '../utils/configuration-navigation';
 import { mergeChannelSettingsForUpdate } from '../utils/merge';
 import { isValidModelPattern, matchesModelPattern } from '../utils/pattern';
 import { ProxyType } from './channels-proxy-dialog';
 import { CopilotDeviceFlow } from './copilot-device-flow';
 import { ManualModelBadge } from './manual-model-badge';
+import { NewApiCreateDialog } from './new-api-discovery';
 
 interface Props {
   currentRow?: Channel;
@@ -318,6 +323,11 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const isEdit = !!currentRow;
   const isDuplicate = !!duplicateFromRow && !isEdit;
   const initialRow: Channel | undefined = currentRow || duplicateFromRow;
+  const [dialogStep, setDialogStep] = useState<'provider' | 'configuration'>(() => (initialRow ? 'configuration' : 'provider'));
+  const [configurationCategory, setConfigurationCategory] = useState<ConfigurationCategory>('connection');
+  const configurationHeadingRef = useRef<HTMLDivElement>(null);
+  const channelFormRef = useRef<HTMLFormElement>(null);
+  const channelDialogRef = useRef<HTMLDivElement>(null);
   const { data: generalSettings } = useGeneralSettings();
   const defaultBillingCurrency = normalizeCurrencyCode(generalSettings?.accountingCurrencyCode || DEFAULT_ACCOUNTING_CURRENCY_CODE);
   const createChannel = useCreateChannel();
@@ -358,6 +368,8 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const [authMode, setAuthMode] = useState<'official' | 'auth-json' | 'third-party'>('official');
   const [codexAuthJSONText, setCodexAuthJSONText] = useState('');
   const [patternError, setPatternError] = useState<string | null>(null);
+  const [retryableStatusCodesError, setRetryableStatusCodesError] = useState('');
+  const [retryableErrorPatternsError, setRetryableErrorPatternsError] = useState('');
 
   // Debounced search values for better performance
   const debouncedFetchedModelsSearch = useDebounce(fetchedModelsSearch, 300);
@@ -521,6 +533,8 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
   useEffect(() => {
     if (!open) {
+      setDialogStep(initialRow ? 'configuration' : 'provider');
+      setConfigurationCategory('connection');
       setShowApiKey(false);
       setShowApiKeysPanel(false);
       setApiKeysSearch('');
@@ -528,8 +542,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
       setConfirmRemoveSelectedOpen(false);
       setConfirmRemoveKey(null);
       setPatternError(null);
+      setRetryableStatusCodesError('');
+      setRetryableErrorPatternsError('');
     }
-  }, [open]);
+  }, [open, initialRow]);
 
   useEffect(() => {
     if (!open) return;
@@ -550,7 +566,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     }, 100);
 
     return () => clearTimeout(timer);
-  }, [open, isEdit, selectedProvider]);
+  }, [open, isEdit, selectedProvider, dialogStep]);
 
   // Auto-open supported models panel when showModelsPanel is true
   useEffect(() => {
@@ -644,6 +660,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
+    shouldFocusError: false,
     defaultValues:
       isEdit && currentRow
         ? {
@@ -729,6 +746,54 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const apiKeys = form.watch('credentials.apiKeys');
   const apiKeysCount = useMemo(() => (apiKeys || []).filter((k) => k.trim().length > 0).length, [apiKeys]);
   const isSubmitting = createChannel.isPending || duplicateChannel.isPending || updateChannel.isPending;
+  const isSidePanelOpen =
+    configurationCategory === 'connection' && (showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel);
+  const selectedProviderOption = availableProviders.find((provider) => provider.key === selectedProvider);
+  const SelectedProviderIcon = selectedProviderOption?.icon;
+
+  const changeConfigurationCategory = (category: ConfigurationCategory) => {
+    setConfigurationCategory(category);
+  };
+
+  const revealConfigurationError = useCallback((path?: string) => {
+    const target = getChannelConfigurationTarget(path);
+    setDialogStep('configuration');
+    setConfigurationCategory(target.category);
+    setShowFetchedModelsPanel(path === 'selectedFetchedModels');
+    setShowSupportedModelsPanel(false);
+    setShowApiKeysPanel(false);
+    requestAnimationFrame(() => {
+      const panel = channelFormRef.current?.querySelector<HTMLElement>(`[data-channel-category="${target.category}"]`);
+      const field =
+        path === 'selectedFetchedModels'
+          ? channelDialogRef.current?.querySelector<HTMLElement>(target.selector)
+          : panel?.matches(target.selector)
+            ? panel
+            : panel?.querySelector<HTMLElement>(target.selector);
+      let details = field?.closest('details');
+      while (details) {
+        details.open = true;
+        details = details.parentElement?.closest('details') ?? null;
+      }
+      const focusable = 'input:not(:disabled):not([type="hidden"]), textarea:not(:disabled), button:not(:disabled), [tabindex="0"]';
+      const control = field?.matches(focusable) ? field : field?.querySelector<HTMLElement>(focusable);
+      (control || field || panel)?.focus();
+      (control || field)?.scrollIntoView({ block: 'nearest' });
+    });
+  }, []);
+
+  const showProviderSelection = () => {
+    setDialogStep('provider');
+    requestAnimationFrame(() => {
+      providerRefs.current[selectedProvider]?.querySelector<HTMLButtonElement>('[role="radio"]')?.focus();
+    });
+  };
+
+  const showChannelConfiguration = async () => {
+    if (!selectedProviderOption || !(await form.trigger('type'))) return;
+    setDialogStep('configuration');
+    requestAnimationFrame(() => configurationHeadingRef.current?.focus());
+  };
 
   const { data: disabledKeys = [] } = useChannelDisabledAPIKeys(currentRow?.id || '', {
     enabled: isEdit && !!currentRow?.id && showApiKeysPanel,
@@ -1135,6 +1200,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
     // Check if there are selected fetched models that haven't been confirmed
     if (selectedFetchedModels.length > 0) {
+      revealConfigurationError('selectedFetchedModels');
       toast.error(t('channels.messages.modelsNotConfirmed'));
       return;
     }
@@ -1152,6 +1218,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     setBillingCurrencyError(nextBillingCurrencyError);
     setRechargeMultiplierError(nextRechargeMultiplierError);
     if (nextBillingCurrencyError || nextRechargeMultiplierError) {
+      revealConfigurationError(nextBillingCurrencyError ? 'billingCurrency' : 'rechargeMultiplier');
       toast.error(t('channels.pricing.requiredError'));
       return;
     }
@@ -1171,19 +1238,24 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
             type: 'manual',
             message: t('channels.messages.invalidOfficialOpenAIKey'),
           });
+          revealConfigurationError('credentials.apiKeys');
           toast.error(t('channels.messages.invalidOfficialOpenAIKey'));
           return;
         }
       }
 
       const retryableStatusCodes = parseRetryableStatusCodesInput(retryableStatusCodesText);
+      setRetryableStatusCodesError(retryableStatusCodes === null ? t('channels.dialogs.retryableStatusCodes.validation') : '');
       if (retryableStatusCodes === null) {
+        revealConfigurationError('retryableStatusCodes');
         toast.error(t('channels.dialogs.retryableStatusCodes.validation'));
         return;
       }
 
       const retryableErrorPatterns = parseRetryableErrorPatternsInput(retryableErrorPatternsText);
+      setRetryableErrorPatternsError(retryableErrorPatterns === null ? t('channels.dialogs.retryableErrorPatterns.validation') : '');
       if (retryableErrorPatterns === null) {
+        revealConfigurationError('retryableErrorPatterns');
         toast.error(t('channels.dialogs.retryableErrorPatterns.validation'));
         return;
       }
@@ -1214,11 +1286,18 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         }
       }
 
+      if (managementAdapter === 'new_api') {
+        const root = canonicalNewApiURL(dataWithModels.baseURL ?? currentRow?.baseURL ?? '');
+        dataWithModels.baseURL = root;
+        dataWithModels.websiteURL = root;
+      }
+
       if (selectedApiFormat === OPENAI_RESPONSES && !baseURLMatchesResponsesTransport(dataWithModels.baseURL, responsesTransport)) {
         form.setError('baseURL', {
           type: 'manual',
           message: t(getResponsesTransportBaseURLError(responsesTransport)),
         });
+        revealConfigurationError('baseURL');
         return;
       }
 
@@ -1481,6 +1560,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const handleSyncNow = useCallback(async () => {
     if (!currentRow) return [];
     if (patternError) {
+      revealConfigurationError('autoSyncModelPattern');
       toast.error(patternError);
       return [];
     }
@@ -1494,7 +1574,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
     setSupportedModels(result.supportedModels || []);
     return result.supportedModels || [];
-  }, [currentRow, form, patternError, syncChannelModels]);
+  }, [currentRow, form, patternError, syncChannelModels, revealConfigurationError]);
 
   const canFetchModels = () => {
     const baseURL = form.watch('baseURL');
@@ -1684,6 +1764,19 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     overscan: 5,
   });
 
+  if (!isEdit && !isDuplicate && managementAdapter === 'new_api') {
+    return (
+      <NewApiCreateDialog
+        open={open}
+        onOpenChange={(value) => {
+          if (!value) {
+            setManagementAdapter('none');
+            onOpenChange(false);
+          }
+        }}
+      />
+    );
+  }
   return (
     <>
       <Dialog
@@ -1751,24 +1844,89 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         }}
       >
         <DialogContent
-          className={`flex max-h-[90vh] flex-col transition-all duration-300 ${showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel ? 'sm:max-w-6xl' : 'sm:max-w-4xl'}`}
+          ref={channelDialogRef}
+          className='flex h-[min(860px,calc(100dvh-2rem))] w-[calc(100%-2rem)] min-w-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-[1200px]'
         >
-          <DialogHeader className='flex-shrink-0 text-left'>
+          <DialogHeader className='shrink-0 px-5 pt-6 pb-4 text-left sm:px-6'>
             <DialogTitle>{isEdit ? t('channels.dialogs.edit.title') : t('channels.dialogs.create.title')}</DialogTitle>
             <DialogDescription>
-              {isEdit ? t('channels.dialogs.edit.description') : t('channels.dialogs.create.description')}
+              {isEdit
+                ? t('channels.dialogs.edit.description')
+                : dialogStep === 'provider'
+                  ? t('channels.dialogs.steps.providerDescription')
+                  : t('channels.dialogs.steps.configurationDescription')}
             </DialogDescription>
           </DialogHeader>
-          <div className='flex min-h-0 flex-1 overflow-hidden md:gap-4'>
+          <nav className='shrink-0 px-5 pb-4 sm:px-6' aria-label={t('channels.dialogs.steps.label')}>
+            <ol className='grid grid-cols-2 gap-2'>
+              {(['provider', 'configuration'] as const).map((step, index) => (
+                <li key={step}>
+                  <button
+                    type='button'
+                    onClick={step === 'provider' ? showProviderSelection : showChannelConfiguration}
+                    aria-current={dialogStep === step ? 'step' : undefined}
+                    className={`focus-visible:ring-ring flex w-full items-center gap-2.5 rounded-lg border px-3 py-3 text-left text-sm font-medium transition-colors focus-visible:ring-2 focus-visible:outline-none ${
+                      dialogStep === step
+                        ? 'border-primary/40 bg-primary/5 text-foreground'
+                        : 'text-muted-foreground hover:bg-muted/60 border-transparent'
+                    }`}
+                  >
+                    <span
+                      aria-hidden='true'
+                      className={`flex size-6 shrink-0 items-center justify-center rounded-full text-xs ${dialogStep === step ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}
+                    >
+                      {index + 1}
+                    </span>
+                    {t(`channels.dialogs.steps.${step}`)}
+                  </button>
+                </li>
+              ))}
+            </ol>
+          </nav>
+          {dialogStep === 'configuration' && (
+            <div
+              ref={configurationHeadingRef}
+              tabIndex={-1}
+              className='bg-muted/30 mx-5 mb-4 flex shrink-0 items-center justify-between gap-3 rounded-lg border px-4 py-3 outline-none sm:mx-6'
+            >
+              <div className='flex min-w-0 items-center gap-3'>
+                {SelectedProviderIcon && <SelectedProviderIcon size={24} className='shrink-0' />}
+                <div className='min-w-0'>
+                  <p className='text-muted-foreground text-xs'>{t('channels.dialogs.steps.selectedProvider')}</p>
+                  <p className='truncate text-sm font-medium'>{selectedProviderOption?.label}</p>
+                </div>
+              </div>
+              <Button type='button' variant='ghost' size='sm' onClick={showProviderSelection} className='shrink-0'>
+                {t('channels.dialogs.steps.changeProvider')}
+              </Button>
+            </div>
+          )}
+          <div className='relative flex min-h-0 flex-1 overflow-hidden px-5 pb-4 sm:px-6 md:gap-4'>
             {/* Main Form Section */}
             <div
-              className={`flex min-h-0 flex-1 flex-col overflow-hidden py-1 transition-all duration-300 ${showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel ? 'pr-2' : 'pr-0'}`}
+              className={`min-h-0 min-w-0 flex-1 flex-col overflow-hidden py-1 ${isSidePanelOpen && dialogStep === 'configuration' ? 'hidden md:flex' : 'flex'}`}
             >
               <Form {...form}>
-                <form id='channel-form' onSubmit={form.handleSubmit(onSubmit)} className='flex min-h-0 flex-1 flex-col space-y-6 p-0.5'>
-                  {/* Provider Selection - Left Side */}
-                  <div className='flex min-h-0 flex-1 flex-col gap-4 overflow-hidden md:flex-row md:gap-6'>
-                    <div className='flex max-h-48 min-h-0 w-full flex-shrink-0 flex-col md:max-h-none md:w-60'>
+                <form
+                  ref={channelFormRef}
+                  id='channel-form'
+                  onSubmit={(event) => {
+                    if (dialogStep === 'provider') {
+                      event.preventDefault();
+                      return;
+                    }
+                    void form.handleSubmit(onSubmit, (errors) => {
+                      revealConfigurationError(getFirstChannelConfigurationErrorPath(errors));
+                    })(event);
+                  }}
+                  onKeyDown={(event) => {
+                    if (dialogStep === 'provider' && event.key === 'Enter') event.preventDefault();
+                  }}
+                  className='flex min-h-0 min-w-0 flex-1 flex-col p-0.5'
+                >
+                  {/* Keep both steps mounted so navigation preserves the full draft. */}
+                  <div className='flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'>
+                    <div className={dialogStep === 'provider' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}>
                       <FormItem className='flex min-h-0 flex-1 flex-col space-y-2'>
                         <FormLabel className='text-base font-semibold'>{t('channels.dialogs.fields.provider.label')}</FormLabel>
                         <div
@@ -1779,7 +1937,8 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                             value={selectedProvider}
                             onValueChange={handleProviderChange}
                             disabled={!!isOAuthChannel}
-                            className='space-y-2'
+                            aria-label={t('channels.dialogs.steps.provider')}
+                            className='grid grid-cols-1 gap-3 pb-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4'
                           >
                             {availableProviders.map((provider) => {
                               const Icon = provider.icon;
@@ -1792,7 +1951,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                   ref={(el) => {
                                     providerRefs.current[provider.key] = el;
                                   }}
-                                  className={`flex items-center space-x-3 rounded-lg border p-3 transition-colors ${
+                                  className={`flex min-h-16 items-center space-x-3 rounded-lg border p-3 transition-colors ${
                                     isProviderDisabled
                                       ? isSelected
                                         ? 'border-primary bg-muted/80 cursor-not-allowed shadow-sm'
@@ -1807,7 +1966,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                     data-testid={`provider-${provider.key}`}
                                   />
                                   {Icon && <Icon size={20} className='flex-shrink-0' />}
-                                  <FormLabel htmlFor={`provider-${provider.key}`} className='flex-1 cursor-pointer font-normal'>
+                                  <FormLabel htmlFor={`provider-${provider.key}`} className='min-w-0 flex-1 cursor-pointer font-normal'>
                                     {provider.label}
                                   </FormLabel>
                                 </div>
@@ -1820,1099 +1979,1250 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                       <FormField control={form.control} name='type' render={() => <input type='hidden' />} />
                     </div>
 
-                    {/* Right Side - Form Fields */}
-                    <div className='flex-1 space-y-6 overflow-y-auto md:pr-4'>
-                      {selectedProvider !== 'jina' && selectedProvider !== 'codex' && selectedProvider !== 'claudecode' && (
-                        <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                            {t('channels.dialogs.fields.apiFormat.label')}
-                          </FormLabel>
-                          <div className='max-w-64 space-y-1 md:col-span-6 md:max-w-none'>
-                            <SelectDropdown
-                              key={selectedProvider}
-                              defaultValue={selectedApiFormatOption}
-                              onValueChange={(value) => handleApiFormatChange(value as ApiFormatOption)}
-                              disabled={!!isOAuthChannel}
-                              placeholder={t('channels.dialogs.fields.apiFormat.placeholder')}
-                              data-testid='api-format-select'
-                              isControlled={true}
-                              items={availableApiFormatOptions.map((format) => ({
-                                value: format,
-                                label: getApiFormatOptionLabel(format),
-                              }))}
-                            />
-                            {selectedApiFormat === 'gemini/contents' && (
-                              <div className='mt-3'>
-                                <label
-                                  className={`flex items-center gap-2 text-sm ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
-                                >
-                                  <Checkbox
-                                    checked={useGeminiVertex}
-                                    onCheckedChange={(checked) => handleGeminiVertexChange(checked === true)}
-                                    disabled={!!isOAuthChannel}
-                                  />
-                                  <span>{t('channels.dialogs.fields.apiFormat.geminiVertex.label')}</span>
-                                </label>
-                              </div>
-                            )}
-                            {selectedApiFormat === 'anthropic/messages' && selectedProvider === 'anthropic' && (
-                              <div className='mt-3 space-y-2'>
-                                <label
-                                  className={`flex items-center gap-2 text-sm ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
-                                >
-                                  <Checkbox
-                                    checked={useAnthropicAws}
-                                    onCheckedChange={(checked) => handleAnthropicAwsChange(checked === true)}
-                                    disabled={!!isOAuthChannel}
-                                  />
-                                  <span>{t('channels.dialogs.fields.apiFormat.anthropicAWS.label')}</span>
-                                </label>
-                              </div>
-                            )}
-                            {selectedApiFormat === 'anthropic/messages' && selectedProvider === 'moonshot' && (
-                              <div className='mt-3 space-y-2'>
-                                <label
-                                  className={`flex items-center gap-2 text-sm ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
-                                >
-                                  <Checkbox
-                                    checked={useKimiCoding}
-                                    onCheckedChange={(checked) => handleKimiCodingChange(checked === true)}
-                                    disabled={!!isOAuthChannel}
-                                  />
-                                  <span>{t('channels.dialogs.fields.apiFormat.kimiCoding.label')}</span>
-                                </label>
-                              </div>
-                            )}
-                          </div>
-                        </FormItem>
-                      )}
-                      {selectedProvider === 'codex' && (
-                        <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                            {t('channels.dialogs.fields.apiFormat.label')}
-                          </FormLabel>
-                          <div className='max-w-64 space-y-1 md:col-span-6 md:max-w-none'>
-                            <SelectDropdown
-                              defaultValue={responsesTransport === 'websocket' ? OPENAI_RESPONSES_WEBSOCKET : OPENAI_RESPONSES}
-                              onValueChange={(value) =>
-                                handleResponsesTransportChange(value === OPENAI_RESPONSES_WEBSOCKET ? 'websocket' : 'http')
-                              }
-                              placeholder={t('channels.dialogs.fields.apiFormat.placeholder')}
-                              data-testid='api-format-select'
-                              isControlled={true}
-                              items={[
-                                { value: OPENAI_RESPONSES, label: getApiFormatLabel(OPENAI_RESPONSES) },
-                                { value: OPENAI_RESPONSES_WEBSOCKET, label: getApiFormatOptionLabel(OPENAI_RESPONSES_WEBSOCKET) },
-                              ]}
-                            />
-                          </div>
-                        </FormItem>
-                      )}
-
-                      {selectedProvider === 'claudecode' && (
-                        <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                            {t('channels.dialogs.fields.apiFormat.label')}
-                          </FormLabel>
-                          <div className='space-y-1 md:col-span-6'>
-                            <div className='text-sm'>{getApiFormatLabel(ANTHROPIC_MESSAGES)}</div>
-                            <p className='text-muted-foreground mt-1 text-xs'>{t('channels.dialogs.fields.apiFormat.editDisabled')}</p>
-                          </div>
-                        </FormItem>
-                      )}
-
-                      {selectedProvider === 'antigravity' && (
-                        <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                            {t('channels.dialogs.fields.apiFormat.label')}
-                          </FormLabel>
-                          <div className='space-y-1 md:col-span-6'>
-                            <div className='text-sm'>{getApiFormatLabel(GEMINI_CONTENTS)}</div>
-                            <p className='text-muted-foreground mt-1 text-xs'>{t('channels.dialogs.fields.apiFormat.editDisabled')}</p>
-
-                            <div className='mt-3 space-y-2'>
-                              <div className='rounded-md border p-3'>
-                                <div className='flex flex-wrap items-center gap-2'>
-                                  <Button
-                                    type='button'
-                                    variant='secondary'
-                                    onClick={() => antigravityOAuth.start()}
-                                    disabled={antigravityOAuth.isStarting}
-                                  >
-                                    {antigravityOAuth.isStarting
-                                      ? t('channels.dialogs.antigravity.buttons.starting')
-                                      : t('channels.dialogs.antigravity.buttons.startOAuth')}
-                                  </Button>
-                                  {antigravityOAuth.authUrl && (
-                                    <Button
-                                      type='button'
-                                      variant='ghost'
-                                      onClick={() => window.open(antigravityOAuth.authUrl || '', '_blank', 'noopener,noreferrer')}
-                                    >
-                                      {t('channels.dialogs.antigravity.buttons.openOAuthLink')}
-                                    </Button>
-                                  )}
-                                </div>
-
-                                {antigravityOAuth.authUrl && (
-                                  <div className='mt-3 space-y-2'>
-                                    <FormLabel className='text-sm font-medium'>
-                                      {t('channels.dialogs.antigravity.labels.authorizationUrl')}
-                                    </FormLabel>
-                                    <Textarea
-                                      value={antigravityOAuth.authUrl}
-                                      readOnly
-                                      className='min-h-[60px] resize-none font-mono text-xs'
-                                      placeholder={t('channels.dialogs.antigravity.placeholders.authorizationUrl')}
-                                    />
-                                  </div>
-                                )}
-
-                                <div className='mt-3 space-y-2'>
-                                  <FormLabel className='text-sm font-medium'>
-                                    {t('channels.dialogs.antigravity.labels.callbackUrl')}
-                                  </FormLabel>
-                                  <Textarea
-                                    value={antigravityOAuth.callbackUrl}
-                                    onChange={(e) => antigravityOAuth.setCallbackUrl(e.target.value)}
-                                    placeholder={t('channels.dialogs.antigravity.placeholders.callbackUrl')}
-                                    className='min-h-[80px] resize-y font-mono text-xs'
-                                  />
-                                  <Button
-                                    type='button'
-                                    onClick={() => antigravityOAuth.exchange()}
-                                    disabled={antigravityOAuth.isExchanging || !antigravityOAuth.sessionId}
-                                  >
-                                    {antigravityOAuth.isExchanging
-                                      ? t('channels.dialogs.antigravity.buttons.exchanging')
-                                      : t('channels.dialogs.antigravity.buttons.exchangeAndFillApiKey')}
-                                  </Button>
-                                </div>
-
-                                <p className='mt-2 text-xs text-amber-600 dark:text-amber-400'>{t('channels.dialogs.proxy.oauthHint')}</p>
-                                <p className='text-muted-foreground mt-2 text-xs'>
-                                  {t('channels.dialogs.fields.apiFormat.antigravity.description')}
+                    {/* Categorized configuration stays mounted with the form draft. */}
+                    <Tabs
+                      value={configurationCategory}
+                      onValueChange={(value) => changeConfigurationCategory(value as ConfigurationCategory)}
+                      className={dialogStep === 'configuration' ? 'flex min-h-0 min-w-0 flex-1 flex-col gap-4' : 'hidden'}
+                    >
+                      <TabsList
+                        className='grid h-auto w-full shrink-0 grid-cols-2 gap-1 sm:grid-cols-4'
+                        aria-label={t('channels.dialogs.categories.label')}
+                      >
+                        {(['connection', 'billing', 'request', 'other'] as const).map((category) => (
+                          <TabsTrigger key={category} value={category} className='h-auto min-h-10 px-2 py-2 whitespace-normal'>
+                            {t(`channels.dialogs.categories.${category}`)}
+                          </TabsTrigger>
+                        ))}
+                      </TabsList>
+                      <TabsContent
+                        forceMount
+                        value='connection'
+                        data-channel-category='connection'
+                        className={configurationCategory === 'connection' ? 'min-h-0 flex-1 overflow-y-auto pr-2 pb-1' : 'hidden'}
+                      >
+                        <div className={`grid min-w-0 items-start gap-4 ${isSidePanelOpen ? 'grid-cols-1' : 'grid-cols-1 lg:grid-cols-2'}`}>
+                          <div className='min-w-0 space-y-4'>
+                            <section className='bg-background min-w-0 space-y-5 rounded-xl border p-4 sm:p-5'>
+                              <header className='space-y-1'>
+                                <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.connection')}</h3>
+                                <p className='text-muted-foreground text-xs leading-relaxed'>
+                                  {t('channels.dialogs.sections.connectionDescription')}
                                 </p>
-                              </div>
-                            </div>
-                          </div>
-                        </FormItem>
-                      )}
-
-                      {isCopilotType && (
-                        <div className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <div className='col-span-2' />
-                          <div className='space-y-4 md:col-span-6'>
-                            <CopilotDeviceFlow
-                              existingCredentials={form.watch('credentials.apiKey')}
-                              onSuccess={(token) => {
-                                // Store as OAuth JSON format expected by backend
-                                const oauthCredentials = JSON.stringify({
-                                  access_token: token,
-                                  token_type: 'bearer',
-                                });
-                                form.setValue('credentials.apiKey', oauthCredentials, { shouldDirty: true, shouldValidate: true });
-                              }}
-                              onError={(error) => {
-                                toast.error(error);
-                              }}
-                            />
-                          </div>
-                        </div>
-                      )}
-
-                      <FormField
-                        control={form.control}
-                        name='name'
-                        render={({ field, fieldState }) => (
-                          <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                            <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                              {t('channels.dialogs.fields.name.label')}
-                            </FormLabel>
-                            <div className='space-y-1 md:col-span-6'>
-                              <Input
-                                placeholder={t('channels.dialogs.fields.name.placeholder')}
-                                autoComplete='off'
-                                aria-invalid={!!fieldState.error}
-                                data-testid='channel-name-input'
-                                {...field}
+                              </header>
+                              <FormField
+                                control={form.control}
+                                name='name'
+                                render={({ field, fieldState }) => (
+                                  <FormItem className='min-w-0 space-y-2'>
+                                    <FormLabel className='font-medium'>{t('channels.dialogs.fields.name.label')}</FormLabel>
+                                    <div className='space-y-1'>
+                                      <Input
+                                        placeholder={t('channels.dialogs.fields.name.placeholder')}
+                                        autoComplete='off'
+                                        aria-invalid={!!fieldState.error}
+                                        data-testid='channel-name-input'
+                                        {...field}
+                                      />
+                                      <FormMessage />
+                                    </div>
+                                  </FormItem>
+                                )}
                               />
-                              <FormMessage />
-                            </div>
-                          </FormItem>
-                        )}
-                      />
-
-                      <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                          {t('channels.managementAdapter.label')}
-                        </FormLabel>
-                        <div className='space-y-1 md:col-span-6'>
-                          <Select value={managementAdapter} onValueChange={(value) => setManagementAdapter(value as 'none' | 'new_api')}>
-                            <FormControl>
-                              <SelectTrigger data-testid='management-adapter-select'>
-                                <SelectValue />
-                              </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                              <SelectItem value='none'>{t('channels.managementAdapter.none')}</SelectItem>
-                              <SelectItem value='new_api'>{t('channels.managementAdapter.newApi')}</SelectItem>
-                            </SelectContent>
-                          </Select>
-                          <p className='text-muted-foreground text-xs'>{t('channels.managementAdapter.description')}</p>
-                        </div>
-                      </FormItem>
-
-                      <div className='bg-muted/20 grid grid-cols-1 gap-4 rounded-lg border p-4 md:grid-cols-2'>
-                        <div className='space-y-2'>
-                          <FormLabel htmlFor='channel-billing-currency'>{t('channels.pricing.billingCurrency')}</FormLabel>
-                          <Input
-                            id='channel-billing-currency'
-                            value={billingCurrency}
-                            maxLength={3}
-                            className='font-mono uppercase'
-                            aria-invalid={!!billingCurrencyError}
-                            onChange={(event) => {
-                              billingCurrencyEditedRef.current = true;
-                              setBillingCurrency(event.target.value.toUpperCase());
-                              setBillingCurrencyError('');
-                            }}
-                            placeholder='USD'
-                          />
-                          <p className='text-muted-foreground text-xs'>{t('channels.pricing.billingCurrencyDescription')}</p>
-                          {billingCurrencyError && (
-                            <p className='text-destructive text-xs' role='alert'>
-                              {billingCurrencyError}
-                            </p>
-                          )}
-                        </div>
-                        <div className='space-y-2'>
-                          <FormLabel htmlFor='channel-recharge-multiplier'>{t('channels.pricing.rechargeMultiplier')}</FormLabel>
-                          <Input
-                            id='channel-recharge-multiplier'
-                            inputMode='decimal'
-                            value={rechargeMultiplier}
-                            className='font-mono tabular-nums'
-                            aria-invalid={!!rechargeMultiplierError}
-                            onChange={(event) => {
-                              setRechargeMultiplier(event.target.value);
-                              setRechargeMultiplierError('');
-                            }}
-                            placeholder='10'
-                          />
-                          <p className='text-muted-foreground text-xs'>
-                            {t('channels.pricing.rechargeMultiplierDescription', { currency: billingCurrency || '—' })}
-                          </p>
-                          {rechargeMultiplierError && (
-                            <p className='text-destructive text-xs' role='alert'>
-                              {rechargeMultiplierError}
-                            </p>
-                          )}
-                        </div>
-                      </div>
-
-                      {!isEdit && (
-                        <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                            {t('channels.dialogs.proxy.fields.type.label')}
-                          </FormLabel>
-                          <div className='space-y-3 md:col-span-6'>
-                            <Select value={proxyType} onValueChange={(value) => setProxyType(value as ProxyType)}>
-                              <FormControl>
-                                <SelectTrigger>
-                                  <SelectValue placeholder={t('channels.dialogs.proxy.fields.type.placeholder')} />
-                                </SelectTrigger>
-                              </FormControl>
-                              <SelectContent>
-                                <SelectItem value={ProxyType.DISABLED}>{t('channels.dialogs.proxy.types.disabled')}</SelectItem>
-                                <SelectItem value={ProxyType.ENVIRONMENT}>{t('channels.dialogs.proxy.types.environment')}</SelectItem>
-                                <SelectItem value={ProxyType.URL}>{t('channels.dialogs.proxy.types.url')}</SelectItem>
-                              </SelectContent>
-                            </Select>
-
-                            {proxyType === ProxyType.URL && proxyPresets.length > 0 && (
-                              <div className='space-y-1'>
-                                <FormLabel className='text-sm'>{t('channels.dialogs.proxy.presets.label')}</FormLabel>
-                                <Select onValueChange={handleProxyPresetSelect}>
-                                  <FormControl>
-                                    <SelectTrigger>
-                                      <SelectValue placeholder={t('channels.dialogs.proxy.presets.placeholder')} />
-                                    </SelectTrigger>
-                                  </FormControl>
-                                  <SelectContent>
-                                    {proxyPresets.map((preset) => (
-                                      <SelectItem key={preset.url} value={preset.url}>
-                                        {preset.name || preset.url}
-                                      </SelectItem>
-                                    ))}
-                                  </SelectContent>
-                                </Select>
-                              </div>
-                            )}
-
-                            {proxyType === ProxyType.URL && (
-                              <>
-                                <div className='space-y-1'>
-                                  <FormLabel className='text-sm'>{t('channels.dialogs.proxy.fields.url.label')}</FormLabel>
-                                  <Input
-                                    placeholder={t('channels.dialogs.proxy.fields.url.placeholder')}
-                                    value={proxyUrl}
-                                    onChange={(e) => setProxyUrl(e.target.value)}
-                                  />
-                                </div>
-
-                                <div className='space-y-1'>
-                                  <FormLabel className='text-sm'>{t('channels.dialogs.proxy.fields.username.label')}</FormLabel>
-                                  <Input
-                                    placeholder={t('channels.dialogs.proxy.fields.username.placeholder')}
-                                    value={proxyUsername}
-                                    onChange={(e) => setProxyUsername(e.target.value)}
-                                  />
-                                </div>
-
-                                <div className='space-y-1'>
-                                  <FormLabel className='text-sm'>{t('channels.dialogs.proxy.fields.password.label')}</FormLabel>
-                                  <Input
-                                    type='password'
-                                    placeholder={t('channels.dialogs.proxy.fields.password.placeholder')}
-                                    value={proxyPassword}
-                                    onChange={(e) => setProxyPassword(e.target.value)}
-                                  />
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </FormItem>
-                      )}
-
-                      {(isCodexType || isClaudeCodeType) && (
-                        <div className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                          <div className='col-span-2' />
-                          <div className='space-y-4 md:col-span-6'>
-                            <div className='space-y-3'>
-                              <Tabs
-                                value={authMode}
-                                onValueChange={(value) => {
-                                  const mode = value as 'official' | 'auth-json' | 'third-party';
-                                  setAuthMode(mode);
-                                  if (mode !== 'third-party') {
-                                    const currentType = selectedType || derivedChannelType;
-                                    const defaultURL =
-                                      isCodexType && responsesTransport === 'websocket'
-                                        ? getResponsesWebSocketBaseURL('codex')
-                                        : getDefaultBaseURL(currentType);
-                                    if (defaultURL) {
-                                      form.setValue('baseURL', defaultURL);
-                                    }
-                                  }
-                                }}
-                              >
-                                <TabsList className={`grid w-full ${isCodexType ? 'grid-cols-3' : 'grid-cols-2'}`}>
-                                  <TabsTrigger value='official'>{t('channels.dialogs.authMode.official')}</TabsTrigger>
-                                  {isCodexType && <TabsTrigger value='auth-json'>{t('channels.dialogs.authMode.authJson')}</TabsTrigger>}
-                                  <TabsTrigger value='third-party'>{t('channels.dialogs.authMode.thirdParty')}</TabsTrigger>
-                                </TabsList>
-                              </Tabs>
-
-                              {isCodexType && authMode === 'auth-json' && (
-                                <div className='rounded-md border p-3'>
-                                  <div className='space-y-2'>
-                                    <FormLabel className='text-sm font-medium'>{t('channels.dialogs.codexAuthJson.label')}</FormLabel>
-                                    <Textarea
-                                      value={codexAuthJSONText}
-                                      onChange={(e) => setCodexAuthJSONText(e.target.value)}
-                                      placeholder={t('channels.dialogs.codexAuthJson.placeholder')}
-                                      className='min-h-[160px] resize-y font-mono text-xs'
+                              {selectedProvider !== 'jina' && selectedProvider !== 'codex' && selectedProvider !== 'claudecode' && (
+                                <FormItem className='min-w-0 space-y-2'>
+                                  <FormLabel className='font-medium'>{t('channels.dialogs.fields.apiFormat.label')}</FormLabel>
+                                  <div className='min-w-0 space-y-1'>
+                                    <SelectDropdown
+                                      key={selectedProvider}
+                                      defaultValue={selectedApiFormatOption}
+                                      onValueChange={(value) => handleApiFormatChange(value as ApiFormatOption)}
+                                      disabled={!!isOAuthChannel}
+                                      placeholder={t('channels.dialogs.fields.apiFormat.placeholder')}
+                                      data-testid='api-format-select'
+                                      isControlled={true}
+                                      items={availableApiFormatOptions.map((format) => ({
+                                        value: format,
+                                        label: getApiFormatOptionLabel(format),
+                                      }))}
                                     />
-                                    <Button type='button' variant='secondary' onClick={applyCodexAuthJSON}>
-                                      {t('channels.dialogs.codexAuthJson.applyButton')}
-                                    </Button>
-                                    <p className='text-muted-foreground text-xs'>{t('channels.dialogs.codexAuthJson.description')}</p>
+                                    {selectedApiFormat === 'gemini/contents' && (
+                                      <div className='mt-3'>
+                                        <label
+                                          className={`flex items-center gap-2 text-sm ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+                                        >
+                                          <Checkbox
+                                            checked={useGeminiVertex}
+                                            onCheckedChange={(checked) => handleGeminiVertexChange(checked === true)}
+                                            disabled={!!isOAuthChannel}
+                                          />
+                                          <span>{t('channels.dialogs.fields.apiFormat.geminiVertex.label')}</span>
+                                        </label>
+                                      </div>
+                                    )}
+                                    {selectedApiFormat === 'anthropic/messages' && selectedProvider === 'anthropic' && (
+                                      <div className='mt-3 space-y-2'>
+                                        <label
+                                          className={`flex items-center gap-2 text-sm ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+                                        >
+                                          <Checkbox
+                                            checked={useAnthropicAws}
+                                            onCheckedChange={(checked) => handleAnthropicAwsChange(checked === true)}
+                                            disabled={!!isOAuthChannel}
+                                          />
+                                          <span>{t('channels.dialogs.fields.apiFormat.anthropicAWS.label')}</span>
+                                        </label>
+                                      </div>
+                                    )}
+                                    {selectedApiFormat === 'anthropic/messages' && selectedProvider === 'moonshot' && (
+                                      <div className='mt-3 space-y-2'>
+                                        <label
+                                          className={`flex items-center gap-2 text-sm ${isOAuthChannel ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+                                        >
+                                          <Checkbox
+                                            checked={useKimiCoding}
+                                            onCheckedChange={(checked) => handleKimiCodingChange(checked === true)}
+                                            disabled={!!isOAuthChannel}
+                                          />
+                                          <span>{t('channels.dialogs.fields.apiFormat.kimiCoding.label')}</span>
+                                        </label>
+                                      </div>
+                                    )}
                                   </div>
-                                </div>
-                              )}
-                            </div>
-
-                            {isCodexType && (
-                              <div className='space-y-2'>
-                                {authMode === 'official' &&
-                                  renderOAuthSection(codexOAuth, t('channels.dialogs.fields.apiFormat.codex.description'))}
-                              </div>
-                            )}
-
-                            {isClaudeCodeType && (
-                              <div className='space-y-2'>
-                                {authMode === 'official' &&
-                                  renderOAuthSection(claudecodeOAuth, t('channels.dialogs.fields.apiFormat.claudecode.description'))}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      )}
-
-                      <FormField
-                        control={form.control}
-                        name='baseURL'
-                        render={({ field, fieldState }) => (
-                          <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                            <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                              {t('channels.dialogs.fields.baseURL.label')}
-                            </FormLabel>
-                            <div className='space-y-1 md:col-span-6'>
-                              <Input
-                                placeholder={baseURLPlaceholder}
-                                autoComplete='new-password'
-                                data-form-type='other'
-                                aria-invalid={!!fieldState.error}
-                                data-testid='channel-base-url-input'
-                                disabled={
-                                  (isCodexType && authMode !== 'third-party') ||
-                                  (isClaudeCodeType && authMode === 'official') ||
-                                  selectedProvider === 'antigravity'
-                                }
-                                {...field}
-                              />
-                              <FormMessage />
-                            </div>
-                          </FormItem>
-                        )}
-                      />
-
-                      <section className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <div className='space-y-2 md:col-span-6 md:col-start-3'>
-                          <h3 className='text-sm font-medium'>{t('channels.dialogs.quotaSnapshot.title')}</h3>
-                          <div className='bg-muted/20 space-y-4 rounded-md border p-4'>
-                            <FormField
-                              control={form.control}
-                              name='websiteURL'
-                              render={({ field, fieldState }) => (
-                                <FormItem>
-                                  <FormLabel>{t('channels.dialogs.fields.websiteURL.label')}</FormLabel>
-                                  <Input
-                                    placeholder={t('channels.dialogs.fields.websiteURL.placeholder')}
-                                    inputMode='url'
-                                    aria-invalid={!!fieldState.error}
-                                    {...field}
-                                  />
-                                  <FormMessage />
                                 </FormItem>
                               )}
-                            />
-                            <div className='grid grid-cols-1 gap-3 sm:grid-cols-[0.65fr_1fr_1fr]'>
+                              {selectedProvider === 'codex' && (
+                                <FormItem className='min-w-0 space-y-2'>
+                                  <FormLabel className='font-medium'>{t('channels.dialogs.fields.apiFormat.label')}</FormLabel>
+                                  <div className='min-w-0 space-y-1'>
+                                    <SelectDropdown
+                                      defaultValue={responsesTransport === 'websocket' ? OPENAI_RESPONSES_WEBSOCKET : OPENAI_RESPONSES}
+                                      onValueChange={(value) =>
+                                        handleResponsesTransportChange(value === OPENAI_RESPONSES_WEBSOCKET ? 'websocket' : 'http')
+                                      }
+                                      placeholder={t('channels.dialogs.fields.apiFormat.placeholder')}
+                                      data-testid='api-format-select'
+                                      isControlled={true}
+                                      items={[
+                                        { value: OPENAI_RESPONSES, label: getApiFormatLabel(OPENAI_RESPONSES) },
+                                        { value: OPENAI_RESPONSES_WEBSOCKET, label: getApiFormatOptionLabel(OPENAI_RESPONSES_WEBSOCKET) },
+                                      ]}
+                                    />
+                                  </div>
+                                </FormItem>
+                              )}
+
+                              {selectedProvider === 'claudecode' && (
+                                <FormItem className='min-w-0 space-y-2'>
+                                  <FormLabel className='font-medium'>{t('channels.dialogs.fields.apiFormat.label')}</FormLabel>
+                                  <div className='space-y-1'>
+                                    <div className='text-sm'>{getApiFormatLabel(ANTHROPIC_MESSAGES)}</div>
+                                    <p className='text-muted-foreground mt-1 text-xs'>
+                                      {t('channels.dialogs.fields.apiFormat.editDisabled')}
+                                    </p>
+                                  </div>
+                                </FormItem>
+                              )}
                               <FormField
                                 control={form.control}
-                                name='quotaCurrency'
+                                name='baseURL'
                                 render={({ field, fieldState }) => (
-                                  <FormItem>
-                                    <FormLabel>{t('channels.dialogs.fields.quotaCurrency.label')}</FormLabel>
-                                    <Input
-                                      maxLength={8}
-                                      placeholder='USD'
-                                      className='font-mono uppercase'
-                                      aria-invalid={!!fieldState.error}
-                                      {...field}
-                                    />
-                                    <FormMessage />
-                                  </FormItem>
-                                )}
-                              />
-                              <FormField
-                                control={form.control}
-                                name='actualQuotaUsed'
-                                render={({ field, fieldState }) => (
-                                  <FormItem>
-                                    <FormLabel>{t('channels.dialogs.fields.actualQuotaUsed.label')}</FormLabel>
-                                    <Input
-                                      inputMode='decimal'
-                                      placeholder='0.00'
-                                      className='font-mono tabular-nums'
-                                      aria-invalid={!!fieldState.error}
-                                      {...field}
-                                    />
-                                    <FormMessage />
-                                  </FormItem>
-                                )}
-                              />
-                              <FormField
-                                control={form.control}
-                                name='quotaRemaining'
-                                render={({ field, fieldState }) => (
-                                  <FormItem>
-                                    <FormLabel>{t('channels.dialogs.fields.quotaRemaining.label')}</FormLabel>
-                                    <Input
-                                      inputMode='decimal'
-                                      placeholder='0.00'
-                                      className='font-mono tabular-nums'
-                                      aria-invalid={!!fieldState.error}
-                                      {...field}
-                                    />
-                                    <FormMessage />
-                                  </FormItem>
-                                )}
-                              />
-                            </div>
-                            <p className='text-muted-foreground text-xs leading-relaxed'>
-                              {t('channels.dialogs.quotaSnapshot.description')}
-                            </p>
-                          </div>
-                        </div>
-                      </section>
-
-                      {(!(isCodexType || isClaudeCodeType || isCopilotType) || authMode === 'third-party') &&
-                        selectedProvider !== 'antigravity' &&
-                        selectedType !== 'anthropic_gcp' && (
-                          <FormField
-                            control={form.control}
-                            name='credentials.apiKeys'
-                            render={({ field, fieldState }) => (
-                              <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                                <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                                  {t('channels.dialogs.fields.apiKey.label')}
-                                </FormLabel>
-                                <div className='space-y-1 md:col-span-6'>
-                                  {isEdit ? (
-                                    <div className='relative'>
-                                      <Tooltip open={!showApiKey ? undefined : false}>
-                                        <TooltipTrigger asChild>
-                                          <Textarea
-                                            value={
-                                              showApiKey
-                                                ? field.value?.join('\n') || ''
-                                                : (field.value || [])
-                                                    .map((k) => (k.length > 8 ? k.slice(0, 4) + '****' + k.slice(-4) : '****'))
-                                                    .join('\n')
-                                            }
-                                            onChange={(e) => {
-                                              if (!showApiKey) return;
-                                              const keys = e.target.value.split('\n');
-                                              field.onChange(keys);
-                                            }}
-                                            onBlur={(e) => {
-                                              if (!showApiKey) return;
-                                              const keys = [
-                                                ...new Set(
-                                                  e.target.value
-                                                    .split('\n')
-                                                    .map((k) => k.trim())
-                                                    .filter((k) => k.length > 0)
-                                                ),
-                                              ];
-                                              field.onChange(keys);
-                                              field.onBlur();
-                                            }}
-                                            readOnly={!showApiKey}
-                                            placeholder={t('channels.dialogs.fields.apiKey.editPlaceholder')}
-                                            className='min-h-[80px] resize-y pr-10 font-mono text-sm md:col-span-6'
-                                            autoComplete='new-password'
-                                            data-form-type='other'
-                                            spellCheck={false}
-                                            aria-invalid={!!fieldState.error}
-                                            data-testid='channel-api-key-input'
-                                          />
-                                        </TooltipTrigger>
-                                        <TooltipContent>
-                                          <p>{t('channels.dialogs.fields.apiKey.revealToEditHint')}</p>
-                                        </TooltipContent>
-                                      </Tooltip>
-                                      <div className='absolute top-2 right-2 flex flex-col gap-1'>
-                                        <Button
-                                          type='button'
-                                          variant='ghost'
-                                          size='sm'
-                                          className='h-7 w-7 p-0'
-                                          onClick={() => {
-                                            const next = !showApiKey;
-                                            setShowApiKey(next);
-
-                                            if (!next) {
-                                              setShowApiKeysPanel(false);
-                                              return;
-                                            }
-
-                                            if (next) {
-                                              setShowApiKeysPanel(true);
-                                              setShowFetchedModelsPanel(false);
-                                              setShowSupportedModelsPanel(false);
-                                            }
-                                          }}
-                                        >
-                                          {showApiKey ? <EyeOff className='h-4 w-4' /> : <Eye className='h-4 w-4' />}
-                                        </Button>
-                                        <Button
-                                          type='button'
-                                          variant='ghost'
-                                          size='sm'
-                                          className='h-7 w-7 p-0'
-                                          onClick={() => {
-                                            const keys = field.value || [];
-                                            if (keys.length > 0) {
-                                              navigator.clipboard.writeText(keys.join('\n'));
-                                              toast.success(t('channels.messages.credentialsCopied'));
-                                            }
-                                          }}
-                                        >
-                                          <Copy className='h-4 w-4' />
-                                        </Button>
-                                      </div>
-                                      <p className='text-muted-foreground mt-1 text-xs'>
-                                        {t('channels.dialogs.fields.apiKey.multiLineHint')}
-                                      </p>
-                                    </div>
-                                  ) : (
-                                    <>
-                                      <Textarea
-                                        value={field.value?.join('\n') || ''}
-                                        onChange={(e) => {
-                                          const keys = e.target.value.split('\n');
-                                          field.onChange(keys);
-                                        }}
-                                        onBlur={(e) => {
-                                          const keys = [
-                                            ...new Set(
-                                              e.target.value
-                                                .split('\n')
-                                                .map((k) => k.trim())
-                                                .filter((k) => k.length > 0)
-                                            ),
-                                          ];
-                                          field.onChange(keys);
-                                          field.onBlur();
-                                        }}
-                                        placeholder={t('channels.dialogs.fields.apiKey.placeholder')}
-                                        className='min-h-[80px] resize-y font-mono text-sm md:col-span-6'
+                                  <FormItem className='min-w-0 space-y-2'>
+                                    <FormLabel className='font-medium'>
+                                      {t(managementAdapter === 'new_api' ? 'eventPackages.url' : 'channels.dialogs.fields.baseURL.label')}
+                                    </FormLabel>
+                                    <div className='space-y-1'>
+                                      <Input
+                                        placeholder={baseURLPlaceholder}
                                         autoComplete='new-password'
                                         data-form-type='other'
-                                        spellCheck={false}
                                         aria-invalid={!!fieldState.error}
-                                        data-testid='channel-api-key-input'
+                                        data-testid='channel-base-url-input'
+                                        disabled={
+                                          (isCodexType && authMode !== 'third-party') ||
+                                          (isClaudeCodeType && authMode === 'official') ||
+                                          selectedProvider === 'antigravity'
+                                        }
+                                        {...field}
                                       />
-                                      <p className='text-muted-foreground text-xs'>{t('channels.dialogs.fields.apiKey.multiLineHint')}</p>
-                                    </>
+                                      <FormMessage />
+                                      {managementAdapter === 'new_api' && field.value && (
+                                        <p className='text-muted-foreground text-xs break-all'>
+                                          {t('eventPackages.canonicalAddress', {
+                                            url: (() => {
+                                              try {
+                                                return canonicalNewApiURL(field.value);
+                                              } catch {
+                                                return t('eventPackages.urlInvalid');
+                                              }
+                                            })(),
+                                          })}
+                                        </p>
+                                      )}
+                                      {managementAdapter === 'new_api' &&
+                                        initialRow?.websiteURL &&
+                                        initialRow.websiteURL !== initialRow.baseURL && (
+                                          <p className='text-xs break-all text-amber-700 dark:text-amber-400'>
+                                            {t('eventPackages.addressDrift', { url: initialRow.websiteURL })}
+                                          </p>
+                                        )}
+                                    </div>
+                                  </FormItem>
+                                )}
+                              />
+                              <FormItem className='min-w-0 space-y-2'>
+                                <FormLabel className='font-medium'>{t('channels.managementAdapter.label')}</FormLabel>
+                                <div className='space-y-1'>
+                                  <Select
+                                    value={managementAdapter}
+                                    onValueChange={(value) => setManagementAdapter(value as 'none' | 'new_api')}
+                                  >
+                                    <FormControl>
+                                      <SelectTrigger data-testid='management-adapter-select'>
+                                        <SelectValue />
+                                      </SelectTrigger>
+                                    </FormControl>
+                                    <SelectContent>
+                                      <SelectItem value='none'>{t('channels.managementAdapter.none')}</SelectItem>
+                                      <SelectItem value='new_api'>{t('channels.managementAdapter.newApi')}</SelectItem>
+                                    </SelectContent>
+                                  </Select>
+                                  <p className='text-muted-foreground text-xs'>{t('channels.managementAdapter.description')}</p>
+                                </div>
+                              </FormItem>
+                              {!isEdit && (
+                                <FormItem className='min-w-0 space-y-2'>
+                                  <FormLabel className='font-medium'>{t('channels.dialogs.proxy.fields.type.label')}</FormLabel>
+                                  <div className='space-y-3'>
+                                    <Select value={proxyType} onValueChange={(value) => setProxyType(value as ProxyType)}>
+                                      <FormControl>
+                                        <SelectTrigger>
+                                          <SelectValue placeholder={t('channels.dialogs.proxy.fields.type.placeholder')} />
+                                        </SelectTrigger>
+                                      </FormControl>
+                                      <SelectContent>
+                                        <SelectItem value={ProxyType.DISABLED}>{t('channels.dialogs.proxy.types.disabled')}</SelectItem>
+                                        <SelectItem value={ProxyType.ENVIRONMENT}>
+                                          {t('channels.dialogs.proxy.types.environment')}
+                                        </SelectItem>
+                                        <SelectItem value={ProxyType.URL}>{t('channels.dialogs.proxy.types.url')}</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+
+                                    {proxyType === ProxyType.URL && proxyPresets.length > 0 && (
+                                      <div className='space-y-1'>
+                                        <FormLabel className='text-sm'>{t('channels.dialogs.proxy.presets.label')}</FormLabel>
+                                        <Select onValueChange={handleProxyPresetSelect}>
+                                          <FormControl>
+                                            <SelectTrigger>
+                                              <SelectValue placeholder={t('channels.dialogs.proxy.presets.placeholder')} />
+                                            </SelectTrigger>
+                                          </FormControl>
+                                          <SelectContent>
+                                            {proxyPresets.map((preset) => (
+                                              <SelectItem key={preset.url} value={preset.url}>
+                                                {preset.name || preset.url}
+                                              </SelectItem>
+                                            ))}
+                                          </SelectContent>
+                                        </Select>
+                                      </div>
+                                    )}
+
+                                    {proxyType === ProxyType.URL && (
+                                      <>
+                                        <div className='space-y-1'>
+                                          <FormLabel className='text-sm'>{t('channels.dialogs.proxy.fields.url.label')}</FormLabel>
+                                          <Input
+                                            placeholder={t('channels.dialogs.proxy.fields.url.placeholder')}
+                                            value={proxyUrl}
+                                            onChange={(e) => setProxyUrl(e.target.value)}
+                                          />
+                                        </div>
+
+                                        <div className='space-y-1'>
+                                          <FormLabel className='text-sm'>{t('channels.dialogs.proxy.fields.username.label')}</FormLabel>
+                                          <Input
+                                            placeholder={t('channels.dialogs.proxy.fields.username.placeholder')}
+                                            value={proxyUsername}
+                                            onChange={(e) => setProxyUsername(e.target.value)}
+                                          />
+                                        </div>
+
+                                        <div className='space-y-1'>
+                                          <FormLabel className='text-sm'>{t('channels.dialogs.proxy.fields.password.label')}</FormLabel>
+                                          <Input
+                                            type='password'
+                                            placeholder={t('channels.dialogs.proxy.fields.password.placeholder')}
+                                            value={proxyPassword}
+                                            onChange={(e) => setProxyPassword(e.target.value)}
+                                          />
+                                        </div>
+                                      </>
+                                    )}
+                                  </div>
+                                </FormItem>
+                              )}
+                            </section>
+                            <section
+                              data-channel-field='credentials'
+                              tabIndex={-1}
+                              className='bg-background min-w-0 space-y-5 rounded-xl border p-4 outline-none sm:p-5'
+                            >
+                              <header className='space-y-1'>
+                                <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.authentication')}</h3>
+                                <p className='text-muted-foreground text-xs leading-relaxed'>
+                                  {t('channels.dialogs.sections.authenticationDescription')}
+                                </p>
+                              </header>
+                              {selectedProvider === 'antigravity' && (
+                                <FormItem className='min-w-0 space-y-2'>
+                                  <FormLabel className='font-medium'>{t('channels.dialogs.fields.apiFormat.label')}</FormLabel>
+                                  <div className='space-y-1'>
+                                    <div className='text-sm'>{getApiFormatLabel(GEMINI_CONTENTS)}</div>
+                                    <p className='text-muted-foreground mt-1 text-xs'>
+                                      {t('channels.dialogs.fields.apiFormat.editDisabled')}
+                                    </p>
+
+                                    <div className='mt-3 space-y-2'>
+                                      <div className='rounded-md border p-3'>
+                                        <div className='flex flex-wrap items-center gap-2'>
+                                          <Button
+                                            type='button'
+                                            variant='secondary'
+                                            onClick={() => antigravityOAuth.start()}
+                                            disabled={antigravityOAuth.isStarting}
+                                          >
+                                            {antigravityOAuth.isStarting
+                                              ? t('channels.dialogs.antigravity.buttons.starting')
+                                              : t('channels.dialogs.antigravity.buttons.startOAuth')}
+                                          </Button>
+                                          {antigravityOAuth.authUrl && (
+                                            <Button
+                                              type='button'
+                                              variant='ghost'
+                                              onClick={() => window.open(antigravityOAuth.authUrl || '', '_blank', 'noopener,noreferrer')}
+                                            >
+                                              {t('channels.dialogs.antigravity.buttons.openOAuthLink')}
+                                            </Button>
+                                          )}
+                                        </div>
+
+                                        {antigravityOAuth.authUrl && (
+                                          <div className='mt-3 space-y-2'>
+                                            <FormLabel className='text-sm font-medium'>
+                                              {t('channels.dialogs.antigravity.labels.authorizationUrl')}
+                                            </FormLabel>
+                                            <Textarea
+                                              value={antigravityOAuth.authUrl}
+                                              readOnly
+                                              className='min-h-[60px] resize-none font-mono text-xs'
+                                              placeholder={t('channels.dialogs.antigravity.placeholders.authorizationUrl')}
+                                            />
+                                          </div>
+                                        )}
+
+                                        <div className='mt-3 space-y-2'>
+                                          <FormLabel className='text-sm font-medium'>
+                                            {t('channels.dialogs.antigravity.labels.callbackUrl')}
+                                          </FormLabel>
+                                          <Textarea
+                                            value={antigravityOAuth.callbackUrl}
+                                            onChange={(e) => antigravityOAuth.setCallbackUrl(e.target.value)}
+                                            placeholder={t('channels.dialogs.antigravity.placeholders.callbackUrl')}
+                                            className='min-h-[80px] resize-y font-mono text-xs'
+                                          />
+                                          <Button
+                                            type='button'
+                                            onClick={() => antigravityOAuth.exchange()}
+                                            disabled={antigravityOAuth.isExchanging || !antigravityOAuth.sessionId}
+                                          >
+                                            {antigravityOAuth.isExchanging
+                                              ? t('channels.dialogs.antigravity.buttons.exchanging')
+                                              : t('channels.dialogs.antigravity.buttons.exchangeAndFillApiKey')}
+                                          </Button>
+                                        </div>
+
+                                        <p className='mt-2 text-xs text-amber-600 dark:text-amber-400'>
+                                          {t('channels.dialogs.proxy.oauthHint')}
+                                        </p>
+                                        <p className='text-muted-foreground mt-2 text-xs'>
+                                          {t('channels.dialogs.fields.apiFormat.antigravity.description')}
+                                        </p>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </FormItem>
+                              )}
+
+                              {isCopilotType && (
+                                <div className='min-w-0 space-y-2'>
+                                  <div className='space-y-4'>
+                                    <CopilotDeviceFlow
+                                      existingCredentials={form.watch('credentials.apiKey')}
+                                      onSuccess={(token) => {
+                                        // Store as OAuth JSON format expected by backend
+                                        const oauthCredentials = JSON.stringify({
+                                          access_token: token,
+                                          token_type: 'bearer',
+                                        });
+                                        form.setValue('credentials.apiKey', oauthCredentials, { shouldDirty: true, shouldValidate: true });
+                                      }}
+                                      onError={(error) => {
+                                        toast.error(error);
+                                      }}
+                                    />
+                                  </div>
+                                </div>
+                              )}
+                              {(isCodexType || isClaudeCodeType) && (
+                                <div className='min-w-0 space-y-2'>
+                                  <div className='space-y-4'>
+                                    <div className='space-y-3'>
+                                      <Tabs
+                                        value={authMode}
+                                        onValueChange={(value) => {
+                                          const mode = value as 'official' | 'auth-json' | 'third-party';
+                                          setAuthMode(mode);
+                                          if (mode !== 'third-party') {
+                                            const currentType = selectedType || derivedChannelType;
+                                            const defaultURL =
+                                              isCodexType && responsesTransport === 'websocket'
+                                                ? getResponsesWebSocketBaseURL('codex')
+                                                : getDefaultBaseURL(currentType);
+                                            if (defaultURL) {
+                                              form.setValue('baseURL', defaultURL);
+                                            }
+                                          }
+                                        }}
+                                      >
+                                        <TabsList className={`grid w-full ${isCodexType ? 'grid-cols-3' : 'grid-cols-2'}`}>
+                                          <TabsTrigger value='official'>{t('channels.dialogs.authMode.official')}</TabsTrigger>
+                                          {isCodexType && (
+                                            <TabsTrigger value='auth-json'>{t('channels.dialogs.authMode.authJson')}</TabsTrigger>
+                                          )}
+                                          <TabsTrigger value='third-party'>{t('channels.dialogs.authMode.thirdParty')}</TabsTrigger>
+                                        </TabsList>
+                                      </Tabs>
+
+                                      {isCodexType && authMode === 'auth-json' && (
+                                        <div className='rounded-md border p-3'>
+                                          <div className='space-y-2'>
+                                            <FormLabel className='text-sm font-medium'>
+                                              {t('channels.dialogs.codexAuthJson.label')}
+                                            </FormLabel>
+                                            <Textarea
+                                              value={codexAuthJSONText}
+                                              onChange={(e) => setCodexAuthJSONText(e.target.value)}
+                                              placeholder={t('channels.dialogs.codexAuthJson.placeholder')}
+                                              className='min-h-[160px] resize-y font-mono text-xs'
+                                            />
+                                            <Button type='button' variant='secondary' onClick={applyCodexAuthJSON}>
+                                              {t('channels.dialogs.codexAuthJson.applyButton')}
+                                            </Button>
+                                            <p className='text-muted-foreground text-xs'>
+                                              {t('channels.dialogs.codexAuthJson.description')}
+                                            </p>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </div>
+
+                                    {isCodexType && (
+                                      <div className='space-y-2'>
+                                        {authMode === 'official' &&
+                                          renderOAuthSection(codexOAuth, t('channels.dialogs.fields.apiFormat.codex.description'))}
+                                      </div>
+                                    )}
+
+                                    {isClaudeCodeType && (
+                                      <div className='space-y-2'>
+                                        {authMode === 'official' &&
+                                          renderOAuthSection(
+                                            claudecodeOAuth,
+                                            t('channels.dialogs.fields.apiFormat.claudecode.description')
+                                          )}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                              {(!(isCodexType || isClaudeCodeType || isCopilotType) || authMode === 'third-party') &&
+                                selectedProvider !== 'antigravity' &&
+                                selectedType !== 'anthropic_gcp' && (
+                                  <FormField
+                                    control={form.control}
+                                    name='credentials.apiKeys'
+                                    render={({ field, fieldState }) => (
+                                      <FormItem className='min-w-0 space-y-2'>
+                                        <FormLabel className='font-medium'>{t('channels.dialogs.fields.apiKey.label')}</FormLabel>
+                                        <div className='space-y-1'>
+                                          {isEdit ? (
+                                            <div className='relative'>
+                                              <Tooltip open={!showApiKey ? undefined : false}>
+                                                <TooltipTrigger asChild>
+                                                  <Textarea
+                                                    value={
+                                                      showApiKey
+                                                        ? field.value?.join('\n') || ''
+                                                        : (field.value || [])
+                                                            .map((k) => (k.length > 8 ? k.slice(0, 4) + '****' + k.slice(-4) : '****'))
+                                                            .join('\n')
+                                                    }
+                                                    onChange={(e) => {
+                                                      if (!showApiKey) return;
+                                                      const keys = e.target.value.split('\n');
+                                                      field.onChange(keys);
+                                                    }}
+                                                    onBlur={(e) => {
+                                                      if (!showApiKey) return;
+                                                      const keys = [
+                                                        ...new Set(
+                                                          e.target.value
+                                                            .split('\n')
+                                                            .map((k) => k.trim())
+                                                            .filter((k) => k.length > 0)
+                                                        ),
+                                                      ];
+                                                      field.onChange(keys);
+                                                      field.onBlur();
+                                                    }}
+                                                    readOnly={!showApiKey}
+                                                    placeholder={t('channels.dialogs.fields.apiKey.editPlaceholder')}
+                                                    className='min-h-[80px] resize-y pr-10 font-mono text-sm'
+                                                    autoComplete='new-password'
+                                                    data-form-type='other'
+                                                    spellCheck={false}
+                                                    aria-invalid={!!fieldState.error}
+                                                    data-testid='channel-api-key-input'
+                                                  />
+                                                </TooltipTrigger>
+                                                <TooltipContent>
+                                                  <p>{t('channels.dialogs.fields.apiKey.revealToEditHint')}</p>
+                                                </TooltipContent>
+                                              </Tooltip>
+                                              <div className='absolute top-2 right-2 flex flex-col gap-1'>
+                                                <Button
+                                                  type='button'
+                                                  variant='ghost'
+                                                  size='sm'
+                                                  className='h-7 w-7 p-0'
+                                                  onClick={() => {
+                                                    const next = !showApiKey;
+                                                    setShowApiKey(next);
+
+                                                    if (!next) {
+                                                      setShowApiKeysPanel(false);
+                                                      return;
+                                                    }
+
+                                                    if (next) {
+                                                      setShowApiKeysPanel(true);
+                                                      setShowFetchedModelsPanel(false);
+                                                      setShowSupportedModelsPanel(false);
+                                                    }
+                                                  }}
+                                                >
+                                                  {showApiKey ? <EyeOff className='h-4 w-4' /> : <Eye className='h-4 w-4' />}
+                                                </Button>
+                                                <Button
+                                                  type='button'
+                                                  variant='ghost'
+                                                  size='sm'
+                                                  className='h-7 w-7 p-0'
+                                                  onClick={() => {
+                                                    const keys = field.value || [];
+                                                    if (keys.length > 0) {
+                                                      navigator.clipboard.writeText(keys.join('\n'));
+                                                      toast.success(t('channels.messages.credentialsCopied'));
+                                                    }
+                                                  }}
+                                                >
+                                                  <Copy className='h-4 w-4' />
+                                                </Button>
+                                              </div>
+                                              <p className='text-muted-foreground mt-1 text-xs'>
+                                                {t('channels.dialogs.fields.apiKey.multiLineHint')}
+                                              </p>
+                                            </div>
+                                          ) : (
+                                            <>
+                                              <Textarea
+                                                value={field.value?.join('\n') || ''}
+                                                onChange={(e) => {
+                                                  const keys = e.target.value.split('\n');
+                                                  field.onChange(keys);
+                                                }}
+                                                onBlur={(e) => {
+                                                  const keys = [
+                                                    ...new Set(
+                                                      e.target.value
+                                                        .split('\n')
+                                                        .map((k) => k.trim())
+                                                        .filter((k) => k.length > 0)
+                                                    ),
+                                                  ];
+                                                  field.onChange(keys);
+                                                  field.onBlur();
+                                                }}
+                                                placeholder={t('channels.dialogs.fields.apiKey.placeholder')}
+                                                className='min-h-[80px] resize-y font-mono text-sm'
+                                                autoComplete='new-password'
+                                                data-form-type='other'
+                                                spellCheck={false}
+                                                aria-invalid={!!fieldState.error}
+                                                data-testid='channel-api-key-input'
+                                              />
+                                              <p className='text-muted-foreground text-xs'>
+                                                {t('channels.dialogs.fields.apiKey.multiLineHint')}
+                                              </p>
+                                            </>
+                                          )}
+                                          <FormMessage />
+                                        </div>
+                                      </FormItem>
+                                    )}
+                                  />
+                                )}
+                            </section>
+                          </div>
+                          <div className='min-w-0'>
+                            <section
+                              data-channel-field='models'
+                              tabIndex={-1}
+                              className='bg-background min-w-0 space-y-5 rounded-xl border p-4 outline-none sm:p-5'
+                            >
+                              <header className='space-y-1'>
+                                <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.models')}</h3>
+                                <p className='text-muted-foreground text-xs leading-relaxed'>
+                                  {t('channels.dialogs.sections.modelsDescription')}
+                                </p>
+                              </header>
+                              <div className='min-w-0 space-y-2'>
+                                <FormLabel className='font-medium'>{t('channels.dialogs.fields.supportedModels.label')}</FormLabel>
+                                <div className='space-y-2'>
+                                  <div className='flex gap-2'>
+                                    {useFetchedModels && fetchedModels.length > 20 ? (
+                                      <AutoCompleteSelect
+                                        items={fetchedModels.map((model) => ({ value: model, label: model }))}
+                                        selectedValue={newModel}
+                                        onSelectedValueChange={setNewModel}
+                                        placeholder={t('channels.dialogs.fields.supportedModels.description')}
+                                      />
+                                    ) : (
+                                      <Input
+                                        placeholder={t('channels.dialogs.fields.supportedModels.description')}
+                                        value={newModel}
+                                        onChange={(e) => setNewModel(e.target.value)}
+                                        onKeyDown={handleKeyDown}
+                                        className='flex-1'
+                                      />
+                                    )}
+                                    <Button type='button' onClick={addModel} size='sm'>
+                                      {t('channels.dialogs.buttons.add')}
+                                    </Button>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <Button type='button' onClick={batchAddModels} size='sm' variant='outline'>
+                                          {t('channels.dialogs.buttons.batchAdd')}
+                                        </Button>
+                                      </TooltipTrigger>
+                                      <TooltipContent>
+                                        <p>{t('channels.dialogs.buttons.batchAddTooltip')}</p>
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </div>
+
+                                  {supportedModels.length === 0 && (
+                                    <p className='text-destructive text-sm'>{t('channels.dialogs.fields.supportedModels.required')}</p>
                                   )}
+
+                                  {/* Supported models display - limited to 3 with expand button */}
+                                  <div className='flex flex-wrap items-center gap-1'>
+                                    {displayedSupportedModels.map((model) => (
+                                      <Badge key={model} variant='secondary' className='text-xs'>
+                                        {model}
+                                        <ManualModelBadge isManual={isModelManual(model)} className='ml-1' />
+                                        <button type='button' onClick={() => removeModel(model)} className='hover:text-destructive ml-1'>
+                                          <X size={12} />
+                                        </button>
+                                      </Badge>
+                                    ))}
+                                    {supportedModels.length > MAX_MODELS_DISPLAY && !supportedModelsExpanded && (
+                                      <Button
+                                        type='button'
+                                        variant='ghost'
+                                        size='sm'
+                                        className='h-6 px-2 text-xs'
+                                        onClick={() => {
+                                          setShowSupportedModelsPanel(true);
+                                          setShowFetchedModelsPanel(false);
+                                          setShowApiKeysPanel(false);
+                                        }}
+                                      >
+                                        <ChevronRight className='mr-1 h-3 w-3' />
+                                        {t('channels.dialogs.fields.supportedModels.showMore', {
+                                          count: supportedModels.length - MAX_MODELS_DISPLAY,
+                                        })}
+                                      </Button>
+                                    )}
+                                  </div>
+
+                                  {/* Auto sync checkbox */}
+                                  <div className='pt-3'>
+                                    <FormField
+                                      control={form.control}
+                                      name='autoSyncSupportedModels'
+                                      render={({ field }) => (
+                                        <FormItem
+                                          className={`flex items-center gap-2 ${isCodexType || isClaudeCodeType || isCopilotType ? 'opacity-60' : ''}`}
+                                        >
+                                          {wrapUnsupported(
+                                            isCodexType || isClaudeCodeType || isCopilotType,
+                                            <Checkbox
+                                              checked={field.value}
+                                              onCheckedChange={field.onChange}
+                                              data-testid='auto-sync-supported-models-checkbox'
+                                              disabled={isCodexType || isClaudeCodeType || isCopilotType}
+                                              className={
+                                                isCodexType || isClaudeCodeType || isCopilotType ? 'pointer-events-none' : undefined
+                                              }
+                                            />,
+                                            'inline-flex items-center'
+                                          )}
+                                          <div className='flex flex-1 items-center justify-between'>
+                                            <div className='space-y-0.5'>
+                                              <div className='flex items-center gap-1.5'>
+                                                <FormLabel className='cursor-pointer text-sm font-normal'>
+                                                  {t('channels.dialogs.fields.autoSyncSupportedModels.label')}
+                                                </FormLabel>
+                                                <Tooltip>
+                                                  <TooltipTrigger asChild>
+                                                    <button
+                                                      type='button'
+                                                      className='text-muted-foreground hover:text-foreground inline-flex items-center'
+                                                      aria-label={t('channels.dialogs.fields.autoSyncSupportedModels.description')}
+                                                      data-testid='auto-sync-supported-models-tip'
+                                                    >
+                                                      <Info className='h-3.5 w-3.5' />
+                                                    </button>
+                                                  </TooltipTrigger>
+                                                  <TooltipContent>
+                                                    <p>{t('channels.dialogs.fields.autoSyncSupportedModels.description')}</p>
+                                                  </TooltipContent>
+                                                </Tooltip>
+                                              </div>
+                                            </div>
+                                            {isEdit && field.value && (
+                                              <Button
+                                                type='button'
+                                                size='sm'
+                                                variant='outline'
+                                                onClick={handleSyncNow}
+                                                disabled={syncChannelModels.isPending || updateChannel.isPending}
+                                              >
+                                                <Play className={`mr-1 h-3 w-3 ${syncChannelModels.isPending ? 'animate-spin' : ''}`} />
+                                                {syncChannelModels.isPending
+                                                  ? t('channels.dialogs.buttons.syncingNow')
+                                                  : t('channels.dialogs.buttons.syncNow')}
+                                              </Button>
+                                            )}
+                                          </div>
+                                        </FormItem>
+                                      )}
+                                    />
+
+                                    {/* Auto sync model pattern */}
+                                    {form.watch('autoSyncSupportedModels') && (
+                                      <FormField
+                                        control={form.control}
+                                        name='autoSyncModelPattern'
+                                        render={({ field }) => (
+                                          <FormItem className='mt-2 pl-6'>
+                                            <FormLabel className='text-sm font-normal'>
+                                              {t('channels.dialogs.fields.autoSyncModelPattern.label')}
+                                            </FormLabel>
+                                            <FormControl>
+                                              <Input
+                                                placeholder={t('channels.dialogs.fields.autoSyncModelPattern.placeholder')}
+                                                {...field}
+                                                value={field.value || ''}
+                                                onChange={(e) => {
+                                                  const val = e.target.value;
+                                                  field.onChange(val);
+                                                  if (val === '') {
+                                                    setPatternError(null);
+                                                  } else if (isValidModelPattern(val)) {
+                                                    setPatternError(null);
+                                                  } else {
+                                                    setPatternError(t('channels.dialogs.fields.autoSyncModelPattern.invalid'));
+                                                  }
+                                                }}
+                                                className='font-mono text-sm'
+                                              />
+                                            </FormControl>
+                                            <p className='text-muted-foreground text-xs'>
+                                              {t('channels.dialogs.fields.autoSyncModelPattern.description')}
+                                            </p>
+                                            {patternError && <p className='text-destructive text-xs'>{patternError}</p>}
+                                          </FormItem>
+                                        )}
+                                      />
+                                    )}
+                                  </div>
+
+                                  {/* Quick add models section */}
+                                  <div className='pt-3'>
+                                    <div className='mb-2 flex items-center justify-between'>
+                                      <span className='text-sm font-medium'>
+                                        {t('channels.dialogs.fields.supportedModels.defaultModelsLabel')}
+                                      </span>
+                                      <div className='flex items-center gap-2'>
+                                        <Button
+                                          type='button'
+                                          onClick={handleFetchModels}
+                                          size='sm'
+                                          variant='outline'
+                                          disabled={!canFetchModels() || fetchModels.isPending}
+                                        >
+                                          <RefreshCw className={`mr-1 h-4 w-4 ${fetchModels.isPending ? 'animate-spin' : ''}`} />
+                                          {t('channels.dialogs.buttons.fetchModels')}
+                                        </Button>
+                                        <Button
+                                          type='button'
+                                          onClick={addSelectedDefaultModels}
+                                          size='sm'
+                                          variant='outline'
+                                          disabled={selectedDefaultModels.length === 0}
+                                          data-testid='add-selected-models-button'
+                                        >
+                                          <Plus className='mr-1 h-4 w-4' />
+                                          {t('channels.dialogs.buttons.addSelected')}
+                                        </Button>
+                                      </div>
+                                    </div>
+                                    <div className='flex flex-wrap gap-2'>
+                                      {quickModels.map((model: string) => (
+                                        <Badge
+                                          key={model}
+                                          variant={selectedDefaultModels.includes(model) ? 'default' : 'secondary'}
+                                          className='cursor-pointer text-xs'
+                                          onClick={() => toggleDefaultModel(model)}
+                                          data-testid={`quick-model-${model}`}
+                                        >
+                                          {model}
+                                          {selectedDefaultModels.includes(model) && <span className='ml-1'>✓</span>}
+                                        </Badge>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                              <FormField
+                                control={form.control}
+                                name='defaultTestModel'
+                                render={({ field }) => (
+                                  <FormItem className='min-w-0 space-y-2'>
+                                    <FormLabel className='font-medium'>{t('channels.dialogs.fields.defaultTestModel.label')}</FormLabel>
+                                    <div className='space-y-1'>
+                                      <SelectDropdown
+                                        defaultValue={field.value}
+                                        onValueChange={field.onChange}
+                                        items={supportedModels.map((model) => ({ value: model, label: model }))}
+                                        placeholder={t('channels.dialogs.fields.defaultTestModel.description')}
+                                        className='w-full'
+                                        disabled={supportedModels.length === 0}
+                                        isControlled={true}
+                                        data-testid='default-test-model-select'
+                                      />
+                                      <FormMessage />
+                                    </div>
+                                  </FormItem>
+                                )}
+                              />
+                            </section>
+                          </div>
+                        </div>
+                      </TabsContent>
+                      <TabsContent
+                        forceMount
+                        value='billing'
+                        data-channel-category='billing'
+                        className={configurationCategory === 'billing' ? 'min-h-0 flex-1 space-y-4 overflow-y-auto pr-2 pb-1' : 'hidden'}
+                      >
+                        <section className='bg-background min-w-0 space-y-5 rounded-xl border p-4 sm:p-5'>
+                          <header className='space-y-1'>
+                            <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.procurement')}</h3>
+                            <p className='text-muted-foreground text-xs leading-relaxed'>
+                              {t('channels.dialogs.sections.procurementDescription')}
+                            </p>
+                          </header>
+                          <div className='bg-muted/20 grid grid-cols-1 gap-4 rounded-lg border p-4 md:grid-cols-2'>
+                            <div className='space-y-2'>
+                              <FormLabel htmlFor='channel-billing-currency'>{t('channels.pricing.billingCurrency')}</FormLabel>
+                              <Input
+                                id='channel-billing-currency'
+                                value={billingCurrency}
+                                maxLength={3}
+                                className='font-mono uppercase'
+                                aria-invalid={!!billingCurrencyError}
+                                onChange={(event) => {
+                                  billingCurrencyEditedRef.current = true;
+                                  setBillingCurrency(event.target.value.toUpperCase());
+                                  setBillingCurrencyError('');
+                                }}
+                                placeholder='USD'
+                              />
+                              <p className='text-muted-foreground text-xs'>{t('channels.pricing.billingCurrencyDescription')}</p>
+                              {billingCurrencyError && (
+                                <p className='text-destructive text-xs' role='alert'>
+                                  {billingCurrencyError}
+                                </p>
+                              )}
+                            </div>
+                            <div className='space-y-2'>
+                              <FormLabel htmlFor='channel-recharge-multiplier'>{t('channels.pricing.rechargeMultiplier')}</FormLabel>
+                              <Input
+                                id='channel-recharge-multiplier'
+                                inputMode='decimal'
+                                value={rechargeMultiplier}
+                                className='font-mono tabular-nums'
+                                aria-invalid={!!rechargeMultiplierError}
+                                onChange={(event) => {
+                                  setRechargeMultiplier(event.target.value);
+                                  setRechargeMultiplierError('');
+                                }}
+                                placeholder='10'
+                              />
+                              <p className='text-muted-foreground text-xs'>
+                                {t('channels.pricing.rechargeMultiplierDescription', { currency: billingCurrency || '—' })}
+                              </p>
+                              {rechargeMultiplierError && (
+                                <p className='text-destructive text-xs' role='alert'>
+                                  {rechargeMultiplierError}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        </section>
+                        <section className='bg-background min-w-0 space-y-5 rounded-xl border p-4 sm:p-5'>
+                          <header className='space-y-1'>
+                            <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.quota')}</h3>
+                            <p className='text-muted-foreground text-xs leading-relaxed'>
+                              {t('channels.dialogs.sections.quotaDescription')}
+                            </p>
+                          </header>
+                          <section className='min-w-0 space-y-2'>
+                            <details className='space-y-2'>
+                              <summary className='min-h-10 cursor-pointer py-2 text-sm font-medium'>
+                                {t('channels.dialogs.quotaSnapshot.title')}
+                              </summary>
+                              <div className='bg-muted/20 space-y-4 rounded-md border p-4'>
+                                {managementAdapter !== 'new_api' && (
+                                  <FormField
+                                    control={form.control}
+                                    name='websiteURL'
+                                    render={({ field, fieldState }) => (
+                                      <FormItem>
+                                        <FormLabel>{t('channels.dialogs.fields.websiteURL.label')}</FormLabel>
+                                        <Input
+                                          placeholder={t('channels.dialogs.fields.websiteURL.placeholder')}
+                                          inputMode='url'
+                                          aria-invalid={!!fieldState.error}
+                                          {...field}
+                                        />
+                                        <FormMessage />
+                                      </FormItem>
+                                    )}
+                                  />
+                                )}
+                                <div className='grid grid-cols-1 gap-3 sm:grid-cols-[0.65fr_1fr_1fr]'>
+                                  <FormField
+                                    control={form.control}
+                                    name='quotaCurrency'
+                                    render={({ field, fieldState }) => (
+                                      <FormItem>
+                                        <FormLabel>{t('channels.dialogs.fields.quotaCurrency.label')}</FormLabel>
+                                        <Input
+                                          maxLength={8}
+                                          placeholder='USD'
+                                          className='font-mono uppercase'
+                                          aria-invalid={!!fieldState.error}
+                                          {...field}
+                                        />
+                                        <FormMessage />
+                                      </FormItem>
+                                    )}
+                                  />
+                                  <FormField
+                                    control={form.control}
+                                    name='actualQuotaUsed'
+                                    render={({ field, fieldState }) => (
+                                      <FormItem>
+                                        <FormLabel>{t('channels.dialogs.fields.actualQuotaUsed.label')}</FormLabel>
+                                        <Input
+                                          inputMode='decimal'
+                                          placeholder='0.00'
+                                          className='font-mono tabular-nums'
+                                          aria-invalid={!!fieldState.error}
+                                          {...field}
+                                        />
+                                        <FormMessage />
+                                      </FormItem>
+                                    )}
+                                  />
+                                  <FormField
+                                    control={form.control}
+                                    name='quotaRemaining'
+                                    render={({ field, fieldState }) => (
+                                      <FormItem>
+                                        <FormLabel>{t('channels.dialogs.fields.quotaRemaining.label')}</FormLabel>
+                                        <Input
+                                          inputMode='decimal'
+                                          placeholder='0.00'
+                                          className='font-mono tabular-nums'
+                                          aria-invalid={!!fieldState.error}
+                                          {...field}
+                                        />
+                                        <FormMessage />
+                                      </FormItem>
+                                    )}
+                                  />
+                                </div>
+                                <p className='text-muted-foreground text-xs leading-relaxed'>
+                                  {t('channels.dialogs.quotaSnapshot.description')}
+                                </p>
+                              </div>
+                            </details>
+                          </section>
+                        </section>
+                      </TabsContent>
+                      <TabsContent
+                        forceMount
+                        value='request'
+                        data-channel-category='request'
+                        className={configurationCategory === 'request' ? 'min-h-0 flex-1 space-y-4 overflow-y-auto pr-2 pb-1' : 'hidden'}
+                      >
+                        <section className='bg-background min-w-0 space-y-5 rounded-xl border p-4 sm:p-5'>
+                          <header className='space-y-1'>
+                            <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.request')}</h3>
+                            <p className='text-muted-foreground text-xs leading-relaxed'>
+                              {t('channels.dialogs.sections.requestDescription')}
+                            </p>
+                          </header>
+                          <FormField
+                            control={form.control}
+                            name='policies.stream'
+                            render={({ field }) => (
+                              <FormItem className='min-w-0 space-y-2'>
+                                <FormLabel className='font-medium'>{t('channels.dialogs.fields.streamPolicy.label')}</FormLabel>
+                                <div className='space-y-1'>
+                                  <SelectDropdown
+                                    defaultValue={(field.value as string) || 'unlimited'}
+                                    onValueChange={(value) => field.onChange(value)}
+                                    placeholder={t('channels.dialogs.fields.streamPolicy.placeholder')}
+                                    data-testid='channel-stream-policy-select'
+                                    isControlled={true}
+                                    items={[
+                                      { value: 'unlimited', label: t('channels.dialogs.fields.streamPolicy.options.unlimited') },
+                                      { value: 'require', label: t('channels.dialogs.fields.streamPolicy.options.require') },
+                                      { value: 'forbid', label: t('channels.dialogs.fields.streamPolicy.options.forbid') },
+                                    ]}
+                                  />
                                   <FormMessage />
                                 </div>
                               </FormItem>
                             )}
                           />
-                        )}
-
-                      <FormField
-                        control={form.control}
-                        name='policies.stream'
-                        render={({ field }) => (
-                          <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                            <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                              {t('channels.dialogs.fields.streamPolicy.label')}
-                            </FormLabel>
-                            <div className='space-y-1 md:col-span-6'>
-                              <SelectDropdown
-                                defaultValue={(field.value as string) || 'unlimited'}
-                                onValueChange={(value) => field.onChange(value)}
-                                placeholder={t('channels.dialogs.fields.streamPolicy.placeholder')}
-                                data-testid='channel-stream-policy-select'
-                                isControlled={true}
-                                items={[
-                                  { value: 'unlimited', label: t('channels.dialogs.fields.streamPolicy.options.unlimited') },
-                                  { value: 'require', label: t('channels.dialogs.fields.streamPolicy.options.require') },
-                                  { value: 'forbid', label: t('channels.dialogs.fields.streamPolicy.options.forbid') },
-                                ]}
-                              />
-                              <FormMessage />
+                          <FormItem className='min-w-0 space-y-2'>
+                            <FormLabel className='font-medium'>{t('channels.dialogs.userAgentPassThrough.label')}</FormLabel>
+                            <div className='space-y-1'>
+                              <Select
+                                value={passThroughUserAgent === null ? 'inherit' : passThroughUserAgent ? 'enabled' : 'disabled'}
+                                onValueChange={(value) => setPassThroughUserAgent(value === 'inherit' ? null : value === 'enabled')}
+                              >
+                                <SelectTrigger id='channel-user-agent-passthrough'>
+                                  <SelectValue placeholder={t('channels.dialogs.userAgentPassThrough.inherit')} />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value='inherit'>{t('channels.dialogs.userAgentPassThrough.inherit')}</SelectItem>
+                                  <SelectItem value='enabled'>{t('channels.dialogs.userAgentPassThrough.enabled')}</SelectItem>
+                                  <SelectItem value='disabled'>{t('channels.dialogs.userAgentPassThrough.disabled')}</SelectItem>
+                                </SelectContent>
+                              </Select>
                             </div>
                           </FormItem>
-                        )}
-                      />
 
-                      <div className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                          {t('channels.dialogs.fields.supportedModels.label')}
-                        </FormLabel>
-                        <div className='space-y-2 md:col-span-6'>
-                          <div className='flex gap-2'>
-                            {useFetchedModels && fetchedModels.length > 20 ? (
-                              <AutoCompleteSelect
-                                items={fetchedModels.map((model) => ({ value: model, label: model }))}
-                                selectedValue={newModel}
-                                onSelectedValueChange={setNewModel}
-                                placeholder={t('channels.dialogs.fields.supportedModels.description')}
-                              />
-                            ) : (
-                              <Input
-                                placeholder={t('channels.dialogs.fields.supportedModels.description')}
-                                value={newModel}
-                                onChange={(e) => setNewModel(e.target.value)}
-                                onKeyDown={handleKeyDown}
-                                className='flex-1'
-                              />
-                            )}
-                            <Button type='button' onClick={addModel} size='sm'>
-                              {t('channels.dialogs.buttons.add')}
-                            </Button>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button type='button' onClick={batchAddModels} size='sm' variant='outline'>
-                                  {t('channels.dialogs.buttons.batchAdd')}
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>
-                                <p>{t('channels.dialogs.buttons.batchAddTooltip')}</p>
-                              </TooltipContent>
-                            </Tooltip>
-                          </div>
-
-                          {supportedModels.length === 0 && (
-                            <p className='text-destructive text-sm'>{t('channels.dialogs.fields.supportedModels.required')}</p>
-                          )}
-
-                          {/* Supported models display - limited to 3 with expand button */}
-                          <div className='flex flex-wrap items-center gap-1'>
-                            {displayedSupportedModels.map((model) => (
-                              <Badge key={model} variant='secondary' className='text-xs'>
-                                {model}
-                                <ManualModelBadge isManual={isModelManual(model)} className='ml-1' />
-                                <button type='button' onClick={() => removeModel(model)} className='hover:text-destructive ml-1'>
-                                  <X size={12} />
-                                </button>
-                              </Badge>
-                            ))}
-                            {supportedModels.length > MAX_MODELS_DISPLAY && !supportedModelsExpanded && (
-                              <Button
-                                type='button'
-                                variant='ghost'
-                                size='sm'
-                                className='h-6 px-2 text-xs'
-                                onClick={() => {
-                                  setShowSupportedModelsPanel(true);
-                                  setShowFetchedModelsPanel(false);
-                                  setShowApiKeysPanel(false);
-                                }}
+                          <FormItem className='min-w-0 space-y-2'>
+                            <FormLabel className='font-medium'>{t('channels.dialogs.bodyPassThrough.label')}</FormLabel>
+                            <div className='space-y-2'>
+                              <Select
+                                value={passThroughBody === null ? 'inherit' : passThroughBody ? 'enabled' : 'disabled'}
+                                onValueChange={(value) => setPassThroughBody(value === 'inherit' ? null : value === 'enabled')}
                               >
-                                <ChevronRight className='mr-1 h-3 w-3' />
-                                {t('channels.dialogs.fields.supportedModels.showMore', {
-                                  count: supportedModels.length - MAX_MODELS_DISPLAY,
-                                })}
-                              </Button>
-                            )}
-                          </div>
-
-                          {/* Auto sync checkbox */}
-                          <div className='pt-3'>
-                            <FormField
-                              control={form.control}
-                              name='autoSyncSupportedModels'
-                              render={({ field }) => (
-                                <FormItem
-                                  className={`flex items-center gap-2 ${isCodexType || isClaudeCodeType || isCopilotType ? 'opacity-60' : ''}`}
-                                >
-                                  {wrapUnsupported(
-                                    isCodexType || isClaudeCodeType || isCopilotType,
-                                    <Checkbox
-                                      checked={field.value}
-                                      onCheckedChange={field.onChange}
-                                      data-testid='auto-sync-supported-models-checkbox'
-                                      disabled={isCodexType || isClaudeCodeType || isCopilotType}
-                                      className={isCodexType || isClaudeCodeType || isCopilotType ? 'pointer-events-none' : undefined}
-                                    />,
-                                    'inline-flex items-center'
-                                  )}
-                                  <div className='flex flex-1 items-center justify-between'>
-                                    <div className='space-y-0.5'>
-                                      <div className='flex items-center gap-1.5'>
-                                        <FormLabel className='cursor-pointer text-sm font-normal'>
-                                          {t('channels.dialogs.fields.autoSyncSupportedModels.label')}
-                                        </FormLabel>
-                                        <Tooltip>
-                                          <TooltipTrigger asChild>
-                                            <button
-                                              type='button'
-                                              className='text-muted-foreground hover:text-foreground inline-flex items-center'
-                                              aria-label={t('channels.dialogs.fields.autoSyncSupportedModels.description')}
-                                              data-testid='auto-sync-supported-models-tip'
-                                            >
-                                              <Info className='h-3.5 w-3.5' />
-                                            </button>
-                                          </TooltipTrigger>
-                                          <TooltipContent>
-                                            <p>{t('channels.dialogs.fields.autoSyncSupportedModels.description')}</p>
-                                          </TooltipContent>
-                                        </Tooltip>
-                                      </div>
-                                    </div>
-                                    {isEdit && field.value && (
-                                      <Button
-                                        type='button'
-                                        size='sm'
-                                        variant='outline'
-                                        onClick={handleSyncNow}
-                                        disabled={syncChannelModels.isPending || updateChannel.isPending}
-                                      >
-                                        <Play className={`mr-1 h-3 w-3 ${syncChannelModels.isPending ? 'animate-spin' : ''}`} />
-                                        {syncChannelModels.isPending
-                                          ? t('channels.dialogs.buttons.syncingNow')
-                                          : t('channels.dialogs.buttons.syncNow')}
-                                      </Button>
-                                    )}
-                                  </div>
-                                </FormItem>
+                                <SelectTrigger id='channel-body-passthrough'>
+                                  <SelectValue placeholder={t('channels.dialogs.bodyPassThrough.inherit')} />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value='inherit'>{t('channels.dialogs.bodyPassThrough.inherit')}</SelectItem>
+                                  <SelectItem value='enabled'>{t('channels.dialogs.bodyPassThrough.enabled')}</SelectItem>
+                                  <SelectItem value='disabled'>{t('channels.dialogs.bodyPassThrough.disabled')}</SelectItem>
+                                </SelectContent>
+                              </Select>
+                              {passThroughBody === true && (
+                                <p className='text-xs text-amber-600 dark:text-amber-400'>
+                                  {t('channels.dialogs.bodyPassThrough.warning')}
+                                </p>
                               )}
-                            />
-
-                            {/* Auto sync model pattern */}
-                            {form.watch('autoSyncSupportedModels') && (
-                              <FormField
-                                control={form.control}
-                                name='autoSyncModelPattern'
-                                render={({ field }) => (
-                                  <FormItem className='mt-2 pl-6'>
-                                    <FormLabel className='text-sm font-normal'>
-                                      {t('channels.dialogs.fields.autoSyncModelPattern.label')}
-                                    </FormLabel>
-                                    <FormControl>
-                                      <Input
-                                        placeholder={t('channels.dialogs.fields.autoSyncModelPattern.placeholder')}
-                                        {...field}
-                                        value={field.value || ''}
-                                        onChange={(e) => {
-                                          const val = e.target.value;
-                                          field.onChange(val);
-                                          if (val === '') {
-                                            setPatternError(null);
-                                          } else if (isValidModelPattern(val)) {
-                                            setPatternError(null);
-                                          } else {
-                                            setPatternError(t('channels.dialogs.fields.autoSyncModelPattern.invalid'));
-                                          }
-                                        }}
-                                        className='font-mono text-sm'
-                                      />
-                                    </FormControl>
-                                    <p className='text-muted-foreground text-xs'>
-                                      {t('channels.dialogs.fields.autoSyncModelPattern.description')}
-                                    </p>
-                                    {patternError && <p className='text-destructive text-xs'>{patternError}</p>}
-                                  </FormItem>
-                                )}
-                              />
-                            )}
-                          </div>
-
-                          {/* Quick add models section */}
-                          <div className='pt-3'>
-                            <div className='mb-2 flex items-center justify-between'>
-                              <span className='text-sm font-medium'>{t('channels.dialogs.fields.supportedModels.defaultModelsLabel')}</span>
-                              <div className='flex items-center gap-2'>
-                                <Button
-                                  type='button'
-                                  onClick={handleFetchModels}
-                                  size='sm'
-                                  variant='outline'
-                                  disabled={!canFetchModels() || fetchModels.isPending}
-                                >
-                                  <RefreshCw className={`mr-1 h-4 w-4 ${fetchModels.isPending ? 'animate-spin' : ''}`} />
-                                  {t('channels.dialogs.buttons.fetchModels')}
-                                </Button>
-                                <Button
-                                  type='button'
-                                  onClick={addSelectedDefaultModels}
-                                  size='sm'
-                                  variant='outline'
-                                  disabled={selectedDefaultModels.length === 0}
-                                  data-testid='add-selected-models-button'
-                                >
-                                  <Plus className='mr-1 h-4 w-4' />
-                                  {t('channels.dialogs.buttons.addSelected')}
-                                </Button>
-                              </div>
-                            </div>
-                            <div className='flex flex-wrap gap-2'>
-                              {quickModels.map((model: string) => (
-                                <Badge
-                                  key={model}
-                                  variant={selectedDefaultModels.includes(model) ? 'default' : 'secondary'}
-                                  className='cursor-pointer text-xs'
-                                  onClick={() => toggleDefaultModel(model)}
-                                  data-testid={`quick-model-${model}`}
-                                >
-                                  {model}
-                                  {selectedDefaultModels.includes(model) && <span className='ml-1'>✓</span>}
-                                </Badge>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-
-                      <FormField
-                        control={form.control}
-                        name='defaultTestModel'
-                        render={({ field }) => (
-                          <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                            <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                              {t('channels.dialogs.fields.defaultTestModel.label')}
-                            </FormLabel>
-                            <div className='space-y-1 md:col-span-6'>
-                              <SelectDropdown
-                                defaultValue={field.value}
-                                onValueChange={field.onChange}
-                                items={supportedModels.map((model) => ({ value: model, label: model }))}
-                                placeholder={t('channels.dialogs.fields.defaultTestModel.description')}
-                                className='md:col-span-6'
-                                disabled={supportedModels.length === 0}
-                                isControlled={true}
-                                data-testid='default-test-model-select'
-                              />
-                              <FormMessage />
                             </div>
                           </FormItem>
-                        )}
-                      />
-
-                      <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                          {t('channels.dialogs.userAgentPassThrough.label')}
-                        </FormLabel>
-                        <div className='space-y-1 md:col-span-6'>
-                          <Select
-                            value={passThroughUserAgent === null ? 'inherit' : passThroughUserAgent ? 'enabled' : 'disabled'}
-                            onValueChange={(value) => setPassThroughUserAgent(value === 'inherit' ? null : value === 'enabled')}
-                          >
-                            <SelectTrigger>
-                              <SelectValue placeholder={t('channels.dialogs.userAgentPassThrough.inherit')} />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value='inherit'>{t('channels.dialogs.userAgentPassThrough.inherit')}</SelectItem>
-                              <SelectItem value='enabled'>{t('channels.dialogs.userAgentPassThrough.enabled')}</SelectItem>
-                              <SelectItem value='disabled'>{t('channels.dialogs.userAgentPassThrough.disabled')}</SelectItem>
-                            </SelectContent>
-                          </Select>
-                        </div>
-                      </FormItem>
-
-                      <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                          {t('channels.dialogs.bodyPassThrough.label')}
-                        </FormLabel>
-                        <div className='space-y-2 md:col-span-6'>
-                          <Select
-                            value={passThroughBody === null ? 'inherit' : passThroughBody ? 'enabled' : 'disabled'}
-                            onValueChange={(value) => setPassThroughBody(value === 'inherit' ? null : value === 'enabled')}
-                          >
-                            <SelectTrigger>
-                              <SelectValue placeholder={t('channels.dialogs.bodyPassThrough.inherit')} />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value='inherit'>{t('channels.dialogs.bodyPassThrough.inherit')}</SelectItem>
-                              <SelectItem value='enabled'>{t('channels.dialogs.bodyPassThrough.enabled')}</SelectItem>
-                              <SelectItem value='disabled'>{t('channels.dialogs.bodyPassThrough.disabled')}</SelectItem>
-                            </SelectContent>
-                          </Select>
-                          {passThroughBody === true && (
-                            <p className='text-xs text-amber-600 dark:text-amber-400'>{t('channels.dialogs.bodyPassThrough.warning')}</p>
-                          )}
-                        </div>
-                      </FormItem>
-
-                      <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <div className='flex items-center gap-1.5 pt-2 md:col-span-2 md:justify-end'>
-                          <FormLabel className='font-medium'>{t('channels.dialogs.retryableStatusCodes.label')}</FormLabel>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                type='button'
-                                className='text-muted-foreground hover:text-foreground inline-flex items-center'
-                                aria-label={t('channels.dialogs.retryableStatusCodes.tooltip')}
-                              >
-                                <Info className='h-3.5 w-3.5' />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent className='max-w-sm'>
-                              <p>{t('channels.dialogs.retryableStatusCodes.tooltip')}</p>
-                            </TooltipContent>
-                          </Tooltip>
-                        </div>
-                        <div className='md:col-span-6'>
-                          <Input
-                            value={retryableStatusCodesText}
-                            onChange={(event) => setRetryableStatusCodesText(event.target.value)}
-                            placeholder={t('channels.dialogs.retryableStatusCodes.placeholder')}
-                            className='font-mono text-sm'
-                          />
-                        </div>
-                      </FormItem>
-
-                      <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                        <div className='flex items-center gap-1.5 pt-2 md:col-span-2 md:justify-end'>
-                          <FormLabel className='font-medium'>{t('channels.dialogs.retryableErrorPatterns.label')}</FormLabel>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <button
-                                type='button'
-                                className='text-muted-foreground hover:text-foreground inline-flex items-center'
-                                aria-label={t('channels.dialogs.retryableErrorPatterns.description')}
-                              >
-                                <Info className='h-3.5 w-3.5' />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent className='max-w-sm'>
-                              <p>{t('channels.dialogs.retryableErrorPatterns.description')}</p>
-                            </TooltipContent>
-                          </Tooltip>
-                        </div>
-                        <div className='md:col-span-6'>
-                          <Textarea
-                            value={retryableErrorPatternsText}
-                            onChange={(event) => setRetryableErrorPatternsText(event.target.value)}
-                            placeholder={t('channels.dialogs.retryableErrorPatterns.placeholder')}
-                            className='min-h-[88px] resize-y font-mono text-sm'
-                          />
-                        </div>
-                      </FormItem>
-
-                      <FormField
-                        control={form.control}
-                        name='tags'
-                        render={({ field }) => (
-                          <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                            <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                              {t('channels.dialogs.fields.tags.label')}
-                            </FormLabel>
-                            <div className='space-y-1 md:col-span-6'>
-                              <TagsAutocompleteInput
-                                value={field.value || []}
-                                onChange={field.onChange}
-                                placeholder={t('channels.dialogs.fields.tags.placeholder')}
-                                suggestions={allTags}
-                                isLoading={isLoadingTags}
+                        </section>
+                        <section className='bg-background min-w-0 space-y-5 rounded-xl border p-4 sm:p-5'>
+                          <header className='space-y-1'>
+                            <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.retry')}</h3>
+                            <p className='text-muted-foreground text-xs leading-relaxed'>
+                              {t('channels.dialogs.sections.retryDescription')}
+                            </p>
+                          </header>
+                          <FormItem className='min-w-0 space-y-2'>
+                            <div className='flex items-center gap-1.5'>
+                              <FormLabel htmlFor='channel-retry-status-codes' className='font-medium'>
+                                {t('channels.dialogs.retryableStatusCodes.label')}
+                              </FormLabel>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button
+                                    type='button'
+                                    className='text-muted-foreground hover:text-foreground inline-flex items-center'
+                                    aria-label={t('channels.dialogs.retryableStatusCodes.tooltip')}
+                                  >
+                                    <Info className='h-3.5 w-3.5' />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent className='max-w-sm'>
+                                  <p>{t('channels.dialogs.retryableStatusCodes.tooltip')}</p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
+                            <div className='w-full'>
+                              <Input
+                                id='channel-retry-status-codes'
+                                value={retryableStatusCodesText}
+                                onChange={(event) => {
+                                  setRetryableStatusCodesText(event.target.value);
+                                  setRetryableStatusCodesError('');
+                                }}
+                                aria-invalid={!!retryableStatusCodesError}
+                                aria-describedby={retryableStatusCodesError ? 'channel-retry-status-codes-error' : undefined}
+                                placeholder={t('channels.dialogs.retryableStatusCodes.placeholder')}
+                                className='font-mono text-sm'
                               />
-                              <p className='text-muted-foreground text-xs'>{t('channels.dialogs.fields.tags.description')}</p>
-                              <FormMessage />
+                              {retryableStatusCodesError && (
+                                <p id='channel-retry-status-codes-error' className='text-destructive text-xs' role='alert'>
+                                  {retryableStatusCodesError}
+                                </p>
+                              )}
                             </div>
                           </FormItem>
-                        )}
-                      />
 
-                      <FormField
-                        control={form.control}
-                        name='remark'
-                        render={({ field }) => (
-                          <FormItem className='grid grid-cols-1 items-start gap-x-6 gap-y-2 md:grid-cols-8'>
-                            <FormLabel className='pt-2 font-medium md:col-span-2 md:text-right'>
-                              {t('channels.dialogs.fields.remark.label')}
-                            </FormLabel>
-                            <div className='space-y-1 md:col-span-6'>
+                          <FormItem className='min-w-0 space-y-2'>
+                            <div className='flex items-center gap-1.5'>
+                              <FormLabel htmlFor='channel-retry-error-patterns' className='font-medium'>
+                                {t('channels.dialogs.retryableErrorPatterns.label')}
+                              </FormLabel>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <button
+                                    type='button'
+                                    className='text-muted-foreground hover:text-foreground inline-flex items-center'
+                                    aria-label={t('channels.dialogs.retryableErrorPatterns.description')}
+                                  >
+                                    <Info className='h-3.5 w-3.5' />
+                                  </button>
+                                </TooltipTrigger>
+                                <TooltipContent className='max-w-sm'>
+                                  <p>{t('channels.dialogs.retryableErrorPatterns.description')}</p>
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
+                            <div className='w-full'>
                               <Textarea
-                                placeholder={t('channels.dialogs.fields.remark.placeholder')}
-                                className='min-h-[80px] resize-y'
-                                {...field}
-                                value={field.value || ''}
+                                id='channel-retry-error-patterns'
+                                value={retryableErrorPatternsText}
+                                onChange={(event) => {
+                                  setRetryableErrorPatternsText(event.target.value);
+                                  setRetryableErrorPatternsError('');
+                                }}
+                                aria-invalid={!!retryableErrorPatternsError}
+                                aria-describedby={retryableErrorPatternsError ? 'channel-retry-error-patterns-error' : undefined}
+                                placeholder={t('channels.dialogs.retryableErrorPatterns.placeholder')}
+                                className='min-h-[88px] resize-y font-mono text-sm'
                               />
-                              <p className='text-muted-foreground text-xs'>{t('channels.dialogs.fields.remark.description')}</p>
-                              <FormMessage />
+                              {retryableErrorPatternsError && (
+                                <p id='channel-retry-error-patterns-error' className='text-destructive text-xs' role='alert'>
+                                  {retryableErrorPatternsError}
+                                </p>
+                              )}
                             </div>
                           </FormItem>
-                        )}
-                      />
-                    </div>
+                        </section>
+                      </TabsContent>
+                      <TabsContent
+                        forceMount
+                        value='other'
+                        data-channel-category='other'
+                        className={configurationCategory === 'other' ? 'min-h-0 flex-1 overflow-y-auto pr-2 pb-1' : 'hidden'}
+                      >
+                        <section className='bg-background min-w-0 space-y-5 rounded-xl border p-4 sm:p-5'>
+                          <header className='space-y-1'>
+                            <h3 className='text-sm font-semibold'>{t('channels.dialogs.sections.metadata')}</h3>
+                            <p className='text-muted-foreground text-xs leading-relaxed'>
+                              {t('channels.dialogs.sections.metadataDescription')}
+                            </p>
+                          </header>
+                          <FormField
+                            control={form.control}
+                            name='tags'
+                            render={({ field }) => (
+                              <FormItem data-channel-field='tags' className='min-w-0 space-y-2'>
+                                <FormLabel className='font-medium'>{t('channels.dialogs.fields.tags.label')}</FormLabel>
+                                <div className='space-y-1'>
+                                  <TagsAutocompleteInput
+                                    value={field.value || []}
+                                    onChange={field.onChange}
+                                    placeholder={t('channels.dialogs.fields.tags.placeholder')}
+                                    suggestions={allTags}
+                                    isLoading={isLoadingTags}
+                                  />
+                                  <p className='text-muted-foreground text-xs'>{t('channels.dialogs.fields.tags.description')}</p>
+                                  <FormMessage />
+                                </div>
+                              </FormItem>
+                            )}
+                          />
+
+                          <FormField
+                            control={form.control}
+                            name='remark'
+                            render={({ field }) => (
+                              <FormItem className='min-w-0 space-y-2'>
+                                <FormLabel className='font-medium'>{t('channels.dialogs.fields.remark.label')}</FormLabel>
+                                <div className='space-y-1'>
+                                  <Textarea
+                                    placeholder={t('channels.dialogs.fields.remark.placeholder')}
+                                    className='min-h-[80px] resize-y'
+                                    {...field}
+                                    value={field.value || ''}
+                                  />
+                                  <p className='text-muted-foreground text-xs'>{t('channels.dialogs.fields.remark.description')}</p>
+                                  <FormMessage />
+                                </div>
+                              </FormItem>
+                            )}
+                          />
+                        </section>
+                      </TabsContent>
+                    </Tabs>
                   </div>
                 </form>
               </Form>
@@ -2920,17 +3230,14 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
             {/* Expandable Side Panel */}
             <div
-              className='border-border flex min-h-0 flex-col overflow-hidden border-l pt-1.5 pl-4 transition-all duration-300 ease-out'
-              style={{
-                width: showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel ? '400px' : '0px',
-                opacity: showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel ? 1 : 0,
-                paddingLeft: showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel ? '16px' : '0px',
-              }}
+              className={
+                isSidePanelOpen && dialogStep === 'configuration'
+                  ? 'border-border flex min-h-0 w-full min-w-0 flex-col overflow-hidden pt-1.5 md:w-[360px] md:shrink-0 md:border-l md:pl-4'
+                  : 'hidden'
+              }
             >
               {/* Fetched Models Panel Content */}
-              <div
-                className={`flex h-full min-h-0 flex-col transition-opacity duration-200 ${showFetchedModelsPanel ? 'opacity-100' : 'pointer-events-none absolute opacity-0'}`}
-              >
+              <div className={showFetchedModelsPanel ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
                 <div className='mb-3 flex items-center justify-between'>
                   <h3 className='text-sm font-semibold'>{t('channels.dialogs.fields.supportedModels.fetchedModelsLabel')}</h3>
                   <Button type='button' variant='ghost' size='sm' className='h-6 w-6 p-0' onClick={closeFetchedModelsPanel}>
@@ -3021,6 +3328,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                     type='button'
                     className='flex-1'
                     size='sm'
+                    id='channel-confirm-fetched-models'
                     onClick={addSelectedFetchedModels}
                     disabled={selectedFetchedModels.length === 0}
                   >
@@ -3045,9 +3353,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
               {showFetchedModelsPanel && showSupportedModelsPanel && <div className='border-border my-2 border-t' />}
 
               {/* API Keys Panel Content */}
-              <div
-                className={`flex h-full min-h-0 flex-col transition-opacity duration-200 ${showApiKeysPanel ? 'opacity-100' : 'pointer-events-none absolute opacity-0'}`}
-              >
+              <div className={showApiKeysPanel ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
                 <div className='mb-3 flex items-center justify-between'>
                   <h3 className='text-sm font-semibold'>{t('channels.dialogs.fields.apiKey.panelTitle', { count: apiKeysCount })}</h3>
                   <Button type='button' variant='ghost' size='sm' className='h-6 w-6 p-0' onClick={closeApiKeysPanel}>
@@ -3215,9 +3521,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
               </div>
 
               {/* Supported Models Panel Content */}
-              <div
-                className={`flex h-full min-h-0 flex-col transition-opacity duration-200 ${showSupportedModelsPanel ? 'opacity-100' : 'pointer-events-none absolute opacity-0'}`}
-              >
+              <div className={showSupportedModelsPanel ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
                 <div className='mb-3 flex items-center justify-between'>
                   <div className='flex items-center gap-2'>
                     <Button type='button' variant='ghost' size='sm' className='h-6 w-6 p-0' onClick={closeSupportedModelsPanel}>
@@ -3310,24 +3614,41 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
               </div>
             </div>
           </div>
-          <DialogFooter className='flex-shrink-0'>
-            <Button type='button' variant='outline' onClick={() => onOpenChange(false)}>
-              {t('common.buttons.cancel')}
-            </Button>
-            <Button
-              type='submit'
-              form='channel-form'
-              disabled={isSubmitting || supportedModels.length === 0}
-              data-testid='channel-submit-button'
-            >
-              {isSubmitting
-                ? isEdit
-                  ? t('common.buttons.editing')
-                  : t('common.buttons.creating')
-                : isEdit
-                  ? t('common.buttons.edit')
-                  : t('common.buttons.create')}
-            </Button>
+          <DialogFooter className='flex-row items-center justify-between border-t px-5 py-4 sm:justify-between sm:px-6'>
+            <div>
+              {dialogStep === 'configuration' && (
+                <Button type='button' variant='outline' onClick={showProviderSelection} disabled={isSubmitting}>
+                  <ChevronLeft className='size-4' />
+                  {t('channels.dialogs.steps.back')}
+                </Button>
+              )}
+            </div>
+            <div className='flex items-center gap-2'>
+              <Button type='button' variant='ghost' onClick={() => onOpenChange(false)}>
+                {t('common.buttons.cancel')}
+              </Button>
+              {dialogStep === 'provider' ? (
+                <Button type='button' onClick={showChannelConfiguration} disabled={!selectedProviderOption || isSubmitting}>
+                  {t('channels.dialogs.steps.next')}
+                  <ChevronRight className='size-4' />
+                </Button>
+              ) : (
+                <Button
+                  type='submit'
+                  form='channel-form'
+                  disabled={isSubmitting || supportedModels.length === 0}
+                  data-testid='channel-submit-button'
+                >
+                  {isSubmitting
+                    ? isEdit
+                      ? t('common.buttons.editing')
+                      : t('common.buttons.creating')
+                    : isEdit
+                      ? t('common.buttons.edit')
+                      : t('common.buttons.create')}
+                </Button>
+              )}
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>

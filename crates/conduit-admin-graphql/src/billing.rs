@@ -15,27 +15,27 @@ pub const MAX_CREDIT_REDEMPTION_DESCRIPTION_CHARS: usize = 500;
 pub const CREDIT_REDEMPTION_CODE_MIN_CHARS: usize = 8;
 pub const CREDIT_REDEMPTION_CODE_MAX_CHARS: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, serde::Serialize, serde::Deserialize)]
 pub enum BillingStatus {
     Enabled,
     Disabled,
     Archived,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, serde::Serialize, serde::Deserialize)]
 pub enum SubscriptionIntervalUnit {
     Day,
     Month,
     Year,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, serde::Serialize, serde::Deserialize)]
 pub enum RolloverMode {
     None,
     Capped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, serde::Serialize, serde::Deserialize)]
 pub enum QuotaClass {
     General,
     Dedicated,
@@ -83,7 +83,7 @@ pub struct CreditLedgerEntry {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, serde::Serialize, serde::Deserialize)]
 pub enum CreditRedemptionCodeStatus {
     Active,
     Redeemed,
@@ -156,7 +156,8 @@ pub struct CreditRedemptionReceipt {
     pub redeemed_at: String,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCreditRedemptionCodesInput {
     pub amount: String,
     pub quantity: i32,
@@ -216,6 +217,41 @@ pub struct ProjectBalance {
     pub reserved_balance: String,
     pub available_balance: String,
     pub ledger_entries: Vec<CreditLedgerEntry>,
+}
+
+/// The current member's Credits summary. Dedicated buckets remain separate
+/// until a model is selected; key token/cost thresholds use their own units.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct MyProjectFunds {
+    #[graphql(name = "projectID")]
+    pub project_id: ID,
+    pub account_type: String,
+    pub shared: bool,
+    pub currency: String,
+    pub project_credit_available: String,
+    pub general_subscription_available: String,
+    pub dedicated_subscription_available: String,
+    pub dedicated_buckets: Vec<SubscriptionAllowanceBucket>,
+    pub member_reserved: String,
+    pub member_spent: String,
+    pub member_limit: Option<String>,
+    pub member_remaining: Option<String>,
+    pub admission_available: String,
+    pub key_limits: Option<async_graphql::Json<serde_json::Value>>,
+    pub selected_model_priced: bool,
+    pub selected_model_authorized: bool,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ProjectMemberSpendLimit {
+    #[graphql(name = "projectID")]
+    pub project_id: ID,
+    #[graphql(name = "userID")]
+    pub user_id: ID,
+    pub limit: Option<String>,
+    pub spent: String,
+    pub reserved: String,
+    pub remaining: Option<String>,
 }
 
 /// Read-only shadow comparison. It never copies or mutates legacy funds.
@@ -300,7 +336,8 @@ pub struct SubscriptionProjectOption {
     pub commercial_policy_active: bool,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantUserCreditInput {
     #[graphql(name = "userID")]
     pub user_id: ID,
@@ -310,7 +347,8 @@ pub struct GrantUserCreditInput {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantProjectCreditInput {
     #[graphql(name = "projectID")]
     pub project_id: ID,
@@ -319,7 +357,8 @@ pub struct GrantProjectCreditInput {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSubscriptionPlanInput {
     pub name: String,
     pub interval_unit: SubscriptionIntervalUnit,
@@ -329,7 +368,8 @@ pub struct CreateSubscriptionPlanInput {
     pub quota_rules: Vec<SubscriptionQuotaRuleInput>,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionQuotaRuleInput {
     pub id: Option<ID>,
     pub name: String,
@@ -342,7 +382,8 @@ pub struct SubscriptionQuotaRuleInput {
     pub access_plan_ids: Vec<ID>,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSubscriptionPlanInput {
     pub id: ID,
     pub name: String,
@@ -354,7 +395,8 @@ pub struct UpdateSubscriptionPlanInput {
     pub status: BillingStatus,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssignUserSubscriptionInput {
     #[graphql(name = "userID")]
     pub user_id: ID,
@@ -368,7 +410,8 @@ pub struct AssignUserSubscriptionInput {
     pub interval_count: Option<i32>,
 }
 
-#[derive(Debug, Clone, InputObject)]
+#[derive(Debug, Clone, InputObject, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetSubscriptionAutoRenewInput {
     #[graphql(name = "subscriptionID")]
     pub subscription_id: ID,
@@ -537,6 +580,36 @@ pub fn normalize_credit_redemption_code(value: &str) -> Result<String, BillingEr
 
 #[async_trait::async_trait]
 pub trait BillingServices: Send + Sync {
+    async fn set_project_member_spend_limit(
+        &self,
+        _actor: i64,
+        _project: &str,
+        _user: &str,
+        _limit: Option<String>,
+    ) -> Result<ProjectMemberSpendLimit, BillingError> {
+        Err(BillingError::Unavailable)
+    }
+
+    async fn my_project_funds(
+        &self,
+        _user_id: &str,
+        _project_id: &str,
+        _public_model_id: Option<&str>,
+        _api_key_id: Option<&str>,
+    ) -> Result<MyProjectFunds, BillingError> {
+        Err(BillingError::Invalid(
+            "Project funds service unavailable".into(),
+        ))
+    }
+    async fn project_member_spend_limit(
+        &self,
+        _project_id: &str,
+        _user_id: &str,
+    ) -> Result<ProjectMemberSpendLimit, BillingError> {
+        Err(BillingError::Invalid(
+            "member spend limit service unavailable".into(),
+        ))
+    }
     async fn user_balance(&self, user_id: &str) -> Result<UserBalance, BillingError>;
     async fn project_balance(&self, project_id: &str) -> Result<ProjectBalance, BillingError>;
     async fn project_wallet_comparison(
