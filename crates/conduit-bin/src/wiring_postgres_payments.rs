@@ -658,9 +658,10 @@ mod tests {
             assert_eq!(fields["type"],"wxpay");
             assert_eq!(fields["money"],"0.01");
             assert_eq!(fields["sign"],crate::epay_classic_md5::signature(&fields,"test-key"));
-            let now=Utc::now().with_timezone(&chrono_tz::Asia::Shanghai).format("%Y-%m-%d %H:%M:%S").to_string();
+            // Each simulated payment must follow creation of its own order.
+            let paid_time=|| Utc::now().with_timezone(&chrono_tz::Asia::Shanghai).format("%Y-%m-%d %H:%M:%S").to_string();
             Mock::given(method("GET")).and(path("/api.php")).and(query_param("act","order")).and(query_param("pid","7")).and(query_param("key","test-key")).and(query_param("out_trade_no",id.to_string()))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":1,"status":1,"pid":"7","out_trade_no":id.to_string(),"trade_no":"gateway-txn-1","api_trade_no":"not-the-ledger-identity","type":"wxpay","money":"0.01","endtime":now}))).mount(&gateway_server).await;
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":1,"status":1,"pid":"7","out_trade_no":id.to_string(),"trade_no":"gateway-txn-1","api_trade_no":"not-the-ledger-identity","type":"wxpay","money":"0.01","endtime":paid_time()}))).mount(&gateway_server).await;
             let mut notice=std::collections::BTreeMap::from([("pid".into(),"7".into()),("out_trade_no".into(),id.to_string()),("trade_no".into(),"gateway-txn-1".into()),("type".into(),"wxpay".into()),("money".into(),"0.01".into()),("name".into(),"中文 +%&=".into()),("trade_status".into(),"TRADE_SUCCESS".into()),("sign_type".into(),"MD5".into())]);
             notice.insert("sign".into(),crate::epay_classic_md5::signature(&notice,"test-key"));
             let raw=url::form_urlencoded::Serializer::new(String::new()).extend_pairs(&notice).finish();
@@ -688,7 +689,7 @@ mod tests {
             // The notification/query discrepancy is durable review with no credit.
             let second=adapter.create(9002,project,CreatePaymentOrderInput {amount_minor:"2".into(),channel:PaymentChannel::Wechat,idempotency_key:"gateway-two".into()}).await?;
             let second_id=Uuid::parse_str(second.id.as_str())?;
-            Mock::given(method("GET")).and(path("/api.php")).and(query_param("out_trade_no",second_id.to_string())).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":1,"status":1,"pid":"7","out_trade_no":second_id.to_string(),"trade_no":"gateway-txn-2","type":"wxpay","money":"0.02","endtime":now}))).mount(&gateway_server).await;
+            Mock::given(method("GET")).and(path("/api.php")).and(query_param("out_trade_no",second_id.to_string())).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":1,"status":1,"pid":"7","out_trade_no":second_id.to_string(),"trade_no":"gateway-txn-2","type":"wxpay","money":"0.02","endtime":paid_time()}))).mount(&gateway_server).await;
             notice.insert("out_trade_no".into(),second_id.to_string());notice.insert("trade_no".into(),"gateway-txn-2".into());
             notice.insert("sign".into(),crate::epay_classic_md5::signature(&notice,"test-key"));
             let raw=url::form_urlencoded::Serializer::new(String::new()).extend_pairs(&notice).finish();
@@ -732,7 +733,7 @@ mod tests {
             for (key,txn) in [("operator-active","operator-txn-active"),("operator-deleted","operator-txn-deleted")] {
                 let order=adapter.create(9002,project,CreatePaymentOrderInput{amount_minor:"1".into(),channel:PaymentChannel::Wechat,idempotency_key:key.into()}).await?;
                 Mock::given(method("GET")).and(path("/api.php")).and(query_param("out_trade_no",order.id.as_str()))
-                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":1,"status":1,"pid":"7","out_trade_no":order.id.as_str(),"trade_no":txn,"type":"wxpay","money":"0.01","endtime":now}))).mount(&gateway_server).await;
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code":1,"status":1,"pid":"7","out_trade_no":order.id.as_str(),"trade_no":txn,"type":"wxpay","money":"0.01","endtime":paid_time()}))).mount(&gateway_server).await;
                 operator_orders.push(order);
             }
             let active=&operator_orders[0];
