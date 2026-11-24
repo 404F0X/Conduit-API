@@ -2241,11 +2241,11 @@ async fn accounting_order_probe(
 #[tokio::test]
 async fn governance_group_and_channel_archive_share_ordered_accounting_locks()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(db) = database().await? else {
+    let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
         return Ok(());
     };
-    let result: Result<(), Box<dyn std::error::Error>> = async {
-        let pool = &db.pool;
+    crate::postgres_test_support::run_private_database(&dsn, |pool| async move {
+        let pool = &pool;
         let actor = owner(pool, "lock-order@contract.test").await?;
         PgGovernanceAdapter::new(pool.clone()).update_settings(actor,
             gql::UpdateGovernanceSettingsInput {
@@ -2273,9 +2273,5 @@ async fn governance_group_and_channel_archive_share_ordered_accounting_locks()
             "upgraded schema must acquire governance before accounting");
         eprintln!("fresh and upgraded 000042 SQL/Rust lock entrants passed");
         Ok(())
-    }.await;
-    let cleanup = db.cleanup().await;
-    result?;
-    cleanup?;
-    Ok(())
+    }).await
 }

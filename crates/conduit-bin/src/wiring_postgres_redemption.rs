@@ -93,12 +93,18 @@ pub(crate) async fn revoke_code(
         .begin()
         .await
         .map_err(|e| sanitized_db_error("revoke_code.begin", e))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::wiring_governance::LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| sanitized_db_error("revoke_code.governance_lock", e))?;
     let code = revoke_code_in_tx(&mut tx, actor, code_id).await?;
     tx.commit()
         .await
         .map_err(|e| sanitized_db_error("revoke_code.commit", e))?;
     Ok(code)
 }
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn revoke_code_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor: gql::CreditRedemptionActor,
@@ -1191,6 +1197,7 @@ mod tests {
     }
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn create_codes_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor: gql::CreditRedemptionActor,

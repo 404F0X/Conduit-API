@@ -6638,3 +6638,7 @@ mod channel_id_filter_query_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "wiring_subscription_lock_tests.rs"]
+mod subscription_lock_tests;

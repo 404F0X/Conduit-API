@@ -2053,6 +2053,11 @@ impl gql::BillingServices for PgBillingAdapter {
         input: gql::CreateSubscriptionPlanInput,
     ) -> Result<gql::SubscriptionPlan, gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         let plan_id = create_subscription_plan_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.plan(plan_id).await
@@ -2063,6 +2068,11 @@ impl gql::BillingServices for PgBillingAdapter {
         input: gql::UpdateSubscriptionPlanInput,
     ) -> Result<gql::SubscriptionPlan, gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         let plan_id = update_subscription_plan_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.plan(plan_id).await
@@ -2073,6 +2083,11 @@ impl gql::BillingServices for PgBillingAdapter {
         input: gql::AssignUserSubscriptionInput,
     ) -> Result<gql::UserSubscription, gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         let subscription_id = assign_user_subscription_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
         self.subscription(subscription_id).await
@@ -2112,6 +2127,11 @@ impl gql::BillingServices for PgBillingAdapter {
         subscription_id: &str,
     ) -> Result<gql::UserSubscription, gql::BillingError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         let subscription_id = cancel_user_subscription_in_tx(&mut tx, subscription_id).await?;
         tx.commit().await.map_err(storage)?;
         self.subscription(subscription_id).await
@@ -3808,6 +3828,7 @@ mod tests {
     }
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn grant_project_credit_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: gql::GrantProjectCreditInput,
@@ -3891,6 +3912,7 @@ pub(crate) async fn grant_project_credit_in_tx(
     Ok(project_id)
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn create_subscription_plan_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: gql::CreateSubscriptionPlanInput,
@@ -3950,6 +3972,7 @@ pub(crate) async fn create_subscription_plan_in_tx(
     Ok(plan_id)
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn update_subscription_plan_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: gql::UpdateSubscriptionPlanInput,
@@ -4058,6 +4081,7 @@ pub(crate) async fn update_subscription_plan_in_tx(
     Ok(plan_id)
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn assign_user_subscription_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: gql::AssignUserSubscriptionInput,
@@ -4193,6 +4217,7 @@ pub(crate) async fn assign_user_subscription_in_tx(
     Ok(subscription_id)
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn cancel_user_subscription_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     subscription_id: &str,
@@ -4206,6 +4231,7 @@ pub(crate) async fn cancel_user_subscription_in_tx(
     Ok(subscription_id)
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn reactivate_subscription_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     subscription_id: i64,
@@ -4310,6 +4336,7 @@ pub(crate) async fn reactivate_subscription_in_tx(
     .map_err(storage)?;
     Ok(())
 }
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn subscription_action_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     action: &str,
@@ -4346,6 +4373,7 @@ async fn require_subscription_management(
         .map_err(gql::BillingError::Invalid)
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn set_member_limit_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     project: i64,

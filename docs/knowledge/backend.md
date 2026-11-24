@@ -684,3 +684,5 @@ A durable successful notification returns exactly `success`; failed verification
 
 
 Governance classification for the group/payment APIs follows the existing domains: `saveModelGroup`, `saveUserGroup`, and `moveUserToGroup` are `group_access`. Enabling review for that domain blocks their direct execution with `APPROVAL_REQUIRED`; these new group commands are not yet implemented in the governed-change package transport, so that restriction must not be silently bypassed. `assignApiKeyModelGroup` follows the operational API-key update exception. Customer order creation and payer/operator verified rechecks follow the operational redemption exception; payer/global billing authorization and the provider-authenticated, frozen-target credit transaction still apply. Unknown mutations continue to fail closed even with governance disabled.
+
+订阅、简单分组和兑换写事务在 BEGIN 后先取得治理 G，再进入幂等、分组 S、业务行或计费 A 锁。`*_in_tx` 写入口要求调用方从事务开始持有 G；治理命令复用外层事务。读取快照不新增 G。不要在已持业务行锁后补取 G。锁序回归使用专用数据库和 pg_blocking_pids 屏障，普通并行测试保持并行。

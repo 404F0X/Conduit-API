@@ -245,6 +245,11 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         input: CreateSimpleGroupInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(simple_group_storage)?;
         let group_id = create_simple_group_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
@@ -256,6 +261,11 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         input: UpdateSimpleGroupInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(simple_group_storage)?;
         let group_id = update_simple_group_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
@@ -267,6 +277,11 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         input: AssignSimpleGroupUsersInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(simple_group_storage)?;
         let group_id = assign_simple_group_users_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
@@ -277,6 +292,11 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         input: UpdateSimpleGroupModelsInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(simple_group_storage)?;
         let group_id = update_simple_group_models_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
@@ -288,6 +308,11 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         input: UpdateSimpleGroupPriceInput,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(simple_group_storage)?;
         let group_id = update_simple_group_price_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
@@ -299,6 +324,11 @@ impl SimpleGroupServices for PgSimpleGroupAdapter {
         group_id: &str,
     ) -> Result<SimpleGroup, SimpleGroupServiceError> {
         let mut tx = self.pool.begin().await.map_err(simple_group_storage)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::wiring_governance::LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(simple_group_storage)?;
         let group_id = delete_simple_group_in_tx(&mut tx, actor_user_id, group_id).await?;
         tx.commit().await.map_err(simple_group_storage)?;
         self.load_native_simple_group(&group_id).await
@@ -1358,6 +1388,7 @@ mod tests {
     }
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn create_simple_group_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor_user_id: Option<i64>,
@@ -1619,6 +1650,7 @@ pub(crate) async fn create_simple_group_in_tx(
     Ok(group_id.to_owned())
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn update_simple_group_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor_user_id: Option<i64>,
@@ -1862,6 +1894,7 @@ pub(crate) async fn update_simple_group_in_tx(
     Ok(group_id.to_owned())
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn assign_simple_group_users_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor_user_id: Option<i64>,
@@ -2004,6 +2037,7 @@ pub(crate) async fn assign_simple_group_users_in_tx(
     Ok(group_id.to_owned())
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn update_simple_group_models_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     input: UpdateSimpleGroupModelsInput,
@@ -2079,6 +2113,7 @@ pub(crate) async fn update_simple_group_models_in_tx(
     Ok(group_id.to_owned())
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn update_simple_group_price_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor_user_id: Option<i64>,
@@ -2168,6 +2203,7 @@ pub(crate) async fn update_simple_group_price_in_tx(
     Ok(group_id.to_owned())
 }
 
+/// Caller must hold governance G from transaction entry, before any business lock.
 pub(crate) async fn delete_simple_group_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     actor_user_id: Option<i64>,
