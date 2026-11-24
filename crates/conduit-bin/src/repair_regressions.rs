@@ -179,17 +179,17 @@ async fn recovery_live_policy_and_cancel_keep_request_and_execution_consistent()
             String,
             Option<sqlx::types::Json<serde_json::Value>>,
             Option<sqlx::types::Json<serde_json::Value>>,
-        ) = sqlx::query_as(&format!(
+        ) = sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT status,response_body,response_chunks FROM {table} WHERE id=1"
-        ))
+        )))
         .fetch_one(&db.pool)
         .await?;
         assert_eq!(stored.0, "completed");
         assert!(stored.1.is_none());
         assert!(stored.2.is_none());
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
             "UPDATE {table} SET status='processing' WHERE id=1"
-        ))
+        )))
         .execute(&db.pool)
         .await?;
     }
@@ -214,17 +214,19 @@ async fn recovery_live_policy_and_cancel_keep_request_and_execution_consistent()
         .await?;
     for table in ["requests", "request_executions"] {
         assert_eq!(
-            sqlx::query_scalar::<_, String>(&format!("SELECT status FROM {table} WHERE id=1"))
-                .fetch_one(&db.pool)
-                .await?,
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe::<&str>(&format!(
+                "SELECT status FROM {table} WHERE id=1"
+            )))
+            .fetch_one(&db.pool)
+            .await?,
             "canceled"
         );
     }
     for message in ["provider canceled operation", "provider unavailable"] {
         for table in ["requests", "request_executions"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
                 "UPDATE {table} SET status='processing' WHERE id=1"
-            ))
+            )))
             .execute(&db.pool)
             .await?;
         }
@@ -249,9 +251,11 @@ async fn recovery_live_policy_and_cancel_keep_request_and_execution_consistent()
             .await?;
         for table in ["requests", "request_executions"] {
             assert_eq!(
-                sqlx::query_scalar::<_, String>(&format!("SELECT status FROM {table} WHERE id=1"))
-                    .fetch_one(&db.pool)
-                    .await?,
+                sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT status FROM {table} WHERE id=1"
+                )))
+                .fetch_one(&db.pool)
+                .await?,
                 "failed",
                 "{table}: {message}"
             );

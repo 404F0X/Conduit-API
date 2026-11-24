@@ -114,11 +114,13 @@ impl RequestRepo for PgRequestRepo {
         _: &RequestContext,
         v: &str,
     ) -> RepoResult<Option<RequestRow>> {
-        sqlx::query_as::<_, RequestRow>(&format!("SELECT {C} FROM requests WHERE id=$1"))
-            .bind(id(v)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| err("find", e))
+        sqlx::query_as::<_, RequestRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {C} FROM requests WHERE id=$1"
+        )))
+        .bind(id(v)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| err("find", e))
     }
     async fn find_request_by_external_id_unchecked(
         &self,
@@ -126,7 +128,7 @@ impl RequestRepo for PgRequestRepo {
         p: &str,
         e: &str,
     ) -> RepoResult<Option<RequestRow>> {
-        sqlx::query_as::<_,RequestRow>(&format!("SELECT {C} FROM requests WHERE project_id=$1 AND external_id=$2 ORDER BY id DESC LIMIT 1")).bind(id(p)?).bind(e).fetch_optional(&self.pool).await.map_err(|e|err("find external",e))
+        sqlx::query_as::<_,RequestRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {C} FROM requests WHERE project_id=$1 AND external_id=$2 ORDER BY id DESC LIMIT 1"))).bind(id(p)?).bind(e).fetch_optional(&self.pool).await.map_err(|e|err("find external",e))
     }
     async fn find_last_successful_channel_id_by_trace_unchecked(
         &self,

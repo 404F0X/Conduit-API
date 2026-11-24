@@ -97,9 +97,9 @@ impl UserRepo for PgUserRepo {
             }
             return Err(database_error("create insert", error));
         }
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE email = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(&input.email)
         .fetch_one(&mut *tx)
         .await
@@ -113,9 +113,9 @@ impl UserRepo for PgUserRepo {
         _ctx: &RequestContext,
         user_id: &str,
     ) -> RepoResult<Option<UserRow>> {
-        sqlx::query_as::<_, UserRow>(&format!(
+        sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(parse_id(user_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -127,9 +127,9 @@ impl UserRepo for PgUserRepo {
         _ctx: &RequestContext,
         user_id: &str,
     ) -> RepoResult<Option<UserRow>> {
-        sqlx::query_as::<_, UserRow>(&format!(
+        sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE id = $1"
-        ))
+        )))
         .bind(parse_id(user_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -141,9 +141,9 @@ impl UserRepo for PgUserRepo {
         _ctx: &RequestContext,
         email: &str,
     ) -> RepoResult<Option<UserRow>> {
-        sqlx::query_as::<_, UserRow>(&format!(
+        sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE email = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(email)
         .fetch_optional(&self.pool)
         .await
@@ -155,10 +155,10 @@ impl UserRepo for PgUserRepo {
         _ctx: &RequestContext,
         email: &str,
     ) -> RepoResult<Option<UserRow>> {
-        sqlx::query_as::<_, UserRow>(&format!(
+        sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE email = $1 \
              ORDER BY deleted_at ASC LIMIT 1"
-        ))
+        )))
         .bind(email)
         .fetch_optional(&self.pool)
         .await
@@ -174,11 +174,11 @@ impl UserRepo for PgUserRepo {
         let rows = if let (Some(timestamp), Some(id)) =
             (query.after_created_at.as_deref(), query.after_id.as_deref())
         {
-            sqlx::query_as::<_, UserRow>(&format!(
+            sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
                 "SELECT {USER_SELECT_COLUMNS} FROM users WHERE deleted_at = 0 \
                  AND (created_at > $1 OR (created_at = $1 AND id > $2)) \
                  ORDER BY created_at, id LIMIT $3"
-            ))
+            )))
             .bind(parse_dt(timestamp))
             .bind(parse_id(id)?)
             .bind(fetch_n)
@@ -186,10 +186,10 @@ impl UserRepo for PgUserRepo {
             .await
             .map_err(|e| database_error("list keyset", e))?
         } else {
-            sqlx::query_as::<_, UserRow>(&format!(
+            sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
                 "SELECT {USER_SELECT_COLUMNS} FROM users WHERE deleted_at = 0 \
                  ORDER BY created_at, id LIMIT $1 OFFSET $2"
-            ))
+            )))
             .bind(fetch_n)
             .bind(i64::from(query.offset))
             .fetch_all(&self.pool)
@@ -270,9 +270,9 @@ impl UserRepo for PgUserRepo {
         if affected == 0 {
             return Err(RepoError::NotFound("user"));
         }
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_one(&mut *tx)
         .await
@@ -310,9 +310,9 @@ impl UserRepo for PgUserRepo {
         let deleted_at = Utc::now().timestamp().max(max_deleted.saturating_add(1));
         sqlx::query("UPDATE users SET deleted_at = $1, status = 'deactivated', updated_at = now() WHERE id = $2")
             .bind(deleted_at).bind(id).execute(&mut *tx).await.map_err(|e| database_error("delete", e))?;
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_one(&mut *tx)
         .await
@@ -348,9 +348,9 @@ impl UserRepo for PgUserRepo {
             sqlx::query("UPDATE users SET deleted_at = 0, status = 'activated', updated_at = now() WHERE id = $1")
                 .bind(id).execute(&mut *tx).await.map_err(|e| database_error("restore", e))?;
         }
-        let row = sqlx::query_as::<_, UserRow>(&format!(
+        let row = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_SELECT_COLUMNS} FROM users WHERE id = $1"
-        ))
+        )))
         .bind(id)
         .fetch_one(&mut *tx)
         .await

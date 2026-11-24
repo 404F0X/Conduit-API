@@ -67,9 +67,9 @@ impl ProjectRepo for PgProjectRepo {
         _ctx: &RequestContext,
         project_id: &str,
     ) -> RepoResult<Option<ProjectRow>> {
-        sqlx::query_as::<_, ProjectRow>(&format!(
+        sqlx::query_as::<_, ProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM projects WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(id(project_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -80,20 +80,22 @@ impl ProjectRepo for PgProjectRepo {
         _ctx: &RequestContext,
         project_id: &str,
     ) -> RepoResult<Option<ProjectRow>> {
-        sqlx::query_as::<_, ProjectRow>(&format!("SELECT {COLUMNS} FROM projects WHERE id = $1"))
-            .bind(id(project_id)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|v| error("find with deleted", v))
+        sqlx::query_as::<_, ProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM projects WHERE id = $1"
+        )))
+        .bind(id(project_id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|v| error("find with deleted", v))
     }
     async fn find_project_by_name_unchecked(
         &self,
         _ctx: &RequestContext,
         name: &str,
     ) -> RepoResult<Option<ProjectRow>> {
-        sqlx::query_as::<_, ProjectRow>(&format!(
+        sqlx::query_as::<_, ProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM projects WHERE name = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(name)
         .fetch_optional(&self.pool)
         .await
@@ -112,10 +114,10 @@ impl ProjectRepo for PgProjectRepo {
             let at = chrono::DateTime::parse_from_rfc3339(at)
                 .map(|v| v.with_timezone(&Utc))
                 .unwrap_or_default();
-            sqlx::query_as::<_, ProjectRow>(&format!("SELECT {COLUMNS} FROM projects WHERE deleted_at = 0 AND (created_at > $1 OR (created_at = $1 AND id > $2)) ORDER BY created_at, id LIMIT $3"))
+            sqlx::query_as::<_, ProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM projects WHERE deleted_at = 0 AND (created_at > $1 OR (created_at = $1 AND id > $2)) ORDER BY created_at, id LIMIT $3")))
                 .bind(at).bind(id(cursor_id)?).bind(fetch_n).fetch_all(&self.pool).await.map_err(|v| error("list keyset", v))?
         } else {
-            sqlx::query_as::<_, ProjectRow>(&format!("SELECT {COLUMNS} FROM projects WHERE deleted_at = 0 ORDER BY created_at, id LIMIT $1 OFFSET $2"))
+            sqlx::query_as::<_, ProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM projects WHERE deleted_at = 0 ORDER BY created_at, id LIMIT $1 OFFSET $2")))
                 .bind(fetch_n).bind(i64::from(query.offset)).fetch_all(&self.pool).await.map_err(|v| error("list offset", v))?
         };
         let has_more = rows.len() > query.limit as usize;

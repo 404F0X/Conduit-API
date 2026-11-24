@@ -51,10 +51,10 @@ impl UserProjectRepo for PgUserProjectRepo {
         _ctx: &RequestContext,
         input: CreateUserProjectInput,
     ) -> RepoResult<UserProjectRow> {
-        sqlx::query_as::<_, UserProjectRow>(&format!(
+        sqlx::query_as::<_, UserProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "INSERT INTO user_projects (user_id, project_id, is_owner, scopes) \
              VALUES ($1, $2, $3, $4) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(id(&input.user_id)?)
         .bind(id(&input.project_id)?)
         .bind(input.is_owner)
@@ -69,9 +69,9 @@ impl UserProjectRepo for PgUserProjectRepo {
         _ctx: &RequestContext,
         user_id: &str,
     ) -> RepoResult<Vec<UserProjectRow>> {
-        sqlx::query_as::<_, UserProjectRow>(&format!(
+        sqlx::query_as::<_, UserProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM user_projects WHERE user_id = $1 ORDER BY id"
-        ))
+        )))
         .bind(id(user_id)?)
         .fetch_all(&self.pool)
         .await

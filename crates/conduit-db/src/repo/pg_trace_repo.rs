@@ -25,16 +25,18 @@ impl PgTraceRepo {
 
     /// Global admin listing used by `Query.traces`.
     pub async fn list_all(&self) -> RepoResult<Vec<TraceRow>> {
-        sqlx::query_as::<_, TraceRow>(&format!("SELECT {COLUMNS} FROM traces ORDER BY id ASC"))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| database_error("list all", error))
+        sqlx::query_as::<_, TraceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM traces ORDER BY id ASC"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| database_error("list all", error))
     }
 
     pub async fn list_by_project(&self, project_id: &str) -> RepoResult<Vec<TraceRow>> {
-        sqlx::query_as::<_, TraceRow>(&format!(
+        sqlx::query_as::<_, TraceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM traces WHERE project_id = $1 ORDER BY id ASC"
-        ))
+        )))
         .bind(parse_id(
             project_id,
             "trace project id not a valid integer",
@@ -46,11 +48,13 @@ impl PgTraceRepo {
 
     /// Primary-key lookup used by the Relay `node(id:)` resolver.
     pub async fn find_by_row_id(&self, id: i64) -> RepoResult<Option<TraceRow>> {
-        sqlx::query_as::<_, TraceRow>(&format!("SELECT {COLUMNS} FROM traces WHERE id = $1"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|error| database_error("find by row id", error))
+        sqlx::query_as::<_, TraceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM traces WHERE id = $1"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| database_error("find by row id", error))
     }
 }
 
@@ -93,9 +97,9 @@ async fn fetch_by_pair(
     project_id: i64,
     trace_id: &str,
 ) -> RepoResult<Option<TraceRow>> {
-    sqlx::query_as::<_, TraceRow>(&format!(
+    sqlx::query_as::<_, TraceRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {COLUMNS} FROM traces WHERE project_id = $1 AND trace_id = $2"
-    ))
+    )))
     .bind(project_id)
     .bind(trace_id)
     .fetch_optional(pool)

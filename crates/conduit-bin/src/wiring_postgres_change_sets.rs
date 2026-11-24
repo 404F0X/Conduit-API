@@ -254,12 +254,12 @@ impl gql::ChangeSetServices for PgChangeSetAdapter {
         scope_id: Option<String>,
         limit: i32,
     ) -> Result<Vec<gql::ChangeSet>, gql::ChangeSetError> {
-        let rows = sqlx::query_as::<_, ChangeSetRow>(&format!(
+        let rows = sqlx::query_as::<_, ChangeSetRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {CHANGE_SET_COLUMNS} FROM change_sets \
              WHERE ($1::text IS NULL OR kind=$1) AND ($2::text IS NULL OR status=$2) \
                AND ($3::text IS NULL OR scope_type=$3) AND ($4::text IS NULL OR scope_id=$4) \
              ORDER BY updated_at DESC,id DESC LIMIT $5"
-        ))
+        )))
         .bind(kind.map(gql::ChangeSetKind::as_str))
         .bind(status.map(gql::ChangeSetStatus::as_str))
         .bind(normalize_filter(scope_type))
@@ -409,9 +409,9 @@ impl ChangeSetItemRow {
 }
 
 async fn load_change_set(pool: &PgPool, id: i64) -> Result<gql::ChangeSet, gql::ChangeSetError> {
-    let row = sqlx::query_as::<_, ChangeSetRow>(&format!(
+    let row = sqlx::query_as::<_, ChangeSetRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {CHANGE_SET_COLUMNS} FROM change_sets WHERE id=$1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -431,10 +431,10 @@ async fn load_change_sets_graphql(
         return Ok(Vec::new());
     }
     let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
-    let item_rows = sqlx::query_as::<_, ChangeSetItemRow>(&format!(
+    let item_rows = sqlx::query_as::<_, ChangeSetItemRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {CHANGE_SET_ITEM_COLUMNS} FROM change_set_items \
          WHERE change_set_id=ANY($1) ORDER BY change_set_id,id"
-    ))
+    )))
     .bind(&ids)
     .fetch_all(pool)
     .await
@@ -522,9 +522,9 @@ async fn lock_change_set(
     tx: &mut Transaction<'_, Postgres>,
     id: i64,
 ) -> Result<ChangeSetRow, gql::ChangeSetError> {
-    sqlx::query_as::<_, ChangeSetRow>(&format!(
+    sqlx::query_as::<_, ChangeSetRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {CHANGE_SET_COLUMNS} FROM change_sets WHERE id=$1 FOR UPDATE"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut **tx)
     .await
@@ -536,9 +536,9 @@ async fn load_items_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     change_set_id: i64,
 ) -> Result<Vec<ChangeSetItemRow>, ApplyFailure> {
-    sqlx::query_as::<_, ChangeSetItemRow>(&format!(
+    sqlx::query_as::<_, ChangeSetItemRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {CHANGE_SET_ITEM_COLUMNS} FROM change_set_items WHERE change_set_id=$1 ORDER BY id"
-    ))
+    )))
     .bind(change_set_id)
     .fetch_all(&mut **tx)
     .await
@@ -549,9 +549,9 @@ async fn load_item_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     item_id: i64,
 ) -> Result<ChangeSetItemRow, gql::ChangeSetError> {
-    sqlx::query_as::<_, ChangeSetItemRow>(&format!(
+    sqlx::query_as::<_, ChangeSetItemRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {CHANGE_SET_ITEM_COLUMNS} FROM change_set_items WHERE id=$1"
-    ))
+    )))
     .bind(item_id)
     .fetch_one(&mut **tx)
     .await

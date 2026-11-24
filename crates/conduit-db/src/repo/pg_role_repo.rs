@@ -86,9 +86,9 @@ impl RoleRepo for PgRoleRepo {
         _ctx: &RequestContext,
         role_id: &str,
     ) -> RepoResult<Option<RoleRow>> {
-        sqlx::query_as::<_, RoleRow>(&format!(
+        sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM roles WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(id(role_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -99,14 +99,16 @@ impl RoleRepo for PgRoleRepo {
         _ctx: &RequestContext,
         role_id: &str,
     ) -> RepoResult<Option<RoleRow>> {
-        sqlx::query_as::<_, RoleRow>(&format!("SELECT {COLUMNS} FROM roles WHERE id = $1"))
-            .bind(id(role_id)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| error("find with deleted", e))
+        sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM roles WHERE id = $1"
+        )))
+        .bind(id(role_id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| error("find with deleted", e))
     }
     async fn list_system_roles_unchecked(&self, _ctx: &RequestContext) -> RepoResult<Vec<RoleRow>> {
-        sqlx::query_as::<_, RoleRow>(&format!("SELECT {COLUMNS} FROM roles WHERE project_id IS NULL AND deleted_at = 0 ORDER BY created_at, id"))
+        sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM roles WHERE project_id IS NULL AND deleted_at = 0 ORDER BY created_at, id")))
             .fetch_all(&self.pool).await.map_err(|e| error("list system", e))
     }
     async fn list_roles_by_project_unchecked(
@@ -114,7 +116,7 @@ impl RoleRepo for PgRoleRepo {
         _ctx: &RequestContext,
         project_id: &str,
     ) -> RepoResult<Vec<RoleRow>> {
-        sqlx::query_as::<_, RoleRow>(&format!("SELECT {COLUMNS} FROM roles WHERE project_id = $1 AND deleted_at = 0 ORDER BY created_at, id"))
+        sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM roles WHERE project_id = $1 AND deleted_at = 0 ORDER BY created_at, id")))
             .bind(id(project_id)?).fetch_all(&self.pool).await.map_err(|e| error("list project", e))
     }
     async fn list_roles_unchecked(

@@ -32,9 +32,9 @@ impl PgPromptRepo {
     /// node dispatcher uses this narrow lookup to recover that row without
     /// guessing an owning project id.
     pub async fn find_by_row_id(&self, prompt_id: i64) -> RepoResult<Option<PromptRow>> {
-        sqlx::query_as::<_, PromptRow>(&format!(
+        sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM prompts WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(prompt_id)
         .fetch_optional(&self.pool)
         .await
@@ -76,12 +76,12 @@ impl PromptRepo for PgPromptRepo {
         let settings = input
             .settings
             .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
-        sqlx::query_as::<_, PromptRow>(&format!(
+        sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "INSERT INTO prompts \
              (project_id, name, description, role, content, status, \"order\", settings) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(parse_project_id(&input.project_id)?)
         .bind(input.name)
         .bind(input.description.unwrap_or_default())
@@ -101,10 +101,10 @@ impl PromptRepo for PgPromptRepo {
         project_id: &str,
         prompt_id: &str,
     ) -> RepoResult<Option<PromptRow>> {
-        sqlx::query_as::<_, PromptRow>(&format!(
+        sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM prompts \
              WHERE project_id = $1 AND id = $2 AND deleted_at = 0"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .bind(parse_id(prompt_id)?)
         .fetch_optional(&self.pool)
@@ -118,9 +118,9 @@ impl PromptRepo for PgPromptRepo {
         project_id: &str,
         prompt_id: &str,
     ) -> RepoResult<Option<PromptRow>> {
-        sqlx::query_as::<_, PromptRow>(&format!(
+        sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM prompts WHERE project_id = $1 AND id = $2"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .bind(parse_id(prompt_id)?)
         .fetch_optional(&self.pool)
@@ -133,11 +133,11 @@ impl PromptRepo for PgPromptRepo {
         _ctx: &RequestContext,
         project_id: &str,
     ) -> RepoResult<Vec<PromptRow>> {
-        sqlx::query_as::<_, PromptRow>(&format!(
+        sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM prompts \
              WHERE project_id = $1 AND deleted_at = 0 \
              ORDER BY \"order\" ASC, id ASC"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .fetch_all(&self.pool)
         .await
@@ -216,11 +216,11 @@ impl PromptRepo for PgPromptRepo {
         status: String,
         _updated_at: String,
     ) -> RepoResult<PromptRow> {
-        sqlx::query_as::<_, PromptRow>(&format!(
+        sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "UPDATE prompts SET status = $3, updated_at = now() \
              WHERE project_id = $1 AND id = $2 AND deleted_at = 0 \
              RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(parse_project_id(project_id)?)
         .bind(parse_id(prompt_id)?)
         .bind(status)
@@ -270,11 +270,11 @@ impl PromptRepo for PgPromptRepo {
             .max(1)
             .max(maximum.saturating_add(1));
 
-        let row = sqlx::query_as::<_, PromptRow>(&format!(
+        let row = sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "UPDATE prompts SET deleted_at = $3, updated_at = now() \
              WHERE project_id = $1 AND id = $2 AND deleted_at = 0 \
              RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(project_id)
         .bind(prompt_id)
         .bind(deleted_at)
@@ -304,10 +304,10 @@ impl PromptRepo for PgPromptRepo {
             .await
             .map_err(|error| database_error("restore begin", error))?;
 
-        let current = sqlx::query_as::<_, PromptRow>(&format!(
+        let current = sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM prompts \
              WHERE project_id = $1 AND id = $2 FOR UPDATE"
-        ))
+        )))
         .bind(project_id)
         .bind(prompt_id)
         .fetch_optional(&mut *transaction)
@@ -316,11 +316,11 @@ impl PromptRepo for PgPromptRepo {
         .ok_or(RepoError::NotFound("prompt"))?;
 
         let row = if current.deleted_at.is_some() {
-            sqlx::query_as::<_, PromptRow>(&format!(
+            sqlx::query_as::<_, PromptRow>(sqlx::AssertSqlSafe::<&str>(&format!(
                 "UPDATE prompts SET deleted_at = 0, updated_at = now() \
                  WHERE project_id = $1 AND id = $2 AND deleted_at <> 0 \
                  RETURNING {COLUMNS}"
-            ))
+            )))
             .bind(project_id)
             .bind(prompt_id)
             .fetch_optional(&mut *transaction)
@@ -357,16 +357,20 @@ mod tests {
             let admin_pool = PgPool::connect(dsn).await?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
             let schema = format!("conduit_prompt_{}_{}", std::process::id(), nonce);
-            sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-                .execute(&admin_pool)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+                "CREATE SCHEMA \"{schema}\""
+            )))
+            .execute(&admin_pool)
+            .await?;
             let search_path = format!("SET search_path TO \"{schema}\"");
             let pool = PgPoolOptions::new()
                 .max_connections(4)
                 .after_connect(move |connection, _| {
                     let search_path = search_path.clone();
                     Box::pin(async move {
-                        sqlx::query(&search_path).execute(connection).await?;
+                        sqlx::query(sqlx::AssertSqlSafe::<&str>(&search_path))
+                            .execute(connection)
+                            .await?;
                         Ok(())
                     })
                 })
@@ -382,9 +386,12 @@ mod tests {
 
         async fn cleanup(self) -> Result<(), sqlx::Error> {
             self.pool.close().await;
-            sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
-                .execute(&self.admin_pool)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+                "DROP SCHEMA \"{}\" CASCADE",
+                self.schema
+            )))
+            .execute(&self.admin_pool)
+            .await?;
             self.admin_pool.close().await;
             Ok(())
         }

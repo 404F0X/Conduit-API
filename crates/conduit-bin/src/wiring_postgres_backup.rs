@@ -47,9 +47,9 @@ impl PgBackupDataSourceAdapter {
     }
 
     async fn load_table(connection: &mut PgConnection, table: &str) -> BackupServiceResult<Value> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT to_jsonb(backup_row) AS payload FROM (SELECT * FROM {table}) backup_row"
-        ))
+        )))
         .fetch_all(&mut *connection)
         .await
         .map_err(|error| backup_storage_error(format!("load {table} failed: {error}")))?;
@@ -1374,9 +1374,9 @@ async fn restore_history_row(
     let mut comparable = object.clone();
     comparable.remove("id");
     let table_name = quote_identifier(table);
-    let identical_id = sqlx::query_scalar::<_, i64>(&format!(
+    let identical_id = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT id FROM {table_name} AS target WHERE (to_jsonb(target) - 'id') = $1 LIMIT 1"
-    ))
+    )))
     .bind(Json(Value::Object(comparable)))
     .fetch_optional(&mut **tx)
     .await
@@ -1385,9 +1385,9 @@ async fn restore_history_row(
         return Ok(id);
     }
 
-    let id_exists = sqlx::query_scalar::<_, bool>(&format!(
+    let id_exists = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT EXISTS(SELECT 1 FROM {table_name} WHERE id=$1)"
-    ))
+    )))
     .bind(source_id)
     .fetch_one(&mut **tx)
     .await
@@ -1424,7 +1424,7 @@ async fn restore_history_row(
          SELECT {source_names} FROM jsonb_populate_record(NULL::{table_name}, $1::jsonb) AS source \
          RETURNING id"
     );
-    sqlx::query_scalar::<_, i64>(&sql)
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(&sql))
         .bind(Json(Value::Object(object)))
         .fetch_one(&mut **tx)
         .await
@@ -1540,11 +1540,11 @@ async fn restore_row_with_identity(
     }
     let identity = json_integer_key(&filtered, identity_column)?;
     let exists = if let Some(identity) = identity {
-        sqlx::query_scalar::<_, bool>(&format!(
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT EXISTS(SELECT 1 FROM {} WHERE {} = $1)",
             quote_identifier(table),
             quote_identifier(identity_column),
-        ))
+        )))
         .bind(identity)
         .fetch_one(&mut **tx)
         .await
@@ -1587,7 +1587,7 @@ async fn restore_row_with_identity(
                     table_name = quote_identifier(table),
                     identity = quote_identifier(identity_column),
                 );
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe::<&str>(&sql))
                     .bind(Json(Value::Object(filtered)))
                     .execute(&mut **tx)
                     .await
@@ -1622,7 +1622,7 @@ async fn restore_row_with_identity(
         "INSERT INTO {table_name} ({names}) \
          SELECT {source_names} FROM jsonb_populate_record(NULL::{table_name}, $1::jsonb) AS source{conflict}"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe::<&str>(&sql))
         .bind(Json(Value::Object(filtered)))
         .execute(&mut **tx)
         .await
@@ -1657,7 +1657,10 @@ async fn reset_id_sequence(
         "SELECT setval($1::regclass, \
          GREATEST(COALESCE(MAX(id), 1), 1), COUNT(*) > 0) FROM {table_name}"
     );
-    sqlx::query(&sql).bind(sequence).execute(&mut **tx).await?;
+    sqlx::query(sqlx::AssertSqlSafe::<&str>(&sql))
+        .bind(sequence)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -2543,11 +2546,12 @@ mod tests {
             ("change_set_items", 831),
             ("change_set_events", 832),
         ] {
-            let mut archived: Value =
-                sqlx::query_scalar(&format!("SELECT to_jsonb(t) FROM {table} t WHERE id=$1"))
-                    .bind(id)
-                    .fetch_one(&target.pool)
-                    .await?;
+            let mut archived: Value = sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&format!(
+                "SELECT to_jsonb(t) FROM {table} t WHERE id=$1"
+            )))
+            .bind(id)
+            .fetch_one(&target.pool)
+            .await?;
             archived
                 .as_object_mut()
                 .unwrap()

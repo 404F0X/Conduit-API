@@ -42,10 +42,10 @@ impl PgPromptProtectionRuleRepo {
         live_only: bool,
     ) -> RepoResult<Option<PromptProtectionRuleRow>> {
         let live_filter = if live_only { " AND deleted_at = 0" } else { "" };
-        sqlx::query_as::<_, PromptProtectionRuleRow>(&format!(
+        sqlx::query_as::<_, PromptProtectionRuleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM prompt_protection_rules \
              WHERE id = $1{live_filter}"
-        ))
+        )))
         .bind(rule_id)
         .fetch_optional(&self.pool)
         .await
@@ -57,21 +57,25 @@ impl PgPromptProtectionRuleRepo {
         status: Option<&str>,
     ) -> RepoResult<Vec<PromptProtectionRuleRow>> {
         match status {
-            Some(status) => sqlx::query_as::<_, PromptProtectionRuleRow>(&format!(
-                "SELECT {COLUMNS} FROM prompt_protection_rules \
+            Some(status) => {
+                sqlx::query_as::<_, PromptProtectionRuleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT {COLUMNS} FROM prompt_protection_rules \
                  WHERE deleted_at = 0 AND status = $1 ORDER BY id ASC"
-            ))
-            .bind(status)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| database_error("list by status", error)),
-            None => sqlx::query_as::<_, PromptProtectionRuleRow>(&format!(
-                "SELECT {COLUMNS} FROM prompt_protection_rules \
+                )))
+                .bind(status)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|error| database_error("list by status", error))
+            }
+            None => {
+                sqlx::query_as::<_, PromptProtectionRuleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                    "SELECT {COLUMNS} FROM prompt_protection_rules \
                  WHERE deleted_at = 0 ORDER BY id ASC"
-            ))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|error| database_error("list", error)),
+                )))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|error| database_error("list", error))
+            }
         }
     }
 
@@ -135,11 +139,11 @@ impl PromptProtectionRuleRepo for PgPromptProtectionRuleRepo {
         input: CreateProtectionRuleInput,
     ) -> RepoResult<PromptProtectionRuleRow> {
         let created_at = parse_timestamp(&input.created_at);
-        sqlx::query_as::<_, PromptProtectionRuleRow>(&format!(
+        sqlx::query_as::<_, PromptProtectionRuleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "INSERT INTO prompt_protection_rules \
              (name, description, pattern, settings, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $5) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name)
         .bind(input.description.unwrap_or_default())
         .bind(input.pattern)
@@ -237,10 +241,10 @@ impl PromptProtectionRuleRepo for PgPromptProtectionRuleRepo {
         status: &str,
         updated_at: String,
     ) -> RepoResult<PromptProtectionRuleRow> {
-        sqlx::query_as::<_, PromptProtectionRuleRow>(&format!(
+        sqlx::query_as::<_, PromptProtectionRuleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "UPDATE prompt_protection_rules SET status = $1, updated_at = $2 \
              WHERE id = $3 AND deleted_at = 0 RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(status)
         .bind(parse_timestamp(&updated_at))
         .bind(parse_id(rule_id)?)
@@ -280,17 +284,18 @@ impl PromptProtectionRuleRepo for PgPromptProtectionRuleRepo {
         .await
         .map_err(|error| database_error("soft delete timestamp lookup", error))?;
 
-        let row = sqlx::query_as::<_, PromptProtectionRuleRow>(&format!(
-            "UPDATE prompt_protection_rules \
+        let row =
+            sqlx::query_as::<_, PromptProtectionRuleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+                "UPDATE prompt_protection_rules \
              SET deleted_at = $1, updated_at = now() \
              WHERE id = $2 AND deleted_at = 0 RETURNING {COLUMNS}"
-        ))
-        .bind(next_deleted_at(maximum))
-        .bind(rule_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|error| database_error("soft delete", error))?
-        .ok_or(RepoError::NotFound("prompt protection rule"))?;
+            )))
+            .bind(next_deleted_at(maximum))
+            .bind(rule_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| database_error("soft delete", error))?
+            .ok_or(RepoError::NotFound("prompt protection rule"))?;
 
         transaction
             .commit()
@@ -422,9 +427,11 @@ mod tests {
             let admin_pool = PgPool::connect(dsn).await?;
             let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros();
             let schema = format!("conduit_prompt_protection_{}_{}", std::process::id(), nonce);
-            sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-                .execute(&admin_pool)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+                "CREATE SCHEMA \"{schema}\""
+            )))
+            .execute(&admin_pool)
+            .await?;
 
             let search_path = format!("SET search_path TO \"{schema}\"");
             let pool = PgPoolOptions::new()
@@ -432,7 +439,9 @@ mod tests {
                 .after_connect(move |connection, _| {
                     let search_path = search_path.clone();
                     Box::pin(async move {
-                        sqlx::query(&search_path).execute(connection).await?;
+                        sqlx::query(sqlx::AssertSqlSafe::<&str>(&search_path))
+                            .execute(connection)
+                            .await?;
                         Ok(())
                     })
                 })
@@ -449,9 +458,12 @@ mod tests {
 
         async fn cleanup(self) -> Result<(), sqlx::Error> {
             self.pool.close().await;
-            sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", self.schema))
-                .execute(&self.admin_pool)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+                "DROP SCHEMA \"{}\" CASCADE",
+                self.schema
+            )))
+            .execute(&self.admin_pool)
+            .await?;
             self.admin_pool.close().await;
             Ok(())
         }

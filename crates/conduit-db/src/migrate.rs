@@ -450,11 +450,11 @@ async fn run_postgres_migration_catalog(
     let migrations = prepare_postgres_migration_catalog(migrations)?;
     let mut transaction = conn.begin().await?;
     let result: Result<Option<&'static str>, MigrationRunnerError> = async {
-        sqlx::query(POSTGRES_MIGRATION_LOCK_SQL)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(POSTGRES_MIGRATION_LOCK_SQL))
             .bind(POSTGRES_MIGRATION_LOCK_KEY)
             .execute(&mut *transaction)
             .await?;
-        sqlx::query(CREATE_TRACKING_TABLE_SQL)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(CREATE_TRACKING_TABLE_SQL))
             .execute(&mut *transaction)
             .await?;
 
@@ -471,10 +471,12 @@ async fn run_postgres_migration_catalog(
             }
 
             for statement in &migration.statements {
-                sqlx::raw_sql(statement).execute(&mut *transaction).await?;
+                sqlx::raw_sql(sqlx::AssertSqlSafe::<&str>(statement))
+                    .execute(&mut *transaction)
+                    .await?;
             }
 
-            sqlx::query(MIGRATION_APPLIED_SQL)
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(MIGRATION_APPLIED_SQL))
                 .bind(migration.version)
                 .bind(rfc3339_utc_now())
                 .execute(&mut *transaction)

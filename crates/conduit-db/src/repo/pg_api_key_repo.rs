@@ -183,7 +183,7 @@ impl ApiKeyRepo for PgApiKeyRepo {
             .execute(&mut *tx)
             .await
             .map_err(|e| db_error("batch policy", e))?;
-        let rows:Vec<ApiKeyRow>=sqlx::query_as(&format!("SELECT {COLUMNS} FROM api_keys WHERE id=ANY($1) AND project_id=$2 AND deleted_at=0 ORDER BY id FOR UPDATE")).bind(&keys).bind(project).fetch_all(&mut *tx).await.map_err(|e|db_error("batch selection",e))?;
+        let rows:Vec<ApiKeyRow>=sqlx::query_as(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM api_keys WHERE id=ANY($1) AND project_id=$2 AND deleted_at=0 ORDER BY id FOR UPDATE"))).bind(&keys).bind(project).fetch_all(&mut *tx).await.map_err(|e|db_error("batch selection",e))?;
         if rows.len() != ids.len() || rows.iter().any(|r| r.key_type == "noauth") {
             return Err(RepoError::NotFound("api_key batch"));
         }
@@ -258,9 +258,9 @@ impl ApiKeyRepo for PgApiKeyRepo {
             }
             return Err(db_error("create", error));
         }
-        let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
+        let row = sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_keys WHERE key = $1"
-        ))
+        )))
         .bind(&input.key)
         .fetch_one(&mut *tx)
         .await
@@ -293,9 +293,9 @@ impl ApiKeyRepo for PgApiKeyRepo {
         _ctx: &RequestContext,
         id: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!(
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_keys WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(parse_id(id)?)
         .fetch_optional(&self.pool)
         .await
@@ -306,20 +306,22 @@ impl ApiKeyRepo for PgApiKeyRepo {
         _ctx: &RequestContext,
         id: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!("SELECT {COLUMNS} FROM api_keys WHERE id = $1"))
-            .bind(parse_id(id)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| db_error("find id with deleted", e))
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM api_keys WHERE id = $1"
+        )))
+        .bind(parse_id(id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| db_error("find id with deleted", e))
     }
     async fn find_api_key_by_key_unchecked(
         &self,
         _ctx: &RequestContext,
         key: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!(
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM api_keys WHERE key = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(key)
         .fetch_optional(&self.pool)
         .await
@@ -330,11 +332,13 @@ impl ApiKeyRepo for PgApiKeyRepo {
         _ctx: &RequestContext,
         key: &str,
     ) -> RepoResult<Option<ApiKeyRow>> {
-        sqlx::query_as::<_, ApiKeyRow>(&format!("SELECT {COLUMNS} FROM api_keys WHERE key = $1"))
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| db_error("find key with deleted", e))
+        sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM api_keys WHERE key = $1"
+        )))
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| db_error("find key with deleted", e))
     }
     async fn list_api_keys_by_user_unchecked(
         &self,
@@ -411,12 +415,13 @@ impl ApiKeyRepo for PgApiKeyRepo {
         if affected == 0 {
             return Err(RepoError::NotFound("api_key"));
         }
-        let row =
-            sqlx::query_as::<_, ApiKeyRow>(&format!("SELECT {COLUMNS} FROM api_keys WHERE id=$1"))
-                .bind(id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| db_error("update readback", e))?;
+        let row = sqlx::query_as::<_, ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM api_keys WHERE id=$1"
+        )))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db_error("update readback", e))?;
         tx.commit().await.map_err(|e| db_error("commit", e))?;
         Ok(row)
     }
@@ -429,7 +434,7 @@ impl ApiKeyRepo for PgApiKeyRepo {
     ) -> RepoResult<ApiKeyRow> {
         let mut tx = self.pool.begin().await.map_err(|e| db_error("begin", e))?;
         existing_self_key_permit(&mut tx, _ctx, parse_id(api_key_id)?, false).await?;
-        let row=sqlx::query_as::<_,ApiKeyRow>(&format!("UPDATE api_keys SET key=$1,updated_at=now() WHERE id=$2 AND deleted_at=0 RETURNING {COLUMNS}"))
+        let row=sqlx::query_as::<_,ApiKeyRow>(sqlx::AssertSqlSafe::<&str>(&format!("UPDATE api_keys SET key=$1,updated_at=now() WHERE id=$2 AND deleted_at=0 RETURNING {COLUMNS}")))
             .bind(new_key).bind(parse_id(api_key_id)?).fetch_optional(&mut *tx).await.map_err(|e|db_error("rotate",e))?;
         tx.commit().await.map_err(|e| db_error("commit", e))?;
         row.ok_or(RepoError::NotFound("api_key"))

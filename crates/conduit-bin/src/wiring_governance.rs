@@ -513,9 +513,9 @@ impl gql::GovernanceServices for PgGovernanceAdapter {
             .execute(&mut *tx)
             .await
             .map_err(|_| "emergency authority unavailable")?;
-        let result = sqlx::query(&format!(
+        let result = sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
             "UPDATE {table} SET status=$1,updated_at=now() WHERE id=$2 AND deleted_at=0"
-        ))
+        )))
         .bind(status)
         .bind(id)
         .execute(&mut *tx)

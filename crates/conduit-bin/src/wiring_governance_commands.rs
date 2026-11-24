@@ -1058,9 +1058,9 @@ async fn dependency_rows(
     }
     let mut rows = Vec::new();
     for (table, id) in refs {
-        let row: Option<Value> = sqlx::query_scalar(&format!(
+        let row: Option<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT to_jsonb(t) FROM {table} t WHERE id=$1 FOR UPDATE"
-        ))
+        )))
         .bind(id)
         .fetch_optional(&mut **tx)
         .await
@@ -1095,7 +1095,7 @@ async fn dependency_rows(
                 "SELECT to_jsonb(i) FROM access_plan_items i WHERE access_plan_version_id=ANY($1) ORDER BY access_plan_version_id,public_model_id FOR UPDATE",
                 "SELECT to_jsonb(i) FROM access_plan_route_items i WHERE access_plan_version_id=ANY($1) ORDER BY access_plan_version_id,model_route_id FOR UPDATE",
             ] {
-                let items: Vec<Value> = sqlx::query_scalar(query)
+                let items: Vec<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(query))
                     .bind(&ids)
                     .fetch_all(&mut **tx)
                     .await
@@ -1147,7 +1147,7 @@ async fn dependency_rows(
             _ => vec![],
         };
         for query in queries {
-            let values: Vec<Value> = sqlx::query_scalar(query)
+            let values: Vec<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(query))
                 .bind(target)
                 .fetch_all(&mut **tx)
                 .await
@@ -1552,9 +1552,9 @@ async fn target_revision(
     let mut rows = dependency_rows(tx, command, targets).await?;
     if let Some(table) = table(command) {
         for id in targets {
-            let row: Option<Value> = sqlx::query_scalar(&format!(
+            let row: Option<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&format!(
                 "SELECT to_jsonb(t) FROM {table} t WHERE id::text=$1 FOR UPDATE"
-            ))
+            )))
             .bind(id)
             .fetch_optional(&mut **tx)
             .await
@@ -2409,7 +2409,7 @@ async fn write_row<T: Serialize>(
             "INSERT INTO {table} ({columns}) SELECT {columns} FROM jsonb_populate_record(NULL::{table},$1) RETURNING id::text"
         );
         result.push(
-            sqlx::query_scalar(&sql)
+            sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&sql))
                 .bind(sqlx::types::Json(value))
                 .fetch_one(&mut **tx)
                 .await
@@ -2426,7 +2426,7 @@ async fn write_row<T: Serialize>(
                 "UPDATE {table} SET {set},updated_at=now() WHERE id::text=$2 RETURNING id::text"
             );
             result.push(
-                sqlx::query_scalar(&sql)
+                sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&sql))
                     .bind(sqlx::types::Json(value.clone()))
                     .bind(target)
                     .fetch_optional(&mut **tx)
@@ -2452,7 +2452,7 @@ async fn remove(
         "archived"
     };
     for target in targets {
-        sqlx::query(&format!("UPDATE {table} SET status='{status}',deleted_at=EXTRACT(EPOCH FROM now())::bigint,updated_at=now() WHERE id::text=$1 AND deleted_at=0")).bind(target).execute(&mut **tx).await.map_err(|_|"domain removal failed")?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("UPDATE {table} SET status='{status}',deleted_at=EXTRACT(EPOCH FROM now())::bigint,updated_at=now() WHERE id::text=$1 AND deleted_at=0"))).bind(target).execute(&mut **tx).await.map_err(|_|"domain removal failed")?;
     }
     Ok(targets.to_vec())
 }
@@ -2537,7 +2537,7 @@ pub(crate) async fn apply(
             Command::Roles(v)=>{sqlx::query("DELETE FROM user_roles WHERE user_id=$1").bind(v.user_id).execute(&mut **tx).await.map_err(|_|"role assignment failed")?;for role in v.role_ids {let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM roles WHERE id=$1 AND deleted_at=0 AND (level='system' OR EXISTS(SELECT 1 FROM user_projects WHERE project_id=roles.project_id AND user_id=$2)))").bind(role).bind(v.user_id).fetch_one(&mut **tx).await.map_err(|_|"role scope lookup failed")?;if !exists{return Err("role scope does not belong to the target user".into());}sqlx::query("INSERT INTO user_roles(user_id,role_id,created_at,updated_at) VALUES($1,$2,now(),now())").bind(v.user_id).bind(role).execute(&mut **tx).await.map_err(|_|"role assignment failed")?;}vec![v.user_id.to_string()]},
             Command::Route(v)=>vec![crate::wiring_postgres_commercialization::upsert_model_route_in_tx(tx,conduit_admin_graphql::commercialization::UpsertModelRouteInput{id:targets.first().map(|v|v.clone().into()),public_model_id:v.public_model_id.to_string().into(),deployment_id:v.deployment_id.to_string().into(),status:Some(match v.status.as_str(){"enabled"=>conduit_admin_graphql::commercialization::CommercialStatus::Enabled,"disabled"=>conduit_admin_graphql::commercialization::CommercialStatus::Disabled,_=>return Err("invalid route status".into())}),confirm_compatibility:Some(v.confirm_compatibility)}).await.map_err(|_|"route publication rejected")?.to_string()],
             Command::Deployment(v)=>{if !matches!(v.status.as_str(),"enabled"|"disabled")||v.upstream_model_id.trim().is_empty(){return Err("invalid deployment".into());}let available:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM channels WHERE id=$1 AND deleted_at=0 AND (supported_models ? $2 OR manual_models ? $2))").bind(v.channel_id).bind(&v.upstream_model_id).fetch_one(&mut **tx).await.map_err(|_|"deployment source lookup failed")?;if !available{return Err("SOURCE_CHANGED: publish model supply before its deployment".into());}vec![sqlx::query_scalar::<_,i64>("INSERT INTO upstream_model_deployments(channel_id,upstream_model_id,internal_name,variant,status,source) VALUES($1,$2,$3,$4,$5,'manual') ON CONFLICT(channel_id,upstream_model_id,variant) DO UPDATE SET internal_name=EXCLUDED.internal_name,status=EXCLUDED.status,updated_at=now() RETURNING id").bind(v.channel_id).bind(v.upstream_model_id).bind(v.internal_name).bind(v.variant).bind(v.status).fetch_one(&mut **tx).await.map_err(|_|"deployment application failed")?.to_string()]},
-            Command::Commercial(v)=>{for target in &targets {let value=serde_json::to_value(&v).map_err(|_|"invalid commercial profile")?;let fields=value.as_object().ok_or("invalid profile")?.keys().map(|k|format!("{k}=(jsonb_populate_record(NULL::project_commercial_profiles,$1)).{k}")).collect::<Vec<_>>().join(",");if fields.is_empty(){return Err("commercial profile is empty".into());}sqlx::query(&format!("UPDATE project_commercial_profiles SET {fields},updated_at=now() WHERE project_id::text=$2")).bind(sqlx::types::Json(value)).bind(target).execute(&mut **tx).await.map_err(|_|"commercial profile application failed")?;}targets.clone()},
+            Command::Commercial(v)=>{for target in &targets {let value=serde_json::to_value(&v).map_err(|_|"invalid commercial profile")?;let fields=value.as_object().ok_or("invalid profile")?.keys().map(|k|format!("{k}=(jsonb_populate_record(NULL::project_commercial_profiles,$1)).{k}")).collect::<Vec<_>>().join(",");if fields.is_empty(){return Err("commercial profile is empty".into());}sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("UPDATE project_commercial_profiles SET {fields},updated_at=now() WHERE project_id::text=$2"))).bind(sqlx::types::Json(value)).bind(target).execute(&mut **tx).await.map_err(|_|"commercial profile application failed")?;}targets.clone()},
             Command::Member(v)=>{let project=v.project_id.ok_or("project_id is required")?;let user=v.user_id.ok_or("user_id is required")?;let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_projects WHERE project_id=$1 AND user_id=$2)").bind(project).bind(user).fetch_one(&mut **tx).await.map_err(|_|"membership lookup failed")?;if exists{crate::wiring_postgres_user::update_project_user_in_tx(tx,conduit_admin_graphql::user::UpdateProjectUserInput{project_id:project.to_string().into(),user_id:user.to_string().into(),is_owner:v.is_owner,scopes:v.scopes,add_role_ids:None,remove_role_ids:None}).await.map_err(|_|"membership update rejected")?;}else{crate::wiring_postgres_user::add_user_to_project_in_tx(tx,conduit_admin_graphql::user::AddUserToProjectInput{project_id:project.to_string().into(),user_id:user.to_string().into(),is_owner:v.is_owner,scopes:v.scopes,role_ids:None}).await.map_err(|_|"membership creation rejected")?;}vec![project.to_string()]},
             Command::MemberRemove(v)=>{let project=v.project_id.ok_or("project_id is required")?;crate::wiring_postgres_user::remove_user_from_project_in_tx(tx,conduit_admin_graphql::user::RemoveUserFromProjectInput{project_id:project.to_string().into(),user_id:v.user_id.ok_or("user_id is required")?.to_string().into()}).await.map_err(|_|"membership removal rejected")?;vec![project.to_string()]},
             Command::SpendLimit(v)=>{crate::wiring_postgres_billing::set_member_limit_in_tx(tx,v.project_id,v.user_id,v.limit).await.map_err(|_|"member budget configuration failed")?;vec![v.project_id.to_string()]},
@@ -2664,7 +2664,7 @@ async fn soft_delete_only(
     targets: &[String],
 ) -> Result<Vec<String>, String> {
     for target in targets {
-        sqlx::query(&format!("UPDATE {table} SET deleted_at=EXTRACT(EPOCH FROM now())::bigint,updated_at=now() WHERE id::text=$1 AND deleted_at=0")).bind(target).execute(&mut **tx).await.map_err(|_|"domain removal failed")?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("UPDATE {table} SET deleted_at=EXTRACT(EPOCH FROM now())::bigint,updated_at=now() WHERE id::text=$1 AND deleted_at=0"))).bind(target).execute(&mut **tx).await.map_err(|_|"domain removal failed")?;
     }
     Ok(targets.to_vec())
 }

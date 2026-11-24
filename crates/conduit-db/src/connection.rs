@@ -386,21 +386,23 @@ mod tests {
              (user_id,plan_id,assignment_key,assignment_request_snapshot, \
               current_period_start,current_period_end,created_at,updated_at) \
              VALUES($1,$2,$3,'{}'::jsonb,'2026-01-01','2026-02-01',now(),now()) RETURNING id";
-        let subscription_a = sqlx::query_scalar::<_, i64>(create_subscription)
-            .bind(user_a)
-            .bind(plan_id)
-            .bind("billing-assignment-a")
-            .fetch_one(&database.pool)
-            .await?;
-        let subscription_b = sqlx::query_scalar::<_, i64>(create_subscription)
-            .bind(user_b)
-            .bind(plan_id)
-            .bind("billing-assignment-b")
-            .fetch_one(&database.pool)
-            .await?;
+        let subscription_a =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(create_subscription))
+                .bind(user_a)
+                .bind(plan_id)
+                .bind("billing-assignment-a")
+                .fetch_one(&database.pool)
+                .await?;
+        let subscription_b =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(create_subscription))
+                .bind(user_b)
+                .bind(plan_id)
+                .bind("billing-assignment-b")
+                .fetch_one(&database.pool)
+                .await?;
 
         let duplicate_assignment_key = require_postgres_error(
-            sqlx::query_scalar::<_, i64>(create_subscription)
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(create_subscription))
                 .bind(user_b)
                 .bind(plan_id)
                 .bind("billing-assignment-a")
@@ -421,21 +423,23 @@ mod tests {
         let create_entitlement = "INSERT INTO subscription_entitlement_snapshots \
              (subscription_id,period_start,period_end,created_at) \
              VALUES($1,'2026-01-01','2026-02-01',now()) RETURNING id";
-        let entitlement_a = sqlx::query_scalar::<_, i64>(create_entitlement)
-            .bind(subscription_a)
-            .fetch_one(&database.pool)
-            .await?;
-        let entitlement_b = sqlx::query_scalar::<_, i64>(create_entitlement)
-            .bind(subscription_b)
-            .fetch_one(&database.pool)
-            .await?;
+        let entitlement_a =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(create_entitlement))
+                .bind(subscription_a)
+                .fetch_one(&database.pool)
+                .await?;
+        let entitlement_b =
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(create_entitlement))
+                .bind(subscription_b)
+                .fetch_one(&database.pool)
+                .await?;
 
         let insert_bucket = "INSERT INTO subscription_allowance_buckets \
              (subscription_id,quota_rule_snapshot_id,entitlement_snapshot_id,quota_class, \
               issued_at,period_start,period_end,expires_at,granted_micros,created_at,updated_at) \
              VALUES($1,$2,$3,$4,now(),'2026-01-01','2026-02-01','2026-02-01',1000000,now(),now())";
         let wrong_rule_owner = require_postgres_error(
-            sqlx::query(insert_bucket)
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(insert_bucket))
                 .bind(subscription_b)
                 .bind(rule_a)
                 .bind(entitlement_b)
@@ -447,7 +451,7 @@ mod tests {
         assert_postgres_error_code(&wrong_rule_owner, "23503");
 
         let wrong_entitlement_owner = require_postgres_error(
-            sqlx::query(insert_bucket)
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(insert_bucket))
                 .bind(subscription_a)
                 .bind(rule_a)
                 .bind(entitlement_b)
@@ -459,7 +463,7 @@ mod tests {
         assert_postgres_error_code(&wrong_entitlement_owner, "23503");
 
         let wrong_quota_class = require_postgres_error(
-            sqlx::query(insert_bucket)
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(insert_bucket))
                 .bind(subscription_a)
                 .bind(rule_a)
                 .bind(entitlement_a)
@@ -470,7 +474,7 @@ mod tests {
         )?;
         assert_postgres_error_code(&wrong_quota_class, "23503");
 
-        sqlx::query(insert_bucket)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(insert_bucket))
             .bind(subscription_a)
             .bind(rule_a)
             .bind(entitlement_a)

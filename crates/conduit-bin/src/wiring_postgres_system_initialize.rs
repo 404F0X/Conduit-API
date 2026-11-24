@@ -317,9 +317,11 @@ mod tests {
     async fn count(pool: &PgPool, table: &str) -> Result<i64, sqlx::Error> {
         // Callers only pass the fixed table names below; identifiers cannot be
         // bound by PostgreSQL, so keep the interpolation inside this test helper.
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(pool)
-            .await
+        sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT COUNT(*) FROM {table}"
+        )))
+        .fetch_one(pool)
+        .await
     }
 
     async fn assert_empty(pool: &PgPool) -> Result<(), Box<dyn std::error::Error>> {

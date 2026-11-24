@@ -857,11 +857,11 @@ impl UserQueryServices for PostgresUserServiceAdapter {
         args: RoleConnectionArgs,
     ) -> Result<RoleConnection, UserServiceError> {
         let user_id = db_id(user_id)?;
-        let mut rows = sqlx::query_as::<_, RoleRow>(&format!(
+        let mut rows = sqlx::query_as::<_, RoleRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {ROLE_COLUMNS} FROM roles r \
              JOIN user_roles ur ON ur.role_id = r.id \
              WHERE ur.user_id = $1 AND r.deleted_at = 0"
-        ))
+        )))
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
@@ -944,10 +944,10 @@ impl UserQueryServices for PostgresUserServiceAdapter {
     }
 
     async fn project_users(&self, project_id: &str) -> Result<Vec<UserProject>, UserServiceError> {
-        let rows = sqlx::query_as::<_, UserProjectRow>(&format!(
+        let rows = sqlx::query_as::<_, UserProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {USER_PROJECT_COLUMNS} FROM user_projects \
              WHERE project_id = $1 ORDER BY id"
-        ))
+        )))
         .bind(db_id(project_id)?)
         .fetch_all(&self.pool)
         .await
@@ -1333,12 +1333,12 @@ pub(crate) async fn create_user_prepared_in_tx(
     password: String,
 ) -> Result<User, UserServiceError> {
     validate_create_user_input(&input)?;
-    let result = sqlx::query_as::<_, UserRow>(&format!(
+    let result = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "INSERT INTO users (email, password, status, prefer_language, \
              first_name, last_name, avatar, is_owner, scopes) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
              RETURNING {USER_COLUMNS}"
-    ))
+    )))
     .bind(&input.email)
     .bind(password)
     .bind(status_to_wire(
@@ -1504,9 +1504,9 @@ pub(crate) async fn update_user_in_tx(
     if let Some(remove) = &input.remove_role_ids {
         remove_roles(tx, user_id, remove, None, UserServiceError::Update).await?;
     }
-    let row = sqlx::query_as::<_, UserRow>(&format!(
+    let row = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {USER_COLUMNS} FROM users WHERE id = $1 AND deleted_at = 0"
-    ))
+    )))
     .bind(user_id)
     .fetch_one(&mut **tx)
     .await
@@ -1535,10 +1535,10 @@ pub(crate) async fn add_user_to_project_in_tx(
             "user or project not found".to_string(),
         ));
     }
-    let result = sqlx::query_as::<_, UserProjectRow>(&format!(
+    let result = sqlx::query_as::<_, UserProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "INSERT INTO user_projects (user_id, project_id, is_owner, scopes) \
              VALUES ($1, $2, $3, $4) RETURNING {USER_PROJECT_COLUMNS}"
-    ))
+    )))
     .bind(user_id)
     .bind(project_id)
     .bind(input.is_owner.unwrap_or(false))
@@ -1687,10 +1687,10 @@ pub(crate) async fn update_project_user_in_tx(
         )
         .await?;
     }
-    let row = sqlx::query_as::<_, UserProjectRow>(&format!(
+    let row = sqlx::query_as::<_, UserProjectRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {USER_PROJECT_COLUMNS} FROM user_projects \
              WHERE user_id = $1 AND project_id = $2"
-    ))
+    )))
     .bind(user_id)
     .bind(project_id)
     .fetch_one(&mut **tx)
@@ -1790,10 +1790,10 @@ pub(crate) async fn update_user_status_in_tx(
     if status == UserStatus::Deactivated && current_status == "activated" {
         ensure_not_last_system_owner(tx, user_id, is_owner, UserServiceError::UpdateStatus).await?;
     }
-    let row = sqlx::query_as::<_, UserRow>(&format!(
+    let row = sqlx::query_as::<_, UserRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "UPDATE users SET status = $1, updated_at = now() \
              WHERE id = $2 AND deleted_at = 0 RETURNING {USER_COLUMNS}"
-    ))
+    )))
     .bind(status_to_wire(status))
     .bind(user_id)
     .fetch_optional(&mut **tx)

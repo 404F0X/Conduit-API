@@ -40,9 +40,9 @@ impl OidcRepo for PgOidcRepo {
         _ctx: &RequestContext,
         identity_id: &str,
     ) -> RepoResult<Option<OidcIdentityRow>> {
-        sqlx::query_as::<_, OidcIdentityRow>(&format!(
+        sqlx::query_as::<_, OidcIdentityRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM oidc_identities WHERE id = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(id(identity_id, "oidc identity id not a valid integer")?)
         .fetch_optional(&self.pool)
         .await
@@ -54,10 +54,10 @@ impl OidcRepo for PgOidcRepo {
         _ctx: &RequestContext,
         user_id: &str,
     ) -> RepoResult<Vec<OidcIdentityRow>> {
-        sqlx::query_as::<_, OidcIdentityRow>(&format!(
+        sqlx::query_as::<_, OidcIdentityRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM oidc_identities \
              WHERE user_id = $1 AND deleted_at = 0 ORDER BY created_at DESC, id DESC"
-        ))
+        )))
         .bind(id(user_id, "oidc user id not a valid integer")?)
         .fetch_all(&self.pool)
         .await

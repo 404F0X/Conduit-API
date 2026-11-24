@@ -55,7 +55,7 @@ impl PgChannelDiscoveryAdapter {
         }
     }
     async fn receipt(&self, id: Uuid) -> Result<Option<Receipt>, String> {
-        sqlx::query_as::<_,Receipt>(&format!("SELECT {RECEIPT_COLUMNS} FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='NEW_API_DISCOVERY'")).bind(id).fetch_optional(&self.pool).await.map_err(db_error)
+        sqlx::query_as::<_,Receipt>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {RECEIPT_COLUMNS} FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='NEW_API_DISCOVERY'"))).bind(id).fetch_optional(&self.pool).await.map_err(db_error)
     }
     async fn dto(&self, row: Receipt) -> Result<ChannelDiscoveryOperation, String> {
         let expired =
@@ -383,7 +383,7 @@ impl ChannelDiscoveryServices for PgChannelDiscoveryAdapter {
             );
         }
         sqlx::query("INSERT INTO channel_operation_receipts(operation_id,channel_id,operation_type,origin,created_by,request_fingerprint,state,stage_results,created_at,updated_at) VALUES($1,$2,'NEW_API_DISCOVERY','USER_SYNC',$3,$4,'NOT_STARTED',$5,now(),now()) ON CONFLICT(operation_id) DO NOTHING").bind(operation).bind(channel).bind(actor).bind(fingerprint(&json!({"channel":channel,"request":request["request"]}))).bind(Json(&request)).execute(&mut *tx).await.map_err(db_error)?;
-        let row=sqlx::query_as::<_,Receipt>(&format!("SELECT {RECEIPT_COLUMNS} FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='NEW_API_DISCOVERY' FOR UPDATE")).bind(operation).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or("OPERATION_CONFLICT: operation type differs")?;
+        let row=sqlx::query_as::<_,Receipt>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {RECEIPT_COLUMNS} FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='NEW_API_DISCOVERY' FOR UPDATE"))).bind(operation).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or("OPERATION_CONFLICT: operation type differs")?;
         if row.created_by != Some(actor)
             || row.channel_id != channel
             || row.stage_results.0["request"] != request["request"]
@@ -410,7 +410,7 @@ impl ChannelDiscoveryServices for PgChannelDiscoveryAdapter {
         let operation = op(&operation)?;
         let stages = normalized_stages(stages)?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
-        let row=sqlx::query_as::<_,Receipt>(&format!("SELECT {RECEIPT_COLUMNS} FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='NEW_API_DISCOVERY' FOR UPDATE")).bind(operation).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or("OPERATION_CONFLICT: operation missing")?;
+        let row=sqlx::query_as::<_,Receipt>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {RECEIPT_COLUMNS} FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='NEW_API_DISCOVERY' FOR UPDATE"))).bind(operation).fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or("OPERATION_CONFLICT: operation missing")?;
         // A retry resumes the creator's intent. It must not borrow that user's
         // publication authority or replace credentials on another user's receipt.
         if row.created_by != Some(actor) {

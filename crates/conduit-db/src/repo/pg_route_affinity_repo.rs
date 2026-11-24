@@ -47,11 +47,11 @@ impl RouteAffinityRepo for PgRouteAffinityRepo {
         key: &RouteAffinityKey,
         now: DateTime<Utc>,
     ) -> RepoResult<Option<RouteAffinityRow>> {
-        sqlx::query_as::<_, RouteAffinityRow>(&format!(
+        sqlx::query_as::<_, RouteAffinityRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM route_affinities \
              WHERE project_id=$1 AND key_class=$2 AND key_hash=$3 \
                AND public_model_id=$4 AND api_format=$5 AND expires_at>$6"
-        ))
+        )))
         .bind(parse_id(
             &key.project_id,
             "route affinity project id not a valid integer",
@@ -72,7 +72,7 @@ impl RouteAffinityRepo for PgRouteAffinityRepo {
         input: UpsertRouteAffinityInput,
         now: DateTime<Utc>,
     ) -> RepoResult<RouteAffinityRow> {
-        sqlx::query_as::<_, RouteAffinityRow>(&format!(
+        sqlx::query_as::<_, RouteAffinityRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "INSERT INTO route_affinities(\
                 project_id,key_class,key_hash,public_model_id,api_format,channel_id,\
                 upstream_model_id,upstream_api_format,credential_identity,expires_at,created_at,updated_at\
@@ -84,7 +84,7 @@ impl RouteAffinityRepo for PgRouteAffinityRepo {
                 credential_identity=EXCLUDED.credential_identity, \
                 expires_at=EXCLUDED.expires_at, updated_at=EXCLUDED.updated_at \
              RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(parse_id(
             &input.key.project_id,
             "route affinity project id not a valid integer",

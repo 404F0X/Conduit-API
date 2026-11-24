@@ -70,9 +70,9 @@ impl ModelRepo for PgModelRepo {
         _ctx: &RequestContext,
         model_id: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!(
+        sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM models WHERE id=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(id(model_id)?)
         .fetch_optional(&self.pool)
         .await
@@ -83,20 +83,22 @@ impl ModelRepo for PgModelRepo {
         _ctx: &RequestContext,
         model_id: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!("SELECT {COLUMNS} FROM models WHERE id=$1"))
-            .bind(id(model_id)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| error("find with deleted", e))
+        sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM models WHERE id=$1"
+        )))
+        .bind(id(model_id)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| error("find with deleted", e))
     }
     async fn find_model_by_name_unchecked(
         &self,
         _ctx: &RequestContext,
         name: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        let mut rows = sqlx::query_as::<_, ModelRow>(&format!(
+        let mut rows = sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM models WHERE name=$1 AND deleted_at=0 ORDER BY id LIMIT 2"
-        ))
+        )))
         .bind(name)
         .fetch_all(&self.pool)
         .await
@@ -111,9 +113,9 @@ impl ModelRepo for PgModelRepo {
         _ctx: &RequestContext,
         model_id: &str,
     ) -> RepoResult<Option<ModelRow>> {
-        sqlx::query_as::<_, ModelRow>(&format!(
+        sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM models WHERE model_id=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(model_id)
         .fetch_optional(&self.pool)
         .await

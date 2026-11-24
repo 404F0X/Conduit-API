@@ -37,11 +37,11 @@ impl SystemRepo for PgSystemRepo {
                 "settings patch must be an object".into(),
             ));
         }
-        sqlx::query_as::<_, SystemRow>(&format!(
+        sqlx::query_as::<_, SystemRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "INSERT INTO systems(key,value,created_at,updated_at) VALUES($1,$2::jsonb::text,now(),now()) \
              ON CONFLICT(key) DO UPDATE SET value=(systems.value::jsonb || $2::jsonb)::text,updated_at=now(),deleted_at=0 \
              RETURNING {SYSTEM_SELECT_COLUMNS}"
-        )).bind(key).bind(sqlx::types::Json(patch)).fetch_one(&self.pool).await
+        ))).bind(key).bind(sqlx::types::Json(patch)).fetch_one(&self.pool).await
             .map_err(|e| RepoError::Database(format!("settings atomic patch failed: {e}")))
     }
 
@@ -50,9 +50,9 @@ impl SystemRepo for PgSystemRepo {
         _ctx: &RequestContext,
         key: &str,
     ) -> RepoResult<Option<SystemRow>> {
-        sqlx::query_as::<_, SystemRow>(&format!(
+        sqlx::query_as::<_, SystemRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {SYSTEM_SELECT_COLUMNS} FROM systems WHERE key = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(key)
         .fetch_optional(&self.pool)
         .await
@@ -79,9 +79,9 @@ impl SystemRepo for PgSystemRepo {
             RepoError::Database(format!("postgres system repo set failed: {error}"))
         })?;
 
-        sqlx::query_as::<_, SystemRow>(&format!(
+        sqlx::query_as::<_, SystemRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {SYSTEM_SELECT_COLUMNS} FROM systems WHERE key = $1 AND deleted_at = 0"
-        ))
+        )))
         .bind(&row.key)
         .fetch_optional(&self.pool)
         .await

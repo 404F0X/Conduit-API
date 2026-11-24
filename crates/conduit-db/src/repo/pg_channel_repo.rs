@@ -37,9 +37,9 @@ impl PgChannelRepo {
         tx: &mut Transaction<'_, Postgres>,
         value: &str,
     ) -> RepoResult<Option<ChannelRow>> {
-        sqlx::query_as::<_, ChannelRow>(&format!(
+        sqlx::query_as::<_, ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM channels WHERE id=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(id(value)?)
         .fetch_optional(&mut **tx)
         .await
@@ -240,9 +240,9 @@ impl ChannelRepo for PgChannelRepo {
         _: &RequestContext,
         v: &str,
     ) -> RepoResult<Option<ChannelRow>> {
-        sqlx::query_as::<_, ChannelRow>(&format!(
+        sqlx::query_as::<_, ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM channels WHERE id=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(id(v)?)
         .fetch_optional(&self.pool)
         .await
@@ -253,20 +253,22 @@ impl ChannelRepo for PgChannelRepo {
         _: &RequestContext,
         v: &str,
     ) -> RepoResult<Option<ChannelRow>> {
-        sqlx::query_as::<_, ChannelRow>(&format!("SELECT {COLUMNS} FROM channels WHERE id=$1"))
-            .bind(id(v)?)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| error("find deleted", e))
+        sqlx::query_as::<_, ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM channels WHERE id=$1"
+        )))
+        .bind(id(v)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| error("find deleted", e))
     }
     async fn find_channel_by_name_unchecked(
         &self,
         _: &RequestContext,
         v: &str,
     ) -> RepoResult<Option<ChannelRow>> {
-        sqlx::query_as::<_, ChannelRow>(&format!(
+        sqlx::query_as::<_, ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT {COLUMNS} FROM channels WHERE name=$1 AND deleted_at=0"
-        ))
+        )))
         .bind(v)
         .fetch_optional(&self.pool)
         .await
@@ -280,13 +282,13 @@ impl ChannelRepo for PgChannelRepo {
         if tags.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_as::<_,ChannelRow>(&format!("SELECT {COLUMNS} FROM channels WHERE deleted_at=0 AND COALESCE(tags,'[]'::jsonb) ?| $1 ORDER BY ordering_weight DESC,name")).bind(tags).fetch_all(&self.pool).await.map_err(|e|error("find tags",e))
+        sqlx::query_as::<_,ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM channels WHERE deleted_at=0 AND COALESCE(tags,'[]'::jsonb) ?| $1 ORDER BY ordering_weight DESC,name"))).bind(tags).fetch_all(&self.pool).await.map_err(|e|error("find tags",e))
     }
     async fn list_enabled_channels_unchecked(
         &self,
         _: &RequestContext,
     ) -> RepoResult<Vec<ChannelRow>> {
-        sqlx::query_as::<_,ChannelRow>(&format!("SELECT {COLUMNS} FROM channels WHERE status='enabled' AND deleted_at=0 ORDER BY ordering_weight DESC,name")).fetch_all(&self.pool).await.map_err(|e|error("list enabled",e))
+        sqlx::query_as::<_,ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {COLUMNS} FROM channels WHERE status='enabled' AND deleted_at=0 ORDER BY ordering_weight DESC,name"))).fetch_all(&self.pool).await.map_err(|e|error("list enabled",e))
     }
     async fn find_channel_by_cache_signature_unchecked(
         &self,

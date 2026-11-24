@@ -1428,12 +1428,13 @@ pub(crate) async fn create_public_model_with_routes_in_tx(
         .execute(&mut **tx)
         .await
         .map_err(storage)?;
-    let model =
-        sqlx::query_as::<_, ModelRow>(&format!("SELECT {MODEL_COLUMNS} FROM models WHERE id=$1"))
-            .bind(public_model_id)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(storage)?;
+    let model = sqlx::query_as::<_, ModelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+        "SELECT {MODEL_COLUMNS} FROM models WHERE id=$1"
+    )))
+    .bind(public_model_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
     let routes = sqlx::query(
         "SELECT r.id,r.public_model_id,m.model_id AS public_model_key,r.deployment_id, \
                     d.internal_name AS deployment_name,d.channel_id,c.name AS channel_name, \

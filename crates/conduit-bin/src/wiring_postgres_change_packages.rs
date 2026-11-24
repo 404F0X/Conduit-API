@@ -265,9 +265,9 @@ async fn detail(
     let Some(summary) = summaries(pool, &[id]).await?.remove(&id) else {
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, ChangeSetRow>(&format!(
+    let row = sqlx::query_as::<_, ChangeSetRow>(sqlx::AssertSqlSafe::<&str>(&format!(
         "SELECT {CHANGE_SET_COLUMNS} FROM change_sets WHERE id=$1"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -554,9 +554,9 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
             })
             .transpose()?;
         let predicate = "($1::text IS NULL OR kind=$1) AND ($2::text IS NULL OR scope_type=$2) AND ($3::text IS NULL OR scope_id=$3) AND ($4::text IS NULL OR title ILIKE '%'||$4||'%' OR scope_id=$4 OR operation_id::text=$4) AND kind=ANY($5) AND ($6::bigint IS NULL OR conduit_can_read_change_set($6,id))";
-        let counts = sqlx::query_as::<_, (String, i64)>(&format!(
+        let counts = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe::<&str>(&format!(
             "SELECT status,COUNT(*) FROM change_sets WHERE {predicate} GROUP BY status"
-        ))
+        )))
         .bind(kind)
         .bind(&scope_type)
         .bind(&scope_id)
@@ -573,7 +573,7 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
                 .map(|(_, n)| *n)
                 .sum(),
         )?;
-        let rows=sqlx::query_as::<_,(i64,DateTime<Utc>)>(&format!("SELECT id,updated_at FROM change_sets WHERE {predicate} AND (cardinality($7::text[])=0 OR status=ANY($7)) AND ($8::timestamptz IS NULL OR (updated_at,id)<($8,$9)) ORDER BY updated_at DESC,id DESC LIMIT $10")).bind(kind).bind(scope_type).bind(scope_id).bind(search).bind(&allowed).bind(actor).bind(&statuses).bind(time).bind(previous_id).bind(limit+1).fetch_all(&self.pool).await.map_err(query_error)?;
+        let rows=sqlx::query_as::<_,(i64,DateTime<Utc>)>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT id,updated_at FROM change_sets WHERE {predicate} AND (cardinality($7::text[])=0 OR status=ANY($7)) AND ($8::timestamptz IS NULL OR (updated_at,id)<($8,$9)) ORDER BY updated_at DESC,id DESC LIMIT $10"))).bind(kind).bind(scope_type).bind(scope_id).bind(search).bind(&allowed).bind(actor).bind(&statuses).bind(time).bind(previous_id).bind(limit+1).fetch_all(&self.pool).await.map_err(query_error)?;
         let next = rows.len() > limit as usize;
         let rows = rows.into_iter().take(limit as usize).collect::<Vec<_>>();
         let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
@@ -639,9 +639,9 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
             .unwrap_or(0);
         let predicate = "change_set_id=$1 AND ($2::text IS NULL OR item_key ILIKE '%'||$2||'%') AND (NOT $3 OR validation_error IS NOT NULL)";
         let total = count(
-            sqlx::query_scalar::<_, i64>(&format!(
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe::<&str>(&format!(
                 "SELECT COUNT(*) FROM change_set_items WHERE {predicate}"
-            ))
+            )))
             .bind(id)
             .bind(&search)
             .bind(problems_only)
@@ -650,7 +650,7 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
             .map_err(query_error)?,
         )?;
         // Field counts are computed in SQL; no snapshot is sent in a summary connection.
-        let rows=sqlx::query(&format!("SELECT id,item_key,action,validation_error,(SELECT COUNT(*) FROM jsonb_object_keys(COALESCE(before_snapshot,'{{}}'::jsonb)||COALESCE(after_snapshot,'{{}}'::jsonb)) k WHERE before_snapshot->k IS DISTINCT FROM after_snapshot->k) AS changed_fields FROM change_set_items WHERE {predicate} AND id>$4 ORDER BY id LIMIT $5")).bind(id).bind(search).bind(problems_only).bind(after_id).bind(limit+1).fetch_all(&self.pool).await.map_err(query_error)?;
+        let rows=sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!("SELECT id,item_key,action,validation_error,(SELECT COUNT(*) FROM jsonb_object_keys(COALESCE(before_snapshot,'{{}}'::jsonb)||COALESCE(after_snapshot,'{{}}'::jsonb)) k WHERE before_snapshot->k IS DISTINCT FROM after_snapshot->k) AS changed_fields FROM change_set_items WHERE {predicate} AND id>$4 ORDER BY id LIMIT $5"))).bind(id).bind(search).bind(problems_only).bind(after_id).bind(limit+1).fetch_all(&self.pool).await.map_err(query_error)?;
         let next = rows.len() > limit as usize;
         let mut edges = Vec::new();
         for r in rows.into_iter().take(limit as usize) {
@@ -691,7 +691,7 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
     ) -> Result<Option<package::ChangeSetItemDetail>, gql::ChangeSetError> {
         let id = parse_numeric_id(id.as_str(), "change set")?;
         let item_id = parse_numeric_id(item_id.as_str(), "item")?;
-        let row=sqlx::query_as::<_,ChangeSetItemRow>(&format!("SELECT {CHANGE_SET_ITEM_COLUMNS} FROM change_set_items WHERE change_set_id=$1 AND id=$2")).bind(id).bind(item_id).fetch_optional(&self.pool).await.map_err(query_error)?;
+        let row=sqlx::query_as::<_,ChangeSetItemRow>(sqlx::AssertSqlSafe::<&str>(&format!("SELECT {CHANGE_SET_ITEM_COLUMNS} FROM change_set_items WHERE change_set_id=$1 AND id=$2"))).bind(id).bind(item_id).fetch_optional(&self.pool).await.map_err(query_error)?;
         let Some(row) = row else { return Ok(None) };
         let cs = sqlx::query_as::<_, (String, String)>(
             "SELECT kind,scope_id FROM change_sets WHERE id=$1",

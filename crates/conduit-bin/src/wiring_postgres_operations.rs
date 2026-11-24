@@ -538,7 +538,9 @@ impl PgOperationsAdapter {
                 i64,
                 Option<DateTime<Utc>>,
             ),
-        >(OPERATIONS_ATTEMPT_AGGREGATE_SQL)
+        >(sqlx::AssertSqlSafe::<&str>(
+            OPERATIONS_ATTEMPT_AGGREGATE_SQL,
+        ))
         .bind(start)
         .bind(end)
         .fetch_all(pool)
@@ -600,11 +602,12 @@ impl PgOperationsAdapter {
                AND status IN ('failed','canceled') AND created_at >= $1 AND created_at < $2 \
              GROUP BY channel_id, category"
         );
-        let error_rows = sqlx::query_as::<_, (i64, String, i64)>(&error_query)
-            .bind(start)
-            .bind(end)
-            .fetch_all(pool)
-            .await?;
+        let error_rows =
+            sqlx::query_as::<_, (i64, String, i64)>(sqlx::AssertSqlSafe::<&str>(&error_query))
+                .bind(start)
+                .bind(end)
+                .fetch_all(pool)
+                .await?;
         let mut error_map: BTreeMap<i64, Vec<(String, i64)>> = BTreeMap::new();
         for (channel_id, category, value) in error_rows {
             error_map
@@ -625,7 +628,7 @@ impl PgOperationsAdapter {
                 i64,
                 Option<DateTime<Utc>>,
             ),
-        >(OPERATIONS_ROUTE_HEALTH_SQL)
+        >(sqlx::AssertSqlSafe::<&str>(OPERATIONS_ROUTE_HEALTH_SQL))
         .bind(health_start)
         .bind(end)
         .fetch_all(pool)
@@ -638,11 +641,15 @@ impl PgOperationsAdapter {
              GROUP BY channel_id,model_id,credential_identity,category"
         );
         let route_error_rows =
-            sqlx::query_as::<_, (i64, String, Option<String>, String, i64)>(&route_error_query)
-                .bind(health_start)
-                .bind(end)
-                .fetch_all(pool)
-                .await?;
+            sqlx::query_as::<_, (i64, String, Option<String>, String, i64)>(sqlx::AssertSqlSafe::<
+                &str,
+            >(
+                &route_error_query
+            ))
+            .bind(health_start)
+            .bind(end)
+            .fetch_all(pool)
+            .await?;
         let mut route_errors = BTreeMap::new();
         for (channel_id, model, credential, category, value) in route_error_rows {
             route_errors
@@ -685,7 +692,7 @@ impl PgOperationsAdapter {
                 i64,
                 Option<DateTime<Utc>>,
             ),
-        >(OPERATIONS_USAGE_AGGREGATE_SQL)
+        >(sqlx::AssertSqlSafe::<&str>(OPERATIONS_USAGE_AGGREGATE_SQL))
         .bind(start)
         .bind(end)
         .fetch_all(pool)
@@ -1327,11 +1334,12 @@ mod tests {
         max_ms: f64,
     ) -> Result<ExplainReport, Box<dyn std::error::Error>> {
         let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
-        let value: sqlx::types::Json<serde_json::Value> = sqlx::query_scalar(&explain_sql)
-            .bind(start)
-            .bind(end)
-            .fetch_one(&mut *connection)
-            .await?;
+        let value: sqlx::types::Json<serde_json::Value> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe::<&str>(&explain_sql))
+                .bind(start)
+                .bind(end)
+                .fetch_one(&mut *connection)
+                .await?;
         let report = explain_report(&value.0)?;
         assert!(
             report.relations.contains(expected_relation),
@@ -1677,9 +1685,11 @@ mod tests {
         let start = end - Duration::days(7);
         let health_start = end - Duration::minutes(15);
         let mut connection = pool.acquire().await?;
-        sqlx::query(&format!("SET statement_timeout = {max_ms}"))
-            .execute(&mut *connection)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SET statement_timeout = {max_ms}"
+        )))
+        .execute(&mut *connection)
+        .await?;
         explain_operations_query(
             &mut connection,
             "attempt_aggregate",

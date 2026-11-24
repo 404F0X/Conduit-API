@@ -435,7 +435,7 @@ async fn bootstrap_postgres_database(
             quote_postgres_identifier(&target.owner),
             quote_postgres_literal(password)?
         );
-        sqlx::query(&create_role)
+        sqlx::query(sqlx::AssertSqlSafe::<&str>(&create_role))
             .execute(&mut connection)
             .await
             .map_err(|error| {
@@ -452,7 +452,7 @@ async fn bootstrap_postgres_database(
         quote_postgres_identifier(&target.database),
         quote_postgres_identifier(&target.owner)
     );
-    sqlx::query(&create_database)
+    sqlx::query(sqlx::AssertSqlSafe::<&str>(&create_database))
         .execute(&mut connection)
         .await
         .map_err(|error| {

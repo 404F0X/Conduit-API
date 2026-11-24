@@ -2910,7 +2910,7 @@ mod tests {
             "DELETE FROM provider_quota_status WHERE channel_id=ANY($1)",
             "DELETE FROM channels WHERE id=ANY($1)",
         ] {
-            sqlx::query(statement)
+            sqlx::query(sqlx::AssertSqlSafe::<&str>(statement))
                 .bind(&channel_ids)
                 .execute(&pool)
                 .await?;
