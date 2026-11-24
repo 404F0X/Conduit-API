@@ -224,6 +224,28 @@ test.describe('Admin Channels Management', () => {
     await page.waitForTimeout(2000);
   });
 
+  test('can create a channel through the quick form', async ({ page }) => {
+    const name = `pw-test-QuickChannel${Date.now()}`;
+    await page.getByTestId('add-channel-button').click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.locator('#quick-channel-name')).toBeVisible();
+    await expect(dialog.getByRole('combobox')).toContainText('OpenAI');
+    await dialog.locator('#quick-channel-name').fill(name);
+    await dialog.locator('#quick-channel-url').fill(mockUpstreamURL);
+    await dialog.locator('#quick-channel-keys').fill('sk-isolated-quick-channel-fixture');
+    const creation = page.waitForResponse(
+      (response) => response.url().includes('/admin/graphql') && (response.request().postData()?.includes('createChannel(') ?? false)
+    );
+    await dialog.getByRole('button', { name: /^(Create|创建)$/ }).click();
+    const response = await creation;
+    expect(response.ok()).toBe(true);
+    const result = await response.json();
+    expect(result.errors).toBeUndefined();
+    expect(result.data.createChannel.name).toBe(name);
+    expect(result.data.createChannel.type).toBe('openai');
+    await expect(page).toHaveURL(/\/channels\/[^/?]+$/);
+    await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
+  });
   test('can search channels by name', async ({ page }) => {
     const uniqueSuffix = Date.now().toString().slice(-6);
     const searchTerm = `pw-test-SearchChannel${uniqueSuffix}`;

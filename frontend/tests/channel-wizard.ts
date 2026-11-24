@@ -1,6 +1,7 @@
 import { expect, type Locator, type Page } from '@playwright/test';
 
 export async function enterChannelConfiguration(dialog: Locator, provider = 'openai') {
+  await dialog.getByRole('button', { name: /^(Use full form|使用完整表单)$/ }).click();
   await dialog.getByTestId(`provider-${provider}`).click();
   await dialog.getByRole('button', { name: /^(Next|下一步)$/ }).click();
   await expect(dialog.getByRole('tab', { name: /^(Connection & models|连接与模型)$/ })).toBeVisible();
