@@ -48,11 +48,11 @@
 //! ## `where` predicate coverage (Query.channels)
 //! ent lowers the full `ChannelWhereInput` predicate grammar; this adapter
 //! materializes the live rows and filters in-memory. Covered: `not`/`and`/`or`
-//! recursion plus every *scalar-column* predicate family — `type`, `status`,
+//! recursion plus numeric `id` and every *scalar-column* predicate family — `type`, `status`,
 //! `name`, `baseURL`, `defaultTestModel`, `autoSyncSupportedModels`,
 //! `autoSyncModelPattern`, `orderingWeight`, `errorMessage`, `remark`
 //! (comparison + nil families). Deferred (documented, rarely used on the
-//! channels page): the `id` and `createdAt`/`updatedAt` predicate families and
+//! channels page): the `createdAt`/`updatedAt` predicate families and
 //! the six `has<Edge>` existence predicates (they cross into other domains).
 
 use std::sync::Arc;
@@ -1090,6 +1090,45 @@ fn oauth_input_to_json(o: OAuthCredentialsInput) -> Value {
 // `where` predicate evaluation (Query.channels)
 // ---------------------------------------------------------------------------
 
+// Match the existing numeric ID semantics used by the other admin adapters.
+fn channel_id_matches_where(raw: &str, w: &ChannelWhereInput) -> bool {
+    let decode =
+        |id: &async_graphql::ID| channel_db_id(id.as_str()).and_then(|s| s.parse::<i64>().ok());
+    let Some(value) = raw.parse::<i64>().ok() else {
+        return false;
+    };
+    if w.id.as_ref().is_some_and(|id| decode(id) != Some(value))
+        || w.id_neq
+            .as_ref()
+            .is_some_and(|id| decode(id) == Some(value))
+        || w.id_in
+            .as_ref()
+            .is_some_and(|ids| !ids.iter().any(|id| decode(id) == Some(value)))
+        || w.id_not_in
+            .as_ref()
+            .is_some_and(|ids| ids.iter().any(|id| decode(id) == Some(value)))
+    {
+        return false;
+    }
+    for (bound, ordering, inclusive) in [
+        (&w.id_gt, std::cmp::Ordering::Greater, false),
+        (&w.id_gte, std::cmp::Ordering::Greater, true),
+        (&w.id_lt, std::cmp::Ordering::Less, false),
+        (&w.id_lte, std::cmp::Ordering::Less, true),
+    ] {
+        if let Some(id) = bound {
+            let Some(bound) = decode(id) else {
+                return false;
+            };
+            let actual = value.cmp(&bound);
+            if actual != ordering && !(inclusive && actual == std::cmp::Ordering::Equal) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Whether a `ChannelRow` satisfies a `ChannelWhereInput` predicate tree.
 /// `not`/`and`/`or` recurse; an empty `and` matches (ent semantics) and an
 /// empty `or` is ignored so it never blacks out the whole result.
@@ -1108,6 +1147,10 @@ pub(crate) fn channel_row_matches_where(row: &ChannelRow, w: &ChannelWhereInput)
         && !list.is_empty()
         && !list.iter().any(|c| channel_row_matches_where(row, c))
     {
+        return false;
+    }
+
+    if !channel_id_matches_where(&row.id, w) {
         return false;
     }
 
@@ -1602,4 +1645,60 @@ fn validate_new_api_account(c: &ChannelCredentialsInput) -> Result<(), String> {
         return Err("NEWAPI PAT must not be empty".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod channel_id_filter_tests {
+    use super::*;
+    use async_graphql::ID;
+
+    #[test]
+    fn declared_numeric_id_predicate_family() {
+        macro_rules! check {
+            ($field:ident, $v:expr, $yes:expr, $no:expr) => {{
+                let w = ChannelWhereInput {
+                    $field: Some($v),
+                    ..Default::default()
+                };
+                assert!(channel_id_matches_where($yes, &w), stringify!($field));
+                assert!(!channel_id_matches_where($no, &w), stringify!($field));
+            }};
+        }
+        check!(id, ID::from("gid://conduit/Channel/10"), "10", "2");
+        check!(id_neq, ID::from("10"), "2", "10");
+        check!(id_in, vec![ID::from("10")], "10", "2");
+        check!(id_not_in, vec![ID::from("10")], "2", "10");
+        check!(id_gt, ID::from("2"), "10", "2");
+        check!(id_gte, ID::from("10"), "10", "2");
+        check!(id_lt, ID::from("10"), "2", "10");
+        check!(id_lte, ID::from("2"), "2", "10");
+        assert!(!channel_id_matches_where(
+            "10",
+            &ChannelWhereInput {
+                id: Some(ID::from("invalid")),
+                ..Default::default()
+            }
+        ));
+        assert!(!channel_id_matches_where(
+            "10",
+            &ChannelWhereInput {
+                id_in: Some(vec![]),
+                ..Default::default()
+            }
+        ));
+        assert!(channel_id_matches_where(
+            "10",
+            &ChannelWhereInput {
+                id_not_in: Some(vec![]),
+                ..Default::default()
+            }
+        ));
+        assert!(!channel_id_matches_where(
+            "10",
+            &ChannelWhereInput {
+                id_gt: Some(ID::from("invalid")),
+                ..Default::default()
+            }
+        ));
+    }
 }

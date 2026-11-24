@@ -6539,3 +6539,102 @@ pub(crate) fn governed_channel_form(
     domain.extra = old.extra;
     serde_json::to_value(domain).map_err(|_| "invalid channel settings".into())
 }
+
+#[cfg(test)]
+mod channel_id_filter_query_tests {
+    use super::*;
+    use crate::wiring_channel_crud::channel_row_matches_where;
+    use async_graphql::ID;
+    use conduit_admin_graphql::channel::ChannelWhereInput;
+    #[tokio::test]
+    async fn query_first_one_resolves_each_channel_before_pagination()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_admin_graphql::channel_queries::{
+            ChannelExtraQueryServices, QueryChannelsArgs,
+        };
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let mut ids = Vec::new();
+        for name in ["existing-first", "new-second"] {
+            ids.push(sqlx::query_scalar::<_,i64>("INSERT INTO channels(\"type\",name,status,credentials,supported_models,default_test_model,settings) VALUES('openai',$1,'enabled','{}','[]','','{}') RETURNING id").bind(name).fetch_one(&db.pool).await?);
+        }
+        let adapter = crate::wiring::ChannelExtraQueryAdapter {
+            channel_repo: Arc::new(conduit_db::PgChannelRepo::new(db.pool.clone())),
+            price_repo: Arc::new(conduit_db::PgChannelModelPriceRepo::new(db.pool.clone())),
+        };
+        for id in &ids {
+            let result = adapter
+                .query_channels(QueryChannelsArgs {
+                    first: Some(1),
+                    where_filter: Some(ChannelWhereInput {
+                        id: Some(ID::from(format!("gid://conduit/Channel/{id}"))),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .await?;
+            assert_eq!(result.total_count, 1);
+            let edges = result.edges.ok_or("missing edges")?;
+            assert_eq!(edges.len(), 1);
+            let node = edges
+                .into_iter()
+                .next()
+                .flatten()
+                .and_then(|edge| edge.node)
+                .ok_or("missing channel")?;
+            assert_eq!(node.id.as_str(), format!("gid://conduit/Channel/{id}"));
+            use conduit_admin_graphql::channel::{ChannelMutationServices, UpdateChannelInput};
+            let mutation = crate::wiring_channel_crud::ChannelCrudAdapter::new(Arc::new(
+                conduit_db::PgChannelRepo::new(db.pool.clone()),
+            ));
+            mutation
+                .update_channel(
+                    node.id.as_str(),
+                    UpdateChannelInput {
+                        name: Some(format!("edited-{id}")),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
+        let names = sqlx::query_scalar::<_, String>("SELECT name FROM channels ORDER BY id")
+            .fetch_all(&db.pool)
+            .await?;
+        assert_eq!(
+            names,
+            ids.iter()
+                .map(|id| format!("edited-{id}"))
+                .collect::<Vec<_>>()
+        );
+        let row = adapter
+            .load_all(Vec::new())
+            .await?
+            .into_iter()
+            .find(|row| row.id == ids[1].to_string())
+            .ok_or("missing second channel")?;
+        let only = |id| ChannelWhereInput {
+            id: Some(ID::from(id)),
+            ..Default::default()
+        };
+        assert!(channel_row_matches_where(
+            &row,
+            &ChannelWhereInput {
+                and: Some(vec![only(ids[1].to_string())]),
+                or: Some(vec![only(ids[0].to_string()), only(ids[1].to_string())]),
+                not: Some(Box::new(only(ids[0].to_string()))),
+                ..Default::default()
+            }
+        ));
+        assert!(!channel_row_matches_where(
+            &row,
+            &ChannelWhereInput {
+                not: Some(Box::new(only(ids[1].to_string()))),
+                ..Default::default()
+            }
+        ));
+        db.cleanup().await?;
+        Ok(())
+    }
+}
