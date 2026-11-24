@@ -4,7 +4,7 @@ This directory is Conduit API's only runtime migration catalog. The Rust databas
 crate embeds these files in version order and records applied versions in
 `schema_migrations`.
 
-The current catalog ends at `000039_model_price_formulas.sql`. The workspace is
+The current catalog ends at `000042_governance_accounting_lock_order.sql`. The workspace is
 still in its pre-release, rebuildable-database phase. The earlier `000028`
 money-unit contract still requires recreation for databases that recorded its
 superseded draft.
@@ -59,3 +59,11 @@ Live migration tests use an isolated schema and require an explicit
 `000040_user_model_groups.sql` leaves existing users and Keys unassigned intentionally. Alpha operators must explicitly configure membership, grants and Key ModelGroup assignments before public requests are accepted; Project routing/accounting data remains unchanged.
 
 `000041_payment_topups.sql` adds immutable Project payment orders, append-only sanitized events and dedicated one-per-order `payment_topup` ledger constraints, plus independent UserGroup recharge PPM/revision. It reuses the existing wallet balance trigger and does not alter grants, codes or request settlement. Payments default disabled; see backend knowledge for the explicit reference profile and configuration.
+
+`000042_governance_accounting_lock_order.sql` upgrades the formula-input statement
+trigger function to acquire governance advisory lock `4850181378862437889` before
+accounting/price lock `786222001`, matching the Rust accounting helper. All
+production entrants must preserve this order before row locks. Existing
+`000038`/`000039` checksums remain unchanged. Stop older application writers
+before deploying this binary and running its migrations; mixed old/new writers
+can retain the old lock order until the older transactions have ended.

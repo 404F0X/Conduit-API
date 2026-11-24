@@ -2154,3 +2154,128 @@ async fn lite_complete_approve_apply_requires_both_duties_and_records_two_steps(
     db.cleanup().await?;
     Ok(())
 }
+
+// Observe the actual waiter, rather than relying on timing to arrange the cycle.
+async fn accounting_order_probe(
+    pool: &PgPool,
+    actor: i64,
+    group: &str,
+    channel: i64,
+    sql_entry: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut governed = pool.begin().await?;
+    lock_policy(&mut governed).await?;
+    let governed_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *governed)
+        .await?;
+    let mut other = pool.begin().await?;
+    let other_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *other)
+        .await?;
+    let mut worker = tokio::spawn(async move {
+        if sql_entry {
+            sqlx::query(
+                "UPDATE channels SET deleted_at=1,status='archived',updated_at=now() WHERE id=$1",
+            )
+            .bind(channel)
+            .execute(&mut *other)
+            .await?;
+        } else {
+            crate::wiring::lock_accounting_currency_price_writes(&mut other).await?;
+        }
+        other.commit().await
+    });
+    let waiting = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+                .bind(governed_pid)
+                .bind(other_pid)
+                .fetch_one(pool)
+                .await?;
+            if blocked {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if !matches!(waiting, Ok(Ok(()))) {
+        worker.abort();
+        let _ = worker.await;
+        governed.rollback().await?;
+        return Err("accounting entrant did not wait for the governance holder".into());
+    }
+    // A reversed entrant would already hold accounting while waiting for us:
+    // acquiring it normally here would complete the production deadlock cycle.
+    let available: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(786222001)")
+        .fetch_one(&mut *governed)
+        .await?;
+    let update = if available {
+        crate::wiring_postgres_simple_group::update_simple_group_price_in_tx(
+            &mut governed,
+            Some(actor),
+            conduit_admin_graphql::simple_group::UpdateSimpleGroupPriceInput {
+                group_id: ID(group.into()),
+                multiplier_ppm: 1234567,
+            },
+        )
+        .await
+        .map(|_| ())
+    } else {
+        Ok(())
+    };
+    // Always release the holder and join the worker, including the legacy case.
+    governed.rollback().await?;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), &mut worker).await {
+        Ok(joined) => joined??,
+        Err(_) => {
+            worker.abort();
+            let _ = worker.await;
+            return Err("accounting entrant failed to finish after governance release".into());
+        }
+    }
+    update?;
+    Ok(available)
+}
+
+#[tokio::test]
+async fn governance_group_and_channel_archive_share_ordered_accounting_locks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(db) = database().await? else {
+        return Ok(());
+    };
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        let pool = &db.pool;
+        let actor = owner(pool, "lock-order@contract.test").await?;
+        PgGovernanceAdapter::new(pool.clone()).update_settings(actor,
+            gql::UpdateGovernanceSettingsInput {
+                enabled: false, review_kinds: vec![], allow_self_review: Some(true),
+            }, "0".into()).await?;
+        let plan: i64 = sqlx::query_scalar("INSERT INTO access_plans(name,status,created_at,updated_at) VALUES('Lock order','enabled',now(),now()) RETURNING id").fetch_one(pool).await?;
+        let tier: i64 = sqlx::query_scalar("INSERT INTO price_tiers(name,status,multiplier_ppm,created_at,updated_at) VALUES('Lock order','enabled',1000000,now(),now()) RETURNING id").fetch_one(pool).await?;
+        let group = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO simple_groups(id,name,access_plan_id,price_tier_id,status,created_at,updated_at) VALUES($1,'Lock order',$2,$3,'enabled',now(),now())").bind(&group).bind(plan).bind(tier).execute(pool).await?;
+        let channel: i64 = sqlx::query_scalar("INSERT INTO channels(type,name,credentials,default_test_model) VALUES('openai','Lock order','{}','mock') RETURNING id").fetch_one(pool).await?;
+        for sql_entry in [true, false] {
+            assert!(accounting_order_probe(pool, actor, &group, channel, sql_entry).await?,
+                "fresh schema entrant held accounting before governance (SQL={sql_entry})");
+        }
+        // Reconstruct the previous catalog's only changed object and tracking
+        // state, then exercise the normal 000041 -> 000042 migration runner.
+        sqlx::raw_sql("CREATE OR REPLACE FUNCTION lock_formula_inputs() RETURNS trigger AS $body$ BEGIN PERFORM pg_advisory_xact_lock(786222001); RETURN NULL; END; $body$ LANGUAGE plpgsql;")
+            .execute(pool).await?;
+        sqlx::query("DELETE FROM schema_migrations WHERE version='000042'").execute(pool).await?;
+        assert!(!accounting_order_probe(pool, actor, &group, channel, true).await?,
+            "legacy trigger must reproduce the reverse-held accounting lock");
+        eprintln!("legacy 000041 reverse-held accounting lock reproduced");
+        conduit_db::connection::migrate_postgres_with_flag(pool, false).await?;
+        assert!(accounting_order_probe(pool, actor, &group, channel, true).await?,
+            "upgraded schema must acquire governance before accounting");
+        eprintln!("fresh and upgraded 000042 SQL/Rust lock entrants passed");
+        Ok(())
+    }.await;
+    let cleanup = db.cleanup().await;
+    result?;
+    cleanup?;
+    Ok(())
+}

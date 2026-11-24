@@ -2075,6 +2075,12 @@ impl SystemSettingsAdapter {
 pub(crate) async fn lock_accounting_currency_price_writes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), sqlx::Error> {
+    // Governance must precede accounting, including callers that later enter
+    // a governance statement trigger. Keep lock_formula_inputs() in sync.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::wiring_governance::LOCK)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(786222001)")
         .execute(&mut **tx)
         .await?;
