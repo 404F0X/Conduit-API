@@ -3,6 +3,7 @@ import { getTokenFromStorage, removeTokenFromStorage } from '@/stores/authStore'
 import { getProjectIdFromStorage } from '@/stores/projectStore';
 import { withBasePath } from '@/lib/base-path';
 import i18n from '@/lib/i18n';
+import { requestGovernedMutation } from '@/features/change-sets/mutation-adapter';
 
 export class GraphQLRequestError extends Error {
   status?: number;
@@ -151,6 +152,13 @@ export async function graphqlRequest<T>(
       throw new GraphQLRequestError('Unauthorized', { status: 401, isAuthError: true });
     }
 
+    if (
+      result.errors.some(
+        (e: { message?: string; extensions?: { code?: string } }) =>
+          e.extensions?.code === 'APPROVAL_REQUIRED' || e.message?.includes('APPROVAL_REQUIRED')
+      )
+    )
+      requestGovernedMutation(query, variables);
     throw new GraphQLRequestError(firstError?.message || 'GraphQL Error', {
       status: isForbiddenGraphQLError(firstError) ? 403 : undefined,
       extensions: firstError?.extensions,

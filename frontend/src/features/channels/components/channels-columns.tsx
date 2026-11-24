@@ -29,6 +29,7 @@ import { ChannelLimiterCell } from './channel-limiter-cell';
 import { ChannelManagementAdapterBadge } from './channel-management-adapter-badge';
 import { ChannelOverflowMenu } from './channel-overflow-menu';
 import { ChannelsStatusDialog } from './channels-status-dialog';
+import { NewApiChannelActions } from './new-api-discovery';
 
 const WEIGHT_PRECISION = 4;
 const MIN_WEIGHT = 0;
@@ -84,7 +85,8 @@ const ActionCell = memo(({ row }: { row: Row<Channel> }) => {
   }, [channel, setCurrentRow, setOpen]);
 
   return (
-    <div className='flex items-center justify-center gap-1'>
+    <div className='flex flex-wrap items-center justify-center gap-1'>
+      {channel.settings?.managementAdapter === 'new_api' && <NewApiChannelActions channel={channel} />}
       <Button size='sm' variant='outline' className='h-8 w-8 p-0' onClick={handleEdit}>
         <IconEdit className='h-3 w-3' />
       </Button>

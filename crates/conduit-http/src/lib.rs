@@ -22,6 +22,7 @@ pub mod openai_handlers;
 pub mod openapi_graphql_handlers;
 #[path = "middleware/panic_layer.rs"]
 pub mod panic_layer;
+pub mod payment_handlers;
 pub mod request_content_handlers;
 pub mod request_content_helpers;
 pub mod request_preview_handlers;

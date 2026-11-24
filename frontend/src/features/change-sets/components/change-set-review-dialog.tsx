@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { Textarea } from '@/components/ui/textarea';
 import { ConfirmDialog } from '@/components/confirm-dialog';
-import { type ChangeSet, useApproveChangeSet, useRejectChangeSet, useSubmitChangeSet } from '../data/change-sets';
+import { getPackage, type ChangeSet, useApproveChangeSet, useRejectChangeSet, useSubmitChangeSet } from '../data/change-sets';
 import type { ChangeSetActionType } from './change-set-actions';
 
 export type ChangeSetActionSelection = {
@@ -34,12 +34,15 @@ export function ChangeSetReviewDialog({ selection, onClose }: Props) {
     if (!selection) return;
 
     try {
+      const fresh = await getPackage(selection.changeSet.id);
+      if (!fresh) throw new Error(t('eventPackages.error'));
+      const expectedRevision = fresh.summary.revision;
       if (selection.action === 'submit') {
-        await submit.mutateAsync(selection.changeSet.id);
+        await submit.mutateAsync({ id: selection.changeSet.id, expectedRevision });
       } else if (selection.action === 'approve') {
-        await approve.mutateAsync({ id: selection.changeSet.id, reviewNote: reviewNote.trim() || undefined });
+        await approve.mutateAsync({ id: selection.changeSet.id, expectedRevision, reviewNote: reviewNote.trim() || undefined });
       } else {
-        await reject.mutateAsync({ id: selection.changeSet.id, reviewNote: reviewNote.trim() || undefined });
+        await reject.mutateAsync({ id: selection.changeSet.id, expectedRevision, reviewNote: reviewNote.trim() || undefined });
       }
       toast.success(t(`changeSets.toast.${selection.action}`));
       setReviewNote('');

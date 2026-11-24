@@ -271,6 +271,7 @@ pub struct ChannelQuotaProbeResult {
 /// silently persist unsupported rows.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
 pub struct NewApiModelPricingProbe {
+    pub provenance: async_graphql::Json<serde_json::Value>,
     pub model_id: String,
     pub billing_kind: String,
     pub quality: String,
@@ -474,6 +475,209 @@ async fn lifecycle_subscription_mutation(
 
 #[Object]
 impl MutationRoot {
+    async fn operator_recheck_payment_order(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+    ) -> Result<crate::payments::OperatorPaymentOrder, String> {
+        let access = crate::payments::operator_access(ctx, true)?;
+        crate::payments::services(ctx)?
+            .operator_recheck(access, id.as_str())
+            .await
+    }
+    async fn create_payment_order(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::payments::CreatePaymentOrderInput,
+    ) -> Result<crate::payments::PaymentOrder, String> {
+        let (payer, project) = crate::payments::identity(ctx)?;
+        crate::payments::services(ctx)?
+            .create(payer, project, input)
+            .await
+    }
+    async fn recheck_payment_order(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+    ) -> Result<crate::payments::PaymentOrder, String> {
+        let (payer, project) = crate::payments::identity(ctx)?;
+        crate::payments::services(ctx)?
+            .recheck(payer, project, id.as_str())
+            .await
+    }
+    async fn set_project_member_spend_limit(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "projectID")] project_id: async_graphql::ID,
+        #[graphql(name = "userID")] user_id: async_graphql::ID,
+        limit: Option<String>,
+    ) -> Result<crate::billing::ProjectMemberSpendLimit, String> {
+        crate::billing::billing_services(ctx)?
+            .set_project_member_spend_limit(
+                crate::governance::actor(ctx)?,
+                project_id.as_str(),
+                user_id.as_str(),
+                limit,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn claim_governed_change_secrets(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+    ) -> async_graphql::Result<async_graphql::Json<serde_json::Value>> {
+        crate::governance::services(ctx)?
+            .claim_secrets(crate::governance::actor(ctx)?, id)
+            .await
+            .map_err(async_graphql::Error::new)
+    }
+
+    async fn update_governance_settings(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::governance::UpdateGovernanceSettingsInput,
+        expected_revision: String,
+    ) -> Result<crate::governance::GovernanceSettings, String> {
+        crate::governance::services(ctx)?
+            .update_settings(crate::governance::actor(ctx)?, input, expected_revision)
+            .await
+    }
+    async fn propose_governed_change(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::governance::ProposeGovernedChangeInput,
+    ) -> Result<crate::change_package::ChangeSetDetail, String> {
+        crate::governance::services(ctx)?
+            .propose(crate::governance::actor(ctx)?, input)
+            .await
+    }
+    async fn validate_change_set(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+        expected_revision: String,
+    ) -> Result<crate::change_package::ChangeSetDetail, String> {
+        crate::governance::services(ctx)?
+            .validate(crate::governance::actor(ctx)?, id, expected_revision)
+            .await
+    }
+    async fn review_change_set(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+        expected_revision: String,
+        review_note: Option<String>,
+    ) -> Result<crate::change_package::ChangeSetDetail, async_graphql::Error> {
+        crate::change_package::services(ctx)?
+            .transition(
+                crate::change_package::viewer(ctx)?.actor_user_id,
+                id,
+                expected_revision,
+                crate::change_package::ChangeSetAvailableAction::Approve,
+                review_note,
+            )
+            .await
+            .map_err(crate::change_package::graphql_error)
+    }
+    async fn publish_change_set(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+        expected_revision: String,
+    ) -> Result<crate::change_package::ChangeSetDetail, async_graphql::Error> {
+        crate::change_package::services(ctx)?
+            .transition(
+                crate::change_package::viewer(ctx)?.actor_user_id,
+                id,
+                expected_revision,
+                crate::change_package::ChangeSetAvailableAction::Publish,
+                None,
+            )
+            .await
+            .map_err(crate::change_package::graphql_error)
+    }
+    async fn recover_governance_policy(
+        &self,
+        ctx: &Context<'_>,
+        reason: String,
+        expected_revision: String,
+    ) -> Result<crate::governance::GovernanceSettings, String> {
+        crate::governance::services(ctx)?
+            .recover(crate::governance::actor(ctx)?, reason, expected_revision)
+            .await
+    }
+    async fn emergency_restrict_access(
+        &self,
+        ctx: &Context<'_>,
+        target_type: String,
+        id: async_graphql::ID,
+        reason: String,
+    ) -> Result<bool, String> {
+        crate::governance::services(ctx)?
+            .emergency(crate::governance::actor(ctx)?, target_type, id, reason)
+            .await
+    }
+    async fn initialize_new_api_channel(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "channelID")] channel_id: async_graphql::ID,
+        #[graphql(name = "operationID")] operation_id: async_graphql::ID,
+        #[graphql(
+            default_with = "vec![crate::channel_discovery::ChannelDiscoveryStage::Models,crate::channel_discovery::ChannelDiscoveryStage::Prices]"
+        )]
+        stages: Vec<crate::channel_discovery::ChannelDiscoveryStage>,
+        rebuild: Option<crate::channel_discovery::RebuildObservedPricePackagesInput>,
+    ) -> async_graphql::Result<crate::channel_discovery::ChannelDiscoveryOperation> {
+        let viewer = crate::change_package::viewer(ctx)?;
+        let can_rebuild = crate::policy::authorize_current(
+            ctx,
+            conduit_auth::scopes::slug::WRITE_COMMERCIALIZATION,
+        )
+        .is_ok();
+        if rebuild.is_some() && !can_rebuild {
+            return Err(async_graphql::Error::new(
+                "FORBIDDEN: rebuilding requires write_commercialization",
+            ));
+        }
+        crate::channel_discovery::services(ctx)?
+            .initialize(
+                viewer.actor_user_id,
+                can_rebuild,
+                channel_id,
+                operation_id,
+                stages,
+                rebuild,
+            )
+            .await
+            .map_err(async_graphql::Error::new)
+    }
+    async fn retry_new_api_channel_discovery(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "operationID")] operation_id: async_graphql::ID,
+        expected_attempt: i32,
+        stages: Vec<crate::channel_discovery::ChannelDiscoveryStage>,
+        credentials: Option<crate::channel_discovery::NewApiAccountCredentialsInput>,
+    ) -> async_graphql::Result<crate::channel_discovery::ChannelDiscoveryOperation> {
+        crate::channel_discovery::services(ctx)?
+            .retry(
+                crate::change_package::viewer(ctx)?.actor_user_id,
+                crate::policy::authorize_current(
+                    ctx,
+                    conduit_auth::scopes::slug::WRITE_COMMERCIALIZATION,
+                )
+                .is_ok(),
+                operation_id,
+                expected_attempt,
+                stages,
+                credentials,
+            )
+            .await
+            .map_err(async_graphql::Error::new)
+    }
+
     /// Switch the product projection. Authorization is owner-only in the
     /// production authz extension; this resolver only persists the setting.
     async fn update_product_experience_settings(
@@ -761,6 +965,16 @@ impl MutationRoot {
             .map_err(|error| error.to_string())
     }
 
+    async fn save_retail_price_formula(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::price_formula::RetailPriceFormulaInput,
+    ) -> Result<crate::price_formula::RetailPriceFormula, String> {
+        crate::price_formula::services(ctx)?
+            .save(crate::price_formula::actor(ctx)?, input)
+            .await
+    }
+
     async fn create_price_book(
         &self,
         ctx: &Context<'_>,
@@ -779,97 +993,165 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         #[graphql(name = "priceBookID")] price_book_id: async_graphql::ID,
-    ) -> Result<crate::change_set::ChangeSet, String> {
-        let actor_user_id = ctx
-            .data::<crate::me::CurrentUser>()
-            .map_err(|_| "authentication required".to_string())?
-            .user_id;
-        crate::change_set::change_set_services(ctx)?
-            .create_retail_price_change_set(actor_user_id, price_book_id)
+        #[graphql(name = "operationID")] operation_id: async_graphql::ID,
+        expected_base_revision: String,
+    ) -> async_graphql::Result<crate::change_package::ChangeSetDetail> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .create_retail(actor, price_book_id, operation_id, expected_base_revision)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
-
     async fn create_provider_price_change_set(
         &self,
         ctx: &Context<'_>,
         #[graphql(name = "channelID")] channel_id: async_graphql::ID,
+        #[graphql(name = "operationID")] operation_id: async_graphql::ID,
+        expected_base_revision: String,
         input: Vec<crate::model_ext::SaveChannelModelPriceInput>,
-    ) -> Result<crate::change_set::ChangeSet, String> {
-        let actor_user_id = ctx
-            .data::<crate::me::CurrentUser>()
-            .map_err(|_| "authentication required".to_string())?
-            .user_id;
-        crate::change_set::change_set_services(ctx)?
-            .create_provider_price_change_set(actor_user_id, channel_id, input)
+        correction: Option<crate::change_package::ChangeSetCorrectionInput>,
+    ) -> async_graphql::Result<crate::change_package::CreateChangeSetResult> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .create_provider(
+                actor,
+                channel_id,
+                operation_id,
+                expected_base_revision,
+                input,
+                correction,
+            )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
-
+    async fn save_provider_price_change_set(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+        expected_revision: String,
+        input: Vec<crate::model_ext::SaveChannelModelPriceInput>,
+    ) -> async_graphql::Result<crate::change_package::ChangeSetDetail> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .save_provider(actor, id, expected_revision, input)
+            .await
+            .map_err(crate::change_package::graphql_error)
+    }
     async fn save_retail_price_change_set_item(
         &self,
         ctx: &Context<'_>,
         input: crate::change_set::SaveRetailPriceChangeSetItemInput,
-    ) -> Result<crate::change_set::ChangeSetItem, String> {
-        let actor_user_id = ctx
-            .data::<crate::me::CurrentUser>()
-            .map_err(|_| "authentication required".to_string())?
-            .user_id;
-        crate::change_set::change_set_services(ctx)?
-            .save_retail_price_change_set_item(actor_user_id, input)
+    ) -> async_graphql::Result<crate::change_package::SaveRetailPriceChangeSetItemResult> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .save_retail_item(actor, input)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
-
     async fn submit_change_set(
         &self,
         ctx: &Context<'_>,
         id: async_graphql::ID,
-    ) -> Result<crate::change_set::ChangeSet, String> {
-        let actor_user_id = ctx
-            .data::<crate::me::CurrentUser>()
-            .map_err(|_| "authentication required".to_string())?
-            .user_id;
-        crate::change_set::change_set_services(ctx)?
-            .submit_change_set(actor_user_id, id)
+        expected_revision: String,
+    ) -> async_graphql::Result<crate::change_package::ChangeSetDetail> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .transition(
+                actor,
+                id,
+                expected_revision,
+                crate::change_package::ChangeSetAvailableAction::Submit,
+                None,
+            )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
-
     async fn approve_change_set(
         &self,
         ctx: &Context<'_>,
         id: async_graphql::ID,
+        expected_revision: String,
         review_note: Option<String>,
-    ) -> Result<crate::change_set::ChangeSet, String> {
-        let actor_user_id = ctx
-            .data::<crate::me::CurrentUser>()
-            .map_err(|_| "authentication required".to_string())?
-            .user_id;
-        crate::change_set::change_set_services(ctx)?
-            .approve_change_set(actor_user_id, id, review_note)
+    ) -> async_graphql::Result<crate::change_package::ChangeSetDetail> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .transition(
+                actor,
+                id,
+                expected_revision,
+                crate::change_package::ChangeSetAvailableAction::Approve,
+                review_note,
+            )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
-
     async fn reject_change_set(
         &self,
         ctx: &Context<'_>,
         id: async_graphql::ID,
+        expected_revision: String,
         review_note: Option<String>,
-    ) -> Result<crate::change_set::ChangeSet, String> {
-        let actor_user_id = ctx
-            .data::<crate::me::CurrentUser>()
-            .map_err(|_| "authentication required".to_string())?
-            .user_id;
-        crate::change_set::change_set_services(ctx)?
-            .reject_change_set(actor_user_id, id, review_note)
+    ) -> async_graphql::Result<crate::change_package::ChangeSetDetail> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .transition(
+                actor,
+                id,
+                expected_revision,
+                crate::change_package::ChangeSetAvailableAction::Reject,
+                review_note,
+            )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
 
     /// Create a simple-mode Group and its normalized commercial references in
     /// one service transaction.
+    async fn save_model_group(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::groups::SaveModelGroupInput,
+    ) -> Result<crate::groups::ModelGroup, String> {
+        crate::groups::global(ctx, true)?;
+        crate::groups::services(ctx)?.save_model_group(input).await
+    }
+    async fn save_user_group(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::groups::SaveUserGroupInput,
+    ) -> Result<crate::groups::UserGroup, String> {
+        crate::groups::global(ctx, true)?;
+        crate::groups::services(ctx)?.save_user_group(input).await
+    }
+    async fn move_user_to_group(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "userID")] user_id: async_graphql::ID,
+        #[graphql(name = "userGroupID")] group_id: async_graphql::ID,
+    ) -> Result<bool, String> {
+        crate::groups::global(ctx, true)?;
+        crate::groups::services(ctx)?
+            .move_user(
+                crate::groups::numeric_id(user_id.as_str())?,
+                group_id.as_str(),
+            )
+            .await
+    }
+    async fn assign_api_key_model_group(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+        #[graphql(name = "modelGroupID")] group_id: async_graphql::ID,
+    ) -> Result<bool, String> {
+        let project = crate::groups::project(ctx, true)?;
+        crate::groups::services(ctx)?
+            .assign_key(
+                crate::groups::numeric_id(id.as_str())?,
+                project,
+                group_id.as_str(),
+            )
+            .await
+    }
     async fn create_simple_group(
         &self,
         ctx: &Context<'_>,
@@ -1103,21 +1385,25 @@ impl MutationRoot {
     async fn save_channel_model_prices(
         &self,
         ctx: &Context<'_>,
-        #[graphql(name = "channelId")] channel_id: async_graphql::ID,
+        #[graphql(name = "channelID")] channel_id: async_graphql::ID,
+        #[graphql(name = "operationID")] operation_id: async_graphql::ID,
+        expected_base_revision: String,
         input: Vec<crate::model_ext::SaveChannelModelPriceInput>,
-    ) -> Result<Vec<crate::model_ext::ChannelModelPrice>, String> {
-        let s = crate::model_ext::model_ext_services(ctx)?;
-        let actor_user_id = ctx
-            .data_opt::<crate::me::CurrentUser>()
-            .map(|user| user.user_id);
-        s.save_channel_model_prices(actor_user_id, channel_id, input)
+    ) -> async_graphql::Result<crate::change_package::CreateChangeSetResult> {
+        let actor = crate::change_package::viewer(ctx)?.actor_user_id;
+        crate::change_package::services(ctx)?
+            .create_provider(
+                actor,
+                channel_id,
+                operation_id,
+                expected_base_revision,
+                input,
+                None,
+            )
             .await
-            .map_err(|e| e.to_string())
+            .map_err(crate::change_package::graphql_error)
     }
 
-    /// Mirrors Go `Mutation.checkProviderQuotas` (system.resolvers.go:237-245):
-    /// trigger a manual provider-quota re-check across all relevant channels.
-    /// Returns `true` if the check was successfully kicked off.
     async fn check_provider_quotas(&self, ctx: &Context<'_>) -> Result<bool, String> {
         let services = quota_services(ctx)?;
         match services.manual_check().await {
@@ -1238,7 +1524,10 @@ impl MutationRoot {
             .map_err(|err| err.to_string())?;
         let services = channel_mutation_services(ctx)?;
         services
-            .create_channel(input)
+            .create_channel(
+                ctx.data_opt::<crate::me::CurrentUser>().map(|u| u.user_id),
+                input,
+            )
             .await
             .map_err(|err| err.to_string())
     }
@@ -3356,6 +3645,7 @@ mod tests {
                 matched_key_count: 1,
                 warnings: Vec::new(),
                 models: vec![NewApiModelPricingProbe {
+                    provenance: async_graphql::Json(serde_json::json!({})),
                     model_id: "gpt-test".to_string(),
                     billing_kind: "token".to_string(),
                     quality: "exact".to_string(),

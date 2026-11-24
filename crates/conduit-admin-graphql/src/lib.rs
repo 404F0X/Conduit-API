@@ -1,13 +1,16 @@
 #![forbid(unsafe_code)]
 
 use async_graphql::{Context, EmptySubscription, Enum, ID, Object, Schema, SimpleObject};
+use std::sync::Arc;
 
 pub mod apikey;
 pub mod authz_extension;
 pub mod backup_ext;
 pub mod billing;
+pub mod change_package;
 pub mod change_set;
 pub mod channel;
+pub mod channel_discovery;
 pub mod channel_ext;
 pub mod channel_ext2;
 pub mod channel_override_template_ext;
@@ -17,6 +20,8 @@ pub mod commercialization;
 pub mod dashboard;
 pub mod data_storage;
 pub mod dataloader;
+pub mod governance;
+pub mod groups;
 pub mod input;
 pub mod me;
 pub mod me_ext;
@@ -27,7 +32,9 @@ pub mod mutation;
 pub mod node;
 pub mod operations;
 pub mod pagination;
+pub mod payments;
 pub mod policy;
+pub mod price_formula;
 pub mod product_experience;
 pub mod profile_template;
 pub mod project;
@@ -98,6 +105,67 @@ pub struct GraphqlConnectionProbe {
 
 #[Object]
 impl QueryRoot {
+    async fn operator_payment_orders(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] limit: i32,
+        #[graphql(default = 0)] offset: i32,
+    ) -> Result<Vec<payments::OperatorPaymentOrder>, String> {
+        let access = payments::operator_access(ctx, false)?;
+        payments::services(ctx)?
+            .operator_orders(access, limit, offset)
+            .await
+    }
+    async fn operator_payment_order(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> Result<payments::OperatorPaymentOrder, String> {
+        let access = payments::operator_access(ctx, false)?;
+        payments::services(ctx)?
+            .operator_order(access, id.as_str())
+            .await
+    }
+    async fn payment_capabilities(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<payments::PaymentCapabilities, String> {
+        ctx.data::<crate::me::CurrentUser>()
+            .map_err(|_| "authentication required")?;
+        Ok(payments::services(ctx)?.capabilities())
+    }
+    async fn payment_orders(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 20)] limit: i32,
+        #[graphql(default = 0)] offset: i32,
+    ) -> Result<Vec<payments::PaymentOrder>, String> {
+        let (payer, project) = payments::identity(ctx)?;
+        payments::services(ctx)?
+            .orders(payer, project, limit, offset)
+            .await
+    }
+    async fn payment_order(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> Result<payments::PaymentOrder, String> {
+        let (payer, project) = payments::identity(ctx)?;
+        payments::services(ctx)?
+            .order(payer, project, id.as_str())
+            .await
+    }
+    async fn channel_discovery_operation(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "operationID")] operation_id: ID,
+    ) -> async_graphql::Result<Option<crate::channel_discovery::ChannelDiscoveryOperation>> {
+        crate::channel_discovery::services(ctx)?
+            .get(operation_id)
+            .await
+            .map_err(async_graphql::Error::new)
+    }
+
     async fn health(&self) -> &'static str {
         "ok"
     }
@@ -109,22 +177,123 @@ impl QueryRoot {
     async fn change_sets(
         &self,
         ctx: &Context<'_>,
-        kind: Option<change_set::ChangeSetKind>,
-        status: Option<change_set::ChangeSetStatus>,
-        scope_type: Option<String>,
-        #[graphql(name = "scopeID")] scope_id: Option<ID>,
-        limit: Option<i32>,
-    ) -> Result<Vec<change_set::ChangeSet>, String> {
-        change_set::change_set_services(ctx)?
-            .change_sets(
+        filter: Option<change_package::ChangeSetFilterInput>,
+        after: Option<CursorScalar>,
+        #[graphql(default = 20)] first: i32,
+    ) -> async_graphql::Result<change_package::ChangeSetSummaryConnection> {
+        let mut filter = filter.unwrap_or_default();
+        if let Some(service) = ctx.data_opt::<Arc<dyn governance::GovernanceServices>>() {
+            filter.actor_user_id = Some(governance::actor(ctx)?);
+            filter.allowed_kinds = Some(service.readable_kinds(governance::actor(ctx)?).await?);
+        }
+        change_package::services(ctx)?
+            .list_summaries(filter, after, first)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn change_set(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> async_graphql::Result<Option<change_package::ChangeSetDetail>> {
+        change_package::authorize_read(ctx, id.clone()).await?;
+        change_package::services(ctx)?
+            .get_detail(change_package::viewer(ctx)?, id)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn change_set_by_operation(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "operationID")] operation_id: ID,
+        kind: change_set::ChangeSetKind,
+        scope_type: String,
+        #[graphql(name = "scopeID")] scope_id: ID,
+    ) -> async_graphql::Result<Option<change_package::ChangeSetDetail>> {
+        let detail = change_package::services(ctx)?
+            .find_by_operation(
+                change_package::viewer(ctx)?,
+                operation_id,
                 kind,
-                status,
                 scope_type,
-                scope_id.map(|id| id.to_string()),
-                limit.unwrap_or(100).clamp(1, 500),
+                scope_id,
             )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(change_package::graphql_error)?;
+        if let Some(detail) = &detail {
+            change_package::authorize_read(ctx, detail.summary.id.clone()).await?;
+        }
+        Ok(detail)
+    }
+    async fn provider_price_change_set_operation(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "operationID")] operation_id: ID,
+    ) -> async_graphql::Result<Option<change_package::CreateChangeSetResult>> {
+        change_package::services(ctx)?
+            .find_provider_operation(change_package::viewer(ctx)?, operation_id)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn change_set_items(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "changeSetID")] change_set_id: ID,
+        after: Option<CursorScalar>,
+        #[graphql(default = 50)] first: i32,
+        search: Option<String>,
+        #[graphql(default = false)] problems_only: bool,
+    ) -> async_graphql::Result<change_package::ChangeSetItemSummaryConnection> {
+        change_package::authorize_read(ctx, change_set_id.clone()).await?;
+        change_package::services(ctx)?
+            .list_items(change_set_id, after, first, search, problems_only)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn change_set_item(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "changeSetID")] change_set_id: ID,
+        #[graphql(name = "itemID")] item_id: ID,
+    ) -> async_graphql::Result<Option<change_package::ChangeSetItemDetail>> {
+        change_package::authorize_read(ctx, change_set_id.clone()).await?;
+        change_package::services(ctx)?
+            .get_item(change_set_id, item_id)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn change_set_events(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "changeSetID")] change_set_id: ID,
+        after: Option<CursorScalar>,
+        #[graphql(default = 50)] first: i32,
+    ) -> async_graphql::Result<change_package::ChangeSetEventConnection> {
+        change_package::authorize_read(ctx, change_set_id.clone()).await?;
+        change_package::services(ctx)?
+            .list_events(change_set_id, after, first)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn provider_price_edit_base(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "channelID")] channel_id: ID,
+    ) -> async_graphql::Result<change_package::ProviderPriceEditBase> {
+        change_package::services(ctx)?
+            .provider_edit_base(channel_id)
+            .await
+            .map_err(change_package::graphql_error)
+    }
+    async fn retail_price_edit_base(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "priceBookID")] price_book_id: ID,
+    ) -> async_graphql::Result<change_package::RetailPriceEditBase> {
+        change_package::services(ctx)?
+            .retail_edit_base(price_book_id)
+            .await
+            .map_err(change_package::graphql_error)
     }
 
     /// Credential-free routing explanation for one persisted request.
@@ -208,6 +377,8 @@ impl QueryRoot {
     async fn my_model_catalog(
         &self,
         ctx: &Context<'_>,
+        #[graphql(name = "modelGroupID")] model_group_id: Option<ID>,
+        #[graphql(name = "apiKeyID")] api_key_id: Option<ID>,
     ) -> Result<model_catalog::MyModelCatalog, String> {
         let current = ctx
             .data::<me::CurrentUser>()
@@ -218,13 +389,69 @@ impl QueryRoot {
             .parse::<i64>()
             .map_err(|_| model_catalog::ModelCatalogError::ProjectRequired.to_string())?;
         model_catalog::model_catalog_services(ctx)?
-            .my_model_catalog(current.user_id, project_id)
+            .my_model_catalog(
+                current.user_id,
+                project_id,
+                model_group_id.map(|id| id.to_string()),
+                api_key_id.map(|id| id.to_string()),
+            )
             .await
             .map_err(|error| error.to_string())
     }
 
-    /// Simple-mode commercial façade. Unlike `userGroups`, this contract does
-    /// not expose legacy model/channel arrays or User membership internals.
+    /// Key creation metadata from its server-derived billing member, without prices.
+    async fn api_key_creation_catalog(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "modelGroupID")] model_group_id: ID,
+    ) -> Result<groups::APIKeyProfileCatalog, String> {
+        let project = groups::project(ctx, true)?;
+        let user = ctx.data_opt::<me::CurrentUser>().map(|u| u.user_id);
+        let parent = policy::request_context(ctx)
+            .and_then(|r| r.principal.as_ref())
+            .filter(|p| p.kind == conduit_auth::PrincipalKind::ApiKey)
+            .and_then(|p| p.id.as_deref())
+            .map(groups::numeric_id)
+            .transpose()?;
+        groups::services(ctx)?
+            .creation_catalog(user, parent, project, model_group_id.as_str())
+            .await
+    }
+    async fn api_key_profile_catalog(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "keyID")] key_id: ID,
+    ) -> Result<groups::APIKeyProfileCatalog, String> {
+        let project = groups::project(ctx, false)?;
+        groups::services(ctx)?
+            .profile_catalog(groups::numeric_id(key_id.as_str())?, project)
+            .await
+    }
+    async fn model_groups(&self, ctx: &Context<'_>) -> Result<Vec<groups::ModelGroup>, String> {
+        groups::global(ctx, false)?;
+        groups::services(ctx)?.model_groups().await
+    }
+    async fn user_groups(&self, ctx: &Context<'_>) -> Result<Vec<groups::UserGroup>, String> {
+        groups::global(ctx, false)?;
+        groups::services(ctx)?.user_groups().await
+    }
+    async fn api_key_assignable_model_groups(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "keyID")] key_id: Option<ID>,
+    ) -> Result<Vec<groups::ModelGroup>, String> {
+        let project = groups::project(ctx, false)?;
+        if let Some(key) = key_id {
+            return groups::services(ctx)?
+                .assignable_for_key(groups::numeric_id(key.as_str())?, project)
+                .await;
+        }
+        let user = ctx
+            .data_opt::<me::CurrentUser>()
+            .map(|u| u.user_id)
+            .ok_or("user login required")?;
+        groups::services(ctx)?.assignable(user, project).await
+    }
     async fn simple_groups(
         &self,
         ctx: &Context<'_>,
@@ -311,6 +538,26 @@ impl QueryRoot {
             .map_err(|error| error.to_string())
     }
 
+    async fn retail_price_formulas(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "priceBookID")] price_book_id: ID,
+    ) -> Result<Vec<price_formula::RetailPriceFormula>, String> {
+        price_formula::services(ctx)?
+            .list(price_formula::actor(ctx)?, price_book_id.as_str())
+            .await
+    }
+
+    async fn preview_retail_price_formula(
+        &self,
+        ctx: &Context<'_>,
+        input: price_formula::RetailPriceFormulaInput,
+    ) -> Result<price_formula::RetailPriceFormulaPreview, String> {
+        price_formula::services(ctx)?
+            .preview(price_formula::actor(ctx)?, input)
+            .await
+    }
+
     /// Simple-mode account context. The user identity always comes from JWT;
     /// the service returns Missing/Ambiguous instead of guessing a Project.
     async fn my_primary_project(
@@ -349,6 +596,65 @@ impl QueryRoot {
             .project_balance(project_id.as_str())
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn governance_settings(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<governance::GovernanceSettings, String> {
+        governance::services(ctx)?.settings().await
+    }
+    async fn governance_capabilities(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<governance::GovernanceCapabilities, String> {
+        governance::services(ctx)?
+            .capabilities(governance::actor(ctx)?)
+            .await
+    }
+    async fn governed_change_base(
+        &self,
+        ctx: &Context<'_>,
+        action: String,
+        #[graphql(name = "targetIDs")] target_ids: Vec<ID>,
+        payload: async_graphql::Json<serde_json::Value>,
+    ) -> Result<String, String> {
+        governance::services(ctx)?
+            .target_revision(governance::actor(ctx)?, action, target_ids, payload)
+            .await
+    }
+
+    async fn my_project_funds(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "projectID")] project_id: ID,
+        #[graphql(name = "publicModelID")] public_model_id: Option<ID>,
+        #[graphql(name = "apiKeyID")] api_key_id: Option<ID>,
+    ) -> Result<billing::MyProjectFunds, String> {
+        let user = ctx
+            .data::<me::CurrentUser>()
+            .map_err(|_| "authentication required")?;
+        billing::billing_services(ctx)?
+            .my_project_funds(
+                &user.user_id.to_string(),
+                project_id.as_str(),
+                public_model_id.as_ref().map(|v| v.as_str()),
+                api_key_id.as_ref().map(|v| v.as_str()),
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn project_member_spend_limit(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "projectID")] project_id: ID,
+        #[graphql(name = "userID")] user_id: ID,
+    ) -> Result<billing::ProjectMemberSpendLimit, String> {
+        billing::billing_services(ctx)?
+            .project_member_spend_limit(project_id.as_str(), user_id.as_str())
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn project_wallet_comparison(
@@ -1913,6 +2219,76 @@ pub fn build_admin_schema() -> AdminSchema {
 #[cfg(test)]
 mod tests {
     use super::build_admin_schema;
+
+    #[tokio::test]
+    async fn r3_committed_frontend_operations_validate_against_the_real_schema_and_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use async_graphql::{Request, Variables};
+        use conduit_auth::{Principal, RequestContext};
+        let operations: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tests/contracts/change-package-operations.json"
+        ))?;
+        assert_eq!(operations.len(), 22);
+        let schema = build_admin_schema();
+        let guarded = super::admin_schema_builder()
+            .extension(crate::authz_extension::ScopeAuthExtensionFactory)
+            .finish();
+        for operation in operations {
+            let query = operation["query"]
+                .as_str()
+                .ok_or("missing operation document")?;
+            let variables = Variables::from_json(operation["variables"].clone());
+            let mut owner = RequestContext::new();
+            owner.set_principal(Principal::user("1").with_owner(true))?;
+            let result = schema
+                .execute(
+                    Request::new(query)
+                        .variables(variables.clone())
+                        .data(crate::me::CurrentUser { user_id: 1 })
+                        .data(owner),
+                )
+                .await;
+            assert!(
+                !result.errors.is_empty(),
+                "missing service injection must not execute"
+            );
+            for error in result.errors {
+                assert!(
+                    matches!(
+                        error.message.as_str(),
+                        "commercial change services unavailable"
+                            | "channel discovery service unavailable"
+                            | "price formulas unavailable"
+                    ),
+                    "{} fails the current schema/contract: {}",
+                    operation["method"],
+                    error.message
+                );
+            }
+            let mut unprivileged = RequestContext::new();
+            unprivileged.set_principal(Principal::user("1"))?;
+            let result = guarded
+                .execute(
+                    Request::new(query)
+                        .variables(variables)
+                        .data(crate::me::CurrentUser { user_id: 1 })
+                        .data(unprivileged),
+                )
+                .await;
+            assert!(!result.errors.is_empty());
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .all(|error| error.message.contains("authz:")
+                        && error.message.contains("required scope")),
+                "{} must be denied before its service is entered: {:?}",
+                operation["method"],
+                result.errors
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn admin_schema_sdl_contains_placeholder_query_fields() {

@@ -100,6 +100,15 @@ pub struct ApiKeyServiceAdapter {
 }
 
 impl ApiKeyServiceAdapter {
+    fn scope_ctx(scope: &APIKeyAccessScope) -> RequestContext {
+        let mut ctx = Self::ctx();
+        if let (Some(principal), Some(actor)) = (ctx.policy.principal.as_mut(), scope.actor_user_id)
+        {
+            principal.subject_id = actor.to_string();
+        }
+        ctx.project_id = Some(scope.project_id.clone());
+        ctx
+    }
     pub fn new(repo: Arc<dyn ApiKeyRepo>, key_prefix: String) -> Self {
         Self { repo, key_prefix }
     }
@@ -117,7 +126,7 @@ impl ApiKeyServiceAdapter {
         &self,
         scope: &APIKeyAccessScope,
     ) -> Result<Vec<ApiKeyRow>, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let project_id = decode_gql_id(&scope.project_id)
             .ok_or_else(|| APIKeyServiceError::Query("invalid selected project id".to_string()))?;
         let mut rows = Vec::new();
@@ -171,7 +180,7 @@ impl ApiKeyServiceAdapter {
         if ids.is_empty() {
             return Ok(());
         }
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
 
         // Distinct decoded ids — an undecodable id contributes no row, so it
         // fails the count check below exactly like a missing row (Go IN(...) also
@@ -225,21 +234,17 @@ impl ApiKeyServiceAdapter {
             ));
         }
 
-        let now = chrono::Utc::now().to_rfc3339();
-        for row in &rows {
-            self.repo
-                .update_api_key(
-                    &ctx,
-                    &row.id,
-                    RepoUpdateApiKeyInput {
-                        status: Some(status_wire.to_owned()),
-                        updated_at: now.clone(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| APIKeyServiceError::BulkUpdate(action.to_owned(), e.to_string()))?;
-        }
+        self.repo
+            .update_api_key_status_batch(
+                &ctx,
+                &decode_gql_id(&scope.project_id).ok_or_else(|| {
+                    APIKeyServiceError::BulkUpdate(action.into(), "invalid Project".into())
+                })?,
+                &distinct,
+                status_wire,
+            )
+            .await
+            .map_err(|e| APIKeyServiceError::BulkUpdate(action.into(), e.to_string()))?;
         Ok(())
     }
 }
@@ -355,7 +360,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         current_user_id: Option<i64>,
         input: CreateAPIKeyInput,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let mut ctx = Self::scope_ctx(scope);
 
         // Go api_key.go:316-319: an explicit `noauth` type is reserved.
         if matches!(input.key_type, Some(APIKeyType::Noauth)) {
@@ -419,10 +424,47 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
             .transpose()
             .map_err(|error| APIKeyServiceError::Create(error.to_string()))?;
 
+        let billing_member = if let Some(user) = current_user_id {
+            Some(user.to_string())
+        } else if let Some(parent) = &scope.actor_api_key_id {
+            let parent = self
+                .repo
+                .find_api_key_by_id(&ctx, parent)
+                .await
+                .map_err(|_| APIKeyServiceError::Create("calling API key is unavailable".into()))?
+                .ok_or_else(|| {
+                    APIKeyServiceError::Create("calling API key is unavailable".into())
+                })?;
+            if parent.project_id != project_db {
+                return Err(APIKeyServiceError::Create(
+                    "calling API key is outside the selected Project".into(),
+                ));
+            }
+            Some(parent.user_id.ok_or_else(|| {
+                APIKeyServiceError::Create(
+                    "a billing member must be assigned before key delegation".into(),
+                )
+            })?)
+        } else {
+            return Err(APIKeyServiceError::Create(
+                "billing member is required".into(),
+            ));
+        };
+        if let (Some(actor), Some(principal)) = (&billing_member, ctx.policy.principal.as_mut()) {
+            principal.subject_id = actor.clone();
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let repo_input = RepoCreateApiKeyInput {
+            model_group_id: Some(
+                input
+                    .model_group_id
+                    .ok_or_else(|| {
+                        APIKeyServiceError::Create("ModelGroup must be configured".into())
+                    })?
+                    .to_string(),
+            ),
             id: String::new(), // the database owns the generated PK
-            user_id: current_user_id.map(|id| id.to_string()),
+            user_id: billing_member,
             project_id: project_db,
             name: input.name.clone(),
             key: generated,
@@ -450,7 +492,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         id: &str,
         input: UpdateAPIKeyInput,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id)
             .ok_or_else(|| APIKeyServiceError::Update(APIKeyServiceError::NotFound.to_string()))?;
 
@@ -538,7 +580,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         id: &str,
         status: APIKeyStatus,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id).ok_or_else(|| {
             APIKeyServiceError::UpdateStatus(APIKeyServiceError::NotFound.to_string())
         })?;
@@ -586,7 +628,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         scope: &APIKeyAccessScope,
         id: &str,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id)
             .ok_or_else(|| APIKeyServiceError::Rotate(APIKeyServiceError::NotFound.to_string()))?;
 
@@ -628,7 +670,7 @@ impl ApiKeyMutationServices for ApiKeyServiceAdapter {
         id: &str,
         input: UpdateAPIKeyProfilesInput,
     ) -> Result<APIKey, APIKeyServiceError> {
-        let ctx = Self::ctx();
+        let ctx = Self::scope_ctx(scope);
         let db_id = decode_gql_id(id).ok_or_else(|| {
             APIKeyServiceError::UpdateProfiles(APIKeyServiceError::NotFound.to_string())
         })?;
@@ -835,7 +877,7 @@ fn core_quota_to_gql(q: CoreApiKeyQuota) -> APIKeyQuota {
 /// Lower the GraphQL profiles input into the Go on-disk JSON shape by building
 /// the canonical `conduit_core` objects and serializing them (guarantees the
 /// exact camelCase + omitempty layout Go persists and the read path parses).
-fn profiles_input_to_core(
+pub(crate) fn profiles_input_to_core(
     input: UpdateAPIKeyProfilesInput,
 ) -> Result<CoreApiKeyProfiles, APIKeyServiceError> {
     let profiles = input.profiles.unwrap_or_default();

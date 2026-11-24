@@ -302,7 +302,9 @@ fn decode_channel_ids(ids: &[async_graphql::ID]) -> ExtResult<Vec<i64>> {
     Ok(decoded)
 }
 
-fn convert_ops(inputs: Vec<OverrideOperationInput>) -> Vec<core_override::OverrideOperation> {
+pub(crate) fn convert_ops(
+    inputs: Vec<OverrideOperationInput>,
+) -> Vec<core_override::OverrideOperation> {
     inputs
         .into_iter()
         .map(|input| core_override::OverrideOperation {
@@ -322,7 +324,7 @@ fn convert_ops(inputs: Vec<OverrideOperationInput>) -> Vec<core_override::Overri
         .collect()
 }
 
-fn merged_update_ops(
+pub(crate) fn merged_update_ops(
     current: Vec<core_override::OverrideOperation>,
     replacement: Option<Vec<OverrideOperationInput>>,
     append: Option<Vec<OverrideOperationInput>>,
@@ -344,7 +346,7 @@ fn merged_update_ops(
     Some(result)
 }
 
-fn validate_header_ops(ops: &[core_override::OverrideOperation]) -> ExtResult<()> {
+pub(crate) fn validate_header_ops(ops: &[core_override::OverrideOperation]) -> ExtResult<()> {
     for (index, op) in ops.iter().enumerate() {
         match op.op.as_str() {
             "set" | "delete" if op.path.trim().is_empty() => {
@@ -368,7 +370,7 @@ fn validate_header_ops(ops: &[core_override::OverrideOperation]) -> ExtResult<()
     Ok(())
 }
 
-fn validate_body_ops(ops: &[core_override::OverrideOperation]) -> ExtResult<()> {
+pub(crate) fn validate_body_ops(ops: &[core_override::OverrideOperation]) -> ExtResult<()> {
     for (index, op) in ops.iter().enumerate() {
         match op.op.as_str() {
             "set" | "delete" | "array_append" | "array_prepend" | "array_insert"
@@ -445,7 +447,7 @@ fn existing_body_ops(
         .map_err(ChannelOverrideTemplateAdapter::error)
 }
 
-fn merge_header_ops(
+pub(crate) fn merge_header_ops(
     mut existing: Vec<core_override::OverrideOperation>,
     template: &[core_override::OverrideOperation],
 ) -> Vec<core_override::OverrideOperation> {
@@ -465,7 +467,7 @@ fn merge_header_ops(
     existing
 }
 
-fn merge_body_ops(
+pub(crate) fn merge_body_ops(
     mut existing: Vec<core_override::OverrideOperation>,
     template: &[core_override::OverrideOperation],
 ) -> Vec<core_override::OverrideOperation> {

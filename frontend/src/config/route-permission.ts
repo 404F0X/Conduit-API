@@ -1,5 +1,34 @@
 import type { ProductMode } from '@/features/product-experience/mode';
 
+export const GOVERNANCE_ROUTE_SCOPES = [
+  'read_commercialization',
+  'write_commercialization',
+  'read_channels',
+  'write_channels',
+  'read_users',
+  'write_users',
+  'read_roles',
+  'write_roles',
+  'read_api_keys',
+  'write_api_keys',
+  'read_projects',
+  'write_projects',
+  'read_groups',
+  'write_groups',
+  'read_settings',
+  'write_settings',
+  'read_billing',
+  'write_billing',
+  'grant_credit',
+  'read_subscriptions',
+  'write_subscriptions',
+  'read_data_storages',
+  'write_data_storages',
+  'review_changes',
+  'publish_changes',
+  'manage_governance',
+];
+
 // 路由权限配置
 export type ScopeLevel = 'system' | 'project' | 'any';
 
@@ -75,12 +104,12 @@ export const routeConfigs: RouteGroup[] = [
       },
       {
         path: '/change-sets',
-        requiredScopes: ['read_commercialization'],
+        requiredScopes: GOVERNANCE_ROUTE_SCOPES,
         mode: 'hidden',
       },
       {
         path: '/changelog',
-        requiredScopes: ['read_commercialization'],
+        requiredScopes: GOVERNANCE_ROUTE_SCOPES,
         mode: 'hidden',
       },
       {

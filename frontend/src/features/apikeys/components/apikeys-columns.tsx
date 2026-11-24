@@ -46,6 +46,7 @@ export const createColumns = (
   canWrite: boolean = true,
   canViewCreators: boolean = false
 ): ColumnDef<ApiKey>[] => [
+  { id: 'modelGroup', header: '模型组', cell: ({ row }) => <span>{row.original.modelGroupID || '待配置'}</span> },
   ...(canWrite
     ? [
         {

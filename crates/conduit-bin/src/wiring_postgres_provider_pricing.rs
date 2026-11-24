@@ -95,13 +95,38 @@ pub(crate) async fn record_pricing_failure(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PricingDiscoveryCommit {
+    pub snapshot_id: i64,
+    pub package: Option<crate::wiring_postgres_change_sets::packages::StagedPackage>,
+}
 pub(crate) async fn record_new_api_pricing_snapshot(
     pool: &PgPool,
     channel_id: i64,
     endpoint: &str,
     snapshot: &NewApiPricingSnapshot,
 ) -> Result<i64, String> {
-    let conversion = load_conversion_context(pool, channel_id).await;
+    record_new_api_pricing_snapshot_with_context(
+        pool,
+        channel_id,
+        endpoint,
+        snapshot,
+        &crate::wiring_postgres_change_sets::OperationContext::automatic(),
+        None,
+        None,
+    )
+    .await
+    .map(|c| c.snapshot_id)
+}
+pub(crate) async fn record_new_api_pricing_snapshot_with_context(
+    pool: &PgPool,
+    channel_id: i64,
+    endpoint: &str,
+    snapshot: &NewApiPricingSnapshot,
+    context: &crate::wiring_postgres_change_sets::OperationContext,
+    fence: Option<&crate::wiring_postgres_channel_discovery::DiscoveryFence>,
+    rebuild: Option<&conduit_admin_graphql::channel_discovery::RebuildObservedPricePackagesInput>,
+) -> Result<PricingDiscoveryCommit, String> {
     let group = snapshot.effective_groups.join(",");
     let normalized = json!({
         "pricingVersion": snapshot.pricing_version,
@@ -112,9 +137,22 @@ pub(crate) async fn record_new_api_pricing_snapshot(
     let payload_hash = sha256_hex(normalized.to_string().as_bytes());
 
     let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    if let Some(fence) = fence {
+        crate::wiring_postgres_channel_discovery::lock_fence(&mut tx, fence).await?;
+    }
     // A channel's observations form one linear history. Serialize writers so
     // concurrent manual/scheduled probes cannot both diff from the same head.
     lock_provider_pricing_channel(&mut tx, channel_id).await?;
+    sqlx::query("SELECT id FROM change_sets WHERE scope_type='channel' AND scope_id=$1 ORDER BY id FOR UPDATE").bind(channel_id.to_string()).fetch_all(&mut *tx).await.map_err(|e|e.to_string())?;
+    crate::wiring::lock_accounting_currency_price_writes(&mut tx)
+        .await
+        .map_err(|_| "accounting price lock unavailable".to_string())?;
+    sqlx::query("SELECT id FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE")
+        .bind(channel_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| "channel is unavailable".to_string())?;
+    let conversion = load_conversion_context(&mut tx, channel_id).await;
 
     let previous_snapshot_id = sqlx::query_scalar::<_, i64>(
         "SELECT id FROM provider_price_snapshots \
@@ -150,6 +188,7 @@ pub(crate) async fn record_new_api_pricing_snapshot(
     .map_err(|error| error.to_string())?;
 
     let mut current = BTreeMap::new();
+    let mut proposals = Vec::new();
     for model in &snapshot.models {
         let converted = conversion.convert(model);
         let row = comparable_row(model, &group, &conversion, &converted);
@@ -162,9 +201,9 @@ pub(crate) async fn record_new_api_pricing_snapshot(
               accounting_currency,accounting_input_per_million, \
               accounting_output_per_million,accounting_cache_read_per_million, \
               accounting_cache_write_per_million,accounting_flat_per_request, \
-              accounting_settings_version,conversion_error) \
+              accounting_settings_version,conversion_error,provenance) \
              VALUES($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10,$11,$12,$13,$14, \
-                    'CHANNEL_BALANCE_UNIT',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING id",
+                    'CHANNEL_BALANCE_UNIT',$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25) RETURNING id",
         )
         .bind(snapshot_id)
         .bind(channel_id)
@@ -200,10 +239,11 @@ pub(crate) async fn record_new_api_pricing_snapshot(
                 .and_then(|settings| i64::try_from(settings.version).ok()),
         )
         .bind(&converted.error)
+        .bind(Json(model.provenance.clone()))
         .fetch_one(&mut *tx)
         .await
         .map_err(|error| error.to_string())?;
-        stage_provider_price_change_set(
+        if let Some(proposal) = provider_price_proposal(
             &mut tx,
             channel_id,
             snapshot_id,
@@ -212,9 +252,11 @@ pub(crate) async fn record_new_api_pricing_snapshot(
             &group,
             &conversion,
             &converted,
-            snapshot.fetched_at,
         )
-        .await?;
+        .await?
+        {
+            proposals.push(proposal);
+        }
         current.insert(row.identity.clone(), row);
     }
 
@@ -258,22 +300,8 @@ pub(crate) async fn record_new_api_pricing_snapshot(
             _ => {}
         }
     }
-    let current_models = current
-        .keys()
-        .map(|identity| identity.model.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
     for (identity, old) in &previous {
         if !current.contains_key(identity) {
-            if !current_models.contains(identity.model.as_str()) {
-                supersede_pending_price_change_sets(
-                    &mut tx,
-                    channel_id,
-                    &identity.model,
-                    snapshot.fetched_at,
-                    None,
-                )
-                .await?;
-            }
             insert_event(
                 &mut tx,
                 channel_id,
@@ -290,14 +318,46 @@ pub(crate) async fn record_new_api_pricing_snapshot(
         }
     }
 
+    let package = crate::wiring_postgres_change_sets::packages::stage_observed(
+        &mut tx,
+        context,
+        "provider_price",
+        channel_id,
+        "Upstream procurement price discovery",
+        &snapshot_id.to_string(),
+        &proposals,
+        snapshot.fetched_at,
+    )
+    .await?;
+    let commit = PricingDiscoveryCommit {
+        snapshot_id,
+        package,
+    };
+    if let Some(fence) = fence {
+        crate::wiring_postgres_channel_discovery::finish_prices(
+            &mut tx, fence, channel_id, &commit, snapshot, rebuild,
+        )
+        .await?;
+    }
     tx.commit().await.map_err(|error| error.to_string())?;
-    Ok(snapshot_id)
+    Ok(commit)
 }
 
 fn proposed_model_price(
     model: &NewApiModelPricingSnapshot,
     converted: &ConvertedPrices,
 ) -> Result<ModelPrice, String> {
+    if model
+        .provenance
+        .get("issues")
+        .and_then(Value::as_array)
+        .is_some_and(|issues| issues.iter().any(|i| i["severity"] == "BLOCKING"))
+    {
+        return Err(model
+            .reason
+            .clone()
+            .unwrap_or_else(|| "upstream pricing evidence requires correction".into()));
+    }
     if let Some(error) = converted.error.as_ref() {
         return Err(error.clone());
     }
@@ -354,7 +414,7 @@ fn proposed_model_price(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn stage_provider_price_change_set(
+async fn provider_price_proposal(
     tx: &mut Transaction<'_, Postgres>,
     channel_id: i64,
     snapshot_id: i64,
@@ -363,8 +423,7 @@ async fn stage_provider_price_change_set(
     group: &str,
     conversion: &PriceConversionContext,
     converted: &ConvertedPrices,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), String> {
+) -> Result<Option<crate::wiring_postgres_change_sets::packages::Proposal>, String> {
     let proposed = proposed_model_price(model, converted);
     let proposed_json = proposed
         .as_ref()
@@ -398,182 +457,37 @@ async fn stage_provider_price_change_set(
     source.insert("groupName".into(), json!(group));
     source.insert("billingKind".into(), json!(model.billing_kind));
     source.insert("quality".into(), json!(normalize_quality(&model.quality)));
+    source.insert("source".into(), json!("observed"));
+    source.insert("provenance".into(), model.provenance.clone());
     let source_price_snapshot = Value::Object(source);
     if proposed_json.as_ref().is_some_and(|price| {
         current
             .as_ref()
-            .is_some_and(|(_, _, Json(current), _)| current == price)
+            .is_some_and(|(_, currency, Json(current), _)| {
+                current == price
+                    && conversion
+                        .accounting_settings
+                        .as_ref()
+                        .is_some_and(|s| currency == &s.accounting_currency)
+            })
     }) {
-        supersede_pending_price_change_sets(tx, channel_id, &model.model_id, now, None).await?;
-        return Ok(());
+        return Ok(None);
     }
-    if let Some(price) = proposed_json.as_ref() {
-        let duplicate_pending = sqlx::query_scalar::<_, i64>(
-            "SELECT cs.id FROM change_sets cs JOIN change_set_items item ON item.change_set_id=cs.id \
-             WHERE cs.kind='provider_price' AND cs.scope_type='channel' AND cs.scope_id=$1 \
-               AND cs.status='pending_review' AND item.item_key=$2 AND item.after_snapshot=$3 \
-               AND COALESCE(item.source_snapshot->>'source','observed')<>'manual' \
-               AND item.before_snapshot IS NOT DISTINCT FROM $4 ORDER BY cs.id DESC LIMIT 1",
-        )
-        .bind(channel_id.to_string())
-        .bind(&model.model_id)
-        .bind(Json(price))
-        .bind(base_price_snapshot.as_ref().map(Json))
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|error| error.to_string())?;
-        if let Some(duplicate_id) = duplicate_pending {
-            supersede_pending_price_change_sets(
-                tx,
-                channel_id,
-                &model.model_id,
-                now,
-                Some(duplicate_id),
-            )
-            .await?;
-            sqlx::query("UPDATE change_sets SET source_revision=$2,updated_at=$3 WHERE id=$1")
-                .bind(duplicate_id)
-                .bind(snapshot_id.to_string())
-                .bind(now)
-                .execute(&mut **tx)
-                .await
-                .map_err(|error| error.to_string())?;
-            sqlx::query(
-                "UPDATE change_set_items SET source_snapshot=$2,validation_error=NULL,updated_at=$3 \
-                 WHERE change_set_id=$1 AND item_key=$4",
-            )
-            .bind(duplicate_id)
-            .bind(Json(source_price_snapshot))
-            .bind(now)
-            .bind(&model.model_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| error.to_string())?;
-            insert_change_set_event(
-                tx,
-                duplicate_id,
-                "source_refreshed",
-                json!({"snapshotID": snapshot_id, "providerPriceRowID": provider_price_row_id}),
-                now,
-            )
-            .await?;
-            return Ok(());
-        }
-    }
-    supersede_pending_price_change_sets(tx, channel_id, &model.model_id, now, None).await?;
-
-    let validation_error = proposed.err();
-    let status = if validation_error.is_some() {
-        "invalid"
-    } else {
-        "pending_review"
-    };
-    let change_set_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO change_sets \
-         (kind,scope_type,scope_id,title,status,base_revision,source_revision,validation_error,\
-          submitted_at,created_at,updated_at) \
-         VALUES('provider_price','channel',$1,$2,$3,$4,$5,$6,\
-                CASE WHEN $3='pending_review' THEN $7 ELSE NULL END,$7,$7) RETURNING id",
-    )
-    .bind(channel_id.to_string())
-    .bind(format!("Provider price: {}", model.model_id))
-    .bind(status)
-    .bind(
-        current
-            .as_ref()
-            .map(|(_, _, _, reference_id)| reference_id.as_str())
-            .unwrap_or(""),
-    )
-    .bind(snapshot_id.to_string())
-    .bind(validation_error.as_deref())
-    .bind(now)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    sqlx::query(
-        "INSERT INTO change_set_items \
-         (change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,\
-          validation_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)",
-    )
-    .bind(change_set_id)
-    .bind(&model.model_id)
-    .bind(if current.is_some() {
-        "update"
-    } else {
-        "create"
-    })
-    .bind(base_price_snapshot.map(Json))
-    .bind(proposed_json.map(Json))
-    .bind(Json(source_price_snapshot))
-    .bind(validation_error)
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    insert_change_set_event(
-        tx,
-        change_set_id,
-        if status == "invalid" {
-            "invalid"
-        } else {
-            "submitted"
+    Ok(Some(
+        crate::wiring_postgres_change_sets::packages::Proposal {
+            key: model.model_id.clone(),
+            action: if current.is_some() {
+                "update"
+            } else {
+                "create"
+            }
+            .into(),
+            before: base_price_snapshot,
+            after: proposed_json,
+            source: source_price_snapshot,
+            error: proposed.err(),
         },
-        json!({"snapshotID": snapshot_id, "providerPriceRowID": provider_price_row_id}),
-        now,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn supersede_pending_price_change_sets(
-    tx: &mut Transaction<'_, Postgres>,
-    channel_id: i64,
-    upstream_model_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-    except_id: Option<i64>,
-) -> Result<(), String> {
-    sqlx::query(
-        "WITH superseded AS (\
-           UPDATE change_sets cs SET status='superseded',validation_error=NULL,reviewed_at=$3,\
-                  review_note='superseded by a newer provider observation',updated_at=$3 \
-           WHERE cs.kind='provider_price' AND cs.scope_type='channel' AND cs.scope_id=$1 \
-             AND cs.status IN ('pending_review','invalid') AND ($4::BIGINT IS NULL OR cs.id<>$4) \
-             AND EXISTS(SELECT 1 FROM change_set_items item WHERE item.change_set_id=cs.id \
-                        AND item.item_key=$2 \
-                        AND COALESCE(item.source_snapshot->>'source','observed')<>'manual') \
-           RETURNING cs.id) \
-         INSERT INTO change_set_events(change_set_id,event_type,actor_type,detail,created_at) \
-         SELECT id,'superseded','system','{}'::jsonb,$3 FROM superseded",
-    )
-    .bind(channel_id.to_string())
-    .bind(upstream_model_id)
-    .bind(now)
-    .bind(except_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-async fn insert_change_set_event(
-    tx: &mut Transaction<'_, Postgres>,
-    change_set_id: i64,
-    event_type: &str,
-    detail: Value,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), String> {
-    sqlx::query(
-        "INSERT INTO change_set_events(change_set_id,event_type,actor_type,detail,created_at) \
-         VALUES($1,$2,'system',$3,$4)",
-    )
-    .bind(change_set_id)
-    .bind(event_type)
-    .bind(Json(detail))
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    ))
 }
 
 pub(crate) async fn lock_provider_pricing_channel(
@@ -705,12 +619,15 @@ fn comparable_row(
     }
 }
 
-async fn load_conversion_context(pool: &PgPool, channel_id: i64) -> PriceConversionContext {
+async fn load_conversion_context(
+    tx: &mut Transaction<'_, Postgres>,
+    channel_id: i64,
+) -> PriceConversionContext {
     let channel_settings = sqlx::query_scalar::<_, Json<Value>>(
         "SELECT COALESCE(settings, '{}'::jsonb) FROM channels WHERE id=$1 AND deleted_at=0",
     )
     .bind(channel_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await;
     let (billing_currency, recharge_multiplier, mut errors) = match channel_settings {
         Ok(Some(Json(value))) => match serde_json::from_value::<ChannelSettings>(value) {
@@ -741,7 +658,7 @@ async fn load_conversion_context(pool: &PgPool, channel_id: i64) -> PriceConvers
         ),
     };
     let accounting_settings =
-        match crate::usage_charge_settler_postgres::load_accounting_settings(pool).await {
+        match crate::usage_charge_settler_postgres::load_accounting_settings_from(&mut **tx).await {
             Ok(settings) => Some(settings),
             Err(error) => {
                 errors.push(error);
@@ -874,6 +791,7 @@ mod tests {
 
     fn token_model() -> NewApiModelPricingSnapshot {
         NewApiModelPricingSnapshot {
+            provenance: json!({}),
             model_id: "model-a".into(),
             billing_kind: "token".into(),
             quality: "exact".into(),
@@ -943,6 +861,38 @@ mod tests {
         assert_eq!(error, "provider omitted price metadata");
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_test_observation(
+        tx: &mut Transaction<'_, Postgres>,
+        channel: i64,
+        snapshot: i64,
+        row: i64,
+        model: &NewApiModelPricingSnapshot,
+        group: &str,
+        conversion: &PriceConversionContext,
+        converted: &ConvertedPrices,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        let proposals = provider_price_proposal(
+            tx, channel, snapshot, row, model, group, conversion, converted,
+        )
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+        crate::wiring_postgres_change_sets::packages::stage_observed(
+            tx,
+            &crate::wiring_postgres_change_sets::OperationContext::automatic(),
+            "provider_price",
+            channel,
+            "Provider price observation",
+            &snapshot.to_string(),
+            &proposals,
+            now,
+        )
+        .await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn postgres_new_observations_refresh_or_supersede_price_change_sets_when_dsn_is_provided()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -961,7 +911,7 @@ mod tests {
         let mut tx = database.pool.begin().await?;
         let now = chrono::Utc::now();
 
-        stage_provider_price_change_set(
+        stage_test_observation(
             &mut tx,
             777,
             1001,
@@ -973,7 +923,7 @@ mod tests {
             now,
         )
         .await?;
-        stage_provider_price_change_set(
+        stage_test_observation(
             &mut tx,
             777,
             1002,
@@ -1018,7 +968,7 @@ mod tests {
         .await?;
 
         let invalid = ConvertedPrices::failed("upstream price is incomplete".into());
-        stage_provider_price_change_set(
+        stage_test_observation(
             &mut tx,
             777,
             1003,

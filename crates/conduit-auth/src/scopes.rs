@@ -44,6 +44,10 @@ pub mod slug {
     pub const GRANT_CREDIT: &str = "grant_credit";
     pub const READ_COMMERCIALIZATION: &str = "read_commercialization";
     pub const WRITE_COMMERCIALIZATION: &str = "write_commercialization";
+    pub const REVIEW_CHANGES: &str = "review_changes";
+    pub const PUBLISH_CHANGES: &str = "publish_changes";
+    pub const MANAGE_GOVERNANCE: &str = "manage_governance";
+    pub const EMERGENCY_REVOKE: &str = "emergency_revoke";
 }
 
 /// Direct role/user scope slugs. Derived encodings such as `system:role:*` and
@@ -78,6 +82,10 @@ pub const KNOWN_ROLE_SCOPE_SLUGS: &[&str] = &[
     slug::GRANT_CREDIT,
     slug::READ_COMMERCIALIZATION,
     slug::WRITE_COMMERCIALIZATION,
+    slug::REVIEW_CHANGES,
+    slug::PUBLISH_CHANGES,
+    slug::MANAGE_GOVERNANCE,
+    slug::EMERGENCY_REVOKE,
 ];
 
 /// Whether `scope` is a recognized direct role/user scope slug.

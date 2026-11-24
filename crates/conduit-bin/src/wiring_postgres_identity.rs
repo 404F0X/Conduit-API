@@ -278,6 +278,18 @@ impl PgMeMutationAdapter {
 #[async_trait]
 impl conduit_admin_graphql::me_ext::MeMutationServices for PgMeMutationAdapter {
     async fn update_me(&self, user_id: i64, input: UpdateMeInput) -> Result<User, MeMutationError> {
+        let mut tx =
+            self.pool.begin().await.map_err(|_| {
+                MeMutationError::UpdateUser("profile transaction unavailable".into())
+            })?;
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(MeMutationError::UpdateUser)?;
+        sqlx::query("SELECT set_config('conduit.self_user',$1,true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| MeMutationError::UpdateUser("profile authority unavailable".into()))?;
         sqlx::query(
             "UPDATE users SET \
                 first_name = COALESCE($1, first_name), \
@@ -292,10 +304,13 @@ impl conduit_admin_graphql::me_ext::MeMutationServices for PgMeMutationAdapter {
         .bind(&input.prefer_language)
         .bind(&input.avatar)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|error| MeMutationError::UpdateUser(error.to_string()))?;
 
+        tx.commit()
+            .await
+            .map_err(|_| MeMutationError::UpdateUser("profile commit failed".into()))?;
         self.load_gql_user(user_id)
             .await
             .map_err(MeMutationError::UpdateUser)
@@ -331,15 +346,37 @@ impl conduit_admin_graphql::me_ext::MeMutationServices for PgMeMutationAdapter {
             conduit_auth::password::DEFAULT_BCRYPT_COST,
         )
         .map_err(|error| MeMutationError::UpdatePassword(error.to_string()))?;
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(|_| {
+            MeMutationError::UpdatePassword("password transaction unavailable".into())
+        })?;
+        crate::wiring_governance::lock_policy(&mut tx)
+            .await
+            .map_err(MeMutationError::UpdatePassword)?;
+        sqlx::query("SELECT set_config('conduit.self_user',$1,true)")
+            .bind(user_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                MeMutationError::UpdatePassword("password authority unavailable".into())
+            })?;
+        let updated = sqlx::query(
             "UPDATE users SET password = $1, updated_at = now() \
-             WHERE id = $2 AND deleted_at = 0",
+             WHERE id = $2 AND password=$3 AND deleted_at = 0",
         )
         .bind(hashed)
         .bind(user_id)
-        .execute(&self.pool)
+        .bind(stored)
+        .execute(&mut *tx)
         .await
         .map_err(|error| MeMutationError::UpdatePassword(error.to_string()))?;
+        if updated.rows_affected() != 1 {
+            return Err(MeMutationError::UpdatePassword(
+                "password changed concurrently; retry with the current password".into(),
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|_| MeMutationError::UpdatePassword("password commit failed".into()))?;
         Ok(())
     }
 

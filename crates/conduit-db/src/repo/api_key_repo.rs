@@ -37,6 +37,7 @@ use crate::policy::ProjectAccess;
 /// Fields a caller may set when creating an api-key.
 #[derive(Debug, Clone)]
 pub struct CreateApiKeyInput {
+    pub model_group_id: Option<String>,
     pub id: String,
     pub user_id: Option<String>,
     pub project_id: String,
@@ -299,6 +300,22 @@ pub trait ApiKeyRepo: Send + Sync {
         input: UpdateApiKeyInput,
     ) -> RepoResult<ApiKeyRow>;
 
+    /// Validate and update the entire selection atomically. Implementations
+    /// without an atomic batch primitive must reject before changing any row.
+    async fn update_api_key_status_batch(
+        &self,
+        ctx: &RequestContext,
+        project_id: &str,
+        ids: &[String],
+        status: &str,
+    ) -> RepoResult<()> {
+        guard_project_access(ctx, project_id, ProjectAccess::Write)?;
+        let _ = (ids, status);
+        Err(RepoError::Database(
+            "atomic API-key batch is unavailable".into(),
+        ))
+    }
+
     async fn rotate_api_key_unchecked(
         &self,
         ctx: &RequestContext,
@@ -429,6 +446,35 @@ impl InMemoryApiKeyRepo {
 
 #[async_trait]
 impl ApiKeyRepo for InMemoryApiKeyRepo {
+    async fn update_api_key_status_batch(
+        &self,
+        ctx: &RequestContext,
+        project_id: &str,
+        ids: &[String],
+        status: &str,
+    ) -> RepoResult<()> {
+        guard_project_access(ctx, project_id, ProjectAccess::Write)?;
+        let mut rows = self
+            .rows
+            .lock()
+            .map_err(|_| RepoError::LockPoisoned("api_key repo"))?;
+        if ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len()
+            || ids.iter().any(|id| {
+                rows.get(id).is_none_or(|r| {
+                    !is_live(r) || r.project_id != project_id || r.key_type == "noauth"
+                })
+            })
+        {
+            return Err(RepoError::NotFound("api_key batch"));
+        }
+        let now = Utc::now();
+        for id in ids {
+            let row = rows.get_mut(id).ok_or(RepoError::NotFound("api_key"))?;
+            row.status = status.into();
+            row.updated_at = now;
+        }
+        Ok(())
+    }
     async fn create_api_key_unchecked(
         &self,
         _ctx: &RequestContext,
@@ -741,6 +787,7 @@ mod tests {
         created_at: &str,
     ) -> CreateApiKeyInput {
         CreateApiKeyInput {
+            model_group_id: None,
             id: id.into(),
             user_id: Some("u-1".into()),
             project_id: project.into(),

@@ -1482,6 +1482,9 @@ pub struct OAuthCredentialsInput {
 /// `input ChannelCredentialsInput` — snapshot lines 226-231.
 #[derive(Debug, Clone, Default, PartialEq, Eq, InputObject)]
 pub struct ChannelCredentialsInput {
+    pub new_api_pat: Option<String>,
+    #[graphql(name = "newApiUserID")]
+    pub new_api_user_id: Option<String>,
     pub api_key: Option<String>,
     pub api_keys: Option<Vec<String>>,
     pub gcp: Option<GcpCredentialInput>,
@@ -1491,6 +1494,8 @@ pub struct ChannelCredentialsInput {
 /// `input CreateChannelInput` — snapshot lines 2896-2924 (ent-generated).
 #[derive(Debug, Clone, PartialEq, Eq, InputObject)]
 pub struct CreateChannelInput {
+    #[graphql(name = "operationID")]
+    pub operation_id: Option<async_graphql::ID>,
     #[graphql(name = "type")]
     pub channel_type: ChannelType,
     #[graphql(name = "baseURL")]
@@ -2099,6 +2104,7 @@ pub trait ChannelMutationServices: Send + Sync {
     /// async channel reload.
     async fn create_channel(
         &self,
+        actor_user_id: Option<i64>,
         input: CreateChannelInput,
     ) -> Result<Channel, ChannelServiceError>;
 
@@ -2268,6 +2274,7 @@ mod tests {
     impl ChannelMutationServices for InMemoryChannelService {
         async fn create_channel(
             &self,
+            _actor_user_id: Option<i64>,
             input: CreateChannelInput,
         ) -> Result<Channel, ChannelServiceError> {
             let mut guard = lock(&self.channels);

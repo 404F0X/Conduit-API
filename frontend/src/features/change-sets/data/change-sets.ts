@@ -1,8 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 
-export type ChangeSetKind = 'PROVIDER_PRICE' | 'MODEL_MAPPING' | 'RETAIL_PRICE';
-export type ChangeSetStatus = 'DRAFT' | 'PENDING_REVIEW' | 'APPLIED' | 'REJECTED' | 'SUPERSEDED' | 'INVALID';
+export const CHANGE_SET_KINDS = [
+  'PROVIDER_PRICE',
+  'MODEL_MAPPING',
+  'RETAIL_PRICE',
+  'CHANNEL_CONFIGURATION',
+  'MODEL_SUPPLY',
+  'GROUP_ACCESS',
+  'IDENTITY_ACCESS',
+  'PROJECT_CONFIGURATION',
+  'SYSTEM_CONFIGURATION',
+  'PROJECT_CREDIT',
+] as const;
+export type ChangeSetKind = (typeof CHANGE_SET_KINDS)[number];
+export type ChangeSetStatus = 'DRAFT' | 'PENDING_REVIEW' | 'APPROVED' | 'APPLIED' | 'REJECTED' | 'SUPERSEDED' | 'INVALID';
 
 export type ChangeSetItem = {
   id: string;
@@ -50,111 +62,235 @@ export type ChangeSet = {
   events: ChangeSetEvent[];
 };
 
-const CHANGE_SETS = `
-  query ChangeSets($kind: ChangeSetKind, $status: ChangeSetStatus, $scopeType: String, $scopeID: ID, $limit: Int) {
-    changeSets(kind: $kind, status: $status, scopeType: $scopeType, scopeID: $scopeID, limit: $limit) {
-      id kind scopeType scopeID title status baseRevision sourceRevision
-      appliedTargetType appliedTargetID validationError reviewNote
-      createdBy submittedBy reviewedBy
-      createdAt updatedAt submittedAt reviewedAt appliedAt
-      items { id itemKey action beforeSnapshot afterSnapshot sourceSnapshot validationError createdAt updatedAt }
-      events { id eventType actorType actorID detail createdAt }
-    }
-  }
-`;
-
-const CREATE_RETAIL = `
-  mutation CreateRetailPriceChangeSet($priceBookID: ID!) {
-    createRetailPriceChangeSet(priceBookID: $priceBookID) {
-      id kind scopeType scopeID title status baseRevision sourceRevision
-      createdAt updatedAt
-      items { id itemKey action beforeSnapshot afterSnapshot sourceSnapshot validationError createdAt updatedAt }
-      events { id eventType actorType actorID detail createdAt }
-    }
-  }
-`;
-
-const SAVE_RETAIL_ITEM = `
-  mutation SaveRetailPriceChangeSetItem($input: SaveRetailPriceChangeSetItemInput!) {
-    saveRetailPriceChangeSetItem(input: $input) { id itemKey action afterSnapshot }
-  }
-`;
-
-const SUBMIT = `mutation SubmitChangeSet($id: ID!) { submitChangeSet(id: $id) { id status } }`;
-const APPROVE = `mutation ApproveChangeSet($id: ID!, $reviewNote: String) { approveChangeSet(id: $id, reviewNote: $reviewNote) { id status } }`;
-const REJECT = `mutation RejectChangeSet($id: ID!, $reviewNote: String) { rejectChangeSet(id: $id, reviewNote: $reviewNote) { id status } }`;
-
-type ChangeSetFilters = {
+export type PackageSummary = Omit<ChangeSet, 'items' | 'events' | 'baseRevision' | 'sourceRevision'> & {
+  operationID?: string | null;
+  revision: string;
+  scopeName?: string | null;
+  actorName?: string | null;
+  sourceOrigin: string;
+  itemCount: number;
+  createCount: number;
+  updateCount: number;
+  deleteCount: number;
+  invalidItemCount: number;
+  validationState: string;
+};
+export type PackageIssue = {
+  itemKey?: string | null;
+  field?: string | null;
+  code: string;
+  message: string;
+  severity: 'BLOCKING' | 'WARNING';
+};
+export type PackageDetail = {
+  summary: PackageSummary;
+  baseRevision: string;
+  sourceRevision: string;
+  currentBaseRevision?: string | null;
+  reviewNote?: string | null;
+  issues: PackageIssue[];
+  availableActions: string[];
+  appliedTargets: Array<{ type: string; id: string; itemKey: string }>;
+};
+export type ItemSummary = {
+  id: string;
+  itemKey: string;
+  action: string;
+  modelLabel?: string | null;
+  changedFieldCount: number;
+  validationState: string;
+  issues: PackageIssue[];
+};
+export type ItemDetail = { item: ChangeSetItem; currentSnapshot?: unknown | null; currentMatchesBefore: boolean; issues: PackageIssue[] };
+export type Connection<T> = {
+  edges: Array<{ cursor: string; node: T }>;
+  pageInfo: { hasNextPage: boolean; hasPreviousPage: boolean; startCursor?: string | null; endCursor?: string | null };
+  totalCount: number;
+};
+export type PackageFilter = {
   kind?: ChangeSetKind;
-  status?: ChangeSetStatus;
   statuses?: readonly ChangeSetStatus[];
   scopeType?: string;
   scopeID?: string;
-  limit?: number;
-  enabled?: boolean;
+  search?: string;
 };
-
-export function useChangeSets(filters: ChangeSetFilters = {}) {
-  const { enabled = true, statuses, ...variables } = filters;
+export type ProviderPriceInput = { modelId: string; currencyCode: string; price: unknown };
+export type ProviderEditBase = {
+  channelID: string;
+  revision: string;
+  accountingCurrency: string;
+  accountingSettingsVersion: string;
+  prices: Array<{ id: string; modelID: string; currencyCode: string; price: unknown }>;
+};
+export type RetailEditBase = {
+  priceBookID: string;
+  revision: string;
+  accountingCurrency: string;
+  accountingSettingsVersion: string;
+  prices: Array<{ publicModelID: string; price: unknown }>;
+};
+export const SUMMARY_FIELDS = `id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError`;
+const ISSUE_FIELDS = `itemKey field code message severity`;
+export const DETAIL_FIELDS = `summary { ${SUMMARY_FIELDS} } baseRevision sourceRevision currentBaseRevision reviewNote issues { ${ISSUE_FIELDS} } availableActions appliedTargets { type id itemKey }`;
+const PAGE_FIELDS = `hasNextPage hasPreviousPage startCursor endCursor`;
+export async function getPackage(id: string) {
+  return graphqlRequest<{ changeSet: PackageDetail | null }>(`query ChangeSet($id: ID!) { changeSet(id: $id) { ${DETAIL_FIELDS} } }`, {
+    id,
+  }).then((d) => d.changeSet);
+}
+export async function getPackageByOperation(operationID: string, kind: ChangeSetKind, scopeType: string, scopeID: string) {
+  return graphqlRequest<{ changeSetByOperation: PackageDetail | null }>(
+    `query PackageByOperation($operationID: ID!, $kind: ChangeSetKind!, $scopeType: String!, $scopeID: ID!) { changeSetByOperation(operationID: $operationID, kind: $kind, scopeType: $scopeType, scopeID: $scopeID) { ${DETAIL_FIELDS} } }`,
+    { operationID, kind, scopeType, scopeID }
+  ).then((d) => d.changeSetByOperation);
+}
+export function usePackage(id?: string) {
+  return useQuery({ queryKey: ['changeSet', id], queryFn: () => getPackage(id!), enabled: Boolean(id), staleTime: 0 });
+}
+export async function getPackagePage(filter: PackageFilter, after?: string) {
+  return graphqlRequest<{ changeSets: Connection<PackageSummary> & { statusCounts: Array<{ status: ChangeSetStatus; count: number }> } }>(
+    `query ChangeSets($filter: ChangeSetFilterInput, $after: Cursor, $first: Int!) { changeSets(filter: $filter, after: $after, first: $first) { edges { cursor node { ${SUMMARY_FIELDS} } } pageInfo { ${PAGE_FIELDS} } totalCount statusCounts { status count } } }`,
+    { filter, after, first: 20 }
+  ).then((d) => d.changeSets);
+}
+export function usePackagePage(filter: PackageFilter, after?: string) {
+  return useQuery({ queryKey: ['changeSets', filter, after], queryFn: () => getPackagePage(filter, after) });
+}
+export async function getItemPage(id: string, after?: string, search?: string, problemsOnly = false) {
+  return graphqlRequest<{ changeSetItems: Connection<ItemSummary> }>(
+    `query PackageItems($id: ID!, $after: Cursor, $search: String, $problemsOnly: Boolean!) { changeSetItems(changeSetID: $id, after: $after, first: 50, search: $search, problemsOnly: $problemsOnly) { edges { cursor node { id itemKey action modelLabel changedFieldCount validationState issues { ${ISSUE_FIELDS} } } } pageInfo { ${PAGE_FIELDS} } totalCount } }`,
+    { id, after, search, problemsOnly }
+  ).then((d) => d.changeSetItems);
+}
+export async function getItem(id: string, itemID: string) {
+  return graphqlRequest<{ changeSetItem: ItemDetail | null }>(
+    `query PackageItem($id: ID!, $itemID: ID!) { changeSetItem(changeSetID: $id, itemID: $itemID) { item { id itemKey action beforeSnapshot afterSnapshot sourceSnapshot validationError createdAt updatedAt } currentSnapshot currentMatchesBefore issues { ${ISSUE_FIELDS} } } }`,
+    { id, itemID }
+  ).then((d) => d.changeSetItem);
+}
+export async function getEventPage(id: string, after?: string) {
+  return graphqlRequest<{ changeSetEvents: Connection<ChangeSetEvent> }>(
+    `query PackageEvents($id: ID!, $after: Cursor) { changeSetEvents(changeSetID: $id, after: $after, first: 50) { edges { cursor node { id eventType actorType actorID detail createdAt } } pageInfo { ${PAGE_FIELDS} } totalCount } }`,
+    { id, after }
+  ).then((d) => d.changeSetEvents);
+}
+export async function getProviderBase(channelID: string) {
+  return graphqlRequest<{ providerPriceEditBase: ProviderEditBase }>(
+    `query ProviderEditBase($channelID: ID!) { providerPriceEditBase(channelID: $channelID) { channelID revision accountingCurrency accountingSettingsVersion prices { id modelID currencyCode price { items { itemCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } promptWriteCacheVariants { variantCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } } } } } } }`,
+    { channelID }
+  ).then((d) => d.providerPriceEditBase);
+}
+export async function getRetailBase(priceBookID: string) {
+  return graphqlRequest<{ retailPriceEditBase: RetailEditBase }>(
+    `query RetailEditBase($priceBookID: ID!) { retailPriceEditBase(priceBookID: $priceBookID) { priceBookID revision accountingCurrency accountingSettingsVersion prices { publicModelID price } } }`,
+    { priceBookID }
+  ).then((d) => d.retailPriceEditBase);
+}
+export type Correction = { sourceChangeSetID: string; expectedSourcePackageRevision: string; excludedItemKeys: string[]; reason: string };
+export type CreateProviderResult = { operationID: string; outcome: 'CREATED' | 'NO_CHANGE'; changeSetDetail?: PackageDetail | null };
+export async function findProviderOperation(operationID: string) {
+  return graphqlRequest<{ providerPriceChangeSetOperation: CreateProviderResult | null }>(
+    `query ProviderOperation($operationID: ID!) { providerPriceChangeSetOperation(operationID: $operationID) { operationID outcome changeSetDetail { ${DETAIL_FIELDS} } } }`,
+    { operationID }
+  ).then((d) => d.providerPriceChangeSetOperation);
+}
+export async function createProviderPackage(input: {
+  channelID: string;
+  operationID: string;
+  expectedBaseRevision: string;
+  input: ProviderPriceInput[];
+  correction?: Correction;
+}) {
+  return graphqlRequest<{ createProviderPriceChangeSet: CreateProviderResult }>(
+    `mutation CreateProviderPriceChangeSet($channelID: ID!, $operationID: ID!, $expectedBaseRevision: String!, $input: [SaveChannelModelPriceInput!]!, $correction: ChangeSetCorrectionInput) { createProviderPriceChangeSet(channelID: $channelID, operationID: $operationID, expectedBaseRevision: $expectedBaseRevision, input: $input, correction: $correction) { operationID outcome changeSetDetail { ${DETAIL_FIELDS} } } }`,
+    input
+  ).then((d) => d.createProviderPriceChangeSet);
+}
+export async function saveProviderPackage(input: { id: string; expectedRevision: string; input: ProviderPriceInput[] }) {
+  return graphqlRequest<{ saveProviderPriceChangeSet: PackageDetail }>(
+    `mutation SaveProviderPackage($id: ID!, $expectedRevision: String!, $input: [SaveChannelModelPriceInput!]!) { saveProviderPriceChangeSet(id: $id, expectedRevision: $expectedRevision, input: $input) { ${DETAIL_FIELDS} } }`,
+    input
+  ).then((d) => d.saveProviderPriceChangeSet);
+}
+export async function transitionPackage(
+  action: 'submit' | 'approve' | 'publish' | 'reject',
+  input: { id: string; expectedRevision: string; reviewNote?: string }
+) {
+  const field = action === 'approve' ? 'reviewChangeSet' : `${action}ChangeSet`;
+  const withNote = action === 'approve' || action === 'reject';
+  return graphqlRequest<Record<string, PackageDetail>>(
+    `mutation PackageTransition($id: ID!, $expectedRevision: String!${withNote ? ', $reviewNote: String' : ''}) { ${field}(id: $id, expectedRevision: $expectedRevision${withNote ? ', reviewNote: $reviewNote' : ''}) { ${DETAIL_FIELDS} } }`,
+    input
+  ).then((d) => d[field]);
+}
+export async function createRetailPackage(input: { priceBookID: string; operationID: string; expectedBaseRevision: string }) {
+  return graphqlRequest<{ createRetailPriceChangeSet: PackageDetail }>(
+    `mutation CreateRetailPriceChangeSet($priceBookID: ID!, $operationID: ID!, $expectedBaseRevision: String!) { createRetailPriceChangeSet(priceBookID: $priceBookID, operationID: $operationID, expectedBaseRevision: $expectedBaseRevision) { ${DETAIL_FIELDS} } }`,
+    input
+  ).then((d) => d.createRetailPriceChangeSet);
+}
+export async function saveRetailItem(input: { changeSetID: string; expectedRevision: string; publicModelID: string; price: unknown }) {
+  return graphqlRequest<{ saveRetailPriceChangeSetItem: { item: ChangeSetItem; changeSetRevision: string } }>(
+    `mutation SaveRetailPriceChangeSetItem($input: SaveRetailPriceChangeSetItemInput!) { saveRetailPriceChangeSetItem(input: $input) { item { id itemKey action beforeSnapshot afterSnapshot sourceSnapshot validationError createdAt updatedAt } changeSetRevision } }`,
+    { input }
+  ).then((d) => d.saveRetailPriceChangeSetItem);
+}
+export function useChangeSets(
+  filters: {
+    kind?: ChangeSetKind;
+    status?: ChangeSetStatus;
+    statuses?: readonly ChangeSetStatus[];
+    scopeType?: string;
+    scopeID?: string;
+    limit?: number;
+    enabled?: boolean;
+  } = {}
+) {
+  const { enabled = true, status, statuses, kind, scopeType, scopeID } = filters;
   return useQuery({
-    queryKey: ['changeSets', { ...variables, statuses }],
-    queryFn: async () => {
-      if (!statuses?.length) {
-        return graphqlRequest<{ changeSets: ChangeSet[] }>(CHANGE_SETS, variables).then((data) => data.changeSets);
-      }
-
-      const batches = await Promise.all(
-        [...new Set(statuses)].map((status) =>
-          graphqlRequest<{ changeSets: ChangeSet[] }>(CHANGE_SETS, { ...variables, status }).then((data) => data.changeSets)
-        )
-      );
-      return [...new Map(batches.flat().map((changeSet) => [changeSet.id, changeSet])).values()];
-    },
+    queryKey: ['changeSets', kind, statuses, status, scopeType, scopeID],
+    queryFn: () =>
+      getPackagePage({ kind, statuses: statuses ?? (status ? [status] : undefined), scopeType, scopeID }).then((d) =>
+        d.edges.map((e) => e.node)
+      ),
     enabled,
   });
 }
-
-function useChangeSetMutation<T>(mutationFn: (input: T) => Promise<unknown>) {
+function useChangeSetMutation<T, R>(mutationFn: (input: T) => Promise<R>) {
   const client = useQueryClient();
   return useMutation({
     mutationFn,
-    // Approval may atomically mark a stale change set as superseded and still
-    // return an operation error. Refresh on both success and failure so the
-    // review queue always reflects the committed state.
     onSettled: () =>
-      Promise.all([
-        client.invalidateQueries({ queryKey: ['changeSets'] }),
-        client.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
-        client.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
-        client.invalidateQueries({ queryKey: ['models'] }),
-        client.invalidateQueries({ queryKey: ['channels'] }),
-        client.invalidateQueries({ queryKey: ['generalSettings'] }),
-      ]),
+      Promise.all(
+        [
+          'changeSets',
+          'changeSet',
+          'packageItems',
+          'packageItem',
+          'packageEvents',
+          'commercialization-catalog',
+          'upstream-supply-catalog',
+          'models',
+          'channels',
+          'generalSettings',
+        ].map((key) => client.invalidateQueries({ queryKey: [key] }))
+      ),
   });
 }
-
 export function useCreateRetailPriceChangeSet() {
-  return useChangeSetMutation((priceBookID: string) =>
-    graphqlRequest<{ createRetailPriceChangeSet: ChangeSet }>(CREATE_RETAIL, { priceBookID }).then(
-      (data) => data.createRetailPriceChangeSet
-    )
-  );
+  return useChangeSetMutation(createRetailPackage);
 }
-
 export function useSaveRetailPriceChangeSetItem() {
-  return useChangeSetMutation((input: { changeSetID: string; publicModelID: string; price: unknown }) =>
-    graphqlRequest(SAVE_RETAIL_ITEM, { input })
+  return useChangeSetMutation(saveRetailItem);
+}
+export function useSubmitChangeSet() {
+  return useChangeSetMutation((input: { id: string; expectedRevision: string }) => transitionPackage('submit', input));
+}
+export function useApproveChangeSet() {
+  return useChangeSetMutation((input: { id: string; expectedRevision: string; reviewNote?: string }) =>
+    transitionPackage('approve', input)
   );
 }
-
-export function useSubmitChangeSet() {
-  return useChangeSetMutation((id: string) => graphqlRequest(SUBMIT, { id }));
-}
-
-export function useApproveChangeSet() {
-  return useChangeSetMutation((input: { id: string; reviewNote?: string }) => graphqlRequest(APPROVE, input));
-}
-
 export function useRejectChangeSet() {
-  return useChangeSetMutation((input: { id: string; reviewNote?: string }) => graphqlRequest(REJECT, input));
+  return useChangeSetMutation((input: { id: string; expectedRevision: string; reviewNote?: string }) => transitionPackage('reject', input));
 }

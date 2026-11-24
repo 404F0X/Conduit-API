@@ -61,6 +61,7 @@ pub(crate) struct NewApiQuotaSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewApiModelPricingSnapshot {
+    pub provenance: Value,
     pub model_id: String,
     pub billing_kind: String,
     pub quality: String,
@@ -151,6 +152,16 @@ impl PgProviderQuotaAdapter {
     }
 
     pub(crate) async fn check(&self, force: bool) -> Result<(), String> {
+        if !force
+            && !crate::wiring_product_experience::feature_enabled(
+                &self.pool,
+                "automatic_provider_observation",
+            )
+            .await?
+        {
+            tracing::debug!("automatic provider observation skipped: FEATURE_DISABLED");
+            return Ok(());
+        }
         let rows = sqlx::query_as::<_, ProviderChannelRow>(
             "SELECT c.id,c.name,c.\"type\" AS channel_type,c.base_url,c.credentials,c.settings, \
                     q.probe_adapter,q.probe_verified_at \
@@ -179,6 +190,7 @@ impl PgProviderQuotaAdapter {
             let Some(provider) = provider else { continue };
             let key = format!("provider-quota:{}", row.id);
             crate::maintenance_claim::run(&self.pool, &key, false, async {
+                if !force && !crate::wiring_product_experience::feature_enabled(&self.pool,"automatic_provider_observation").await? {return Ok(());}
                 let due: bool = sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM provider_quota_status WHERE channel_id=$1 AND deleted_at=0 AND next_check_at>now())").bind(row.id).fetch_one(&self.pool).await.map_err(|e| e.to_string())?;
                 if !force && !due { return Ok(()); }
                 match self.check_one(&row, &provider).await {
@@ -354,8 +366,25 @@ impl PgProviderQuotaAdapter {
     ) -> Result<NewApiPricingSnapshot, String> {
         let row = self.load_channel(channel_id).await?;
         let result = self
-            .probe_new_api_pricing_row(&row, supplied_pat, supplied_user_id)
+            .fetch_new_api_pricing_row(&row, supplied_pat, supplied_user_id)
             .await;
+        if let Ok(snapshot) = &result {
+            if let Some(pat) = supplied_pat {
+                let pat = normalize_new_api_pat(pat)?;
+                let user_id = supplied_user_id
+                    .map(normalize_new_api_user_id)
+                    .transpose()?;
+                self.save_new_api_account_credentials(channel_id, &pat, user_id)
+                    .await?;
+            }
+            crate::wiring_postgres_provider_pricing::record_new_api_pricing_snapshot(
+                &self.pool,
+                channel_id,
+                &snapshot.source_endpoint,
+                snapshot,
+            )
+            .await?;
+        }
         if let Err(error) = &result
             && let Err(db_error) = crate::wiring_postgres_provider_pricing::record_pricing_failure(
                 &self.pool,
@@ -379,7 +408,15 @@ impl PgProviderQuotaAdapter {
         result
     }
 
-    async fn probe_new_api_pricing_row(
+    pub(crate) async fn fetch_pricing(
+        &self,
+        channel_id: i64,
+    ) -> Result<NewApiPricingSnapshot, String> {
+        let row = self.load_channel(channel_id).await?;
+        self.fetch_new_api_pricing_row(&row, None, None).await
+    }
+
+    async fn fetch_new_api_pricing_row(
         &self,
         row: &ProviderChannelRow,
         supplied_pat: Option<&str>,
@@ -403,9 +440,7 @@ impl PgProviderQuotaAdapter {
         let pat = submitted_pat
             .as_deref()
             .or(stored_pat.as_deref())
-            .ok_or_else(|| {
-                "此渠道尚未保存 NEW API 用户 PAT；请填写 PAT 后再探测实际采购价".to_string()
-            })?;
+            .unwrap_or_default();
         let user_id = submitted_user_id.or(stored_user_id);
 
         let credentials: ChannelCredentials = serde_json::from_value(row.credentials.0.clone())
@@ -415,12 +450,30 @@ impl PgProviderQuotaAdapter {
             .filter(|keys| !keys.is_empty())
             .ok_or_else(|| "channel has no API keys".to_string())?;
 
-        let account = self
-            .get_new_api_json(&format!("{root}/api/user/self"), pat, user_id)
+        let status = self
+            .client
+            .get(format!("{root}/api/status"))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
             .await
-            .map_err(|error| format!("NEW API 用户 PAT 验证失败：{error}"))?;
-        if account["success"].as_bool() != Some(true) || !account["data"].is_object() {
-            return Err("NEW API 用户 PAT 验证失败：上游未返回用户账户数据".to_string());
+            .map_err(|_| "NEWAPI status request failed".to_string())?
+            .error_for_status()
+            .map_err(|_| "NEWAPI status unavailable".to_string())?
+            .json::<Value>()
+            .await
+            .map_err(|_| "NEWAPI status is not JSON".to_string())?;
+        let metadata = status.get("data").cloned().unwrap_or(Value::Null);
+        let account = if pat.is_empty() {
+            json!({"success":true,"data":{}})
+        } else {
+            self.get_new_api_json(&format!("{root}/api/user/self"), pat, user_id)
+                .await
+                .map_err(|_| "NEWAPI PAT verification failed".to_string())?
+        };
+        if !pat.is_empty()
+            && (account["success"].as_bool() != Some(true) || !account["data"].is_object())
+        {
+            return Err("NEWAPI PAT verification failed".into());
         }
         let account_group = account["data"]["group"]
             .as_str()
@@ -444,6 +497,12 @@ impl PgProviderQuotaAdapter {
             }
         }
 
+        if priced_payload.is_none() && pat.is_empty() {
+            return Err(
+                "PAT_REQUIRED: public pricing is unavailable; provide account access explicitly"
+                    .into(),
+            );
+        }
         if priced_payload.is_none() {
             let (source_endpoint, model_ids, mut catalog_warnings) = self
                 .fetch_unpriced_model_catalog(&root, pat, user_id, &keys[0])
@@ -469,6 +528,7 @@ impl PgProviderQuotaAdapter {
                 models: model_ids
                     .into_iter()
                     .map(|model_id| NewApiModelPricingSnapshot {
+                        provenance: json!({}),
                         model_id,
                         billing_kind: "unknown".into(),
                         quality: "unavailable".into(),
@@ -482,23 +542,16 @@ impl PgProviderQuotaAdapter {
                     })
                     .collect(),
             };
-            if submitted_pat.is_some() {
-                self.save_new_api_account_credentials(row.id, pat, user_id)
-                    .await?;
-            }
-            crate::wiring_postgres_provider_pricing::record_new_api_pricing_snapshot(
-                &self.pool,
-                row.id,
-                &source_endpoint,
-                &snapshot,
-            )
-            .await?;
             return Ok(snapshot);
         }
         let (pricing, source_endpoint) = priced_payload
             .ok_or_else(|| "upstream pricing payload became unavailable".to_string())?;
 
-        let token_rows = self.list_new_api_tokens(&root, pat, user_id).await?;
+        let token_rows = if pat.is_empty() {
+            Vec::new()
+        } else {
+            self.list_new_api_tokens(&root, pat, user_id).await?
+        };
         let mut effective_groups = BTreeSet::new();
         let mut matched_key_count = 0usize;
         let mut group_resolution_estimated = false;
@@ -553,6 +606,15 @@ impl PgProviderQuotaAdapter {
         warnings.sort();
         warnings.dedup();
 
+        if effective_groups.is_empty() {
+            if let Some(groups) = pricing["usable_group"].as_object() {
+                effective_groups.extend(groups.keys().cloned());
+            }
+            if effective_groups.is_empty() {
+                effective_groups.insert("default".into());
+            }
+            group_resolution_estimated = true;
+        }
         let group_ratios = pricing["group_ratio"]
             .as_object()
             .map(|object| {
@@ -564,24 +626,32 @@ impl PgProviderQuotaAdapter {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let models = pricing["data"]
+        let items = pricing["data"]
             .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|item| {
-                normalize_new_api_pricing_item(
-                    item,
-                    &effective_groups,
-                    &group_ratios,
-                    group_resolution_estimated,
-                )
-            })
-            .collect();
-
-        if submitted_pat.is_some() {
-            self.save_new_api_account_credentials(row.id, pat, user_id)
-                .await?;
+            .ok_or("NEWAPI pricing response is incomplete")?;
+        let mut seen = BTreeSet::new();
+        let mut models = Vec::new();
+        for item in items {
+            let model = normalize_new_api_pricing_item_with_contract(
+                item,
+                &effective_groups,
+                &group_ratios,
+                group_resolution_estimated,
+                &metadata,
+                matched_key_count == keys.len() && !pat.is_empty(),
+                matched_key_count,
+                keys.len(),
+            )
+            .ok_or("NEWAPI pricing contains a row without a model identity")?;
+            if !seen.insert(model.model_id.clone()) {
+                return Err(
+                    "NEWAPI pricing contains duplicate model rows; observation was not committed"
+                        .into(),
+                );
+            }
+            models.push(model);
         }
+
         let snapshot = NewApiPricingSnapshot {
             fetched_at: Utc::now(),
             source_endpoint: source_endpoint.clone(),
@@ -593,13 +663,6 @@ impl PgProviderQuotaAdapter {
             warnings,
             models,
         };
-        crate::wiring_postgres_provider_pricing::record_new_api_pricing_snapshot(
-            &self.pool,
-            row.id,
-            &source_endpoint,
-            &snapshot,
-        )
-        .await?;
         Ok(snapshot)
     }
 
@@ -912,7 +975,7 @@ impl PgProviderQuotaAdapter {
         let mut request = self
             .client
             .get(url)
-            .timeout(provider_quota_checker_http_timeout());
+            .timeout(std::time::Duration::from_secs(10));
         if !key.is_empty() {
             request = request.bearer_auth(key);
         }
@@ -1353,14 +1416,14 @@ impl QuotaMutationServices for PgProviderQuotaAdapter {
         new_api_user_id: Option<&str>,
     ) -> Result<NewApiPricingProbeResult, QuotaMutationError> {
         let channel_id = numeric_id_from_gql(channel_id).map_err(QuotaMutationError::Check)?;
-        let snapshot = PgProviderQuotaAdapter::probe_new_api_pricing(
-            self,
-            channel_id,
-            new_api_pat,
-            new_api_user_id,
-        )
-        .await
-        .map_err(QuotaMutationError::Check)?;
+        let row = self
+            .load_channel(channel_id)
+            .await
+            .map_err(QuotaMutationError::Check)?;
+        let snapshot = self
+            .fetch_new_api_pricing_row(&row, new_api_pat, new_api_user_id)
+            .await
+            .map_err(QuotaMutationError::Check)?;
         let decimal = |value: Option<Decimal>| value.map(|value| value.normalize().to_string());
         Ok(NewApiPricingProbeResult {
             source: "new_api_pricing".to_string(),
@@ -1376,6 +1439,7 @@ impl QuotaMutationServices for PgProviderQuotaAdapter {
                 .models
                 .into_iter()
                 .map(|model| NewApiModelPricingProbe {
+                    provenance: async_graphql::Json(model.provenance),
                     model_id: model.model_id,
                     billing_kind: model.billing_kind,
                     quality: model.quality,
@@ -1582,7 +1646,7 @@ async fn response_error(response: reqwest::Response) -> String {
     }
 }
 
-fn new_api_root(base_url: &str) -> Result<String, String> {
+pub(crate) fn new_api_root(base_url: &str) -> Result<String, String> {
     let mut url = reqwest::Url::parse(base_url.trim())
         .map_err(|error| format!("invalid channel base URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -1657,6 +1721,7 @@ fn normalize_new_api_pricing_item(
         .collect::<BTreeSet<_>>();
     let Some(group_ratio) = ratios.iter().next_back().copied() else {
         return Some(NewApiModelPricingSnapshot {
+            provenance: json!({}),
             model_id,
             billing_kind: "unsupported".into(),
             quality: "unsupported".into(),
@@ -1671,6 +1736,7 @@ fn normalize_new_api_pricing_item(
     };
     if item["billing_mode"].as_str() == Some("tiered_expr") {
         return Some(NewApiModelPricingSnapshot {
+            provenance: json!({}),
             model_id,
             billing_kind: "tiered_expr".into(),
             quality: "unsupported".into(),
@@ -1694,6 +1760,7 @@ fn normalize_new_api_pricing_item(
     if item["quota_type"].as_i64() == Some(1) {
         let flat = json_decimal(&item["model_price"]).map(|value| value * group_ratio);
         return Some(NewApiModelPricingSnapshot {
+            provenance: json!({}),
             model_id,
             billing_kind: "per_request".into(),
             quality,
@@ -1708,6 +1775,7 @@ fn normalize_new_api_pricing_item(
     }
     let Some(model_ratio) = json_decimal(&item["model_ratio"]) else {
         return Some(NewApiModelPricingSnapshot {
+            provenance: json!({}),
             model_id,
             billing_kind: "token".into(),
             quality: "unsupported".into(),
@@ -1725,6 +1793,7 @@ fn normalize_new_api_pricing_item(
     let cache_read = json_decimal(&item["cache_ratio"]).map(|ratio| input * ratio);
     let cache_write = json_decimal(&item["create_cache_ratio"]).map(|ratio| input * ratio);
     Some(NewApiModelPricingSnapshot {
+        provenance: json!({}),
         model_id,
         billing_kind: "token".into(),
         quality,
@@ -1736,6 +1805,102 @@ fn normalize_new_api_pricing_item(
         flat_per_request: None,
         reason,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normalize_new_api_pricing_item_with_contract(
+    item: &Value,
+    groups: &BTreeSet<String>,
+    ratios: &BTreeMap<String, Decimal>,
+    estimated: bool,
+    metadata: &Value,
+    group_verified: bool,
+    matched: usize,
+    key_count: usize,
+) -> Option<NewApiModelPricingSnapshot> {
+    let mut model = normalize_new_api_pricing_item(item, groups, ratios, estimated)?;
+    let version = metadata["version"].as_str().unwrap_or_default();
+    let quota = json_decimal(&metadata["quota_per_unit"]);
+    let unit = metadata["quota_display_type"].as_str().unwrap_or_default();
+    let supported =
+        version.starts_with("c2b7a9a") && quota.is_some_and(|v| v > Decimal::ZERO) && unit == "USD";
+    let mut issues = Vec::new();
+    if !supported {
+        issues.push(json!({"code":"UPSTREAM_CONTRACT_UNKNOWN","severity":"BLOCKING","message":"fixed legacy version, quota unit and USD convention must be verified"}));
+    }
+    if !group_verified {
+        issues.push(json!({"code":"GROUP_UNVERIFIED","severity":"BLOCKING","message":"channel KEY groups are not verified; public reference prices are not procurement prices"}));
+    }
+    let raw_mode = item["billing_mode"].as_str().unwrap_or_default();
+    let legacy = raw_mode.is_empty() || raw_mode == "legacy";
+    if !legacy {
+        issues.push(json!({"code":"BILLING_MODE_UNSUPPORTED","severity":"BLOCKING","message":"expression or unknown billing mode cannot be converted to a constant price"}));
+        model.billing_kind = if raw_mode == "tiered_expr" {
+            "tiered_expr"
+        } else {
+            "unsupported"
+        }
+        .into();
+        model.quality = "unsupported".into();
+    }
+    let mut read_origin = "UNKNOWN";
+    let mut write_origin = "UNKNOWN";
+    if supported && legacy {
+        if item["quota_type"].as_i64() == Some(0) {
+            if let (Some(ratio), Some(group), Some(quota)) =
+                (json_decimal(&item["model_ratio"]), model.group_ratio, quota)
+            {
+                let input = ratio * Decimal::from(1_000_000u32) / quota * group;
+                model.input_per_million = Some(input.normalize());
+                model.output_per_million =
+                    json_decimal(&item["completion_ratio"]).map(|v| (input * v).normalize());
+                let cache = if item.get("cache_ratio").is_none_or(Value::is_null) {
+                    read_origin = "VERSION_DEFAULT";
+                    Some(Decimal::ONE)
+                } else {
+                    read_origin = "EXPLICIT";
+                    json_decimal(&item["cache_ratio"])
+                };
+                let write = if item.get("create_cache_ratio").is_none_or(Value::is_null) {
+                    write_origin = "VERSION_DEFAULT";
+                    Some(Decimal::new(125, 2))
+                } else {
+                    write_origin = "EXPLICIT";
+                    json_decimal(&item["create_cache_ratio"])
+                };
+                model.cache_read_per_million = cache.map(|v| (input * v).normalize());
+                model.cache_write_per_million = write.map(|v| (input * v).normalize());
+                if ratio == Decimal::new(375, 1) {
+                    model.quality = "estimated".into();
+                    issues.push(json!({"code":"MODEL_RATIO_PROVENANCE_UNKNOWN","severity":"WARNING","message":"37.5 is publicly configured or fallback; exact provenance is not available"}));
+                }
+            }
+        } else if item["quota_type"].as_i64() != Some(1) {
+            issues.push(json!({"code":"QUOTA_TYPE_UNKNOWN","severity":"BLOCKING","message":"quota_type is not a supported token/per-request convention"}));
+        }
+    }
+    if !supported || !legacy {
+        model.input_per_million = None;
+        model.output_per_million = None;
+        model.cache_read_per_million = None;
+        model.cache_write_per_million = None;
+        model.flat_per_request = None;
+    }
+    if issues.iter().any(|i| i["severity"] == "BLOCKING") {
+        model.reason = Some(
+            issues
+                .iter()
+                .filter(|i| i["severity"] == "BLOCKING")
+                .filter_map(|i| i["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+        if model.quality == "exact" {
+            model.quality = "estimated".into();
+        }
+    }
+    model.provenance = json!({"upstreamVersion":version,"adapterVersion":"new_api_legacy_c2b7a9a_v1","quotaPerUnit":quota.map(|v|v.to_string()),"quotaDisplayType":unit,"referenceCurrency":"USD","referenceUnit":if model.billing_kind=="per_request"{"PER_REQUEST"}else{"PER_MILLION_TOKENS"},"referenceAmounts":{"input":model.input_per_million.map(|v|v.to_string()),"output":model.output_per_million.map(|v|v.to_string()),"cacheRead":model.cache_read_per_million.map(|v|v.to_string()),"cacheWrite":model.cache_write_per_million.map(|v|v.to_string()),"flat":model.flat_per_request.map(|v|v.to_string())},"sourceUnit":"CHANNEL_BALANCE_UNIT","fieldOrigins":{"modelRatio":"PUBLIC_RATIO_OR_FALLBACK","completionRatio":if item.get("completion_ratio").is_some(){"EXPLICIT"}else{"UNKNOWN"},"cacheRead":read_origin,"cacheWrite":write_origin},"groupEvidence":{"resolution":if !group_verified{"UNVERIFIED"}else if estimated||groups.len()>1{"MULTI_GROUP_CONSERVATIVE"}else{"VERIFIED"},"matchedKeyCount":matched,"keyCount":key_count,"groups":groups,"ratios":ratios.iter().map(|(k,v)|(k.clone(),v.to_string())).collect::<BTreeMap<_,_>>()},"issues":issues});
+    Some(model)
 }
 
 fn new_api_pricing_shape(payload: &Value) -> bool {
@@ -2207,7 +2372,7 @@ mod tests {
             .and(path("/api/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "success": true,
-                "data": {"quota_per_unit": 20, "quota_display_type": "USD"}
+                "data": {"version":"c2b7a9a-test", "quota_per_unit": 20, "quota_display_type": "USD"}
             })))
             .mount(server)
             .await;
@@ -2337,6 +2502,80 @@ mod tests {
         assert_eq!(price.quality, "exact");
         assert_eq!(price.input_per_million, Some(Decimal::from(4)));
         assert_eq!(price.output_per_million, Some(Decimal::from(12)));
+    }
+
+    #[test]
+    fn r3_fixed_new_api_contract_preserves_zero_and_blocks_unknown_modes() {
+        let groups = BTreeSet::from(["default".into()]);
+        let ratios = BTreeMap::from([("default".into(), Decimal::ONE)]);
+        let metadata =
+            json!({"version":"c2b7a9a-test","quota_per_unit":500000,"quota_display_type":"USD"});
+        let mut item = json!({"model_name":"m","quota_type":0,"model_ratio":2,"completion_ratio":3,"billing_mode":"legacy","enable_groups":["all"]});
+        let defaults = normalize_new_api_pricing_item_with_contract(
+            &item, &groups, &ratios, false, &metadata, true, 1, 1,
+        )
+        .unwrap();
+        assert_eq!(defaults.input_per_million, Some(Decimal::from(4)));
+        assert_eq!(defaults.cache_read_per_million, Some(Decimal::from(4)));
+        assert_eq!(defaults.cache_write_per_million, Some(Decimal::from(5)));
+        assert_eq!(
+            defaults.provenance["fieldOrigins"]["cacheRead"],
+            "VERSION_DEFAULT"
+        );
+        item["cache_ratio"] = json!(0);
+        item["create_cache_ratio"] = json!(0);
+        let zero = normalize_new_api_pricing_item_with_contract(
+            &item, &groups, &ratios, false, &metadata, true, 1, 1,
+        )
+        .unwrap();
+        assert_eq!(zero.cache_read_per_million, Some(Decimal::ZERO));
+        assert_eq!(zero.cache_write_per_million, Some(Decimal::ZERO));
+        assert_eq!(zero.provenance["fieldOrigins"]["cacheWrite"], "EXPLICIT");
+        let unknown = normalize_new_api_pricing_item_with_contract(
+            &item,
+            &groups,
+            &ratios,
+            false,
+            &json!({"version":"other","quota_per_unit":500000,"quota_display_type":"USD"}),
+            true,
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(unknown.input_per_million.is_none());
+        assert!(unknown.flat_per_request.is_none());
+        item["billing_mode"] = json!("tiered_expr");
+        let expression = normalize_new_api_pricing_item_with_contract(
+            &item, &groups, &ratios, false, &metadata, true, 1, 1,
+        )
+        .unwrap();
+        assert_eq!(expression.quality, "unsupported");
+        assert!(expression.input_per_million.is_none());
+        assert!(expression.cache_read_per_million.is_none());
+        item["billing_mode"] = json!("legacy");
+        item["model_ratio"] = json!(37.5);
+        let uncertain = normalize_new_api_pricing_item_with_contract(
+            &item, &groups, &ratios, false, &metadata, false, 0, 1,
+        )
+        .unwrap();
+        assert_eq!(uncertain.quality, "estimated");
+        assert_eq!(uncertain.input_per_million, Some(Decimal::from(75)));
+        assert!(
+            uncertain.provenance["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["code"] == "GROUP_UNVERIFIED" && v["severity"] == "BLOCKING")
+        );
+        assert!(
+            uncertain.provenance["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |v| v["code"] == "MODEL_RATIO_PROVENANCE_UNKNOWN" && v["severity"] == "WARNING"
+                )
+        );
     }
 
     #[tokio::test]
@@ -2493,8 +2732,22 @@ mod tests {
         assert_eq!(first_price.models[0].quality, "exact");
         assert_eq!(
             first_price.models[0].input_per_million.as_deref(),
-            Some("2")
+            Some("50000")
         );
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM provider_price_snapshots WHERE channel_id=$1"
+            )
+            .bind(priced_channel)
+            .fetch_one(&pool)
+            .await?,
+            0,
+            "the UI pricing preview must not persist observations or stage packages"
+        );
+        adapter
+            .probe_new_api_pricing(priced_channel, Some("user-pat"), Some("19301"))
+            .await?;
 
         sqlx::query("UPDATE channels SET base_url=$1,updated_at=now() WHERE id=$2")
             .bind(format!("{}/v1", second.uri()))
@@ -2510,20 +2763,50 @@ mod tests {
         .await?;
         assert_eq!(
             second_price.models[0].input_per_million.as_deref(),
-            Some("4")
+            Some("100000")
         );
+
+        adapter
+            .probe_new_api_pricing(priced_channel, None, None)
+            .await?;
 
         let pat_error = QuotaMutationServices::probe_new_api_pricing(
             &adapter,
             &priced_channel.to_string(),
             Some("invalid-pat"),
-            None,
+            Some("19301"),
         )
         .await
         .expect_err("invalid PAT must fail");
         let pat_error = pat_error.to_string();
-        assert!(pat_error.contains("401 Unauthorized"));
-        assert!(pat_error.contains("AUTH_UNAUTHORIZED"));
+        assert!(pat_error.contains("NEWAPI PAT verification failed"));
+        assert!(!pat_error.contains("invalid-pat"));
+        assert!(!pat_error.contains("Access token is invalid"));
+
+        assert!(
+            adapter
+                .probe_new_api_pricing(priced_channel, Some("invalid-pat"), Some("19301"))
+                .await
+                .is_err()
+        );
+        let requests = second.received_requests().await.expect("mock requests");
+        let rejected_pat_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .is_some_and(|value| value == "Bearer invalid-pat")
+            })
+            .collect();
+        assert_eq!(rejected_pat_requests.len(), 2);
+        assert!(rejected_pat_requests.iter().all(|request| {
+            request.url.path() == "/api/user/self"
+                && request
+                    .headers
+                    .get("new-api-user")
+                    .is_some_and(|value| value == "19301")
+        }));
 
         let status = ProviderQuotaStatusServices::provider_quota_status_for_channel(
             &adapter,

@@ -15,16 +15,14 @@ export function isProductModeAllowed(mode: ProductMode, allowedModes?: ProductMo
 }
 
 export function resolveProjectSelection(
-  mode: ProductMode,
+  _mode: ProductMode,
   selectedProjectId: string | null,
   availableProjectIds: string[],
   primaryProjectId: string | null
 ): string | null {
-  if (mode === 'SIMPLE') {
-    return primaryProjectId && availableProjectIds.includes(primaryProjectId) ? primaryProjectId : null;
-  }
   if (selectedProjectId && availableProjectIds.includes(selectedProjectId)) {
     return selectedProjectId;
   }
-  return availableProjectIds[0] ?? null;
+  if (primaryProjectId && availableProjectIds.includes(primaryProjectId)) return primaryProjectId;
+  return availableProjectIds.length === 1 ? availableProjectIds[0] : null;
 }

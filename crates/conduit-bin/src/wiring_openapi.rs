@@ -588,15 +588,36 @@ impl OpenApiApiKeyService for OpenApiApiKeyAdapter {
             )
         })?;
 
-        let ctx = repo_ctx();
+        let caller_key = self
+            .api_key_repo
+            .find_api_key_by_id(
+                &repo_ctx(),
+                caller.id.as_deref().ok_or_else(api_key_not_found)?,
+            )
+            .await
+            .map_err(repo_error_to_axon)?
+            .ok_or_else(api_key_not_found)?;
+        if caller_key.project_id != project {
+            return Err(api_key_not_found());
+        }
+        let user_id = caller_key.user_id.ok_or_else(|| {
+            ConduitError::new(
+                ErrorKind::Forbidden,
+                "service account requires an explicit billing member before it can delegate a key",
+            )
+        })?;
+        let mut ctx = repo_ctx();
+        ctx.project_id = Some(project.clone());
+        if caller_key.key_type == "user" {
+            if let Some(principal) = ctx.policy.principal.as_mut() {
+                principal.subject_id = user_id.clone();
+            }
+        }
         let now = Utc::now().to_rfc3339();
         let input = RepoCreateApiKeyInput {
+            model_group_id: None,
             id: String::new(), // PostgreSQL owns the generated PK
-            // Go stamps `owner.UserID`; the OpenAPI principal does not carry the
-            // owning user id (only the api-key id + project), so the row is
-            // created with `user_id = NULL` — same documented divergence as
-            // `wiring_apikey::create_api_key`.
-            user_id: None,
+            user_id: Some(user_id),
             project_id: project,
             name: name.to_string(),
             key: generated,
@@ -685,7 +706,17 @@ impl OpenApiApiKeyService for OpenApiApiKeyAdapter {
         require_scope(caller, slug::WRITE_API_KEYS)?;
         let project = caller_project(caller)?;
 
-        let ctx = repo_ctx();
+        let mut ctx = repo_ctx();
+        ctx.project_id = Some(project.clone());
+        let calling_key = self
+            .api_key_repo
+            .find_api_key_by_id(&ctx, caller.id.as_deref().ok_or_else(api_key_not_found)?)
+            .await
+            .map_err(repo_error_to_axon)?
+            .ok_or_else(api_key_not_found)?;
+        if calling_key.project_id != project {
+            return Err(api_key_not_found());
+        }
         let existing = self
             .api_key_repo
             .find_api_key_by_id(&ctx, &id.to_string())
@@ -694,6 +725,13 @@ impl OpenApiApiKeyService for OpenApiApiKeyAdapter {
         match &existing {
             Some(row) if row.project_id == project => {}
             _ => return Err(api_key_not_found()),
+        }
+        if let (Some(actor), Some(target)) = (calling_key.user_id.as_ref(), existing.as_ref()) {
+            if target.user_id.as_ref() == Some(actor) {
+                if let Some(p) = ctx.policy.principal.as_mut() {
+                    p.subject_id = actor.clone();
+                }
+            }
         }
 
         // Lower the GraphQL profiles into the canonical Go on-disk JSON shape by
@@ -829,7 +867,17 @@ impl OpenApiApiKeyProfileTemplateService for OpenApiProfileTemplateAdapter {
         require_scope(caller, slug::WRITE_API_KEYS)?;
         let project = caller_project(caller)?;
 
-        let ctx = repo_ctx();
+        let mut ctx = repo_ctx();
+        ctx.project_id = Some(project.clone());
+        let calling_key = self
+            .api_key_repo
+            .find_api_key_by_id(&ctx, caller.id.as_deref().ok_or_else(api_key_not_found)?)
+            .await
+            .map_err(repo_error_to_axon)?
+            .ok_or_else(api_key_not_found)?;
+        if calling_key.project_id != project {
+            return Err(api_key_not_found());
+        }
 
         // Load template (project-scoped by the repo) → NotFound otherwise.
         let template = self
@@ -849,6 +897,13 @@ impl OpenApiApiKeyProfileTemplateService for OpenApiProfileTemplateAdapter {
             Some(row) if row.project_id == project => row,
             _ => return Err(api_key_not_found()),
         };
+        if let Some(actor) = calling_key.user_id.as_ref() {
+            if key_row.user_id.as_ref() == Some(actor) {
+                if let Some(p) = ctx.policy.principal.as_mut() {
+                    p.subject_id = actor.clone();
+                }
+            }
+        }
 
         // Same-project guard verbatim from `LoadTemplate` (go:196-198) — kept
         // even though the project filters above already imply it.

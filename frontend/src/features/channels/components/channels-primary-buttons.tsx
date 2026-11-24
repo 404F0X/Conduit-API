@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
 import { IconPlus, IconUpload, IconArrowsSort, IconSettings, IconScale, IconDots } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
@@ -5,14 +6,24 @@ import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { PermissionGuard } from '@/components/permission-guard';
 import { useChannels } from '../context/channels-context';
+import { NewApiCreateDialog } from './new-api-discovery';
 
 export function ChannelsPrimaryButtons() {
   const { t } = useTranslation();
+  const [newApiOpen, setNewApiOpen] = useState(false);
   const navigate = useNavigate();
   const { setOpen } = useChannels();
 
   return (
     <div className='w-full lg:w-auto'>
+      <div className='mb-2 flex justify-end'>
+        <PermissionGuard requiredSystemScope='write_channels'>
+          <Button variant='outline' size='sm' onClick={() => setNewApiOpen(true)}>
+            {t('eventPackages.newApi')}
+          </Button>
+        </PermissionGuard>
+      </div>
+      <NewApiCreateDialog key={newApiOpen ? 'open' : 'closed'} open={newApiOpen} onOpenChange={setNewApiOpen} />
       <div className='hidden flex-wrap justify-end gap-2 xl:flex'>
         <PermissionGuard requiredSystemScope='read_settings'>
           {/* Load Balancing Strategy - navigate to system retry configuration */}

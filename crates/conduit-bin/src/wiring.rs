@@ -627,9 +627,10 @@ async fn build_postgres_core_services(
     let admin_price_repo: Arc<dyn ChannelModelPriceRepo> =
         Arc::new(conduit_db::PgChannelModelPriceRepo::new(pool.clone()));
     let model_crud = Arc::new(ModelCrudAdapter::new(admin_model_repo.clone()));
-    let channel_crud = Arc::new(crate::wiring_channel_crud::ChannelCrudAdapter::new(
-        admin_channel_repo.clone(),
-    ));
+    let channel_crud = Arc::new(
+        crate::wiring_channel_crud::ChannelCrudAdapter::new(admin_channel_repo.clone())
+            .with_pool(pool.clone()),
+    );
     let api_key_crud = Arc::new(crate::wiring_apikey::ApiKeyServiceAdapter::new(
         Arc::new(conduit_db::PgApiKeyRepo::new(pool.clone())),
         "conduit".into(),
@@ -730,8 +731,10 @@ async fn build_postgres_core_services(
             admin_data_storage_repo,
         ),
     );
-    let product_experience: Arc<dyn ProductExperienceServices> =
-        Arc::new(crate::wiring_product_experience::ProductExperienceAdapter::new(system.clone()));
+    let product_experience: Arc<dyn ProductExperienceServices> = Arc::new(
+        crate::wiring_product_experience::ProductExperienceAdapter::new(system.clone())
+            .with_pool(pool.clone()),
+    );
     let user_admin = Arc::new(
         crate::wiring_postgres_user::PostgresUserServiceAdapter::with_bcrypt_cost(
             pool.clone(),
@@ -772,6 +775,8 @@ async fn build_postgres_core_services(
     > = Arc::new(
         crate::wiring_postgres_commercialization::PgCommercializationAdapter::new(pool.clone()),
     );
+    let price_formulas: Arc<dyn conduit_admin_graphql::price_formula::PriceFormulaServices> =
+        Arc::new(crate::wiring_postgres_price_formula::PgPriceFormulaAdapter::new(pool.clone()));
     let simple_groups: Arc<dyn conduit_admin_graphql::simple_group::SimpleGroupServices> =
         Arc::new(crate::wiring_postgres_simple_group::PgSimpleGroupAdapter::new(pool.clone()));
     let dashboard: Arc<dyn DashboardServices> = Arc::new(
@@ -822,7 +827,14 @@ async fn build_postgres_core_services(
     let provider_quota_status: Arc<dyn ProviderQuotaStatusServices> = provider_quota_adapter;
     let (thread_query, trace_query, node_resolver) =
         crate::wiring_postgres_observability::build_postgres_observability_services(pool.clone());
+    let payments = Arc::new(
+        crate::wiring_postgres_payments::PgPaymentAdapter::from_config(
+            pool.clone(),
+            config.payments.clone(),
+        )?,
+    );
     let admin_schema = conduit_admin_graphql::admin_schema_builder()
+        .data(payments.clone() as Arc<dyn conduit_admin_graphql::payments::PaymentServices>)
         .extension(conduit_admin_graphql::authz_extension::ScopeAuthExtensionFactory)
         .data(Arc::new(PgSettingsWriteLock(
             sqlx::postgres::PgPoolOptions::new()
@@ -864,6 +876,11 @@ async fn build_postgres_core_services(
                 pool.clone(),
             )) as Arc<dyn conduit_admin_graphql::change_set::ChangeSetServices>,
         )
+        .data(
+            Arc::new(crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(
+                pool.clone(),
+            )) as Arc<dyn conduit_admin_graphql::change_package::ChangePackageServices>,
+        )
         .data(model_crud.clone() as Arc<dyn ModelQueryServices>)
         .data(model_crud as Arc<dyn ModelMutationServices>)
         .data(Arc::new(ModelAssociationCountAdapter::new(
@@ -891,6 +908,12 @@ async fn build_postgres_core_services(
         .data(channel_bulk_mutation)
         .data(system_settings_ext)
         .data(product_experience)
+        .data(Arc::new(crate::wiring_governance::PgGovernanceAdapter::new(
+            pool.clone(),
+        ))
+            as Arc<
+                dyn conduit_admin_graphql::governance::GovernanceServices,
+            >)
         .data(user_query)
         .data(user_mutation)
         .data(billing)
@@ -900,7 +923,12 @@ async fn build_postgres_core_services(
         .data(role_mutation)
         .data(model_market)
         .data(commercialization)
+        .data(price_formulas)
         .data(simple_groups)
+        .data(Arc::new(crate::wiring_postgres_groups::PgGroupAdapter::new(
+            pool.clone(),
+        ))
+            as Arc<dyn conduit_admin_graphql::groups::GroupServices>)
         .data(dashboard)
         .data(system_operations)
         .data(operations)
@@ -908,6 +936,16 @@ async fn build_postgres_core_services(
         .data(quota_query)
         .data(quota_mutation)
         .data(provider_quota_status)
+        .data(Arc::new(
+            crate::wiring_postgres_channel_discovery::PgChannelDiscoveryAdapter::new(
+                pool.clone(),
+                system.clone(),
+                config.provider_quota.enabled,
+            ),
+        )
+            as Arc<
+                dyn conduit_admin_graphql::channel_discovery::ChannelDiscoveryServices,
+            >)
         .data(request_query)
         .data(usage_query)
         .data(data_storage)
@@ -945,6 +983,9 @@ async fn build_postgres_core_services(
             pool.clone(),
         ));
     let services = AppServices::new()
+        .with_payment_notification_service(
+            payments as Arc<dyn conduit_http::payment_handlers::PaymentNotificationService>,
+        )
         .with_readiness_service(Arc::new(
             crate::wiring_route_health::PgReadinessService::new(pool.clone()),
         ))
@@ -1023,7 +1064,7 @@ async fn build_postgres_proxy_service(
         crate::usage_charge_settler_postgres::PgUsageChargeSettler::new_supervised(
             pool.clone(),
             tasks.clone(),
-        )
+        )?
         .with_reservation_ttl(
             llm_request_timeout.saturating_add(std::time::Duration::from_secs(300)),
         ),
@@ -1059,7 +1100,9 @@ async fn build_postgres_proxy_service(
             ),
     );
     let request_repo: Arc<dyn conduit_db::repo::request_repo::RequestRepo> = Arc::new(
-        conduit_db::PgRequestRepo::new(pool.clone()).with_activity_timeout(llm_request_timeout),
+        conduit_db::PgRequestRepo::new(pool.clone())
+            .with_activity_timeout(llm_request_timeout)
+            .with_metering_protection(),
     );
     let execution_repo: Arc<dyn conduit_db::repo::request_execution_repo::RequestExecutionRepo> =
         Arc::new(
@@ -1143,6 +1186,7 @@ async fn build_postgres_proxy_service(
                     conduit_orchestrator::middlewares::PersistRequestMiddleware::new(
                         request_repo.clone(),
                     )
+                    .with_required_persistence()
                     .with_artifact_storage(request_artifact_storage.clone()),
                 ),
                 Arc::new(conduit_orchestrator::middlewares::OverrideRequestMiddleware),
@@ -2472,8 +2516,6 @@ impl gql_system::SystemSettingsServices for SystemSettingsAdapter {
             accounting_rate_version: u64::try_from(chrono::Utc::now().timestamp_millis())
                 .unwrap_or(1),
         };
-        let encoded = serde_json::to_string(&wire)
-            .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
 
         // Currency identity and every price write share this transaction lock.
         // The current-value read, price-existence recheck, and settings upsert
@@ -2483,63 +2525,14 @@ impl gql_system::SystemSettingsServices for SystemSettingsAdapter {
             .begin()
             .await
             .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
-        lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
-        let current = sqlx::query_scalar::<_, String>(
-            "SELECT value FROM systems WHERE key=$1 AND deleted_at=0 LIMIT 1",
-        )
-        .bind(system_key::GENERAL_SETTINGS)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?
-        .map(|value| serde_json::from_str::<WireGeneralSettings>(&value))
-        .transpose()
-        .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?
-        .unwrap_or_default();
-        if !current
-            .accounting_currency_code
-            .trim()
-            .eq_ignore_ascii_case(&requested_currency)
-            && postgres_accounting_currency_locked_in_tx(&mut tx)
-                .await
-                .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?
-        {
-            return Err(SSErr::UpdateGeneralSettings(
-                "accounting currency cannot be changed after any retail or channel procurement price exists; rebuild pricing data before changing it"
-                    .to_string(),
-            ));
-        }
-        let before_snapshot = serde_json::to_value(&current)
-            .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
-        let after_snapshot = serde_json::to_value(&wire)
-            .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
-        let now = chrono::Utc::now();
-        sqlx::query(
-            "INSERT INTO systems (key,value,created_at,updated_at) VALUES ($1,$2,$3,$3) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value, \
-             updated_at=excluded.updated_at,deleted_at=0",
-        )
-        .bind(system_key::GENERAL_SETTINGS)
-        .bind(encoded)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
-        insert_pricing_change_audit(
+        apply_general_setting_in_tx(
             &mut tx,
             actor_user_id,
-            "update_accounting_settings",
-            "accounting_settings",
-            system_key::GENERAL_SETTINGS,
-            Some(before_snapshot),
-            Some(after_snapshot),
-            &requested_currency,
-            wire.accounting_rate_version,
-            &uuid::Uuid::new_v4().to_string(),
+            serde_json::to_value(&wire)
+                .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?,
         )
         .await
-        .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
+        .map_err(SSErr::UpdateGeneralSettings)?;
         tx.commit()
             .await
             .map_err(|err| SSErr::UpdateGeneralSettings(err.to_string()))?;
@@ -3007,7 +3000,7 @@ fn model_status_str_to_channel_status(status: &str) -> GqlChannelStatus {
 
 /// GraphQL `ModelStatus` enum → domain wire literal (`enabled`/`disabled`/
 /// `archived`). Matches the `#[graphql(name = ...)]` spellings on the enum.
-fn model_status_to_wire(status: GqlModelStatus) -> &'static str {
+pub(crate) fn model_status_to_wire(status: GqlModelStatus) -> &'static str {
     match status {
         GqlModelStatus::Enabled => "enabled",
         GqlModelStatus::Disabled => "disabled",
@@ -3401,7 +3394,7 @@ pub(crate) fn generate_reference_id() -> String {
 /// output object. The `price` JSON column is deserialized through the core
 /// `objects::ModelPrice` (zero-filling missing fields, mirroring Ent's
 /// value-type marshalling) and then mapped to the GraphQL price object.
-fn price_row_to_gql(
+pub(crate) fn price_row_to_gql(
     row: conduit_db::row::ChannelModelPriceRow,
 ) -> Result<conduit_admin_graphql::model_ext::ChannelModelPrice, ModelExtError> {
     use conduit_admin_graphql::model_ext::ChannelModelPrice as GqlChannelModelPrice;
@@ -3850,28 +3843,16 @@ impl ModelExtServices for ModelExtAdapter {
         channel_id: async_graphql::ID,
         input: Vec<conduit_admin_graphql::model_ext::SaveChannelModelPriceInput>,
     ) -> Result<Vec<conduit_admin_graphql::model_ext::ChannelModelPrice>, ModelExtError> {
-        // Compatibility entry point: manual edits now stage a unified draft.
-        // Formal prices are only changed by ChangeSet approval.
-        let staging_actor_user_id = actor_user_id.ok_or_else(|| {
+        let actor = actor_user_id.ok_or_else(|| {
             ModelExtError::SaveChannelModelPrices("authentication required".into())
         })?;
-        let change_sets =
-            crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(self.pool.clone());
-        conduit_admin_graphql::change_set::ChangeSetServices::create_provider_price_change_set(
-            &change_sets,
-            staging_actor_user_id,
-            channel_id.clone(),
-            input,
+        let channel_db = channel_price_db_id(channel_id.as_str())
+            .ok_or_else(|| ModelExtError::SaveChannelModelPrices("invalid channel ID".into()))?;
+        crate::wiring_postgres_change_sets::packages::save_native_provider(
+            &self.pool, actor, channel_db, input,
         )
         .await
-        .map_err(|error| ModelExtError::SaveChannelModelPrices(error.to_string()))?;
-
-        let channel_db = channel_price_db_id(channel_id.as_str()).ok_or_else(|| {
-            ModelExtError::SaveChannelModelPrices(format!(
-                "invalid channel id: {}",
-                channel_id.as_str()
-            ))
-        })?;
+        .map_err(ModelExtError::SaveChannelModelPrices)?;
         let price_repo = conduit_db::PgChannelModelPriceRepo::new(self.pool.clone());
         price_repo
             .list_prices_by_channel(&boot_request_context(), channel_db)
@@ -4015,7 +3996,7 @@ struct ModelCrudAdapter {
 /// GraphQL `ModelType` enum → the Go wire literal stored in the `type` column.
 /// Matches the `#[graphql(name = ...)]` spellings on the enum (and the private
 /// `model_type_to_wire` in `crate::conv`).
-fn gql_model_type_to_wire(t: GqlModelType) -> &'static str {
+pub(crate) fn gql_model_type_to_wire(t: GqlModelType) -> &'static str {
     match t {
         GqlModelType::Chat => "chat",
         GqlModelType::Embedding => "embedding",
@@ -4377,12 +4358,7 @@ impl ModelMutationServices for ModelCrudAdapter {
     ) -> Result<GqlModel, ModelServiceError> {
         let ctx = boot_request_context();
 
-        // Go CreateModel (biz/model.go:319-329): the duplicate probe queries
-        // `model.ModelID(input.ModelID)` ONLY and fails with
-        // `xerrors.DuplicateNameError("model", input.ModelID)`. We probe first so
-        // a modelID collision surfaces that message; a `name` collision (also a
-        // unique index in Go) falls through to the repo's insert and surfaces as
-        // a wrapped "failed to create model" (Go's ent Save error path).
+        // Public model keys are unique; display names may repeat.
         let existing = self
             .model_repo
             .find_model_by_model_id(&ctx, &input.model_id)
@@ -6278,6 +6254,7 @@ mod postgres_accounting_currency_tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[7]).await?;
         let channel_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO channels (\"type\",name,credentials,default_test_model) \
              VALUES ('openai','price-rollback','{}'::jsonb,'mock-chat') RETURNING id",
@@ -6304,8 +6281,8 @@ mod postgres_accounting_currency_tests {
                         model_id: "mock-chat".to_string(),
                         currency_code: "CNY".to_string(),
                         price: conduit_admin_graphql::model_ext::ModelPriceInput {
-                            items: vec![conduit_admin_graphql::model_ext::ModelPriceItemInput {
-                                item_code: conduit_admin_graphql::request_usage::PriceItemCode::PromptTokens,
+                            items: [conduit_admin_graphql::request_usage::PriceItemCode::PromptTokens,conduit_admin_graphql::request_usage::PriceItemCode::CompletionTokens,conduit_admin_graphql::request_usage::PriceItemCode::PromptCachedTokens,conduit_admin_graphql::request_usage::PriceItemCode::PromptWriteCachedTokens].into_iter().map(|item_code| conduit_admin_graphql::model_ext::ModelPriceItemInput {
+                                item_code,
                                 pricing: conduit_admin_graphql::model_ext::PricingInput {
                                     mode: conduit_admin_graphql::model_ext::PricingMode::UsagePerUnit,
                                     flat_fee: None,
@@ -6317,7 +6294,7 @@ mod postgres_accounting_currency_tests {
                                     usage_tiered: None,
                                 },
                                 prompt_write_cache_variants: None,
-                            }],
+                            }).collect(),
                         },
                     },
                 ],
@@ -6358,4 +6335,201 @@ mod postgres_accounting_currency_tests {
         database.cleanup().await?;
         Ok(())
     }
+}
+
+pub(crate) async fn apply_general_setting_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor_user_id: Option<i64>,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let mut wire: WireGeneralSettings =
+        serde_json::from_value(value).map_err(|_| "invalid accounting setting")?;
+    let requested_currency = wire.accounting_currency_code.trim().to_ascii_uppercase();
+    wire.accounting_currency_code = requested_currency.clone();
+    wire.accounting_rate_version =
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(1);
+    let encoded = serde_json::to_string(&wire).map_err(|_| "invalid accounting setting")?;
+    lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(|err| err.to_string())?;
+    let current = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM systems WHERE key=$1 AND deleted_at=0 LIMIT 1",
+    )
+    .bind(system_key::GENERAL_SETTINGS)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|err| err.to_string())?
+    .map(|value| serde_json::from_str::<WireGeneralSettings>(&value))
+    .transpose()
+    .map_err(|err| err.to_string())?
+    .unwrap_or_default();
+    if !current
+        .accounting_currency_code
+        .trim()
+        .eq_ignore_ascii_case(&requested_currency)
+        && postgres_accounting_currency_locked_in_tx(tx)
+            .await
+            .map_err(|err| err.to_string())?
+    {
+        return Err(
+                "accounting currency cannot be changed after any retail or channel procurement price exists; rebuild pricing data before changing it"
+                    .to_string(),
+            );
+    }
+    let before_snapshot = serde_json::to_value(&current).map_err(|err| err.to_string())?;
+    let after_snapshot = serde_json::to_value(&wire).map_err(|err| err.to_string())?;
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO systems (key,value,created_at,updated_at) VALUES ($1,$2,$3,$3) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, \
+             updated_at=excluded.updated_at,deleted_at=0",
+    )
+    .bind(system_key::GENERAL_SETTINGS)
+    .bind(encoded)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(|err| err.to_string())?;
+    insert_pricing_change_audit(
+        tx,
+        actor_user_id,
+        "update_accounting_settings",
+        "accounting_settings",
+        system_key::GENERAL_SETTINGS,
+        Some(before_snapshot),
+        Some(after_snapshot),
+        &requested_currency,
+        wire.accounting_rate_version,
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn governed_general_form(
+    input: gql_system::UpdateSystemGeneralSettingsInput,
+    old: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut v: WireGeneralSettings = if old.is_null() {
+        WireGeneralSettings::default()
+    } else {
+        serde_json::from_value(old).map_err(|_| "invalid stored accounting setting")?
+    };
+    if let Some(x) = input.accounting_currency_code {
+        v.accounting_currency_code = x;
+    }
+    if let Some(x) = input.timezone {
+        v.timezone = x;
+    }
+    if let Some(x) = input.credit_display_name {
+        v.credit_display_name = x;
+    }
+    if let Some(x) = input.credits_per_accounting_unit {
+        v.credits_per_accounting_unit = x.0;
+    }
+    if let Some(x) = input.exchange_rates {
+        v.exchange_rates = x
+            .into_iter()
+            .map(|r| conduit_core::objects::money::CurrencyExchangeRate {
+                currency: r.currency_code,
+                quote_per_accounting_unit: r.quote_per_accounting_unit.0,
+            })
+            .collect();
+    }
+    serde_json::to_value(v).map_err(|_| "invalid accounting setting".into())
+}
+pub(crate) fn governed_retry_form(
+    input: gql_system::UpdateRetryPolicyInput,
+) -> Result<serde_json::Value, String> {
+    let v = WireRetryPolicy::from_gql(input.into());
+    validate_wire_auto_disable_channel(&v.auto_disable_channel)
+        .map_err(|_| "invalid auto-disable rule")?;
+    serde_json::to_value(v).map_err(|_| "invalid retry policy".into())
+}
+pub(crate) fn normalize_governed_retry(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let fields = [
+        "max_channel_retries",
+        "max_single_channel_retries",
+        "retry_delay_ms",
+        "stream_first_event_timeout_seconds",
+        "non_stream_response_timeout_seconds",
+        "load_balancer_strategy",
+        "cost_score_weight",
+        "enabled",
+        "auto_disable_channel",
+        "empty_response_detection",
+        "upstream_error_policy",
+    ];
+    if value
+        .as_object()
+        .is_none_or(|v| v.keys().any(|k| !fields.contains(&k.as_str())))
+    {
+        return Err("unknown retry policy field".into());
+    }
+    let v: WireRetryPolicy = serde_json::from_value(value).map_err(|_| "invalid retry policy")?;
+    if !(0..=100).contains(&v.cost_score_weight)
+        || v.max_channel_retries < 0
+        || v.max_single_channel_retries < 0
+        || v.retry_delay_ms < 0
+    {
+        return Err("invalid retry limit".into());
+    }
+    validate_wire_auto_disable_channel(&v.auto_disable_channel)
+        .map_err(|_| "invalid auto-disable rule")?;
+    serde_json::to_value(v).map_err(|_| "invalid retry policy".into())
+}
+pub(crate) fn governed_model_form(
+    input: gql_system::UpdateSystemModelSettingsInput,
+    old: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let v: gql_system::SystemModelSettings = input.into();
+    let mut value = serde_json::to_value(conduit_core::objects::SystemModelSettings {
+        fallback_to_channels_on_model_not_found: v.fallback_to_channels_on_model_not_found,
+        query_all_channel_models: v.query_all_channel_models,
+        default_model_api_include_all: v.default_model_api_include_all,
+        auto_reasoning_effort: v.auto_reasoning_effort,
+        model_blacklist_regex: v.model_blacklist_regex,
+        developer_settings: v
+            .developer_settings
+            .into_iter()
+            .map(|d| conduit_core::objects::DeveloperModelSettings {
+                developer: d.developer,
+                associations: d
+                    .associations
+                    .into_iter()
+                    .map(crate::conv::model_association_to_core)
+                    .collect(),
+            })
+            .collect(),
+    })
+    .map_err(|_| "invalid model setting")?;
+    if value["developer_settings"]
+        .as_array()
+        .is_some_and(|a| a.is_empty())
+    {
+        if let Some(previous) = old.get("developer_settings") {
+            value["developer_settings"] = previous.clone();
+        }
+    }
+    Ok(value)
+}
+pub(crate) fn governed_channel_form(
+    input: conduit_admin_graphql::system_ext::UpdateSystemChannelSettingsInput,
+    old: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let old: conduit_services::SystemChannelSettings = if old.is_null() {
+        Default::default()
+    } else {
+        serde_json::from_value(old).map_err(|_| "invalid channel settings")?
+    };
+    let merged = conduit_admin_graphql::system_ext::merge_channel_settings(
+        domain_channel_to_graphql(old.clone()),
+        input,
+    );
+    let mut domain = graphql_channel_to_domain(merged);
+    domain.extra = old.extra;
+    serde_json::to_value(domain).map_err(|_| "invalid channel settings".into())
 }

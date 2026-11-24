@@ -1,3 +1,21 @@
+#[path = "wiring_postgres_change_packages.rs"]
+pub(crate) mod packages;
+
+#[derive(Clone, Debug)]
+pub(crate) struct OperationContext {
+    pub operation_id: uuid::Uuid,
+    pub origin: conduit_admin_graphql::change_package::OperationOrigin,
+    pub actor_user_id: Option<i64>,
+}
+impl OperationContext {
+    pub(crate) fn automatic() -> Self {
+        Self {
+            operation_id: uuid::Uuid::new_v4(),
+            origin: conduit_admin_graphql::change_package::OperationOrigin::AutomaticSync,
+            actor_user_id: None,
+        }
+    }
+}
 use async_graphql::ID;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -118,22 +136,25 @@ pub(crate) async fn stage_duplicated_provider_prices(
         }
     }
 
+    let edit_base = packages::provider_base_in_tx(tx, target_channel_id).await?;
     let change_set_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO change_sets \
-         (kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,created_at,updated_at) \
-         VALUES('provider_price','channel',$1,$2,'draft','',$3,$4,$5,$5) RETURNING id",
+         (operation_id,kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,created_at,updated_at) \
+         VALUES($6,'provider_price','channel',$1,$2,'draft',$7,$3,$4,$5,$5) RETURNING id",
     )
     .bind(target_channel_id.to_string())
     .bind(format!("Duplicated procurement prices: {target_channel_name}"))
     .bind(accounting_settings_version.to_string())
     .bind(actor_user_id)
     .bind(now)
+    .bind(uuid::Uuid::new_v4())
+    .bind(edit_base.revision)
     .fetch_one(&mut **tx)
     .await
     .map_err(storage_error)?;
     let source = json!({
         "source": "manual",
-        "origin": "channel_duplicate",
+        "origin": "CHANNEL_IMPORT",
         "sourceChannelID": source_channel_id,
         "accountingCurrency": accounting_currency,
         "accountingSettingsVersion": accounting_settings_version,
@@ -174,6 +195,55 @@ pub(crate) async fn stage_duplicated_provider_prices(
     Ok(Some(change_set_id))
 }
 
+pub(crate) async fn publish_copied_provider_prices(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: i64,
+    parent: Option<i64>,
+    source: i64,
+    target: i64,
+    name: &str,
+) -> Result<(), String> {
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(|_| "price settings lock failed")?;
+    let settings=crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(tx).await.map_err(|_|"price settings unavailable")?;
+    let prices = conduit_db::PgChannelModelPriceRepo::list_prices_by_channel_in_tx(tx, source)
+        .await
+        .map_err(|_| "source prices unavailable")?;
+    let now = Utc::now();
+    let Some(id) = stage_duplicated_provider_prices(
+        tx,
+        Some(actor),
+        source,
+        target,
+        name,
+        &prices,
+        &settings.currency,
+        settings.version,
+        now,
+    )
+    .await
+    .map_err(|_| "price copy rejected")?
+    else {
+        return Ok(());
+    };
+    crate::wiring_governance::authorize(tx, actor, "write_channels").await?;
+    crate::wiring_governance::authorize(tx, actor, "write_commercialization").await?;
+    let cs = lock_change_set(tx, id)
+        .await
+        .map_err(|_| "price copy unavailable")?;
+    let policy = crate::wiring_governance::lock_policy(tx).await?;
+    if parent.is_none() && policy.requires("provider_price") {
+        return Ok(());
+    }
+    let (kind, target) = apply_provider_price(tx, &cs, actor)
+        .await
+        .map_err(|_| "price copy publication rejected")?;
+    sqlx::query("UPDATE change_sets SET status='applied',applied_at=$2,published_at=$2,published_by=$3,applied_target_type=$4,applied_target_id=$5,updated_at=$2 WHERE id=$1").bind(id).bind(now).bind(actor).bind(kind).bind(target).execute(&mut **tx).await.map_err(|_|"price copy receipt failed")?;
+    insert_event(tx,id,"published","user",Some(actor),json!({"parentChangeSetID":parent,"approvalRequired":policy.requires("provider_price"),"policyRevision":policy.revision}),now).await.map_err(|_|"price copy audit failed")?;
+    Ok(())
+}
+
 #[async_trait]
 impl gql::ChangeSetServices for PgChangeSetAdapter {
     async fn change_sets(
@@ -203,644 +273,123 @@ impl gql::ChangeSetServices for PgChangeSetAdapter {
 
     async fn create_provider_price_change_set(
         &self,
-        actor_user_id: i64,
-        channel_id: ID,
+        actor: i64,
+        channel: ID,
         input: Vec<conduit_admin_graphql::model_ext::SaveChannelModelPriceInput>,
     ) -> Result<gql::ChangeSet, gql::ChangeSetError> {
-        let channel_id = parse_numeric_id(channel_id.as_str(), "channel")?;
-        let mut seen = std::collections::HashSet::new();
-        let mut prepared = Vec::with_capacity(input.len());
-        for item in input {
-            if !seen.insert(item.model_id.clone()) {
-                return Err(gql::ChangeSetError::Invalid(format!(
-                    "duplicate model price input: model_id={}",
-                    item.model_id
-                )));
-            }
-            let currency = crate::wiring::normalize_price_currency_code(&item.currency_code)
-                .map_err(gql::ChangeSetError::Invalid)?;
-            let price = crate::conv::model_price_input_to_core(item.price);
-            crate::wiring::validate_model_price(&price).map_err(|error| {
-                gql::ChangeSetError::Invalid(format!(
-                    "invalid model price for {}: {error}",
-                    item.model_id
-                ))
-            })?;
-            if price.items.is_empty() {
-                return Err(gql::ChangeSetError::Invalid(format!(
-                    "provider price for {} must contain at least one item",
-                    item.model_id
-                )));
-            }
-            let price_json = serde_json::to_value(&price).map_err(|error| {
-                gql::ChangeSetError::Invalid(format!(
-                    "cannot encode provider price for {}: {error}",
-                    item.model_id
-                ))
-            })?;
-            prepared.push((item.model_id, currency, price, price_json));
-        }
-
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        crate::wiring_postgres_provider_pricing::lock_provider_pricing_channel(&mut tx, channel_id)
-            .await
-            .map_err(gql::ChangeSetError::Storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(storage_error)?;
-        let settings = crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(&mut tx)
-            .await
-            .map_err(|error| gql::ChangeSetError::Invalid(error.to_string()))?;
-        if let Some((model_id, currency, _, _)) = prepared
-            .iter()
-            .find(|(_, currency, _, _)| !currency.eq_ignore_ascii_case(&settings.currency))
-        {
-            return Err(gql::ChangeSetError::Invalid(format!(
-                "procurement price for model {model_id} must use accounting currency {}, got {currency}",
-                settings.currency
-            )));
-        }
-        let channel_name = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE",
-        )
-        .bind(channel_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?
-        .ok_or_else(|| gql::ChangeSetError::Invalid(format!("channel {channel_id} not found")))?;
-        let existing =
-            conduit_db::PgChannelModelPriceRepo::list_prices_by_channel_in_tx(&mut tx, channel_id)
-                .await
-                .map_err(storage_error)?;
-        let actions = crate::wiring::calculate_price_changes(&existing, &prepared);
-        if actions
-            .iter()
-            .all(|action| matches!(action, crate::wiring::PriceAction::Skip))
-        {
-            return Err(gql::ChangeSetError::Invalid(
-                "the submitted procurement prices do not change the formal price list".into(),
-            ));
-        }
-
-        let existing_draft = sqlx::query_scalar::<_, i64>(
-            "SELECT cs.id FROM change_sets cs WHERE cs.kind='provider_price' \
-             AND cs.scope_type='channel' AND cs.scope_id=$1 AND cs.status='draft' \
-             AND EXISTS(SELECT 1 FROM change_set_items item WHERE item.change_set_id=cs.id \
-                        AND item.source_snapshot->>'source'='manual') \
-             ORDER BY cs.id DESC LIMIT 1",
-        )
-        .bind(channel_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        let now = Utc::now();
-        let title = format!("Manual procurement prices: {channel_name}");
-        let change_set_id = if let Some(id) = existing_draft {
-            sqlx::query(
-                "UPDATE change_sets SET title=$2,base_revision='',source_revision=$3,\
-                 validation_error=NULL,updated_at=$4 WHERE id=$1",
+        use conduit_admin_graphql::change_package::ChangePackageServices as _;
+        let base = self.provider_edit_base(channel.clone()).await?;
+        let result = self
+            .create_provider(
+                actor,
+                channel,
+                ID(uuid::Uuid::new_v4().to_string()),
+                base.revision,
+                input,
+                None,
             )
-            .bind(id)
-            .bind(&title)
-            .bind(settings.version.to_string())
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-            sqlx::query("DELETE FROM change_set_items WHERE change_set_id=$1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(storage_error)?;
-            id
-        } else {
-            sqlx::query_scalar::<_, i64>(
-                "INSERT INTO change_sets \
-                 (kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,created_at,updated_at) \
-                 VALUES('provider_price','channel',$1,$2,'draft','',$3,$4,$5,$5) RETURNING id",
-            )
-            .bind(channel_id.to_string())
-            .bind(&title)
-            .bind(settings.version.to_string())
-            .bind(actor_user_id)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(storage_error)?
-        };
-        let source = json!({
-            "source": "manual",
-            "accountingCurrency": settings.currency,
-            "accountingSettingsVersion": settings.version,
-        });
-        let mut changed_items = 0_u64;
-        for action in actions {
-            let (item_key, action, before, after) = match action {
-                crate::wiring::PriceAction::Skip => continue,
-                crate::wiring::PriceAction::Delete { existing } => (
-                    existing.model_id.clone(),
-                    "delete",
-                    Some(base_price_snapshot(&existing)),
-                    None,
-                ),
-                crate::wiring::PriceAction::Create {
-                    model_id,
-                    price_json,
-                    ..
-                } => (model_id, "create", None, Some(price_json)),
-                crate::wiring::PriceAction::Update {
-                    existing,
-                    model_id,
-                    price_json,
-                    ..
-                } => (
-                    model_id,
-                    "update",
-                    Some(base_price_snapshot(&existing)),
-                    Some(price_json),
-                ),
-            };
-            sqlx::query(
-                "INSERT INTO change_set_items \
-                 (change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,created_at,updated_at) \
-                 VALUES($1,$2,$3,$4,$5,$6,$7,$7)",
-            )
-            .bind(change_set_id)
-            .bind(item_key)
-            .bind(action)
-            .bind(before.map(SqlJson))
-            .bind(after.map(SqlJson))
-            .bind(SqlJson(source.clone()))
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-            changed_items += 1;
-        }
-        insert_event(
-            &mut tx,
-            change_set_id,
-            if existing_draft.is_some() {
-                "items_replaced"
-            } else {
-                "created"
-            },
-            "user",
-            Some(actor_user_id),
-            json!({"source": "manual", "itemCount": changed_items}),
-            now,
-        )
-        .await?;
-        tx.commit().await.map_err(storage_error)?;
-        load_change_set(&self.pool, change_set_id).await
+            .await?;
+        let id = result
+            .change_set_detail
+            .ok_or_else(|| {
+                gql::ChangeSetError::Invalid("NO_CHANGE: no package was created".into())
+            })?
+            .summary
+            .id;
+        load_change_set(&self.pool, parse_numeric_id(id.as_str(), "package")?).await
     }
-
     async fn create_retail_price_change_set(
         &self,
-        actor_user_id: i64,
-        price_book_id: ID,
+        actor: i64,
+        book: ID,
     ) -> Result<gql::ChangeSet, gql::ChangeSetError> {
-        let book_id = parse_numeric_id(price_book_id.as_str(), "price book")?;
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(storage_error)?;
-        let settings = crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(&mut tx)
-            .await
-            .map_err(|error| gql::ChangeSetError::Invalid(error.to_string()))?;
-        let book = sqlx::query("SELECT name,currency FROM price_books WHERE id=$1 FOR UPDATE")
-            .bind(book_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| {
-                gql::ChangeSetError::Invalid(format!("price book {book_id} not found"))
-            })?;
-        let book_name: String = book.get("name");
-        let currency: String = book.get("currency");
-        if !currency.eq_ignore_ascii_case(&settings.currency) {
-            return Err(gql::ChangeSetError::Invalid(format!(
-                "price book currency {currency} does not match accounting currency {}",
-                settings.currency
-            )));
-        }
-        let pending_review = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM change_sets WHERE kind='retail_price' AND scope_type='price_book' \
-             AND scope_id=$1 AND status='pending_review' ORDER BY id DESC LIMIT 1",
-        )
-        .bind(book_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        if let Some(id) = pending_review {
-            return Err(gql::ChangeSetError::Invalid(format!(
-                "retail price change set {id} is awaiting review"
-            )));
-        }
-        if let Some(existing) = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM change_sets WHERE kind='retail_price' AND scope_type='price_book' \
-             AND scope_id=$1 AND status='draft' ORDER BY id DESC LIMIT 1",
-        )
-        .bind(book_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?
-        {
-            tx.commit().await.map_err(storage_error)?;
-            return load_change_set(&self.pool, existing).await;
-        }
-        let published = sqlx::query_as::<_, (i64, String)>(
-            "SELECT id,reference_id FROM price_book_versions WHERE price_book_id=$1 \
-             AND status='published' ORDER BY version DESC LIMIT 1",
-        )
-        .bind(book_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        let now = Utc::now();
-        let change_set_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO change_sets \
-             (kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,created_at,updated_at) \
-             VALUES('retail_price','price_book',$1,$2,'draft',$3,$4,$5,$6,$6) RETURNING id",
-        )
-        .bind(book_id.to_string())
-        .bind(format!("Retail prices: {book_name}"))
-        .bind(published.as_ref().map(|(_, reference)| reference.as_str()).unwrap_or(""))
-        .bind(settings.version.to_string())
-        .bind(actor_user_id)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        if let Some((version_id, _)) = published {
-            sqlx::query(
-                "INSERT INTO change_set_items \
-                 (change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,created_at,updated_at) \
-                 SELECT $1,CAST(i.public_model_id AS TEXT),'update',i.price,i.price,\
-                        jsonb_build_object('publicModelID',i.public_model_id,'publicModelKey',m.model_id),$2,$2 \
-                 FROM price_book_items i JOIN models m ON m.id=i.public_model_id AND m.deleted_at=0 \
-                 WHERE i.price_book_version_id=$3",
+        use conduit_admin_graphql::change_package::ChangePackageServices as _;
+        let base = self.retail_edit_base(book.clone()).await?;
+        let result = self
+            .create_retail(
+                actor,
+                book,
+                ID(uuid::Uuid::new_v4().to_string()),
+                base.revision,
             )
-            .bind(change_set_id)
-            .bind(now)
-            .bind(version_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-        }
-        insert_event(
-            &mut tx,
-            change_set_id,
-            "created",
-            "user",
-            Some(actor_user_id),
-            json!({"priceBookID": book_id}),
-            now,
+            .await?;
+        load_change_set(
+            &self.pool,
+            parse_numeric_id(result.summary.id.as_str(), "package")?,
         )
-        .await?;
-        tx.commit().await.map_err(storage_error)?;
-        load_change_set(&self.pool, change_set_id).await
+        .await
     }
-
     async fn save_retail_price_change_set_item(
         &self,
-        actor_user_id: i64,
-        input: gql::SaveRetailPriceChangeSetItemInput,
+        actor: i64,
+        mut input: gql::SaveRetailPriceChangeSetItemInput,
     ) -> Result<gql::ChangeSetItem, gql::ChangeSetError> {
-        let change_set_id = parse_numeric_id(input.change_set_id.as_str(), "change set")?;
-        let public_model_id = parse_numeric_id(input.public_model_id.as_str(), "public model")?;
-        let price: ModelPrice = serde_json::from_value(input.price.0).map_err(|error| {
-            gql::ChangeSetError::Invalid(format!("invalid model price: {error}"))
-        })?;
-        crate::wiring::validate_model_price(&price).map_err(|error| {
-            gql::ChangeSetError::Invalid(format!("invalid model price: {error}"))
-        })?;
-        if price.items.is_empty() {
-            return Err(gql::ChangeSetError::Invalid(
-                "a retail price must contain at least one item".into(),
-            ));
+        use conduit_admin_graphql::change_package::ChangePackageServices as _;
+        // Internal callers supply a freshly read revision. Public mutations require their client's revision.
+        if input.expected_revision.is_empty() {
+            input.expected_revision =
+                packages::current_revision(&self.pool, input.change_set_id.clone()).await?;
         }
-        let after = serde_json::to_value(price).map_err(|error| {
-            gql::ChangeSetError::Invalid(format!("cannot encode model price: {error}"))
-        })?;
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let change_set = lock_change_set(&mut tx, change_set_id).await?;
-        if change_set.kind != "retail_price" || change_set.status != "draft" {
-            return Err(gql::ChangeSetError::Invalid(
-                "only a draft retail-price change set can be edited".into(),
-            ));
-        }
-        let model_key = sqlx::query_scalar::<_, String>(
-            "SELECT model_id FROM models WHERE id=$1 AND deleted_at=0",
-        )
-        .bind(public_model_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?
-        .ok_or_else(|| {
-            gql::ChangeSetError::Invalid(format!("public model {public_model_id} not found"))
-        })?;
-        let had_before = sqlx::query_scalar::<_, bool>(
-            "SELECT before_snapshot IS NOT NULL FROM change_set_items \
-             WHERE change_set_id=$1 AND item_key=$2",
-        )
-        .bind(change_set_id)
-        .bind(public_model_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        let action = if had_before.unwrap_or(false) {
-            "update"
-        } else {
-            "create"
-        };
-        let now = Utc::now();
-        let item_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO change_set_items \
-             (change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,created_at,updated_at) \
-             VALUES($1,$2,$3,NULL,$4,$5,$6,$6) \
-             ON CONFLICT(change_set_id,item_key) DO UPDATE SET action=$3,after_snapshot=$4,\
-             source_snapshot=$5,validation_error=NULL,updated_at=$6 RETURNING id",
-        )
-        .bind(change_set_id)
-        .bind(public_model_id.to_string())
-        .bind(action)
-        .bind(SqlJson(after))
-        .bind(SqlJson(json!({"publicModelID": public_model_id, "publicModelKey": model_key})))
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        sqlx::query("UPDATE change_sets SET updated_at=$2 WHERE id=$1")
-            .bind(change_set_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-        insert_event(
-            &mut tx,
-            change_set_id,
-            "item_saved",
-            "user",
-            Some(actor_user_id),
-            json!({"itemKey": public_model_id.to_string()}),
-            now,
-        )
-        .await?;
-        let item = load_item_in_tx(&mut tx, item_id).await?;
-        tx.commit().await.map_err(storage_error)?;
-        item.into_graphql()
+        Ok(self.save_retail_item(actor, input).await?.item)
     }
-
     async fn submit_change_set(
         &self,
-        actor_user_id: i64,
+        actor: i64,
         id: ID,
     ) -> Result<gql::ChangeSet, gql::ChangeSetError> {
-        let id = parse_numeric_id(id.as_str(), "change set")?;
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let change_set = lock_change_set(&mut tx, id).await?;
-        if change_set.status != "draft" {
-            return Err(gql::ChangeSetError::Invalid(format!(
-                "change set {id} is {}, only drafts can be submitted",
-                change_set.status
-            )));
-        }
-        let item_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM change_set_items WHERE change_set_id=$1 \
-             AND validation_error IS NULL AND (\
-                 (action='delete' AND before_snapshot IS NOT NULL AND after_snapshot IS NULL) OR \
-                 (action IN ('create','update') AND after_snapshot IS NOT NULL)\
-             )",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        if item_count == 0 {
-            return Err(gql::ChangeSetError::Invalid(
-                "an empty change set cannot be submitted".into(),
-            ));
-        }
-        let now = Utc::now();
-        if change_set.kind == "provider_price" {
-            sqlx::query(
-                "WITH superseded AS (\
-                   UPDATE change_sets candidate \
-                   SET status='superseded',validation_error=NULL,reviewed_by=$2,reviewed_at=$3,\
-                       review_note=$4,updated_at=$3 \
-                   WHERE candidate.kind='provider_price' AND candidate.id<>$1 \
-                     AND candidate.scope_type=$5 AND candidate.scope_id=$6 \
-                     AND candidate.status IN ('pending_review','invalid') \
-                     AND EXISTS(\
-                       SELECT 1 FROM change_set_items manual_item \
-                       JOIN change_set_items candidate_item \
-                         ON candidate_item.item_key=manual_item.item_key \
-                        AND candidate_item.change_set_id=candidate.id \
-                       WHERE manual_item.change_set_id=$1 \
-                         AND manual_item.source_snapshot->>'source'='manual' \
-                         AND COALESCE(candidate_item.source_snapshot->>'source','observed')<>'manual'\
-                     ) \
-                   RETURNING candidate.id) \
-                 INSERT INTO change_set_events(change_set_id,event_type,actor_type,actor_id,detail,created_at) \
-                 SELECT id,'superseded','user',$2,jsonb_build_object('supersededByChangeSetID',$1),$3 \
-                 FROM superseded",
-            )
-            .bind(id)
-            .bind(actor_user_id)
-            .bind(now)
-            .bind(format!("superseded by manual change set {id}"))
-            .bind(&change_set.scope_type)
-            .bind(&change_set.scope_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-        }
-        sqlx::query(
-            "UPDATE change_sets SET status='pending_review',submitted_by=$2,submitted_at=$3,\
-             updated_at=$3 WHERE id=$1",
-        )
-        .bind(id)
-        .bind(actor_user_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage_error)?;
-        insert_event(
-            &mut tx,
+        internal_transition(
+            self,
+            actor,
             id,
-            "submitted",
-            "user",
-            Some(actor_user_id),
-            json!({}),
-            now,
+            conduit_admin_graphql::change_package::ChangeSetAvailableAction::Submit,
+            None,
         )
-        .await?;
-        tx.commit().await.map_err(storage_error)?;
-        load_change_set(&self.pool, id).await
+        .await
     }
-
     async fn approve_change_set(
         &self,
-        actor_user_id: i64,
+        actor: i64,
         id: ID,
-        review_note: Option<String>,
+        note: Option<String>,
     ) -> Result<gql::ChangeSet, gql::ChangeSetError> {
-        let id = parse_numeric_id(id.as_str(), "change set")?;
-        let review_note = normalize_note(review_note);
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let change_set = lock_change_set(&mut tx, id).await?;
-        if change_set.status != "pending_review" {
-            return Err(gql::ChangeSetError::Invalid(format!(
-                "change set {id} is {}, only pending change sets can be approved",
-                change_set.status
-            )));
-        }
-        let applied = {
-            let mut apply_tx = tx.begin().await.map_err(storage_error)?;
-            let result = match change_set.kind.as_str() {
-                "provider_price" => {
-                    apply_provider_price(&mut apply_tx, &change_set, actor_user_id).await
-                }
-                "model_mapping" => apply_model_mapping(&mut apply_tx, &change_set).await,
-                "retail_price" => {
-                    apply_retail_price(&mut apply_tx, &change_set, actor_user_id).await
-                }
-                other => Err(ApplyFailure::Invalid(format!(
-                    "unsupported change set kind {other}"
-                ))),
-            };
-            match result {
-                Ok(target) => {
-                    apply_tx.commit().await.map_err(storage_error)?;
-                    Ok(target)
-                }
-                Err(error) => {
-                    apply_tx.rollback().await.map_err(storage_error)?;
-                    Err(error)
-                }
-            }
-        };
-        let (target_type, target_id) = match applied {
-            Ok(target) => target,
-            Err(ApplyFailure::Superseded(message)) => {
-                let now = Utc::now();
-                mark_reviewed(
-                    &mut tx,
-                    id,
-                    "superseded",
-                    actor_user_id,
-                    review_note.as_deref(),
-                    None,
-                    now,
-                )
-                .await?;
-                insert_event(
-                    &mut tx,
-                    id,
-                    "superseded",
-                    "user",
-                    Some(actor_user_id),
-                    json!({"reason": message}),
-                    now,
-                )
-                .await?;
-                tx.commit().await.map_err(storage_error)?;
-                return Err(gql::ChangeSetError::Invalid(message));
-            }
-            Err(ApplyFailure::Invalid(message)) => {
-                let now = Utc::now();
-                mark_invalid(
-                    &mut tx,
-                    id,
-                    actor_user_id,
-                    review_note.as_deref(),
-                    &message,
-                    now,
-                )
-                .await?;
-                insert_event(
-                    &mut tx,
-                    id,
-                    "validation_failed",
-                    "user",
-                    Some(actor_user_id),
-                    json!({"reason": message}),
-                    now,
-                )
-                .await?;
-                tx.commit().await.map_err(storage_error)?;
-                return Err(gql::ChangeSetError::Invalid(message));
-            }
-            Err(ApplyFailure::Storage(message)) => {
-                return Err(gql::ChangeSetError::Storage(message));
-            }
-        };
-        let now = Utc::now();
-        mark_reviewed(
-            &mut tx,
+        internal_transition(
+            self,
+            actor,
             id,
-            "applied",
-            actor_user_id,
-            review_note.as_deref(),
-            Some((&target_type, &target_id)),
-            now,
+            conduit_admin_graphql::change_package::ChangeSetAvailableAction::Approve,
+            note,
         )
-        .await?;
-        insert_event(
-            &mut tx,
-            id,
-            "applied",
-            "user",
-            Some(actor_user_id),
-            json!({"targetType": target_type, "targetID": target_id}),
-            now,
-        )
-        .await?;
-        tx.commit().await.map_err(storage_error)?;
-        load_change_set(&self.pool, id).await
+        .await
     }
-
     async fn reject_change_set(
         &self,
-        actor_user_id: i64,
+        actor: i64,
         id: ID,
-        review_note: Option<String>,
+        note: Option<String>,
     ) -> Result<gql::ChangeSet, gql::ChangeSetError> {
-        let id = parse_numeric_id(id.as_str(), "change set")?;
-        let review_note = normalize_note(review_note);
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        let change_set = lock_change_set(&mut tx, id).await?;
-        if !matches!(change_set.status.as_str(), "pending_review" | "invalid") {
-            return Err(gql::ChangeSetError::Invalid(format!(
-                "change set {id} is {}, only pending or invalid change sets can be rejected",
-                change_set.status
-            )));
-        }
-        let now = Utc::now();
-        mark_reviewed(
-            &mut tx,
+        internal_transition(
+            self,
+            actor,
             id,
-            "rejected",
-            actor_user_id,
-            review_note.as_deref(),
-            None,
-            now,
+            conduit_admin_graphql::change_package::ChangeSetAvailableAction::Reject,
+            note,
         )
-        .await?;
-        insert_event(
-            &mut tx,
-            id,
-            "rejected",
-            "user",
-            Some(actor_user_id),
-            json!({}),
-            now,
-        )
-        .await?;
-        tx.commit().await.map_err(storage_error)?;
-        load_change_set(&self.pool, id).await
+        .await
     }
+}
+async fn internal_transition(
+    adapter: &PgChangeSetAdapter,
+    actor: i64,
+    id: ID,
+    action: conduit_admin_graphql::change_package::ChangeSetAvailableAction,
+    note: Option<String>,
+) -> Result<gql::ChangeSet, gql::ChangeSetError> {
+    use conduit_admin_graphql::change_package::ChangePackageServices as _;
+    let revision = packages::current_revision(&adapter.pool, id.clone()).await?;
+    adapter
+        .transition(actor, id.clone(), revision, action, note)
+        .await?;
+    load_change_set(&adapter.pool, parse_numeric_id(id.as_str(), "package")?).await
 }
 
 impl ChangeSetItemRow {
@@ -1261,6 +810,9 @@ async fn apply_provider_price(
         .execute(&mut **tx)
         .await
         .map_err(db_failure)?;
+    crate::wiring_postgres_price_formula::refresh_channel(tx, channel_id)
+        .await
+        .map_err(ApplyFailure::Storage)?;
     Ok(("channel".into(), channel_id.to_string()))
 }
 
@@ -1269,14 +821,15 @@ async fn apply_model_mapping(
     change_set: &ChangeSetRow,
 ) -> Result<(String, String), ApplyFailure> {
     let channel_id = parse_i64(&change_set.scope_id, "channel")?;
-    let channel_exists = sqlx::query_scalar::<_, i64>(
+    if sqlx::query_scalar::<_, i64>(
         "SELECT id FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE",
     )
     .bind(channel_id)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(db_failure)?;
-    if channel_exists.is_none() {
+    .map_err(db_failure)?
+    .is_none()
+    {
         return Err(ApplyFailure::Superseded(
             "mapping channel is no longer available".into(),
         ));
@@ -1284,140 +837,122 @@ async fn apply_model_mapping(
     let items = load_items_in_tx(tx, change_set.id).await?;
     if items.is_empty() {
         return Err(ApplyFailure::Invalid(
-            "model mapping change set is empty".into(),
+            "model mapping package is empty".into(),
         ));
     }
-    let mut last_route_id = None;
-    for item in items {
-        let after = item
-            .after_snapshot
-            .as_ref()
-            .map(|value| &value.0)
-            .ok_or_else(|| ApplyFailure::Invalid("model mapping payload is missing".into()))?;
-        let deployment_id = after
-            .get("deploymentID")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| ApplyFailure::Invalid("deploymentID is missing".into()))?;
-        let public_model = after
-            .get("publicModel")
-            .and_then(Value::as_object)
-            .ok_or_else(|| ApplyFailure::Invalid("publicModel is missing".into()))?;
-        let model_key = required_string(public_model, "modelID")?;
-        let deployment_channel = sqlx::query_scalar::<_, i64>(
-            "SELECT channel_id FROM upstream_model_deployments WHERE id=$1 AND status='enabled' FOR UPDATE",
-        )
-        .bind(deployment_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db_failure)?;
-        if deployment_channel != Some(channel_id) {
-            return Err(ApplyFailure::Superseded(format!(
-                "upstream deployment {deployment_id} is no longer available"
+    let mut metadata = std::collections::BTreeMap::<String, Value>::new();
+    let mut prepared = Vec::new();
+    for item in &items {
+        let after = item.after_snapshot.as_ref().map(|v| &v.0).ok_or_else(|| {
+            ApplyFailure::Invalid(format!("{}: mapping payload is missing", item.item_key))
+        })?;
+        let deployment = if let Some(upstream) = after["upstreamModelID"].as_str() {
+            let available: bool = sqlx::query_scalar(
+                "SELECT supported_models ? $2 FROM channels WHERE id=$1 AND deleted_at=0",
+            )
+            .bind(channel_id)
+            .bind(upstream)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(db_failure)?;
+            if !available {
+                return Err(ApplyFailure::Superseded(
+                    "model supply must be published before its mapping".into(),
+                ));
+            }
+            sqlx::query_scalar::<_,i64>("INSERT INTO upstream_model_deployments(channel_id,upstream_model_id,internal_name,variant,status,source) VALUES($1,$2,$2,'','enabled','discovered') ON CONFLICT(channel_id,upstream_model_id,variant) DO UPDATE SET status='enabled',updated_at=now() RETURNING id").bind(channel_id).bind(upstream).fetch_one(&mut **tx).await.map_err(db_failure)?
+        } else {
+            after["deploymentID"]
+                .as_i64()
+                .ok_or_else(|| ApplyFailure::Invalid("mapping deployment is missing".into()))?
+        };
+        let public = after["publicModel"].as_object().ok_or_else(|| {
+            ApplyFailure::Invalid(format!("{}: publicModel is missing", item.item_key))
+        })?;
+        let key = required_string(public, "modelID")?;
+        for field in ["developer", "type", "name", "group"] {
+            required_string(public, field)?;
+        }
+        if metadata
+            .get(&key)
+            .is_some_and(|old| old != &after["publicModel"])
+        {
+            return Err(ApplyFailure::Invalid(format!(
+                "{}: mappings to {key} disagree about public model metadata",
+                item.item_key
             )));
         }
+        metadata.insert(key.clone(), after["publicModel"].clone());
+        prepared.push((item, deployment, key));
+    }
+    // Lock all public keys before any insert. Fan-in routes compare against the
+    // same pre-apply catalog, rather than a model just created by a prior item.
+    for key in metadata.keys() {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)")
-            .bind(&model_key)
+            .bind(key)
             .execute(&mut **tx)
             .await
             .map_err(db_failure)?;
-        let existing = sqlx::query(
-            "SELECT id,status,developer,\"type\",name,\"group\" FROM models \
-             WHERE model_id=$1 AND deleted_at=0 LIMIT 1",
-        )
-        .bind(&model_key)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db_failure)?;
-        let current_snapshot = match existing.as_ref() {
-            Some(row) => {
-                let model_id: i64 = row.get("id");
-                let route_status = sqlx::query_scalar::<_, String>(
-                    "SELECT status FROM model_routes WHERE public_model_id=$1 AND deployment_id=$2",
-                )
-                .bind(model_id)
-                .bind(deployment_id)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(db_failure)?;
-                Some(json!({
-                    "id": model_id,
-                    "status": row.get::<String, _>("status"),
-                    "developer": row.get::<String, _>("developer"),
-                    "type": row.get::<String, _>("type"),
-                    "name": row.get::<String, _>("name"),
-                    "group": row.get::<String, _>("group"),
-                    "routeStatus": route_status,
-                }))
-            }
-            None => None,
-        };
-        let expected_snapshot = item.before_snapshot.as_ref().map(|value| value.0.clone());
-        if current_snapshot != expected_snapshot {
+    }
+    let mut model_ids = std::collections::BTreeMap::<String, i64>::new();
+    for (item, deployment, key) in &prepared {
+        let deployment_channel=sqlx::query_scalar::<_,i64>("SELECT channel_id FROM upstream_model_deployments WHERE id=$1 AND status='enabled' FOR UPDATE").bind(deployment).fetch_optional(&mut **tx).await.map_err(db_failure)?;
+        if deployment_channel != Some(channel_id) {
             return Err(ApplyFailure::Superseded(format!(
-                "public model or route for {model_key} changed after staging"
+                "{}: upstream deployment {deployment} is no longer available",
+                item.item_key
             )));
         }
-        let public_model_id = match existing {
-            Some(row) if row.get::<String, _>("status") == "archived" => {
+        let existing=sqlx::query("SELECT id,status,developer,\"type\",name,\"group\" FROM models WHERE model_id=$1 AND deleted_at=0 LIMIT 1 FOR UPDATE").bind(key).fetch_optional(&mut **tx).await.map_err(db_failure)?;
+        let current = if let Some(row) = existing.as_ref() {
+            let id: i64 = row.get("id");
+            let route = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM model_routes WHERE public_model_id=$1 AND deployment_id=$2",
+            )
+            .bind(id)
+            .bind(deployment)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_failure)?;
+            Some(
+                json!({"id":id,"status":row.get::<String,_>("status"),"developer":row.get::<String,_>("developer"),"type":row.get::<String,_>("type"),"name":row.get::<String,_>("name"),"group":row.get::<String,_>("group"),"routeStatus":route}),
+            )
+        } else {
+            None
+        };
+        if current != item.before_snapshot.as_ref().map(|v| v.0.clone()) {
+            return Err(ApplyFailure::Superseded(format!(
+                "{}: public model or route for {key} changed after staging",
+                item.item_key
+            )));
+        }
+        if let Some(row) = existing {
+            if row.get::<String, _>("status") == "archived" {
                 return Err(ApplyFailure::Invalid(format!(
-                    "public model {model_key} is archived"
+                    "{}: public model {key} is archived",
+                    item.item_key
                 )));
             }
-            Some(row) => row.get("id"),
-            None => {
-                let developer = required_string(public_model, "developer")?;
-                let model_type = required_string(public_model, "type")?;
-                let name = required_string(public_model, "name")?;
-                let group = required_string(public_model, "group")?;
-                let conflict = sqlx::query_scalar::<_, String>(
-                    "SELECT model_id FROM models WHERE name=$1 AND deleted_at=0 LIMIT 1",
-                )
-                .bind(&name)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(db_failure)?;
-                if conflict.is_some_and(|key| key != model_key) {
-                    return Err(ApplyFailure::Invalid(format!(
-                        "public model name {name} is already used"
-                    )));
-                }
-                sqlx::query_scalar::<_, i64>(
-                    "INSERT INTO models \
-                     (developer,model_id,\"type\",name,icon,\"group\",model_card,settings,status,remark,created_at,updated_at,deleted_at) \
-                     VALUES($1,$2,$3,$4,'',$5,'{}'::jsonb,'{}'::jsonb,'enabled',$6,now(),now(),0) RETURNING id",
-                )
-                .bind(developer)
-                .bind(&model_key)
-                .bind(model_type)
-                .bind(name)
-                .bind(group)
-                .bind(format!("Created from approved model mapping change set {}", change_set.id))
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(db_failure)?
-            }
-        };
-        let route_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO model_routes(public_model_id,deployment_id,status,created_at,updated_at) \
-             VALUES($1,$2,'enabled',now(),now()) ON CONFLICT(public_model_id,deployment_id) \
-             DO UPDATE SET status='enabled',updated_at=now() RETURNING id",
-        )
-        .bind(public_model_id)
-        .bind(deployment_id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(db_failure)?;
-        last_route_id = Some(route_id);
+            model_ids.insert(key.clone(), row.get("id"));
+        }
+    }
+    for (key, public) in &metadata {
+        if !model_ids.contains_key(key) {
+            let id=sqlx::query_scalar::<_,i64>("INSERT INTO models(developer,model_id,\"type\",name,icon,\"group\",model_card,settings,status,remark,created_at,updated_at,deleted_at) VALUES($1,$2,$3,$4,'',$5,'{}'::jsonb,'{}'::jsonb,'enabled',$6,now(),now(),0) RETURNING id").bind(public["developer"].as_str()).bind(key).bind(public["type"].as_str()).bind(public["name"].as_str()).bind(public["group"].as_str()).bind(format!("Created from approved model mapping package {}",change_set.id)).fetch_one(&mut **tx).await.map_err(db_failure)?;
+            model_ids.insert(key.clone(), id);
+        }
+    }
+    let mut last = None;
+    for (_, deployment, key) in &prepared {
+        let id=sqlx::query_scalar::<_,i64>("INSERT INTO model_routes(public_model_id,deployment_id,status,created_at,updated_at) VALUES($1,$2,'enabled',now(),now()) ON CONFLICT(public_model_id,deployment_id) DO UPDATE SET status='enabled',updated_at=now() RETURNING id").bind(model_ids[key]).bind(deployment).fetch_one(&mut **tx).await.map_err(db_failure)?;
+        last = Some(id);
     }
     sqlx::query("UPDATE channels SET updated_at=now() WHERE id=$1 AND deleted_at=0")
         .bind(channel_id)
         .execute(&mut **tx)
         .await
         .map_err(db_failure)?;
-    Ok((
-        "model_route".into(),
-        last_route_id.unwrap_or_default().to_string(),
-    ))
+    Ok(("model_route".into(), last.unwrap_or_default().to_string()))
 }
 
 async fn apply_retail_price(
@@ -1474,18 +1009,25 @@ async fn apply_retail_price(
     let mut validated = Vec::with_capacity(items.len());
     for item in items {
         let public_model_id = parse_i64(&item.item_key, "public model")?;
+        if let (Some(source), Some(proposed)) = (&item.source_snapshot, &item.after_snapshot) {
+            crate::wiring_postgres_price_formula::validate_derived(
+                tx,
+                book_id,
+                public_model_id,
+                &source.0,
+                &proposed.0,
+            )
+            .await
+            .map_err(ApplyFailure::Superseded)?;
+        }
         let price = item
             .after_snapshot
             .map(|value| value.0)
             .ok_or_else(|| ApplyFailure::Invalid("retail price is missing".into()))?;
-        let parsed: ModelPrice = serde_json::from_value(price.clone())
-            .map_err(|error| ApplyFailure::Invalid(format!("invalid retail price: {error}")))?;
-        crate::wiring::validate_model_price(&parsed)
-            .map_err(|error| ApplyFailure::Invalid(format!("invalid retail price: {error}")))?;
-        if parsed.items.is_empty() {
-            return Err(ApplyFailure::Invalid(format!(
-                "retail price for model {public_model_id} is empty"
-            )));
+        let document = conduit_core::objects::retail_price_plan::RetailPriceDocument::parse(&price)
+            .map_err(ApplyFailure::Invalid)?;
+        for leaf in document.leaves() {
+            crate::wiring::validate_model_price(leaf).map_err(ApplyFailure::Invalid)?;
         }
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM models WHERE id=$1 AND deleted_at=0)",
@@ -1501,6 +1043,15 @@ async fn apply_retail_price(
         }
         validated.push((public_model_id, price));
     }
+    let base_items=sqlx::query_as::<_,(i64,SqlJson<Value>)>("SELECT i.public_model_id,i.price FROM price_book_items i JOIN price_book_versions v ON v.id=i.price_book_version_id WHERE v.price_book_id=$1 AND v.reference_id=$2").bind(book_id).bind(&current_reference).fetch_all(&mut **tx).await.map_err(db_failure)?;
+    let mut full = base_items
+        .into_iter()
+        .map(|(id, price)| (id, price.0))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (id, price) in validated {
+        full.insert(id, price);
+    }
+    let validated = full.into_iter().collect::<Vec<_>>();
     let before_snapshot =
         super::wiring_postgres_commercialization::price_book_state_snapshot(tx, book_id)
             .await
@@ -1565,6 +1116,16 @@ async fn apply_retail_price(
     )
     .await
     .map_err(|error| ApplyFailure::Storage(error.to_string()))?;
+    // The currently applying formula draft must become terminal before the
+    // new base is reconciled, so automatic refresh cannot supersede itself.
+    sqlx::query("UPDATE change_sets SET formula_id=NULL WHERE id=$1")
+        .bind(change_set.id)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_failure)?;
+    crate::wiring_postgres_price_formula::refresh_book(tx, book_id)
+        .await
+        .map_err(ApplyFailure::Storage)?;
     Ok(("price_book_version".into(), version_id.to_string()))
 }
 
@@ -1661,7 +1222,7 @@ async fn mark_invalid(
     Ok(())
 }
 
-async fn insert_event(
+pub(crate) async fn insert_event(
     tx: &mut Transaction<'_, Postgres>,
     change_set_id: i64,
     event_type: &str,
@@ -1713,6 +1274,13 @@ fn parse_kind(value: &str) -> Result<gql::ChangeSetKind, gql::ChangeSetError> {
         "provider_price" => Ok(gql::ChangeSetKind::ProviderPrice),
         "model_mapping" => Ok(gql::ChangeSetKind::ModelMapping),
         "retail_price" => Ok(gql::ChangeSetKind::RetailPrice),
+        "channel_configuration" => Ok(gql::ChangeSetKind::ChannelConfiguration),
+        "model_supply" => Ok(gql::ChangeSetKind::ModelSupply),
+        "group_access" => Ok(gql::ChangeSetKind::GroupAccess),
+        "identity_access" => Ok(gql::ChangeSetKind::IdentityAccess),
+        "project_configuration" => Ok(gql::ChangeSetKind::ProjectConfiguration),
+        "system_configuration" => Ok(gql::ChangeSetKind::SystemConfiguration),
+        "project_credit" => Ok(gql::ChangeSetKind::ProjectCredit),
         other => Err(gql::ChangeSetError::Query(format!(
             "unknown change set kind {other}"
         ))),
@@ -1723,6 +1291,7 @@ fn parse_status(value: &str) -> Result<gql::ChangeSetStatus, gql::ChangeSetError
     match value {
         "draft" => Ok(gql::ChangeSetStatus::Draft),
         "pending_review" => Ok(gql::ChangeSetStatus::PendingReview),
+        "approved" => Ok(gql::ChangeSetStatus::Approved),
         "applied" => Ok(gql::ChangeSetStatus::Applied),
         "rejected" => Ok(gql::ChangeSetStatus::Rejected),
         "superseded" => Ok(gql::ChangeSetStatus::Superseded),
@@ -1787,6 +1356,7 @@ fn db_failure(error: sqlx::Error) -> ApplyFailure {
     ApplyFailure::Storage(error.to_string())
 }
 
+#[derive(Debug)]
 enum ApplyFailure {
     Superseded(String),
     Invalid(String),
@@ -1801,6 +1371,43 @@ mod tests {
         ModelPriceItem, PRICING_MODE_USAGE_PER_UNIT, Pricing, price_item_code,
     };
     use rust_decimal::Decimal;
+
+    async fn publish_reviewed(
+        pool: &PgPool,
+        actor: i64,
+        reviewed: gql::ChangeSet,
+    ) -> Result<gql::ChangeSet, gql::ChangeSetError> {
+        use conduit_admin_graphql::change_package::ChangePackageServices;
+        let adapter = PgChangeSetAdapter::new(pool.clone());
+        let detail = super::packages::required_detail(
+            pool,
+            actor,
+            reviewed
+                .id
+                .as_str()
+                .parse()
+                .map_err(|_| gql::ChangeSetError::Invalid("invalid test id".into()))?,
+        )
+        .await?;
+        adapter
+            .transition(
+                actor,
+                reviewed.id.clone(),
+                detail.summary.revision,
+                conduit_admin_graphql::change_package::ChangeSetAvailableAction::Publish,
+                None,
+            )
+            .await?;
+        load_change_set(
+            pool,
+            reviewed
+                .id
+                .as_str()
+                .parse()
+                .map_err(|_| gql::ChangeSetError::Invalid("invalid test id".into()))?,
+        )
+        .await
+    }
 
     fn token_price() -> ModelPrice {
         ModelPrice {
@@ -1831,18 +1438,28 @@ mod tests {
             model_id: model_id.into(),
             currency_code: "CNY".into(),
             price: conduit_admin_graphql::model_ext::ModelPriceInput {
-                items: vec![conduit_admin_graphql::model_ext::ModelPriceItemInput {
-                    item_code: conduit_admin_graphql::request_usage::PriceItemCode::PromptTokens,
-                    pricing: conduit_admin_graphql::model_ext::PricingInput {
-                        mode: conduit_admin_graphql::model_ext::PricingMode::UsagePerUnit,
-                        flat_fee: None,
-                        usage_per_unit: Some(conduit_admin_graphql::scalars::DecimalScalar(
-                            Decimal::ONE,
-                        )),
-                        usage_tiered: None,
+                items: [
+                    conduit_admin_graphql::request_usage::PriceItemCode::PromptTokens,
+                    conduit_admin_graphql::request_usage::PriceItemCode::CompletionTokens,
+                    conduit_admin_graphql::request_usage::PriceItemCode::PromptCachedTokens,
+                    conduit_admin_graphql::request_usage::PriceItemCode::PromptWriteCachedTokens,
+                ]
+                .into_iter()
+                .map(
+                    |item_code| conduit_admin_graphql::model_ext::ModelPriceItemInput {
+                        item_code,
+                        pricing: conduit_admin_graphql::model_ext::PricingInput {
+                            mode: conduit_admin_graphql::model_ext::PricingMode::UsagePerUnit,
+                            flat_fee: None,
+                            usage_per_unit: Some(conduit_admin_graphql::scalars::DecimalScalar(
+                                Decimal::ONE,
+                            )),
+                            usage_tiered: None,
+                        },
+                        prompt_write_cache_variants: None,
                     },
-                    prompt_write_cache_variants: None,
-                }],
+                )
+                .collect(),
             },
         }
     }
@@ -1858,6 +1475,7 @@ mod tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[7, 8]).await?;
         let older_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO change_sets \
              (kind,scope_type,scope_id,title,status,created_at,updated_at) \
@@ -1896,6 +1514,7 @@ mod tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[7, 8]).await?;
         let channel_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO channels \
              (\"type\",name,status,credentials,supported_models,default_test_model,settings) \
@@ -1993,12 +1612,14 @@ mod tests {
             .bind(observed_change_set_id)
             .fetch_one(&database.pool)
             .await?,
-            ("superseded".into(), Some(7)),
-            "a submitted manual proposal must supersede an overlapping observed proposal"
+            ("pending_review".into(), None),
+            "a new manual intent must not silently supersede another observation"
         );
         let applied = adapter
             .approve_change_set(8, draft.id, Some("manual prices verified".into()))
             .await?;
+        assert_eq!(applied.status, gql::ChangeSetStatus::Approved);
+        let applied = publish_reviewed(&database.pool, 8, applied).await?;
         assert_eq!(applied.status, gql::ChangeSetStatus::Applied);
         let formal_models = sqlx::query_scalar::<_, String>(
             "SELECT model_id FROM channel_model_prices WHERE channel_id=$1 AND deleted_at=0",
@@ -2029,6 +1650,7 @@ mod tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[7, 8]).await?;
         let channel_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO channels \
              (\"type\",name,status,credentials,supported_models,default_test_model,settings) \
@@ -2081,8 +1703,11 @@ mod tests {
             state
                 .1
                 .as_deref()
-                .is_some_and(|error| error.contains("usagePerUnit is required"))
+                .is_some_and(|error| error.contains("one or more package items are invalid"))
         );
+        let item_error = sqlx::query_scalar::<_, String>("SELECT validation_error FROM change_set_items WHERE change_set_id=$1 AND item_key='model-b'")
+            .bind(change_set_id).fetch_one(&database.pool).await?;
+        assert!(item_error.contains("usagePerUnit is required"));
         assert_eq!(state.2, Some(8));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -2115,6 +1740,7 @@ mod tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[7, 8]).await?;
         let channel_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO channels \
              (\"type\",name,status,credentials,supported_models,default_test_model,settings) \
@@ -2167,6 +1793,7 @@ mod tests {
             "billingCurrency": "CNY",
             "rechargeMultiplier": "1",
             "providerPriceRowID": provider_row_id,
+            "snapshotID": snapshot_id,
         })))
         .bind(now)
         .execute(&database.pool)
@@ -2176,6 +1803,8 @@ mod tests {
         let applied = adapter
             .approve_change_set(7, change_set_id.to_string().into(), Some("verified".into()))
             .await?;
+        assert_eq!(applied.status, gql::ChangeSetStatus::Approved);
+        let applied = publish_reviewed(&database.pool, 7, applied).await?;
         assert_eq!(applied.status, gql::ChangeSetStatus::Applied);
         assert_eq!(applied.applied_target_type.as_deref(), Some("channel"));
         let stored = sqlx::query_as::<_, (String, SqlJson<Value>)>(

@@ -8,13 +8,19 @@ export function ProductExperienceProvider({ children }: { children: ReactNode })
   const user = useAuthStore((state) => state.auth.user);
   const query = useProductExperienceSettings();
   const mode = query.data?.mode ?? DEFAULT_PRODUCT_MODE;
+  const isAdministrator =
+    !!user?.isOwner ||
+    !!user?.scopes?.some(
+      (scope) => scope === '*' || ['read_dashboard', 'read_channels', 'read_users', 'read_settings', 'read_billing'].includes(scope)
+    );
   const value = useMemo(
     () => ({
       mode,
       isLoading: query.isLoading,
-      homePath: resolveProductLandingPath(mode, user?.isOwner ?? false),
+      homePath: resolveProductLandingPath(mode, isAdministrator),
+      features: query.data?.features ?? [],
     }),
-    [mode, query.isLoading, user?.isOwner]
+    [mode, query.isLoading, isAdministrator, query.data?.features]
   );
 
   return <ProductExperienceContext.Provider value={value}>{children}</ProductExperienceContext.Provider>;

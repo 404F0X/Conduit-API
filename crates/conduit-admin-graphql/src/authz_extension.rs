@@ -92,6 +92,14 @@ pub fn field_authz(field: &str) -> FieldAuthz {
     match field {
         // ── Rust-only trivial ─────────────────────────────────────────────
         "health" | "version" => Public,
+        "changeSetByOperation" | "governanceSettings" | "governanceCapabilities" | "governedChangeBase" | "changeSets" | "changeSet" | "changeSetItems" | "changeSetItem" | "changeSetEvents" => Authenticated,
+        "setProjectMemberSpendLimit" => Scope(slug::WRITE_BILLING),
+        "updateGovernanceSettings" => Scope(slug::MANAGE_GOVERNANCE),
+        "claimGovernedChangeSecrets" | "proposeGovernedChange" | "validateChangeSet" => Authenticated,
+        "reviewChangeSet" => Authenticated,
+        "publishChangeSet" => Authenticated,
+        "emergencyRestrictAccess" => Scope(slug::EMERGENCY_REVOKE),
+        "recoverGovernancePolicy" => OwnerOnly,
         "enumCasingProbe" | "connectionProbe" => Authenticated,
 
         // ── self-service / WithSystemBypass reads (any authenticated admin) ─
@@ -116,7 +124,7 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         "backup" | "restore" => OwnerOnly,
 
         // ── channels (write) ──────────────────────────────────────────────
-        "createChannel" | "updateChannel" | "deleteChannel" | "updateChannelStatus"
+        "initializeNewApiChannel" | "retryNewApiChannelDiscovery" | "createChannel" | "updateChannel" | "deleteChannel" | "updateChannelStatus"
         | "duplicateChannel" | "saveChannelEndpoints" | "bulkArchiveChannels"
         | "bulkDisableChannels" | "bulkEnableChannels" | "bulkRecoverChannels"
         | "bulkDeleteChannels" | "bulkCreateChannels" | "bulkImportChannels"
@@ -144,7 +152,7 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         // ── channels (read) ───────────────────────────────────────────────
         // testChannel* are mutations but Go's only gate is the Channel *Query*
         // policy (Channel.Get; no entity write), so read_channels is faithful.
-        "testChannel" | "testChannelAPIKey" | "testChannelAPIKeys" | "channels" | "models"
+        "testChannel" | "testChannelAPIKey" | "testChannelAPIKeys" | "channelDiscoveryOperation" | "channels" | "models"
         | "promptProtectionRules" | "allChannelSummarys" | "allChannelTags"
         | "countChannelsByType" | "queryChannels" | "queryModels"
         | "queryModelChannelConnections" | "queryUnassociatedChannels" => {
@@ -186,6 +194,10 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         "users" => Scope(slug::READ_USERS),
 
         // ── groups ─────────────────────────────────────────────────────────
+        "modelGroups" | "userGroups" => Scope(slug::READ_USERS),
+        "saveModelGroup" | "saveUserGroup" | "moveUserToGroup" => Scope(slug::WRITE_USERS),
+        "apiKeyAssignableModelGroups" | "apiKeyProfileCatalog" => Scope(slug::READ_API_KEYS),
+        "apiKeyCreationCatalog" | "assignApiKeyModelGroup" => Scope(slug::WRITE_API_KEYS),
         "createSimpleGroup" | "updateSimpleGroup" | "assignSimpleGroupUsers"
         | "updateSimpleGroupModels" | "updateSimpleGroupPrice" | "deleteSimpleGroup" => {
             Scope(slug::WRITE_GROUPS)
@@ -197,6 +209,10 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         "updatePublicChannelHealthSettings" => Scope(slug::WRITE_SETTINGS),
 
         // ── billing + subscriptions ────────────────────────────────────────
+        // Resolvers additionally require GLOBAL billing authority; a Project
+        // role accepted by the generic Scope gate cannot access these APIs.
+        "operatorPaymentOrders" | "operatorPaymentOrder" => Scope(slug::READ_BILLING),
+        "operatorRecheckPaymentOrder" => Scope(slug::WRITE_BILLING),
         "userBalance"
         | "projectBalance"
         | "projectWalletComparison"
@@ -207,12 +223,13 @@ pub fn field_authz(field: &str) -> FieldAuthz {
             Scope(slug::READ_SUBSCRIPTIONS)
         }
         "myBalance" | "mySubscriptions" | "myProjectBalance"
-        | "myProjectWalletComparison" | "myPrimaryProject" => Authenticated,
+        | "myProjectWalletComparison" | "myPrimaryProject" | "myProjectFunds" => Authenticated,
+        "projectMemberSpendLimit" => Scope(slug::READ_BILLING),
         "grantUserCredit"
         | "grantProjectCredit"
         | "createCreditRedemptionCodes"
         | "revokeCreditRedemptionCode" => Scope(slug::GRANT_CREDIT),
-        "redeemCreditCode" => Authenticated,
+        "redeemCreditCode" | "paymentCapabilities" | "paymentOrders" | "paymentOrder" | "createPaymentOrder" | "recheckPaymentOrder" => Authenticated,
         "createSubscriptionPlan" | "updateSubscriptionPlan" | "assignUserSubscription"
         | "refreshSubscriptionAllowance" | "pauseUserSubscription"
         | "resumeUserSubscription" | "cancelUserSubscription" | "renewUserSubscription"
@@ -251,8 +268,8 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         "triggerGcCleanup" => Scope(slug::WRITE_SETTINGS),
 
         // ── commercialization ──────────────────────────────────────────────
-        "createPriceBook" | "createProviderPriceChangeSet" | "createRetailPriceChangeSet"
-        | "saveChannelModelPrices" | "saveRetailPriceChangeSetItem"
+        "createPriceBook" | "saveProviderPriceChangeSet" | "createProviderPriceChangeSet" | "createRetailPriceChangeSet"
+        | "saveChannelModelPrices" | "saveRetailPriceChangeSetItem" | "saveRetailPriceFormula"
         | "submitChangeSet" | "approveChangeSet" | "rejectChangeSet" => {
             Scope(slug::WRITE_COMMERCIALIZATION)
         }
@@ -264,7 +281,8 @@ pub fn field_authz(field: &str) -> FieldAuthz {
             Scope(slug::READ_SETTINGS)
         }
         "previewGcCleanup" => Scope(slug::READ_SETTINGS),
-        "priceBooks" | "previewCustomerCharge" | "changeSets" => {
+        "priceBooks" | "previewCustomerCharge" | "providerPriceChangeSetOperation" | "providerPriceEditBase" | "retailPriceEditBase"
+        | "retailPriceFormulas" | "previewRetailPriceFormula" => {
             Scope(slug::READ_COMMERCIALIZATION)
         }
 
@@ -311,6 +329,65 @@ impl Extension for ScopeAuthExtension {
         {
             return Err(ServerError::new(message, None));
         }
+        let feature = match info.name {
+            "operationsLedger" | "operationsFlow" | "operationsModelSeries" => {
+                Some("operations_reports")
+            }
+            "createCreditRedemptionCodes" => Some("redemption_issuance"),
+            "createSubscriptionPlan"
+            | "updateSubscriptionPlan"
+            | "assignUserSubscription"
+            | "refreshSubscriptionAllowance"
+            | "pauseUserSubscription"
+            | "resumeUserSubscription"
+            | "cancelUserSubscription"
+            | "renewUserSubscription"
+            | "setSubscriptionAutoRenew" => Some("subscription_management"),
+            _ => None,
+        };
+        if info.parent_type == "MutationRoot"
+            && !info.is_for_introspection
+            && let Some(service) = ctx.data_opt::<Arc<dyn crate::governance::GovernanceServices>>()
+        {
+            let actor = ctx
+                .data_opt::<crate::me::CurrentUser>()
+                .map(|u| u.user_id)
+                .ok_or_else(|| ServerError::new("authentication required", None))?;
+            if let Err(message) = service.check_direct(actor, info.name).await {
+                let code = if message.starts_with("APPROVAL_REQUIRED") {
+                    "APPROVAL_REQUIRED"
+                } else {
+                    "GOVERNANCE_UNSUPPORTED"
+                };
+                let mut error = ServerError::new(message, None);
+                let mut ext = async_graphql::ErrorExtensionValues::default();
+                ext.set("code", code);
+                error.extensions = Some(ext);
+                return Err(error);
+            }
+        }
+        if is_root
+            && let Some(feature) = feature
+            && let Some(service) =
+                ctx.data_opt::<Arc<dyn crate::product_experience::ProductExperienceServices>>()
+        {
+            let settings = service
+                .settings()
+                .await
+                .map_err(|_| ServerError::new("feature settings unavailable", None))?;
+            if settings
+                .features
+                .iter()
+                .any(|item| item.id == feature && !item.enabled)
+            {
+                let mut error = ServerError::new("FEATURE_DISABLED", None);
+                let mut extensions = async_graphql::ErrorExtensionValues::default();
+                extensions.set("code", "FEATURE_DISABLED");
+                extensions.set("feature", feature);
+                error.extensions = Some(extensions);
+                return Err(error);
+            }
+        }
         let writes_settings = info.parent_type == "MutationRoot"
             && (field_authz(info.name) == FieldAuthz::Scope(slug::WRITE_SETTINGS)
                 || matches!(
@@ -340,17 +417,92 @@ fn enforce_field(ctx: &ExtensionContext<'_>, field: &str) -> Result<(), String> 
     match field_authz(field) {
         FieldAuthz::Public => Ok(()),
         FieldAuthz::Authenticated => {
-            if principal.is_some() {
-                Ok(())
-            } else {
-                Err(NO_PRINCIPAL.to_string())
+            let Some(principal) = principal else {
+                return Err(NO_PRINCIPAL.to_string());
+            };
+            let package_read = matches!(
+                field,
+                "changeSetByOperation"
+                    | "changeSets"
+                    | "changeSet"
+                    | "changeSetItems"
+                    | "changeSetItem"
+                    | "changeSetEvents"
+            );
+            let package_write = matches!(
+                field,
+                "governedChangeBase"
+                    | "proposeGovernedChange"
+                    | "validateChangeSet"
+                    | "reviewChangeSet"
+                    | "publishChangeSet"
+            );
+            if package_read || package_write {
+                // Domain authorization is checked again for the actual package;
+                // an unrelated login must not enter the package service at all.
+                let read_scopes = [
+                    slug::READ_COMMERCIALIZATION,
+                    slug::READ_CHANNELS,
+                    slug::READ_GROUPS,
+                    slug::READ_USERS,
+                    slug::READ_API_KEYS,
+                    slug::READ_PROJECTS,
+                    slug::READ_SETTINGS,
+                    slug::READ_BILLING,
+                    slug::READ_ROLES,
+                    slug::READ_SUBSCRIPTIONS,
+                    slug::READ_DATA_STORAGES,
+                ];
+                let write_scopes = [
+                    slug::WRITE_COMMERCIALIZATION,
+                    slug::WRITE_CHANNELS,
+                    slug::WRITE_GROUPS,
+                    slug::WRITE_USERS,
+                    slug::WRITE_ROLES,
+                    slug::WRITE_API_KEYS,
+                    slug::WRITE_PROJECTS,
+                    slug::WRITE_SETTINGS,
+                    slug::WRITE_BILLING,
+                    slug::WRITE_SUBSCRIPTIONS,
+                    slug::WRITE_DATA_STORAGES,
+                    slug::GRANT_CREDIT,
+                ];
+                let allowed = write_scopes
+                    .into_iter()
+                    .chain(read_scopes.into_iter().filter(|_| package_read))
+                    .any(|scope| {
+                        if supports_project_role(scope)
+                            && let Some(project) =
+                                request_context.and_then(|rc| rc.project_id.as_deref())
+                        {
+                            authorize_project_resolver(principal, project, scope).is_ok()
+                        } else {
+                            authorize_resolver(principal, scope).is_ok()
+                        }
+                    });
+                if !allowed {
+                    return Err("authz: required scope: one package domain permission".into());
+                }
             }
+            Ok(())
         }
         FieldAuthz::Scope(scope) => {
             let Some(principal) = principal else {
                 return Err(NO_PRINCIPAL.to_string());
             };
-            if supports_project_role(scope)
+            if matches!(
+                field,
+                "operatorPaymentOrders"
+                    | "operatorPaymentOrder"
+                    | "operatorRecheckPaymentOrder"
+                    | "modelGroups"
+                    | "userGroups"
+                    | "saveModelGroup"
+                    | "saveUserGroup"
+                    | "moveUserToGroup"
+            ) {
+                authorize_resolver(principal, scope).map_err(|err| err.to_string())
+            } else if supports_project_role(scope)
                 && let Some(project_id) = request_context.and_then(|rc| rc.project_id.as_deref())
             {
                 authorize_project_resolver(principal, project_id, scope)
@@ -389,10 +541,13 @@ mod tests {
 
     #[test]
     fn table_maps_entities_to_the_right_scopes() {
-        assert_eq!(
-            field_authz("createChannel"),
-            FieldAuthz::Scope(slug::WRITE_CHANNELS)
-        );
+        for field in [
+            "initializeNewApiChannel",
+            "retryNewApiChannelDiscovery",
+            "createChannel",
+        ] {
+            assert_eq!(field_authz(field), FieldAuthz::Scope(slug::WRITE_CHANNELS));
+        }
         // models + prompt-protection reuse the CHANNEL scope (Go parity).
         assert_eq!(
             field_authz("createModel"),
@@ -589,6 +744,10 @@ mod tests {
             (
                 "updateAPIKeyProfiles",
                 FieldAuthz::Scope(slug::WRITE_API_KEYS),
+            ),
+            (
+                "channelDiscoveryOperation",
+                FieldAuthz::Scope(slug::READ_CHANNELS),
             ),
             ("channels", FieldAuthz::Scope(slug::READ_CHANNELS)),
             ("models", FieldAuthz::Scope(slug::READ_CHANNELS)),

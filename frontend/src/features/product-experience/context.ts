@@ -1,10 +1,12 @@
 import { createContext, useContext } from 'react';
+import type { ProductFeature } from './data';
 import type { ProductMode } from './mode';
 
 export interface ProductExperienceContextValue {
   mode: ProductMode;
   isLoading: boolean;
   homePath: '/' | '/project/dashboard';
+  features: ProductFeature[];
 }
 
 export const ProductExperienceContext = createContext<ProductExperienceContextValue | null>(null);

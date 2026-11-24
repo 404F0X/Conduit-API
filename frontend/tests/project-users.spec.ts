@@ -1,11 +1,11 @@
-//@ts-ignore
-import { test, expect } from '@playwright/test'
-import { gotoAndEnsureAuth, waitForGraphQLOperation } from './auth.utils'
+import { enterFixtureProject } from './project-fixture'
+import { test, expect, type Locator } from '@playwright/test'
+import { waitForGraphQLOperation } from './auth.utils'
 
 test.describe('Project Users Management', () => {
   test.beforeEach(async ({ page }) => {
     // Navigate directly to project users page
-    await gotoAndEnsureAuth(page, '/project/users')
+    await enterFixtureProject(page, '/project/users')
     
     // Wait for users table to be visible
     const usersTable = page.locator('[data-testid="users-table"]')
@@ -104,7 +104,7 @@ test.describe('Project Users Management', () => {
     const rowCount = await rows.count()
     
     if (rowCount === 0) {
-      test.skip()
+      test.skip(true, 'No Project user row is available to edit')
       return
     }
 
@@ -121,7 +121,7 @@ test.describe('Project Users Management', () => {
     }
 
     if (!targetRow) {
-      test.skip()
+      test.skip(true, 'No non-owner Project user is available to edit')
       return
     }
 
@@ -161,7 +161,7 @@ test.describe('Project Users Management', () => {
     const rowCount = await rows.count()
     
     if (rowCount === 0) {
-      test.skip()
+      test.skip(true, 'No Project user row is available to remove')
       return
     }
 
@@ -180,7 +180,7 @@ test.describe('Project Users Management', () => {
     }
 
     if (!targetRow) {
-      test.skip()
+      test.skip(true, 'No non-owner Project user is available to remove')
       return
     }
 
@@ -215,7 +215,7 @@ test.describe('Project Users Management', () => {
     // Find the search input
     const searchInput = page.getByPlaceholder(/搜索|Search|名称|Name|邮箱|Email/i)
     if (await searchInput.count() === 0) {
-      test.skip()
+      test.skip(true, 'Project user search input is absent')
       return
     }
 
@@ -226,7 +226,7 @@ test.describe('Project Users Management', () => {
     const initialRows = await usersTable.locator('tbody tr').count()
     
     if (initialRows === 0) {
-      test.skip()
+      test.skip(true, 'No Project user row is available to filter')
       return
     }
 

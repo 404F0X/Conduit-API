@@ -122,6 +122,15 @@ impl OperationsServices for PgOperationsAdapter {
         &self,
         period_days: i32,
     ) -> Result<OperationsLedger, OperationsError> {
+        if !crate::wiring_product_experience::feature_enabled(&self.pool, "operations_reports")
+            .await
+            .map_err(OperationsError::Query)?
+        {
+            return Err(OperationsError::Query(
+                "FEATURE_DISABLED: operations_reports".into(),
+            ));
+        }
+
         if let Some(read_pool) = self.read_pool.as_ref() {
             match self.load_from(read_pool, period_days).await {
                 Ok(ledger) => return Ok(ledger),
@@ -139,6 +148,15 @@ impl OperationsServices for PgOperationsAdapter {
         period_days: i32,
         limit: i32,
     ) -> Result<OperationsFlow, OperationsError> {
+        if !crate::wiring_product_experience::feature_enabled(&self.pool, "operations_reports")
+            .await
+            .map_err(OperationsError::Query)?
+        {
+            return Err(OperationsError::Query(
+                "FEATURE_DISABLED: operations_reports".into(),
+            ));
+        }
+
         if let Some(read_pool) = self.read_pool.as_ref() {
             match self.load_flow_from(read_pool, period_days, limit).await {
                 Ok(flow) => return Ok(flow),
@@ -155,6 +173,15 @@ impl OperationsServices for PgOperationsAdapter {
         &self,
         period_days: i32,
     ) -> Result<OperationsModelSeries, OperationsError> {
+        if !crate::wiring_product_experience::feature_enabled(&self.pool, "operations_reports")
+            .await
+            .map_err(OperationsError::Query)?
+        {
+            return Err(OperationsError::Query(
+                "FEATURE_DISABLED: operations_reports".into(),
+            ));
+        }
+
         if let Some(read_pool) = self.read_pool.as_ref() {
             match self.load_model_series_from(read_pool, period_days).await {
                 Ok(series) => return Ok(series),

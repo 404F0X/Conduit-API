@@ -1,0 +1,495 @@
+[
+  {
+    "source": "packages",
+    "method": "getPackage",
+    "args": [
+      "test-id"
+    ],
+    "query": "query ChangeSet($id: ID!) { changeSet(id: $id) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "id": "test-id"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getPackagePage",
+    "args": [
+      {
+        "statuses": [
+          "PENDING_REVIEW"
+        ]
+      }
+    ],
+    "query": "query ChangeSets($filter: ChangeSetFilterInput, $after: Cursor, $first: Int!) { changeSets(filter: $filter, after: $after, first: $first) { edges { cursor node { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } totalCount statusCounts { status count } } }",
+    "variables": {
+      "filter": {
+        "statuses": [
+          "PENDING_REVIEW"
+        ]
+      },
+      "first": 20
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getPackageByOperation",
+    "args": [
+      "00000000-0000-4000-8000-000000000001",
+      "PROVIDER_PRICE",
+      "channel",
+      "test-id"
+    ],
+    "query": "query PackageByOperation($operationID: ID!, $kind: ChangeSetKind!, $scopeType: String!, $scopeID: ID!) { changeSetByOperation(operationID: $operationID, kind: $kind, scopeType: $scopeType, scopeID: $scopeID) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "operationID": "00000000-0000-4000-8000-000000000001",
+      "kind": "PROVIDER_PRICE",
+      "scopeType": "channel",
+      "scopeID": "test-id"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "findProviderOperation",
+    "args": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "query": "query ProviderOperation($operationID: ID!) { providerPriceChangeSetOperation(operationID: $operationID) { operationID outcome changeSetDetail { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } } }",
+    "variables": {
+      "operationID": "00000000-0000-4000-8000-000000000001"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getItemPage",
+    "args": [
+      "test-id"
+    ],
+    "query": "query PackageItems($id: ID!, $after: Cursor, $search: String, $problemsOnly: Boolean!) { changeSetItems(changeSetID: $id, after: $after, first: 50, search: $search, problemsOnly: $problemsOnly) { edges { cursor node { id itemKey action modelLabel changedFieldCount validationState issues { itemKey field code message severity } } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } totalCount } }",
+    "variables": {
+      "id": "test-id",
+      "problemsOnly": false
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getItem",
+    "args": [
+      "test-id",
+      "test-id"
+    ],
+    "query": "query PackageItem($id: ID!, $itemID: ID!) { changeSetItem(changeSetID: $id, itemID: $itemID) { item { id itemKey action beforeSnapshot afterSnapshot sourceSnapshot validationError createdAt updatedAt } currentSnapshot currentMatchesBefore issues { itemKey field code message severity } } }",
+    "variables": {
+      "id": "test-id",
+      "itemID": "test-id"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getEventPage",
+    "args": [
+      "test-id"
+    ],
+    "query": "query PackageEvents($id: ID!, $after: Cursor) { changeSetEvents(changeSetID: $id, after: $after, first: 50) { edges { cursor node { id eventType actorType actorID detail createdAt } } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } totalCount } }",
+    "variables": {
+      "id": "test-id"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getProviderBase",
+    "args": [
+      "test-id"
+    ],
+    "query": "query ProviderEditBase($channelID: ID!) { providerPriceEditBase(channelID: $channelID) { channelID revision accountingCurrency accountingSettingsVersion prices { id modelID currencyCode price { items { itemCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } promptWriteCacheVariants { variantCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } } } } } } }",
+    "variables": {
+      "channelID": "test-id"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "getRetailBase",
+    "args": [
+      "test-id"
+    ],
+    "query": "query RetailEditBase($priceBookID: ID!) { retailPriceEditBase(priceBookID: $priceBookID) { priceBookID revision accountingCurrency accountingSettingsVersion prices { publicModelID price } } }",
+    "variables": {
+      "priceBookID": "test-id"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "createProviderPackage",
+    "args": [
+      {
+        "channelID": "test-id",
+        "operationID": "00000000-0000-4000-8000-000000000001",
+        "expectedBaseRevision": "base",
+        "input": [
+          {
+            "modelId": "model",
+            "currencyCode": "USD",
+            "price": {
+              "items": [
+                {
+                  "itemCode": "prompt_tokens",
+                  "pricing": {
+                    "mode": "flat_fee",
+                    "flatFee": "1"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "correction": {
+          "sourceChangeSetID": "test-id",
+          "expectedSourcePackageRevision": "old",
+          "excludedItemKeys": [
+            "excluded"
+          ],
+          "reason": "correct"
+        }
+      }
+    ],
+    "query": "mutation CreateProviderPriceChangeSet($channelID: ID!, $operationID: ID!, $expectedBaseRevision: String!, $input: [SaveChannelModelPriceInput!]!, $correction: ChangeSetCorrectionInput) { createProviderPriceChangeSet(channelID: $channelID, operationID: $operationID, expectedBaseRevision: $expectedBaseRevision, input: $input, correction: $correction) { operationID outcome changeSetDetail { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } } }",
+    "variables": {
+      "channelID": "test-id",
+      "operationID": "00000000-0000-4000-8000-000000000001",
+      "expectedBaseRevision": "base",
+      "input": [
+        {
+          "modelId": "model",
+          "currencyCode": "USD",
+          "price": {
+            "items": [
+              {
+                "itemCode": "prompt_tokens",
+                "pricing": {
+                  "mode": "flat_fee",
+                  "flatFee": "1"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "correction": {
+        "sourceChangeSetID": "test-id",
+        "expectedSourcePackageRevision": "old",
+        "excludedItemKeys": [
+          "excluded"
+        ],
+        "reason": "correct"
+      }
+    }
+  },
+  {
+    "source": "packages",
+    "method": "saveProviderPackage",
+    "args": [
+      {
+        "id": "test-id",
+        "expectedRevision": "old",
+        "input": [
+          {
+            "modelId": "model",
+            "currencyCode": "USD",
+            "price": {
+              "items": [
+                {
+                  "itemCode": "prompt_tokens",
+                  "pricing": {
+                    "mode": "flat_fee",
+                    "flatFee": "1"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "query": "mutation SaveProviderPackage($id: ID!, $expectedRevision: String!, $input: [SaveChannelModelPriceInput!]!) { saveProviderPriceChangeSet(id: $id, expectedRevision: $expectedRevision, input: $input) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "id": "test-id",
+      "expectedRevision": "old",
+      "input": [
+        {
+          "modelId": "model",
+          "currencyCode": "USD",
+          "price": {
+            "items": [
+              {
+                "itemCode": "prompt_tokens",
+                "pricing": {
+                  "mode": "flat_fee",
+                  "flatFee": "1"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "source": "packages",
+    "method": "transitionPackage",
+    "args": [
+      "submit",
+      {
+        "id": "test-id",
+        "expectedRevision": "old"
+      }
+    ],
+    "query": "mutation PackageTransition($id: ID!, $expectedRevision: String!) { submitChangeSet(id: $id, expectedRevision: $expectedRevision) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "id": "test-id",
+      "expectedRevision": "old"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "transitionPackage",
+    "args": [
+      "approve",
+      {
+        "id": "test-id",
+        "expectedRevision": "old",
+        "reviewNote": "review"
+      }
+    ],
+    "query": "mutation PackageTransition($id: ID!, $expectedRevision: String!, $reviewNote: String) { reviewChangeSet(id: $id, expectedRevision: $expectedRevision, reviewNote: $reviewNote) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "id": "test-id",
+      "expectedRevision": "old",
+      "reviewNote": "review"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "transitionPackage",
+    "args": [
+      "reject",
+      {
+        "id": "test-id",
+        "expectedRevision": "old",
+        "reviewNote": "review"
+      }
+    ],
+    "query": "mutation PackageTransition($id: ID!, $expectedRevision: String!, $reviewNote: String) { rejectChangeSet(id: $id, expectedRevision: $expectedRevision, reviewNote: $reviewNote) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "id": "test-id",
+      "expectedRevision": "old",
+      "reviewNote": "review"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "createRetailPackage",
+    "args": [
+      {
+        "priceBookID": "test-id",
+        "operationID": "00000000-0000-4000-8000-000000000001",
+        "expectedBaseRevision": "base"
+      }
+    ],
+    "query": "mutation CreateRetailPriceChangeSet($priceBookID: ID!, $operationID: ID!, $expectedBaseRevision: String!) { createRetailPriceChangeSet(priceBookID: $priceBookID, operationID: $operationID, expectedBaseRevision: $expectedBaseRevision) { summary { id operationID kind scopeType scopeID scopeName title status revision sourceOrigin actorName createdBy createdAt updatedAt submittedAt reviewedAt appliedAt itemCount createCount updateCount deleteCount invalidItemCount validationState validationError } baseRevision sourceRevision currentBaseRevision reviewNote issues { itemKey field code message severity } availableActions appliedTargets { type id itemKey } } }",
+    "variables": {
+      "priceBookID": "test-id",
+      "operationID": "00000000-0000-4000-8000-000000000001",
+      "expectedBaseRevision": "base"
+    }
+  },
+  {
+    "source": "packages",
+    "method": "saveRetailItem",
+    "args": [
+      {
+        "changeSetID": "test-id",
+        "expectedRevision": "old",
+        "publicModelID": "test-id",
+        "price": {
+          "items": [
+            {
+              "itemCode": "prompt_tokens",
+              "pricing": {
+                "mode": "flat_fee",
+                "flatFee": "1"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "query": "mutation SaveRetailPriceChangeSetItem($input: SaveRetailPriceChangeSetItemInput!) { saveRetailPriceChangeSetItem(input: $input) { item { id itemKey action beforeSnapshot afterSnapshot sourceSnapshot validationError createdAt updatedAt } changeSetRevision } }",
+    "variables": {
+      "input": {
+        "changeSetID": "test-id",
+        "expectedRevision": "old",
+        "publicModelID": "test-id",
+        "price": {
+          "items": [
+            {
+              "itemCode": "prompt_tokens",
+              "pricing": {
+                "mode": "flat_fee",
+                "flatFee": "1"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "source": "discovery",
+    "method": "getDiscovery",
+    "args": [
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "query": "query DiscoveryOperation($operationID: ID!) { channelDiscoveryOperation(operationID: $operationID) { operationID channelID origin attempt state channelCreated createdAt updatedAt leaseExpiresAt models { status discoveredCount changedCount unsupportedCount errorCode message retryable snapshotID completedAt } prices { status discoveredCount changedCount unsupportedCount errorCode message retryable snapshotID completedAt } packageValidation { status totalItems validItems invalidItems warningItems } packages { changeSetID kind status itemCount reused } supersededSourceChangeSetIDs recurringModelSyncEnabled recurringPriceDiscoveryState } }",
+    "variables": {
+      "operationID": "00000000-0000-4000-8000-000000000001"
+    }
+  },
+  {
+    "source": "discovery",
+    "method": "initializeDiscovery",
+    "args": [
+      {
+        "channelID": "test-id",
+        "operationID": "00000000-0000-4000-8000-000000000001",
+        "rebuild": {
+          "sources": [
+            {
+              "id": "test-id",
+              "expectedRevision": "old"
+            }
+          ],
+          "supersedeSources": true
+        }
+      }
+    ],
+    "query": "mutation InitializeNewApiChannel($channelID: ID!, $operationID: ID!, $stages: [ChannelDiscoveryStage!]!, $rebuild: RebuildObservedPricePackagesInput) { initializeNewApiChannel(channelID: $channelID, operationID: $operationID, stages: $stages, rebuild: $rebuild) { operationID channelID origin attempt state channelCreated createdAt updatedAt leaseExpiresAt models { status discoveredCount changedCount unsupportedCount errorCode message retryable snapshotID completedAt } prices { status discoveredCount changedCount unsupportedCount errorCode message retryable snapshotID completedAt } packageValidation { status totalItems validItems invalidItems warningItems } packages { changeSetID kind status itemCount reused } supersededSourceChangeSetIDs recurringModelSyncEnabled recurringPriceDiscoveryState } }",
+    "variables": {
+      "channelID": "test-id",
+      "operationID": "00000000-0000-4000-8000-000000000001",
+      "rebuild": {
+        "sources": [
+          {
+            "id": "test-id",
+            "expectedRevision": "old"
+          }
+        ],
+        "supersedeSources": true
+      },
+      "stages": [
+        "MODELS",
+        "PRICES"
+      ]
+    }
+  },
+  {
+    "source": "discovery",
+    "method": "retryDiscovery",
+    "args": [
+      {
+        "operationID": "00000000-0000-4000-8000-000000000001",
+        "expectedAttempt": 1,
+        "stages": [
+          "PRICES"
+        ],
+        "credentials": {
+          "pat": "fixture-only",
+          "userID": "1"
+        }
+      }
+    ],
+    "query": "mutation RetryNewApiChannelDiscovery($operationID: ID!, $expectedAttempt: Int!, $stages: [ChannelDiscoveryStage!]!, $credentials: NewApiAccountCredentialsInput) { retryNewApiChannelDiscovery(operationID: $operationID, expectedAttempt: $expectedAttempt, stages: $stages, credentials: $credentials) { operationID channelID origin attempt state channelCreated createdAt updatedAt leaseExpiresAt models { status discoveredCount changedCount unsupportedCount errorCode message retryable snapshotID completedAt } prices { status discoveredCount changedCount unsupportedCount errorCode message retryable snapshotID completedAt } packageValidation { status totalItems validItems invalidItems warningItems } packages { changeSetID kind status itemCount reused } supersededSourceChangeSetIDs recurringModelSyncEnabled recurringPriceDiscoveryState } }",
+    "variables": {
+      "operationID": "00000000-0000-4000-8000-000000000001",
+      "expectedAttempt": 1,
+      "stages": [
+        "PRICES"
+      ],
+      "credentials": {
+        "pat": "fixture-only",
+        "userID": "1"
+      }
+    }
+  },
+  {
+    "method": "getRetailFormulas",
+    "query": "query RetailFormulas($priceBookID: ID!) { retailPriceFormulas(priceBookID: $priceBookID) { id priceBookID publicModelID deploymentID expression parameters enabled revision status lastError lastFingerprint lastChangeSetID } }",
+    "variables": {
+      "priceBookID": "1"
+    },
+    "source": "formulas",
+    "args": [
+      "1"
+    ]
+  },
+  {
+    "method": "previewRetailFormula",
+    "query": "query PreviewRetailFormula($input: RetailPriceFormulaInput!) { previewRetailPriceFormula(input: $input) { price sourcePrice currency fingerprint } }",
+    "variables": {
+      "input": {
+        "priceBookID": "1",
+        "publicModelID": "gid://conduit/Model/1",
+        "deploymentID": "1",
+        "expression": "cost * markup",
+        "parameters": {
+          "markup": "1.5"
+        },
+        "enabled": true,
+        "expectedRevision": "0"
+      }
+    },
+    "source": "formulas",
+    "args": [
+      {
+        "priceBookID": "1",
+        "publicModelID": "gid://conduit/Model/1",
+        "deploymentID": "1",
+        "expression": "cost * markup",
+        "parameters": {
+          "markup": "1.5"
+        },
+        "enabled": true,
+        "expectedRevision": "0"
+      }
+    ]
+  },
+  {
+    "method": "saveRetailFormula",
+    "query": "mutation SaveRetailFormula($input: RetailPriceFormulaInput!) { saveRetailPriceFormula(input: $input) { id priceBookID publicModelID deploymentID expression parameters enabled revision status lastError lastFingerprint lastChangeSetID } }",
+    "variables": {
+      "input": {
+        "priceBookID": "1",
+        "publicModelID": "gid://conduit/Model/1",
+        "deploymentID": "1",
+        "expression": "cost * markup",
+        "parameters": {
+          "markup": "1.5"
+        },
+        "enabled": true,
+        "expectedRevision": "0"
+      }
+    },
+    "source": "formulas",
+    "args": [
+      {
+        "priceBookID": "1",
+        "publicModelID": "gid://conduit/Model/1",
+        "deploymentID": "1",
+        "expression": "cost * markup",
+        "parameters": {
+          "markup": "1.5"
+        },
+        "enabled": true,
+        "expectedRevision": "0"
+      }
+    ]
+  }
+]

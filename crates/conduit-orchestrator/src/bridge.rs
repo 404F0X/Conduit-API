@@ -37,11 +37,19 @@ pub async fn resolve_candidates(
     ),
     ConduitError,
 > {
+    let trusted_metadata = http_request.metadata.clone();
     let llm_request = inbound
         .inbound_request(http_request)
         .map_err(|err| ConduitError::internal(format!("inbound transform failed: {err}")))?;
 
-    let candidate_request = build_candidate_request(&llm_request);
+    let channels = trusted_model_channels(
+        &trusted_metadata,
+        llm_request.model.as_deref().unwrap_or_default(),
+    )?;
+    let mut candidate_request = build_candidate_request(&llm_request)?;
+    if let Some(channels) = channels {
+        candidate_request.project_channel_ids = channels;
+    }
     let (candidates, diagnostics) = source.select_with_diagnostics(&candidate_request).await?;
     Ok((llm_request, candidates, diagnostics))
 }
@@ -53,7 +61,9 @@ pub async fn resolve_candidates(
 /// (`ChatMessage`→`RequestMessage`, `UnifiedTool`→`RequestTool`) lands with the
 /// ⑥ outbound/response completion — `select_legacy` matches by model-entry map
 /// and does not consult messages, so this is sufficient to drive selection.
-pub(crate) fn build_candidate_request(llm_request: &LlmRequest) -> CandidateRequest {
+pub(crate) fn build_candidate_request(
+    llm_request: &LlmRequest,
+) -> Result<CandidateRequest, ConduitError> {
     let model = llm_request.model.clone().unwrap_or_default();
     let mut request = CandidateRequest::new(
         model,
@@ -62,12 +72,8 @@ pub(crate) fn build_candidate_request(llm_request: &LlmRequest) -> CandidateRequ
     )
     .with_stream(llm_request.stream);
 
-    request.project_channel_ids = metadata_model_channel_list(
-        &llm_request.metadata,
-        "project_channels_by_model",
-        &request.model,
-    )
-    .unwrap_or_else(|| metadata_string_list(&llm_request.metadata, "project_channel_ids"));
+    request.project_channel_ids = trusted_model_channels(&llm_request.metadata, &request.model)?
+        .unwrap_or_else(|| metadata_string_list(&llm_request.metadata, "project_channel_ids"));
     request.project_upstream_models_by_channel = metadata_model_string_map(
         &llm_request.metadata,
         "project_upstream_models_by_model",
@@ -108,7 +114,56 @@ pub(crate) fn build_candidate_request(llm_request: &LlmRequest) -> CandidateRequ
         conduit_llm::LlmRequestPayload::Image(_) => request.is_image_request = true,
         _ => {}
     }
-    request
+    Ok(request)
+}
+
+/// Authenticated requests require a nonempty, trusted per-public-model scope.
+/// An empty selector list means unrestricted, so it must never represent denial.
+pub(crate) fn trusted_model_channels(
+    metadata: &std::collections::BTreeMap<String, serde_json::Value>,
+    model: &str,
+) -> Result<Option<Vec<String>>, ConduitError> {
+    let authenticated = [
+        "api_key_id",
+        "api_key_allowed_models",
+        "project_channels_by_model",
+    ]
+    .iter()
+    .any(|key| metadata.contains_key(*key));
+    if !authenticated {
+        return Ok(None);
+    }
+    let denied = || ConduitError::invalid_request("model is not authorized for this API key");
+    let allowed = metadata
+        .get("api_key_allowed_models")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(denied)?;
+    if model.trim().is_empty() || !allowed.split(',').any(|entry| entry.trim() == model) {
+        return Err(denied());
+    }
+    let values = metadata
+        .get("project_channels_by_model")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|models| models.get(model))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(denied)?;
+    if values.is_empty() {
+        return Err(denied());
+    }
+    let channels = values
+        .iter()
+        .map(|value| {
+            let id = match value {
+                serde_json::Value::String(value) => value.parse::<i64>().ok(),
+                serde_json::Value::Number(value) => value.as_i64(),
+                _ => None,
+            }
+            .filter(|id| *id > 0)
+            .ok_or_else(denied)?;
+            Ok(id.to_string())
+        })
+        .collect::<Result<Vec<_>, ConduitError>>()?;
+    Ok(Some(channels))
 }
 
 fn metadata_model_string_map(
@@ -132,24 +187,6 @@ fn metadata_model_string_map(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn metadata_model_channel_list(
-    metadata: &std::collections::BTreeMap<String, serde_json::Value>,
-    key: &str,
-    model: &str,
-) -> Option<Vec<String>> {
-    let values = metadata.get(key)?.as_object()?.get(model)?.as_array()?;
-    Some(
-        values
-            .iter()
-            .filter_map(|value| match value {
-                serde_json::Value::String(value) => Some(value.clone()),
-                serde_json::Value::Number(value) => Some(value.to_string()),
-                _ => None,
-            })
-            .collect(),
-    )
 }
 
 fn candidate_message(message: &conduit_llm::ChatMessage) -> RequestMessage {
@@ -344,7 +381,7 @@ mod tests {
             .inbound_request(http_request)
             .unwrap_or_else(|err| panic!("inbound transform failed: {err}"));
 
-        let req = build_candidate_request(&llm_request);
+        let req = build_candidate_request(&llm_request).expect("valid internal request");
 
         assert_eq!(req.model, "gpt-4");
         assert_eq!(req.request_type, RequestType::Chat);
@@ -354,6 +391,57 @@ mod tests {
             req.api_format
         );
         assert!(req.stream);
+    }
+
+    #[test]
+    fn trusted_model_scope_rejects_missing_unknown_empty_or_malformed_mapping() {
+        let base = serde_json::json!({
+            "api_key_id": 7,
+            "api_key_allowed_models": "public",
+            "project_channels_by_model": {"public": [1, "2"]},
+            "project_channel_ids": [1, 2, 99]
+        });
+        let metadata = |value: serde_json::Value| {
+            value
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        };
+        assert_eq!(
+            trusted_model_channels(&metadata(base.clone()), "public").unwrap(),
+            Some(vec!["1".into(), "2".into()])
+        );
+        assert!(trusted_model_channels(&metadata(base.clone()), "unknown").is_err());
+        assert!(trusted_model_channels(&metadata(base.clone()), "").is_err());
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"public": []}),
+            serde_json::json!({"public": [null]}),
+            serde_json::json!({"public": [1, "bad"]}),
+            serde_json::json!({"public": [0]}),
+            serde_json::json!({"public": [-1]}),
+            serde_json::json!({"public": [1.5]}),
+            serde_json::json!({"public": [9223372036854775808u64]}),
+        ] {
+            let mut value = base.clone();
+            value["project_channels_by_model"] = invalid;
+            assert!(trusted_model_channels(&metadata(value), "public").is_err());
+        }
+        for key in ["project_channels_by_model", "api_key_allowed_models"] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(trusted_model_channels(&metadata(value), "public").is_err());
+        }
+        assert!(
+            trusted_model_channels(&metadata(serde_json::json!({"api_key_id": 7})), "public")
+                .is_err()
+        );
+        assert_eq!(
+            trusted_model_channels(&Default::default(), "fixture").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -392,7 +480,7 @@ mod tests {
             }),
         );
 
-        let request = build_candidate_request(&llm_request);
+        let request = build_candidate_request(&llm_request).expect("valid internal request");
         assert_eq!(request.project_channel_ids, ["1", "2"]);
         assert_eq!(request.project_channel_tags, ["prod"]);
         assert_eq!(request.key_channel_ids, ["2"]);

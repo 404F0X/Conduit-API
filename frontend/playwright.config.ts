@@ -1,17 +1,24 @@
-import { defineConfig, devices } from '@playwright/test'
+import { defineConfig, devices } from '@playwright/test';
 
-const frontendPort = Number.parseInt(process.env.CONDUIT_E2E_FRONTEND_PORT ?? '9527', 10)
-const frontendURL =
-  process.env.CONDUIT_E2E_FRONTEND_URL ?? `http://127.0.0.1:${frontendPort}`
-const backendURL = process.env.CONDUIT_API_URL ?? 'http://127.0.0.1:8099'
-const mockOrigin = process.env.CONDUIT_E2E_MOCK_ORIGIN ?? 'http://127.0.0.1:18099'
+const frontendPort = Number.parseInt(process.env.CONDUIT_E2E_FRONTEND_PORT ?? '9527', 10);
+const frontendURL = process.env.CONDUIT_E2E_FRONTEND_URL ?? `http://127.0.0.1:${frontendPort}`;
+const backendURL = process.env.CONDUIT_API_URL ?? 'http://127.0.0.1:8099';
+const mockOrigin = process.env.CONDUIT_E2E_MOCK_ORIGIN ?? 'http://127.0.0.1:18099';
 if (!/^http:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?\/?$/.test(mockOrigin)) {
-  throw new Error('CONDUIT_E2E_MOCK_ORIGIN must be a loopback HTTP origin; use test:e2e')
+  throw new Error('CONDUIT_E2E_MOCK_ORIGIN must be a loopback HTTP origin; use test:e2e');
 }
 
-process.env.CONDUIT_ADMIN_EMAIL ??= 'e2e-owner@conduit.invalid'
-process.env.CONDUIT_ADMIN_PASSWORD ??= 'conduit-e2e-password-2026'
-process.env.CONDUIT_API_URL = backendURL
+// The harness creates a fresh certificate/key for this run. Trust only its
+// exact SPKI, only inside this isolated browser process. Playwright creates
+// an independent temporary user-data-dir for each launched browser.
+const fixtureSPKI = process.env.CONDUIT_E2E_PAYMENT_SPKI;
+if (fixtureSPKI && (process.env.CONDUIT_E2E_ISOLATED !== '1' || !/^[A-Za-z0-9+/]{43}=$/.test(fixtureSPKI))) {
+  throw new Error('Payment SPKI requires the isolated harness and one SHA256 pin');
+}
+
+process.env.CONDUIT_ADMIN_EMAIL ??= 'e2e-owner@conduit.invalid';
+process.env.CONDUIT_ADMIN_PASSWORD ??= 'conduit-e2e-password-2026';
+process.env.CONDUIT_API_URL = backendURL;
 
 /**
  * @see https://playwright.dev/docs/test-configuration
@@ -35,6 +42,7 @@ export default defineConfig({
   use: {
     /* Base URL to use in actions like `await page.goto('/')`. */
     baseURL: frontendURL,
+    launchOptions: fixtureSPKI ? { args: [`--ignore-certificate-errors-spki-list=${fixtureSPKI}`] } : {},
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
@@ -109,4 +117,4 @@ export default defineConfig({
       VITE_API_URL: backendURL,
     },
   },
-})
+});

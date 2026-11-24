@@ -27,6 +27,7 @@ const modelMappingsFieldSchema = z.preprocess((value) => value ?? [], z.array(mo
 
 // API Key schema based on GraphQL schema
 export const apiKeySchema = z.object({
+  modelGroupID: z.string().optional().nullable(),
   id: z.string(),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date(),
@@ -111,6 +112,7 @@ export const createApiKeyInputSchemaFactory = (t: (key: string) => string) =>
 
 // Default schema for backward compatibility
 export const createApiKeyInputSchema = z.object({
+  modelGroupID: z.string().optional(),
   name: z.string().min(1, 'Name is required'),
   type: apiKeyTypeSchema.optional(),
   scopes: z.array(z.string()).optional(),

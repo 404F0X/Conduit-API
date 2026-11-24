@@ -1693,3 +1693,646 @@ async fn a04_anthropic_messages_produce_anthropic_shaped_response()
     assert_eq!(request.status, RequestStatus::Succeeded);
     Ok(())
 }
+
+#[derive(Default)]
+struct ScopeAdmissionRecorder {
+    wallet_calls: AtomicUsize,
+    abandoned: AtomicUsize,
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl conduit_orchestrator::orchestrator::RequestRecorder for ScopeAdmissionRecorder {
+    async fn reserve_request(
+        &self,
+        _ctx: &mut OrchestratorContext,
+        _input: &conduit_orchestrator::orchestrator::BillingAdmissionInput,
+    ) -> Result<(), ConduitError> {
+        self.wallet_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn abandon_request(&self, _ctx: &OrchestratorContext, _reason: &'static str) {
+        self.abandoned.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn record_success(
+        &self,
+        _ctx: &OrchestratorContext,
+        _request_id: &str,
+        _project_id: &str,
+        _attempt: &conduit_pipeline::pipeline::AttemptRecord,
+        _response: &HttpResponse,
+    ) -> Result<(), ConduitError> {
+        Ok(())
+    }
+    async fn record_failure(
+        &self,
+        _ctx: &OrchestratorContext,
+        _request_id: &str,
+        _project_id: &str,
+        _error: &ConduitError,
+    ) -> Result<(), ConduitError> {
+        self.failures.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn scope_orchestrator(
+    harness: &Harness,
+    recorder: Arc<ScopeAdmissionRecorder>,
+    policy: PipeRetryPolicy,
+) -> CommandOrchestrator {
+    let pipeline = Arc::new(
+        Pipeline::new(
+            harness.inbound.clone(),
+            harness.outbound.clone(),
+            harness.executor.clone(),
+        )
+        .with_retry_policy(policy)
+        .with_retry_hooks(RetryHooks {
+            can_retry: Arc::new(|_| true),
+            ..RetryHooks::default()
+        }),
+    );
+    CommandOrchestrator::new(
+        harness.source.clone(),
+        Arc::new(DefaultCandidateProjector),
+        Arc::new(WeightScoring::new()),
+        Arc::new(StaticStickyKeyProvider::none()),
+        LbRetryPolicy::DEFAULT,
+        pipeline,
+        recorder,
+        Arc::new(FlagCancelToken::new()),
+    )
+}
+
+fn scoped_request(stream: bool) -> HttpRequest {
+    let mut request = test_request("public", "hello", stream);
+    request.metadata.insert("api_key_id".into(), json!(7));
+    request
+        .metadata
+        .insert("api_key_allowed_models".into(), json!("public"));
+    request
+        .metadata
+        .insert("project_channels_by_model".into(), json!({"public": [1]}));
+    request
+        .metadata
+        .insert("project_channel_ids".into(), json!([1, 99]));
+    request
+}
+
+#[tokio::test]
+async fn trusted_scope_denies_before_source_wallet_and_provider_in_both_flows() {
+    for stream in [false, true] {
+        let valid = scoped_request(stream);
+        let mut requests = Vec::new();
+        for key in ["api_key_allowed_models", "project_channels_by_model"] {
+            let mut missing = valid.clone();
+            missing.metadata.remove(key);
+            requests.push(missing);
+        }
+        for mapping in [
+            json!({}),
+            json!({"public": []}),
+            json!({"public": [1, null]}),
+            json!({"public": ["bad"]}),
+            json!({"public": [0]}),
+        ] {
+            let mut malformed = valid.clone();
+            malformed
+                .metadata
+                .insert("project_channels_by_model".into(), mapping);
+            requests.push(malformed);
+        }
+        let mut unknown = valid.clone();
+        unknown.json_body.as_mut().unwrap()["model"] = json!("unknown");
+        requests.push(unknown);
+        for request in requests {
+            let model = request.json_body.as_ref().unwrap()["model"]
+                .as_str()
+                .unwrap();
+            let harness = build_harness(
+                vec![test_candidate("99", model)],
+                vec![],
+                no_retry_policy(),
+                RetryHooks::default(),
+            );
+            let recorder = Arc::new(ScopeAdmissionRecorder::default());
+            let orchestrator = scope_orchestrator(&harness, recorder.clone(), no_retry_policy());
+            let mut ctx = OrchestratorContext::new();
+            let candidate = chat_candidate_request(model, stream);
+            let error = if stream {
+                orchestrator
+                    .process_command_stream(
+                        &mut ctx,
+                        harness.inbound.clone(),
+                        "scope",
+                        "1",
+                        &candidate,
+                        request.clone(),
+                        &request,
+                        None,
+                        None,
+                    )
+                    .await
+                    .err()
+                    .expect("must deny")
+            } else {
+                orchestrator
+                    .process_command(
+                        &mut ctx,
+                        "scope",
+                        "1",
+                        &candidate,
+                        request.clone(),
+                        &request,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("must deny")
+            };
+            assert_eq!(error.source.error_type(), "invalid_request");
+            assert!(harness.source.seen_models().is_empty());
+            assert_eq!(recorder.wallet_calls.load(Ordering::SeqCst), 0);
+            assert!(harness.executor.captured_requests().is_empty());
+            // The HTTP bridge must reject before querying even if a transformer drops metadata.
+            let error = conduit_orchestrator::bridge::resolve_candidates(
+                harness.inbound.as_ref(),
+                request,
+                harness.source.as_ref(),
+            )
+            .await
+            .expect_err("bridge must deny");
+            assert_eq!(error.error_type(), "invalid_request");
+            assert!(harness.source.seen_models().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn trusted_scope_mapping_and_retry_keep_only_authorized_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut allowed = test_candidate("1", "public");
+    allowed.models[0].actual_model = "provider-model".into();
+    let harness = build_harness(
+        vec![test_candidate("99", "public"), allowed],
+        vec![
+            Step::Err(ConduitError::upstream("retry").with_provider_status(500)),
+            Step::Ok(mock_openai_response("mapped", "provider-model", "ok", 1, 1)),
+        ],
+        no_retry_policy(),
+        RetryHooks::default(),
+    );
+    let recorder = Arc::new(ScopeAdmissionRecorder::default());
+    let policy = PipeRetryPolicy {
+        enabled: true,
+        max_single_channel_retries: 1,
+        ..no_retry_policy()
+    };
+    let orchestrator = scope_orchestrator(&harness, recorder.clone(), policy);
+    let request = scoped_request(false);
+    let mut ctx = OrchestratorContext::new();
+    let response = orchestrator
+        .process_command(
+            &mut ctx,
+            "scope",
+            "1",
+            &chat_candidate_request("public", false),
+            request.clone(),
+            &request,
+            None,
+            None,
+        )
+        .await?;
+    assert_eq!(response.status, 200);
+    assert_eq!(recorder.wallet_calls.load(Ordering::SeqCst), 1);
+    let sent = harness.executor.captured_requests();
+    assert_eq!(sent.len(), 2);
+    assert!(
+        sent.iter()
+            .all(|request| request.json_body.as_ref().unwrap()["model"] == "provider-model")
+    );
+    assert_eq!(
+        harness.outbound.seen_models(),
+        ["provider-model", "provider-model"]
+    );
+    let ordered: Value = serde_json::from_str(
+        ctx.metadata
+            .get("route_ordered_candidates")
+            .ok_or("missing ordered candidates")?,
+    )?;
+    assert!(!ordered.to_string().contains("99"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn trusted_scope_upstream_failure_calls_release_path_in_both_flows() {
+    for stream in [false, true] {
+        let harness = build_harness(
+            vec![test_candidate("1", "public")],
+            vec![Step::Err(
+                ConduitError::upstream("failed").with_provider_status(500),
+            )],
+            no_retry_policy(),
+            RetryHooks::default(),
+        );
+        let recorder = Arc::new(ScopeAdmissionRecorder::default());
+        let orchestrator = scope_orchestrator(&harness, recorder.clone(), no_retry_policy());
+        let request = scoped_request(stream);
+        let mut ctx = OrchestratorContext::new();
+        let candidate = chat_candidate_request("public", stream);
+        if stream {
+            assert!(
+                orchestrator
+                    .process_command_stream(
+                        &mut ctx,
+                        harness.inbound.clone(),
+                        "scope",
+                        "1",
+                        &candidate,
+                        request.clone(),
+                        &request,
+                        None,
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(
+                orchestrator
+                    .process_command(
+                        &mut ctx,
+                        "scope",
+                        "1",
+                        &candidate,
+                        request.clone(),
+                        &request,
+                        None,
+                        None
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(recorder.wallet_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recorder.failures.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.executor.captured_requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn trusted_scope_valid_stream_mapping_keeps_authorized_route()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut allowed = test_candidate("1", "public");
+    allowed.models[0].actual_model = "provider-model".into();
+    let harness = build_harness(
+        vec![test_candidate("99", "public"), allowed],
+        vec![Step::Stream(vec![StreamEvent {
+            data: Some("[DONE]".into()),
+            ..StreamEvent::default()
+        }])],
+        no_retry_policy(),
+        RetryHooks::default(),
+    );
+    let recorder = Arc::new(ScopeAdmissionRecorder::default());
+    let orchestrator = scope_orchestrator(&harness, recorder.clone(), no_retry_policy());
+    let request = scoped_request(true);
+    let mut handle = orchestrator
+        .process_command_stream(
+            &mut OrchestratorContext::new(),
+            harness.inbound.clone(),
+            "scope",
+            "1",
+            &chat_candidate_request("public", true),
+            request.clone(),
+            &request,
+            None,
+            None,
+        )
+        .await?;
+    while let Some(event) = handle.client_rx.recv().await {
+        event?;
+    }
+    handle.finalizer.await??;
+    assert_eq!(recorder.wallet_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(harness.outbound.seen_models(), ["provider-model"]);
+    Ok(())
+}
+
+// Request audit failures must not bypass metering admission in production.
+struct AuditRepoProbe {
+    inner: conduit_db::repo::request_repo::InMemoryRequestRepo,
+    creates: AtomicUsize,
+    failure: u8,
+}
+
+#[async_trait]
+impl conduit_db::repo::request_repo::RequestRepo for AuditRepoProbe {
+    async fn create_request_unchecked(
+        &self,
+        ctx: &RequestContext,
+        row: conduit_db::row::RequestRow,
+    ) -> conduit_db::repo::RepoResult<conduit_db::row::RequestRow> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        match self.failure {
+            1 => Err(conduit_db::repo::RepoError::Database(
+                "injected audit create failure".into(),
+            )),
+            2 => panic!("injected async-to-sync bridge thread failure"),
+            _ => self.inner.create_request_unchecked(ctx, row).await,
+        }
+    }
+    async fn find_request_by_id_unchecked(
+        &self,
+        ctx: &RequestContext,
+        request_id: &str,
+    ) -> conduit_db::repo::RepoResult<Option<conduit_db::row::RequestRow>> {
+        self.inner
+            .find_request_by_id_unchecked(ctx, request_id)
+            .await
+    }
+    async fn find_request_by_external_id_unchecked(
+        &self,
+        ctx: &RequestContext,
+        project_id: &str,
+        external_id: &str,
+    ) -> conduit_db::repo::RepoResult<Option<conduit_db::row::RequestRow>> {
+        self.inner
+            .find_request_by_external_id_unchecked(ctx, project_id, external_id)
+            .await
+    }
+    async fn list_requests_unchecked(
+        &self,
+        ctx: &RequestContext,
+        query: &conduit_db::repo::request_repo::RequestListQuery,
+    ) -> conduit_db::repo::RepoResult<conduit_db::repo::request_repo::RequestListResult> {
+        self.inner.list_requests_unchecked(ctx, query).await
+    }
+    async fn transition_request_status_unchecked(
+        &self,
+        ctx: &RequestContext,
+        project_id: &str,
+        request_id: &str,
+        expected_status: &str,
+        next_status: &str,
+    ) -> conduit_db::repo::RepoResult<Option<conduit_db::row::RequestRow>> {
+        self.inner
+            .transition_request_status_unchecked(
+                ctx,
+                project_id,
+                request_id,
+                expected_status,
+                next_status,
+            )
+            .await
+    }
+    async fn update_request_unchecked(
+        &self,
+        ctx: &RequestContext,
+        project_id: &str,
+        request_id: &str,
+        input: conduit_db::repo::request_repo::UpdateRequestInput,
+    ) -> conduit_db::repo::RepoResult<conduit_db::row::RequestRow> {
+        self.inner
+            .update_request_unchecked(ctx, project_id, request_id, input)
+            .await
+    }
+    async fn mark_content_saved_unchecked(
+        &self,
+        ctx: &RequestContext,
+        request_id: &str,
+        input: conduit_db::repo::request_repo::ContentSavedInput,
+    ) -> conduit_db::repo::RepoResult<conduit_db::row::RequestRow> {
+        self.inner
+            .mark_content_saved_unchecked(ctx, request_id, input)
+            .await
+    }
+    async fn reclaim_stale_processing_unchecked(
+        &self,
+        ctx: &RequestContext,
+        cutoff_created_at: &str,
+        now: &str,
+    ) -> conduit_db::repo::RepoResult<Vec<String>> {
+        self.inner
+            .reclaim_stale_processing_unchecked(ctx, cutoff_created_at, now)
+            .await
+    }
+}
+
+#[derive(Default)]
+struct AuditAdmissionProbe {
+    admissions: AtomicUsize,
+    finalized: AtomicUsize,
+    slots: AtomicUsize,
+    holds: AtomicUsize,
+}
+impl AuditAdmissionProbe {
+    fn finish(&self) {
+        self.finalized.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(self.slots.fetch_sub(1, Ordering::SeqCst), 1);
+        assert_eq!(self.holds.fetch_sub(1, Ordering::SeqCst), 1);
+    }
+}
+#[async_trait]
+impl conduit_orchestrator::orchestrator::RequestRecorder for AuditAdmissionProbe {
+    fn acquire_api_key_slot(
+        &self,
+        _ctx: &mut OrchestratorContext,
+        _key: i64,
+        _limit: u32,
+    ) -> Result<(), ConduitError> {
+        self.slots.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn reserve_request(
+        &self,
+        _ctx: &mut OrchestratorContext,
+        _input: &conduit_orchestrator::orchestrator::BillingAdmissionInput,
+    ) -> Result<(), ConduitError> {
+        self.admissions.fetch_add(1, Ordering::SeqCst);
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn abandon_request(&self, _ctx: &OrchestratorContext, _reason: &'static str) {
+        self.finish();
+    }
+    async fn record_success(
+        &self,
+        _ctx: &OrchestratorContext,
+        _request_id: &str,
+        _project_id: &str,
+        _attempt: &conduit_pipeline::pipeline::AttemptRecord,
+        _response: &HttpResponse,
+    ) -> Result<(), ConduitError> {
+        self.finish();
+        Ok(())
+    }
+    async fn record_failure(
+        &self,
+        _ctx: &OrchestratorContext,
+        _request_id: &str,
+        _project_id: &str,
+        _error: &ConduitError,
+    ) -> Result<(), ConduitError> {
+        self.finish();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn metering_identity_required_audit_failure_denies_provider_and_releases_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    use conduit_db::repo::request_repo::RequestRepo;
+    for stream in [false, true] {
+        for (failure, required) in [(1, true), (2, true), (2, false), (0, true)] {
+            let retry = failure == 0;
+            let success = if stream {
+                Step::Stream(vec![StreamEvent {
+                    data: Some("[DONE]".into()),
+                    ..StreamEvent::default()
+                }])
+            } else {
+                Step::Ok(mock_openai_response("audit", "public", "ok", 1, 1))
+            };
+            let mut steps = Vec::new();
+            if retry {
+                steps.push(Step::Err(
+                    ConduitError::upstream("retry").with_provider_status(500),
+                ));
+            }
+            steps.push(success);
+            let harness = build_harness(
+                vec![test_candidate("1", "public")],
+                steps,
+                no_retry_policy(),
+                RetryHooks::default(),
+            );
+            let repo = Arc::new(AuditRepoProbe {
+                inner: Default::default(),
+                creates: AtomicUsize::new(0),
+                failure,
+            });
+            let mut persist =
+                conduit_orchestrator::middlewares::PersistRequestMiddleware::new(repo.clone());
+            if required {
+                persist = persist.with_required_persistence();
+            }
+            let policy = PipeRetryPolicy {
+                enabled: retry,
+                max_single_channel_retries: u32::from(retry),
+                ..no_retry_policy()
+            };
+            let pipeline = Arc::new(
+                Pipeline::new(
+                    harness.inbound.clone(),
+                    harness.outbound.clone(),
+                    harness.executor.clone(),
+                )
+                .with_retry_policy(policy)
+                .with_retry_hooks(RetryHooks {
+                    can_retry: Arc::new(|_| true),
+                    ..RetryHooks::default()
+                })
+                .with_middlewares(vec![Arc::new(persist)]),
+            );
+            let recorder = Arc::new(AuditAdmissionProbe::default());
+            let orchestrator = CommandOrchestrator::new(
+                harness.source.clone(),
+                Arc::new(DefaultCandidateProjector),
+                Arc::new(WeightScoring::new()),
+                Arc::new(StaticStickyKeyProvider::none()),
+                LbRetryPolicy::DEFAULT,
+                pipeline,
+                recorder.clone(),
+                Arc::new(FlagCancelToken::new()),
+            );
+            let mut request = scoped_request(stream);
+            request.request_id = Some("ar-audit-public-identity".into());
+            request
+                .metadata
+                .insert("api_key_max_concurrent".into(), json!(1));
+            request.metadata.insert("project_id".into(), json!("1"));
+            let mut ctx = OrchestratorContext::new();
+            let candidate = chat_candidate_request("public", stream);
+            let result = if stream {
+                match orchestrator
+                    .process_command_stream(
+                        &mut ctx,
+                        harness.inbound.clone(),
+                        "ar-audit-public-identity",
+                        "1",
+                        &candidate,
+                        request.clone(),
+                        &request,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(mut handle) => {
+                        while let Some(event) = handle.client_rx.recv().await {
+                            event?;
+                        }
+                        handle.finalizer.await??;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                orchestrator
+                    .process_command(
+                        &mut ctx,
+                        "ar-audit-public-identity",
+                        "1",
+                        &candidate,
+                        request.clone(),
+                        &request,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+            };
+            let denied = required && failure != 0;
+            assert_eq!(
+                result.is_err(),
+                denied,
+                "stream={stream}, failure={failure}, required={required}"
+            );
+            assert_eq!(
+                harness.executor.captured_requests().len(),
+                if denied {
+                    0
+                } else if retry {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(
+                repo.creates.load(Ordering::SeqCst),
+                1,
+                "retries must reuse the audit row"
+            );
+            assert_eq!(recorder.admissions.load(Ordering::SeqCst), 1);
+            assert_eq!(recorder.finalized.load(Ordering::SeqCst), 1);
+            assert_eq!(recorder.slots.load(Ordering::SeqCst), 0);
+            assert_eq!(recorder.holds.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                repo.list_requests_unchecked(
+                    &svc_ctx(),
+                    &conduit_db::repo::request_repo::RequestListQuery {
+                        limit: 10,
+                        ..Default::default()
+                    }
+                )
+                .await?
+                .rows
+                .len(),
+                usize::from(failure == 0)
+            );
+        }
+    }
+    Ok(())
+}

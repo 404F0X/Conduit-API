@@ -824,6 +824,8 @@ pub struct BillingAdmissionInput {
     pub public_model: String,
     pub estimated_input_tokens: u64,
     pub max_output_tokens: u64,
+    pub model_group_id: Option<String>,
+    pub model_group_revision: Option<i64>,
 }
 
 fn estimate_candidate_input_tokens(request: &CandidateRequest) -> u64 {
@@ -1174,6 +1176,27 @@ impl CommandOrchestrator {
             ));
         }
 
+        let mut scoped_request = candidate_request.clone();
+        if let Some(channels) =
+            crate::bridge::trusted_model_channels(&http_request.metadata, &candidate_request.model)
+                .map_err(|err| OrchestratorError::new(OrchestratorStage::Select, err))?
+        {
+            if http_request
+                .json_body
+                .as_ref()
+                .and_then(|body| body.get("model"))
+                .and_then(Value::as_str)
+                .is_some_and(|model| model != candidate_request.model)
+            {
+                return Err(OrchestratorError::new(
+                    OrchestratorStage::Select,
+                    ConduitError::invalid_request("public model does not match candidate request"),
+                ));
+            }
+            scoped_request.project_channel_ids = channels;
+        }
+        let candidate_request = &scoped_request;
+
         // ---- S01 Select + S02 LoadBalance (shared with process_command_stream) ----
         // Resolve candidates, project → score → top-K → sticky, then look each
         // ordered id back up in `resolved` to recover the full channel target
@@ -1222,6 +1245,15 @@ impl CommandOrchestrator {
                         .and_then(Value::as_i64)
                         .map(|value| value.to_string())
                 }),
+            model_group_id: http_request
+                .metadata
+                .get("model_group_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            model_group_revision: http_request
+                .metadata
+                .get("model_group_revision")
+                .and_then(Value::as_i64),
             public_model: candidate_request.model.clone(),
             estimated_input_tokens: estimate_candidate_input_tokens(candidate_request),
             max_output_tokens: candidate_request
@@ -1427,6 +1459,18 @@ impl CommandOrchestrator {
                 .map_err(|err| OrchestratorError::new(OrchestratorStage::Select, err))?;
             &selected
         };
+
+        let filtered: Vec<_> = resolved
+            .iter()
+            .filter(|candidate| {
+                candidate_request.project_channel_ids.is_empty()
+                    || candidate_request
+                        .project_channel_ids
+                        .contains(&candidate.channel_id)
+            })
+            .cloned()
+            .collect();
+        let resolved = filtered.as_slice();
 
         if resolved.is_empty() {
             // Go returns `ErrInvalidModel` (or quota-exhausted) when no
@@ -1890,6 +1934,27 @@ impl CommandOrchestrator {
             ));
         }
 
+        let mut scoped_request = candidate_request.clone();
+        if let Some(channels) =
+            crate::bridge::trusted_model_channels(&http_request.metadata, &candidate_request.model)
+                .map_err(|err| OrchestratorError::new(OrchestratorStage::Select, err))?
+        {
+            if http_request
+                .json_body
+                .as_ref()
+                .and_then(|body| body.get("model"))
+                .and_then(Value::as_str)
+                .is_some_and(|model| model != candidate_request.model)
+            {
+                return Err(OrchestratorError::new(
+                    OrchestratorStage::Select,
+                    ConduitError::invalid_request("public model does not match candidate request"),
+                ));
+            }
+            scoped_request.project_channel_ids = channels;
+        }
+        let candidate_request = &scoped_request;
+
         // ---- S01 Select + S02 LoadBalance ----
         let runtime_retry_policy = self.runtime_retry_policy().await;
         let load_balancer_retry_policy = runtime_retry_policy
@@ -1930,6 +1995,15 @@ impl CommandOrchestrator {
                         .and_then(Value::as_i64)
                         .map(|value| value.to_string())
                 }),
+            model_group_id: http_request
+                .metadata
+                .get("model_group_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            model_group_revision: http_request
+                .metadata
+                .get("model_group_revision")
+                .and_then(Value::as_i64),
             public_model: candidate_request.model.clone(),
             estimated_input_tokens: estimate_candidate_input_tokens(candidate_request),
             max_output_tokens: candidate_request
@@ -5986,6 +6060,8 @@ mod tests {
             public_model: "gpt-5".to_owned(),
             estimated_input_tokens: 1,
             max_output_tokens: 1,
+            model_group_id: None,
+            model_group_revision: None,
         };
 
         let error = match recorder.admit_request(&mut ctx, &input, Some(1)).await {
@@ -6006,6 +6082,8 @@ mod tests {
             public_model: "gpt-5".to_owned(),
             estimated_input_tokens: 1,
             max_output_tokens: 1,
+            model_group_id: None,
+            model_group_revision: None,
         }
     }
 

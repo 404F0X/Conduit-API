@@ -1,4 +1,43 @@
-# 管理GraphQL：254个根字段
+# 管理 GraphQL
+
+当前分组、定价、Key 和支付增量见[知识入口](index.md)、[前端操作](frontend.md)及[后端契约](backend.md)；完整字段以[实际 SDL](../../tests/contracts/admin_graphql_schema.graphql)为准。下方日期与数量是对应历史探索基线。
+
+## 价格公式 API（2026-10-13）
+
+`retailPriceFormulas(priceBookID)` 查询持久配置；`previewRetailPriceFormula(input)` 返回服务器计算的 `price`、`sourcePrice`、币种及输入指纹，两者要求 `read_commercialization`。`saveRetailPriceFormula(input)` 要求当前 `write_commercialization`，返回版本、状态、错误及 `lastChangeSetID`。输入包含价格簿／公共模型内部 ID、来源 `deploymentID`、表达式、十进制字符串常量 JSON、`enabled` 与 `expectedRevision`（首次 `"0"`）。旧版本保存返回 `REVISION_CONFLICT`。启用保存生成草稿，现有送审／发布动作及权限保持适用；正式采购价变化以公式作者的当前权限生成，发布再次校验来源和派生结果。
+
+模型显示名可重复；创建／编辑及映射按唯一 `modelID` 和内部 ID 操作。查询单个名称遇歧义明确失败。公式公共契约见 [SDL](../../tests/contracts/admin_graphql_schema.graphql)。
+
+<a id="lite-full-current"></a>
+## Lite／Full 与治理 API 基线（2026-10-09）
+
+当前 SDL 见 [管理 schema fixture](../../tests/contracts/admin_graphql_schema.graphql)，固定动作和例外见 [治理矩阵](../../tests/contracts/governance_mutations.json)。旧统计、行号和历史字段清单只作定位。新增查询为 `governanceSettings`、`governanceCapabilities`、`governedChangeBase`、`myProjectFunds` 和 `projectMemberSpendLimits`；产品设置返回 revision、逐功能三态和解析结果。设置 mutation 使用 expectedRevision 防丢失更新。
+
+`proposeGovernedChange(input)` 包含 action、targetIDs、固定字段 payload、reason、operationID、expectedTargetRevision。服务器读取角色／成员关系，强类型校验并锁定目标及依赖，返回草稿 detail。`claimGovernedChangeSecrets(id)` 只允许当前仍有领域权限的创建者一次性领取已发布生成值。`emergencyRestrictAccess` 要求 emergency_revoke 与目标领域权限、原因，只能立即收缩访问。
+
+`approveChangeSet` 与 `Approve` 只审核至 APPROVED；`publishChangeSet`／`Publish` 才执行正式写入。`ApproveApply` 在同一事务先审核后发布并要求双方职责。审核仅授予 review_changes 不允许发布；发布仅授予 publish_changes 不允许审核；所有步骤还要求对象领域权限、当前 maker/checker 规则与版本。旧三类审批策略在升级时保留 legacyReviewScopes；显式修改策略后要求显式职责，便捷动作始终要求两项职责。
+
+原生管理 mutations、混合批量 key、OpenAPI 五项管理操作、导入、自动及初始化生产入口分类一致；SQL 保护在审批开启时阻断直写旁路。客户端遇到 APPROVAL_REQUIRED 使用同一原生表单生成提案，不重放 resolver。Project owner 不获得系统角色专属 grant_credit／策略权限。`setProjectMemberSpendLimit` 与固定 project.member_budget 命令返回可重建累计金额，不新增独立余额。
+
+## r3 商业与发现接口历史基线
+
+下方254根字段/105Q149M及源码行号为2026-10-05探索基线，不是当前SDL总数。当前新增与变化的可执行契约以[实际前端文档与变量fixture](../../tests/contracts/change-package-operations.json)和真实schema回归为准；所有仍经POST `/admin/graphql` JWT鉴权，无subscription。旧operation参数/返回值不再用于本轮UI。
+
+| 字段 | 当前参数与结果 | 权限与操作步骤 |
+| --- | --- | --- |
+| changeSets | filter/after/first=20；summary connection、全量count与statusCounts，无snapshot | read_commercialization；[事件包列表](frontend.md#event-packages-r3) |
+| changeSet / changeSetByOperation / providerPriceChangeSetOperation | 精确id或operationID/kind/scope；detail/持久NO_CHANGE结果 | read_commercialization；未知结果先查回 |
+| changeSetItems / changeSetItem / changeSetEvents | changeSetID、after/first=50；itemID精确单项 | read_commercialization；按需差异与活动 |
+| providerPriceEditBase / retailPriceEditBase | channelID / priceBookID；完整当前价格与revision | read_commercialization；provider price是对象，需items/pricing完整selection |
+| createProviderPriceChangeSet | channelID/operationID/expectedBaseRevision/input/correction?；CREATED或NO_CHANGE | write_commercialization；独立手工/修正包 |
+| saveProviderPriceChangeSet | id/expectedRevision/input完整集合 | write_commercialization；只改指定DRAFT |
+| createRetailPriceChangeSet / saveRetailPriceChangeSetItem | operationID/基线；保存指定changeSetID/expectedRevision/publicModelID/price | write_commercialization；独立草稿与增量 |
+| submitChangeSet / approveChangeSet / rejectChangeSet | id/expectedRevision/reviewNote?；最新detail | write_commercialization；[全包批准并应用](frontend.md#flow-event-package-r3) |
+| channelDiscoveryOperation | operationID；真实回执与获准包引用 | read_channels；[本次结果](frontend.md#newapi-discovery-r3)；商业差异另受权限保护 |
+| initializeNewApiChannel | channelID/operationID/stages/rebuild? | write_channels；rebuild另需write_commercialization |
+| retryNewApiChannelDiscovery | operationID/expectedAttempt/stages/credentials? | write_channels；仅回执原创建者可重试失败/中断阶段（含过期租约恢复），在回执事务先于凭据更新/claim校验；当前请求者贯穿实际 Prices/Models 提交并复验当前商业写权限。其他用户或无创建者回执返回 FORBIDDEN；历史重建重试仍需商业写 |
+
+createChannel输入新增可选operationID；NEWAPI创建使用它把Channel与回执原子绑定。模型key/PAT不在回执或复制数据中。revision/error extensions与服务端状态是错误恢复依据，HTTP200不能证明业务成功。fixture不包含真实凭据。
 
 HTTP统一为部署base path下POST /admin/graphql，JWT必需（health/version的Public仅字段策略）。105Query/149Mutation，EmptySubscription。Owner绕过scope，Owner-only仍必须Owner；其余按表中scope，项目scope需正确X-Project-ID及成员权限，node/nodes另验证实体。参数大小写必须保留，输入类型/必填签名点源文件查阅；未执行真实业务。
 
@@ -8,7 +47,7 @@ HTTP统一为部署base path下POST /admin/graphql，JWT必需（health/version�
 | --- | --- | --- | --- | --- | --- |
 | <a id="GQL-health"></a>GQL-health / query | `health()` | public + JWT | [API-ADMIN-CALL](frontend.md#API-ADMIN-CALL)；[专属health步骤](frontend.md#api-health) | [flow-api-only](frontend.md#flow-api-only) | API-only；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L101) |
 | <a id="GQL-version"></a>GQL-version / query | `version()` | public + JWT | [API-ADMIN-CALL](frontend.md#API-ADMIN-CALL)；[专属version步骤](frontend.md#api-version) | [flow-api-only](frontend.md#flow-api-only) | API-only；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L105) |
-| <a id="GQL-changeSets"></a>GQL-changeSets / query | `changeSets(kind, status, scopeType, scopeID, limit)` | read_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-read](frontend.md#flow-read) | UI链；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L109) |
+| <a id="GQL-changeSets"></a>GQL-changeSets / query | `changeSets(filter, after, first)` | read_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-read](frontend.md#flow-read) | UI链；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L109) |
 | <a id="GQL-requestRouteExplanation"></a>GQL-requestRouteExplanation / query | `requestRouteExplanation(requestID)` | read_requests + JWT | [UI-request-detail](frontend.md#UI-request-detail) | [flow-read](frontend.md#flow-read) | UI链；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L131) |
 | <a id="GQL-operationsLedger"></a>GQL-operationsLedger / query | `operationsLedger(periodDays)` | read_dashboard + JWT | [UI-operations](frontend.md#UI-operations) | [flow-read](frontend.md#flow-read) | UI链；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L145) |
 | <a id="GQL-operationsFlow"></a>GQL-operationsFlow / query | `operationsFlow(periodDays, limit)` | read_dashboard + JWT | [UI-operations](frontend.md#UI-operations) | [flow-read](frontend.md#flow-read) | UI链；静态实现；[crates/conduit-admin-graphql/src/lib.rs](../../crates/conduit-admin-graphql/src/lib.rs#L158) |
@@ -134,9 +173,9 @@ HTTP统一为部署base path下POST /admin/graphql，JWT必需（health/version�
 | <a id="GQL-createRetailPriceChangeSet"></a>GQL-createRetailPriceChangeSet / mutation | `createRetailPriceChangeSet(priceBookID)` | write_commercialization + JWT | [UI-model-retail-price](frontend.md#UI-model-retail-price) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L778) |
 | <a id="GQL-createProviderPriceChangeSet"></a>GQL-createProviderPriceChangeSet / mutation | `createProviderPriceChangeSet(channelID, input)` | write_commercialization + JWT | [UI-channel-prices](frontend.md#UI-channel-prices) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L793) |
 | <a id="GQL-saveRetailPriceChangeSetItem"></a>GQL-saveRetailPriceChangeSetItem / mutation | `saveRetailPriceChangeSetItem(input)` | write_commercialization + JWT | [UI-model-retail-price](frontend.md#UI-model-retail-price) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L809) |
-| <a id="GQL-submitChangeSet"></a>GQL-submitChangeSet / mutation | `submitChangeSet(id)` | write_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L824) |
-| <a id="GQL-approveChangeSet"></a>GQL-approveChangeSet / mutation | `approveChangeSet(id, reviewNote)` | write_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L839) |
-| <a id="GQL-rejectChangeSet"></a>GQL-rejectChangeSet / mutation | `rejectChangeSet(id, reviewNote)` | write_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L855) |
+| <a id="GQL-submitChangeSet"></a>GQL-submitChangeSet / mutation | `submitChangeSet(id, expectedRevision)` | write_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L824) |
+| <a id="GQL-approveChangeSet"></a>GQL-approveChangeSet / mutation | `approveChangeSet(id, expectedRevision, reviewNote)` | write_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L839) |
+| <a id="GQL-rejectChangeSet"></a>GQL-rejectChangeSet / mutation | `rejectChangeSet(id, expectedRevision, reviewNote)` | write_commercialization + JWT | [UI-changesets](frontend.md#UI-changesets) | [flow-price](frontend.md#flow-price) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L855) |
 | <a id="GQL-createSimpleGroup"></a>GQL-createSimpleGroup / mutation | `createSimpleGroup(input)` | write_groups + JWT | [UI-group-create](frontend.md#UI-group-create) | [flow-write](frontend.md#flow-write) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L873) |
 | <a id="GQL-updateSimpleGroup"></a>GQL-updateSimpleGroup / mutation | `updateSimpleGroup(input)` | write_groups + JWT | [UI-group-edit](frontend.md#UI-group-edit) | [flow-write](frontend.md#flow-write) | UI链；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L889) |
 | <a id="GQL-assignSimpleGroupUsers"></a>GQL-assignSimpleGroupUsers / mutation | `assignSimpleGroupUsers(input)` | write_groups + JWT | [API-ADMIN-CALL](frontend.md#API-ADMIN-CALL)；[专属assignSimpleGroupUsers步骤](frontend.md#api-assignSimpleGroupUsers) | [flow-api-only](frontend.md#flow-api-only) | API-only；静态实现；[crates/conduit-admin-graphql/src/mutation.rs](../../crates/conduit-admin-graphql/src/mutation.rs#L905) |

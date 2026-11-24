@@ -1,5 +1,47 @@
 # 后端执行、持久化与自动功能
 
+## 同名公共键与自动零售价公式（2026-10-13）
+
+公共模型的内部 ID 与唯一 `model_id` 决定路由、价格和操作身份。显示名可以重名，例如 `channel1.modelA`、`channel2.modelA` 共用“模型 A”显示名；键是不拆分的字符串，渠道改名不自动改键。按名称单值查找遇到重名明确返回歧义错误。
+
+迁移 [000039](../../migrations/postgres/000039_model_price_formulas.sql) 保存每个价格簿／公共模型的单个公式绑定、固定来源部署、十进制参数、启停与版本。启用／编辑和正式采购价发布、修改、删除都在既有事务中重新计算；未发布观察不会触发。算法 `decimal-base-price-v1` 支持 `cost`、常量、括号及四则运算，有界 1024 字节、128 节点、24 层和 32 常量；输入常量最多 12 位小数，结果按半入方式舍入至 12 位，每项在 0 至 10¹² 范围。除零、溢出、负值、缺价与不可用来源明确失败。Token 金额保留每百万 Tokens 单位，固定价保留每次单位；缓存变体、阶梯上限与计费模式保持结构。
+
+结果仅进入既有零售价草稿，仍经当前治理送审／发布。来源及结果原子保存，发布重新核对公式版本、来源价格／路由／模型、会计设置与价格簿基线指纹；来源配置变更退役本公式未发布草稿。重复事件和无价格差异不创建重复草稿；发布自己的结果不会循环生成。停用、删除采购价或来源不可用保留最后有效零售价，来源渠道不会自动替换。人工编辑价格项目清除派生标记并解除自动草稿所有权。自动生成使用公式作者的当前定价权限，采购价发布者不能代其扩大权限。
+
+公式输出模型基础价。预扣原子保存所选零售价版本、价格、会计换算及项目有效倍率；结算使用该快照并只乘一次倍率。过期 reservation 的延迟 outbox 可重新选择资金，仍保留原收费快照。 Global 删除项目后，新请求仍被拒绝；删除前已产生的成功用量继续按保留的软删除 API key 的原始用户身份结算，包括延迟 outbox 恢复。既有终态未计费记录不会自动重算；此约定依赖保留 key 身份，不覆盖物理清除。旧无快照请求按请求开始时间读取 `published` 或 `archived` 的有效时间价格，价格发布不会使旧请求失价。
+
+<a id="lite-full-current"></a>
+## 产品控制、原子治理与成员预算（2026-10-09）
+
+新增迁移 [000038](../../migrations/postgres/000038_product_governance.sql) 保留旧迁移和历史。`ProductExperienceAdapter` 持久保存模式、revision 与三态覆盖；真实 GraphQL 服务、计费发行入口、模型同步与上游观察 worker 每次执行读取权威设置。可见性、模块执行、用户权限与审批四者独立。
+
+固定命令注册表包含 111 个动作，归属十类：采购价、模型映射、零售价、渠道配置、模型供给、分组访问、身份访问、项目配置、系统配置、项目 Credits。命令使用完整原生 GraphQL 表单或固定强类型 DTO，私密表保存真实负载，公开项目只有脱敏摘要。目标、依赖、输入及原因与 operation ID 绑定；已应用操作可幂等重读。同类单条／批量／导入／初始化／自动任务进入相同策略与 SQL 行级保护。含价格、供给或映射侧写的组合操作同时检查涉及的策略与领域权限，不能借外层 kind 关闭绕过受治理的侧写。
+
+`APPROVED` 与 `APPLIED` 分离；每次审核／发布读取当前主体的领域与职责权限。`ApproveApply` 要求 review/publish 两项职责，审核事件和发布事件在同一个既有事务内提交；原生 helper 共用传入事务，禁止顺次调用自行 commit 的服务模拟原子发布。正式写入、不可变报价版本、钱包 ledger、审计和回执一起提交；任一错误回滚全部正式写入，并保存真实失败诊断。审批关闭的直接发布保留发布时间，不伪造审核时间。秘密不进入公开 snapshot／事件／错误，生成秘密由创建者一次性领取。
+
+模型发现先保存完整 `channel_model_observations`，需要审批时只创建供给／映射包，不先修改在线 `supported_models`、部署或路由。初始化回执列出供给和价格／映射包；重试只重新执行失败阶段，成功阶段、attempt fence 和旧历史保留。人工重试仅允许回执原创建者，在回执锁内校验当前请求者，先于凭据更新和 claim；实际请求者显式传至 Prices／Models 的最终提交上下文，事务复核其当前权限。`created_by` 始终保留原作者审计，不作为其他用户的授权。失败及租约过期恢复使用同一规则；历史无创建者的回执不能通过人工重试取得系统身份。需要另一用户操作时，由该用户以新 operationID 发起新的初始化，旧回执和待审包保留。健康自动禁用只能扩大限制，恢复必须走配置权限／审批；备份 worker 只更新观察日期和错误，不改备份策略。
+
+人工初始化、重试和同步的观测阶段保留原 actor；即使审批关闭，正式价格／映射副写也在实际提交事务重检当前 `write_channels` 与 `write_commercialization`。仅有发现权限时，观测与待审核结果可保存，记录 `publication_blocked`，正式数据不变。权限在后台阶段完成前撤销同样阻止即时发布。只有无人工 actor 且明确 `AUTOMATIC_SYNC` 的系统生产者沿原自动政策执行，人工请求不能通过 origin 标签取得该身份。原生渠道复制附带正式价格时也重检两个域权限，拒绝会回滚整个复制。
+
+`group.price`、`group.create`／`group.update` 中的 multiplier 侧写共用实际价格侧写判定；RetailPrice 要求审核时，作者、审核者、发布者都必须具有当前定价域权限，GroupAccess 开关不能绕过。分组提案绑定并锁定实际关联 Price Tier、Access Plan、已发布版本及模型／路由条目配置；已审旧提案不能覆盖后来由 `price_tier.write` 生效的新价。成员已消费／在途预留属于运行账务，不纳入这类配置依赖哈希。
+
+Project 钱包是唯一账本。`myProjectFunds` 按当前本人、当前成员关系、模型权限和当前正式报价读取本人通用／定向权益；无模型不包含定向金额，其他成员权益、外国 key、移除成员、被禁止或未报价模型均不能扩大准入。个人 Project owner 关系显式且歧义不猜测。
+
+`project_member_spend_state` 是可从持久 reservation 与 ledger 重建的准入投影，不是第二钱包。以 `(project_id,user_id)` 跨 key 累计已结算消费和活动预留，同一事务锁定成员状态与 Project 资金。reserve 检查限额；capture 记真实全部结算消费（即使超出预估），不裁剪到账金额；release／到期清理释放预留，补偿与重试沿用稳定幂等键。限额 NULL 为无限，0 为禁用；调低限额、换 key、移除再加入不清历史。超估结算后未来新请求按真实剩余额度拒绝。
+
+普通请求计费、既发行兑换码兑换、既有订阅周期、已有预留 capture/release/reconcile、审计／观察、自有受限 key、自有密码／个人资料、认证注册自己的新工作区、预览探测、删除请求记录与运维 GC／备份执行有明确例外分类，不能用例外扩大管理配置权限。授权收缩也保留最低 Owner／审核者保护。
+
+<a id="operation-packages-r3"></a>
+## 当前事件包事务与发现回执
+
+当前生产 `PgChangePackageServices` / `PgChannelDiscoveryServices` 由 conduit-bin wiring 注入，迁移 [000037](../../migrations/postgres/000037_change_operation_discovery.sql) 定义操作身份、报价provenance和发现回执。公开 schema 使用摘要连接/独立详情；旧内部 staging 接口不代表旧公开 GraphQL 输入仍可调用。当前公共变量与 selection 见[19份实际前端操作fixture](../../tests/contracts/change-package-operations.json)，用户步骤与两图见[事件包](frontend.md#event-packages-r3)。
+
+操作幂等键与规范化完整输入/actor绑定；JSON对象键排序不造成伪新观测，数组顺序保留语义。新手工包相互独立，指定DRAFT编辑受 revision/状态锁约束。自动发现以整个观测的语义指纹去重，只supersede相同自动流中的旧观测，不清空手工包。输入所有项目与当前基线先校验；publish在同一事务锁住包与领域基线，savepoint中全量应用，任何项目失败回滚正式价格/目录写入，另保存持久INVALID或SUPERSEDED及append-only事件。零售价发布克隆完整当前版本再应用增量；未改价格保留。
+
+渠道与NOT_STARTED回执在创建事务一起提交，创建后显式初始化与模型/价格阶段分别执行。claim事务只持短锁，外部HTTP不持数据库事务；attempt与90秒租约防迟到回调写入。阶段结果、错误、快照及所生成精确包ID持久化，租约过期在查询中派生Interrupted而不伪造成功。retry携带expectedAttempt，完成阶段不重做。历史重建先验证所选来源kind/channel/provenance/revision与商业权限；仅成功新观测后supersede显式所选来源，append derived_from事件，不修改原created事件。
+
+UI价格探测是无落库的preview；主动发现和周期观察才持久snapshot/包。固定版本legacy默认与group/unit问题随provenance保留，未知模式不归零。模型映射包与采购价包各自独立事务审批，发现完成并不批准任何正式价格。检查使用隔离PG/本地mock，不证明真实NEWAPI提供商连通性。
+
 绑定[当前源码](source-manifest.md)，原研究来源BACKEND_RESEARCH a2/r2 8批。本轮21项修复另有本地mock与隔离PG回归，真实外部服务未运行。旧行号是定位线索，当前符号实现与内容SHA为准。HTTP逐method/path见[HTTP操作](http-api.md)，管理254根及UI步骤见[GraphQL](admin-graphql.md)，CLI精确命令见[基础设施](infrastructure.md)。
 
 生产明确阻断聊天outbound的六类型：anthropic_gcp、gemini_vertex、claudecode、antigravity、codex、github_copilot（wiring.rs254-272）。非聊天专属格式及multipart断链等限制见HTTP表；配置能保存不等端到端可用。
@@ -177,6 +219,16 @@ flowchart TD
 
 <a id="B-RUNTIME-09"></a>
 B-RUNTIME-09：先财务setup、零售价/采购价、project商业资料和credit/订阅→发授权请求→看usage版本/采购成本/charge→钱包/allowance/ledger/审计。未知price不默认为零。授权候选后、第一次upstream前，估算input/maxOutput（缺省4096）预留STATION_CREDIT与API key lease；request key advisory事务锁幂等并校验归属。成功usage→charge outbox→订阅/credit结算，绑定price/version/rate snapshots；失败取消释放。reconciler每60秒、100批处理过期reservation/缺结算。Decimal/micros换算采购币种→会计币种→Credit；已有价格锁财务币种。商业价格/变更/兑换审计append-only，不与请求GC混淆。orchestrator.rs:1188-1221；usage_log_recorder.rs:733/908；usage_charge_settler_postgres.rs:508/600-665/485；money.rs::AccountingSettings；migrations000026/27/28/30/31/33；wiring_postgres_billing.rs。
+
+计费强制配置在生产启动时读取一次并固定：`CONDUIT_BILLING_ENFORCEMENT_MODE` 缺省 `shadow`，接受 `shadow`、`soft`/`soft_enforce`、`hard`/`hard_enforce`（大小写不敏感）；已设空白、未知值或非 Unicode 会阻止启动。`CONDUIT_BILLING_ENFORCEMENT_PROJECT_IDS` 缺省覆盖所有 Project；显式名单按逗号分隔、修剪、去重，只允许正 i64，空名单/空项/非法数字均阻止启动。名单内采用所选模式，名单外固定 Shadow。启动 tracing 仅记录规范模式、all/list、名单数量和名单外 Shadow，不记录原始配置或 Project ID。运行中修改环境变量需重启生效。
+
+认证推理请求按公开模型检查 `api_key_allowed_models` 和可信 `project_channels_by_model`，逐模型映射必须存在且渠道列表为合法非空正整数；缺失、未知或坏映射在候选查询及钱包预留前返回 InvalidRequest。桥接、直接 orchestrator、buffered 和 stream 共用检查，已有 API key ID 不能以缺少 scope 绕过。候选排序再次限制在该模型的渠道交集内，sticky/fallback/retry 不扩权；后续合法 model mapping、钱包预留和取消/失败释放机制保留。无认证元数据的内部 fixture 继续显式走内部路径。
+
+请求身份分工：公开 `ar-*`/`req_*` 字符串继续作为路由、钱包 reservation 和 journal event 幂等来源，不转换为 SQL 数字 ID。准入先保留 journal 容量和钱包/并发租约；随后生产请求仓库在真实 `requests` 行 INSERT 中原子设置 `metering_pending=true`，返回的 numeric ID 通过 `__persist_request_id` 用于 usage 外键和 SQL。仅该生产仓库实例启用保护；其他仓库默认不启用。生产 persist middleware 必须成功创建审计行才允许上游，创建或运行时桥接失败会拒绝请求并走既有准入清理；retry 复用同一真实行。
+
+`journal.reserve` 仅是内存容量预留。INSERT 之后、terminal/`put_ready` 之前崩溃时，pending 保护审计行，但没有 ready 事件不能重建 usage 或保证补扣，须保守保留 unknown 待核对，不能仅凭超时/取消状态清除。ready 之后由既有 replay/receipt 幂等事务写入 usage/outbox 并清 pending；提交后 ack 失败可重放。`put_ready` 失败拒绝成功并保留 pending；零 usage 且无 flat fee 的明确正常分支、明确失败按既有释放语义清真实行 pending，清除失败保守保留。取消/超时 guard 不能证明 DB 清理完成，可能保留 pending；本机制不保证全部崩溃窗口自动补扣。
+
+
 
 ```mermaid
 flowchart TD
@@ -455,7 +507,7 @@ HTTP53注册/55 GET POST DELETE method-path，不含自动OPTIONS、static fallb
 - imageEdits/audioTranscriptions/audioTranslations multipart走ChatJSON bridge，真实multipart无生产解析。video GET/DELETE本地snapshot/canceled，无provider GET/DELETE/退款；视频归档仅本地URL下载。OAuth凭据不解除6provider outbound阻断。
 - HTTP缺key仍401，allow_no_auth未接anonymousfallback；IP名单加载失败放行；protection只chat text/parts regex；RPM等部分process-local，request预算/跨进程lease/wallet用PG；metrics独立无相同auth。
 - backup retentionDays已消费，见AUTO08及下方删除边界；Dashboard timezone启动FixedOffset；file logging只有DAILY/max_files；PromptCache/DataStorageSync未接；otel无exporter；readReplica仅Dashboard/Operations。
-- Playground补核：只有GET /admin/playground（GraphQL调试），没有POST /admin/playground/chat；UI transport实现但production入口缺失/fallback失败，不能写成已可推理。
+- Playground：GET /admin/playground 仍是 GraphQL 调试页；聊天使用普通 API Key 调用 GET /v1/models 与 POST /v1/chat/completions，经过实际分组授权和计费。不存在 /admin/playground/chat 不表示聊天缺少生产入口。本地 SSE/扣费闭环已验证，真实上游兼容性仍需单独验证。
 - 外部provider/FS/S3/GCS/WebDAV/Redis、PG迁移恢复、并发取消终态、公网OIDC/OAuth第三方条件未运行，不由静态文档宣称成功。
 
 ## 检查范围
@@ -599,4 +651,36 @@ flowchart TD
 
 手动和自动dump所有选定section经一次load_sections调用，在同一REPEATABLE READ READ ONLY PG事务连接读取projects、APIkey join和价格子表；commit后才序列化/加密/写存储。恢复仍用原事务，不将应用JSON archive称为完整钱包数据库备份。
 
+价格配置章节包含持久零售价公式。恢复先按原冲突策略恢复公式配置，再映射价格包历史，最后恢复公式的最新草稿指针，避免配置与草稿之间的循环引用丢失；恢复所依赖的模型和作者须已存在或随相应章节恢复。
+
 retentionDays正值清理新备份存储中严格匹配backups/auto/conduit-UTC时间戳.json的过期对象；0永久。其他前缀、手工备份和未知命名保留。写入成功但清理失败不能伪称整次完成，lastBackupError保留且可重试。生产run_scheduled入口在配置/存储/retention失败时原子patch lastBackupError；下次实际成功清除错误并更新lastBackupAt，不用旧配置整JSON覆盖管理员并发修改；Owner保存配置不能覆盖这些只读运行字段。定时调度领取日期claim后重新读配置，禁用或不再到期返回Skipped并释放claim；同日重新启用可重试，Executed才完成日期fence。
+
+### Independent user and model groups
+
+Migration 000040 introduces independent ModelGroup/UserGroup records. A user has at most one UserGroup; that group explicitly grants ModelGroups. A Key has one persisted ModelGroup assignment. ModelGroups contain public model keys, never route/channel pools or financial rules. Public authentication resolves the Key's real billing member and current enabled membership/grants, then intersects group models with existing Project routes and active Key profile restrictions before quota admission. Missing assignments, disabled groups, revoked grants and empty effective scopes deny. HTTP request bodies cannot supply trusted group identity; the server stamps `model_group_id` and `model_group_revision`. The revision covers model membership/status, not a price version.
+
+Existing users and Keys are deliberately left unassigned by this alpha migration. Configure UserGroup membership/grants and explicitly assign each Key before public calls resume; no Project ownership or old bundle membership is converted into authorization. Projects retain their management, routes and financial identity. The old SimpleGroup facade remains a **Project rules** panel and is not the new UserGroup. Group changes do not change existing price execution; request group identity follows the Key's ModelGroup, while UserGroup adds no request discount.
+
+Admin queries `modelGroups`/`userGroups` and `saveModelGroup`/`saveUserGroup` require global user administration. Saving a group replaces its explicit members/grants transactionally; conflicting user membership errors and `moveUserToGroup` makes an atomic explicit move. Key creation requires `modelGroupID`; `assignApiKeyModelGroup` checks the Key's actual billing member in the selected Project. `apiKeyAssignableModelGroups(keyID: ID)` uses that Key's member, while the omitted argument uses the current logged-in user. Assignment and Key creation commit together.
+
+**Customer recharge:** migration 000041 adds payment orders and `payment_topup` ledger entries into the existing Project wallet. UserGroup `rechargeMultiplierPPM` defaults to 1000000 (range 1..1000000000) and has an independent `rechargeRevision`; changing a saved multiplier requires `expectedRechargeRevision`, while omitted multiplier fields preserve the current value. Order creation freezes the logged-in payer's group/revision and canonical AccountingSettings. CNY integer fen converts through the configured CNY FX quote into accounting currency, credits and group PPM, flooring only the final credit micros. Later group/FX changes never recalculate existing orders. Admin grants, credit codes, subscriptions and channel balance-unit conversion retain their existing semantics.
+
+Key profile administration uses `apiKeyProfileCatalog(keyID: ID!)` under existing selected-Project `read_api_keys` authority. It derives the target Key's actual billing member and persisted group; enabled user/group grants and Project routes determine model/channel metadata. It deliberately ignores the current profile restriction and Key enabled status so an authorized manager can restore a disabled Key or expand a profile within its permitted group. It returns no prices.
+
+`apiKeyCreationCatalog(modelGroupID: ID!)` requires selected-Project `write_api_keys` and derives the same billing member as creation: CurrentUser, or the authenticated parent Key's user for delegation. It accepts no arbitrary billingUserID and never guesses the Project owner. The result has nullable keyID (null before creation), projectID, billingUserID, modelGroupID, configured, modelIDs, models{id,name,channelIDs}, channels{id,name}. Missing member/grants or empty intersection provides no usable candidates; cross-Project parent delegation errors. Initial profile and group assignment remain in the existing atomic Key creation flow. Neither management catalog changes a real request's fixed Key identity or exposes another user's retail price.
+
+
+### Project payment topups (explicit reference profile)
+
+The sole profile `epay-classic-md5-reference-a4d0f042` follows the actual server source at `maajiko/Epay@a4d0f0421cfcbc573913c8007bde3d0c04a5713a`; provenance is not official and compatibility with other vendors is not established. Enable only after confirming that a merchant uses this profile. Real merchant conformance is not part of the local fixture evidence.
+
+Configuration is under `payments` in config.yml. Defaults disable payments. To enable, set `enabled: true`, the exact `profile`, HTTPS `gateway_base_url` ending in `/`, `merchant_id`, secret `merchant_key`, immutable version `merchant_identity`, fixed HTTPS `notify_url` ending in the mounted `/api/payments/epay/notify` path, and fixed HTTPS `return_url` for the wallet UI. `min_amount_minor`/`max_amount_minor` are positive CNY fen (defaults 1/10000000); `order_ttl_seconds` defaults to 900, bounded 60..86400. Optional `gateway_ca_certificate` adds one PEM CA only to this provider client, retaining chain and hostname verification. Requests never follow redirects. Change merchant identity whenever endpoint or credentials change; preserve the frozen configuration until old orders are reconciled. An old order cannot be queried or reopened with another configuration identity. Key, CA content, signed queries and provider request URLs must never enter logs or errors.
+
+Authenticated GraphQL exposes `paymentCapabilities`, `paymentOrders(limit,offset)`, `paymentOrder(id)`, `createPaymentOrder(input)` and `recheckPaymentOrder(id)`. Orders belong to the actual logged-in payer and selected active Project membership; payer/project/currency/amount/channel/config identity/accounting snapshot are immutable. All money, multiplier and revision values are strings. The UI displays frozen amount, credited micros and target Project before opening `checkoutURL`. Same payer/idempotency input replays the same order; conflicting input errors. Rechecks only query the gateway and cannot force payment.
+
+The gateway hosted cashier needs no remote order-create call. The GET-only notification endpoint strictly decodes parameters once, rejects duplicates/arrays/bad encoding, verifies the reference MD5 signature, then queries the fixed TLS gateway using merchant authentication. It binds query pid/out_trade_no/trade_no/type/money and successful status to the signed notice/local order. The profile agrees on CNY; the query response has neither currency nor response signature. `endtime` is parsed in Asia/Shanghai as fixed by the reference common.php. Browser returns never mark payment successful.
+
+A durable successful notification returns exactly `success`; failed verification/query/storage returns `fail` with non-success status so the gateway can retry. Crediting locks the order and wallet, inserts exactly one dedicated ledger entry, updates the receipt and appends sanitized evidence in one transaction. The existing ledger trigger updates wallet balance. Verified paid transactions reserve their first immutable merchant/transaction identity even in review, so another order cannot replay a quarantined payment. Credited orders cannot regress; transaction reuse, mismatched payment, late payment or a closed target becomes `review_required`, with no credit reassignment or automatic refund. Storage failures leave the same order recoverable by a retried notification or authorized payer recheck. Global billing operators can use `operatorPaymentOrders(limit=20,offset=0)` and `operatorPaymentOrder(id)` with global `read_billing`, and `operatorRecheckPaymentOrder(id)` with global `write_billing`. Each returns `OperatorPaymentOrder { payerUserID, order }`; operator receipts never include a cashier URL. Pagination accepts limit 1..100 and nonnegative offset. Global owner/direct/system-role grants apply independently of the selected Project; Project membership/admin grants alone cannot authorize these APIs. Reads include other payers and deleted Projects without requiring a current Project. Recheck uses the same authenticated gateway query and unique credit transaction as notifications; deleted/closed frozen targets remain in review without credit reassignment. No force-paid/refund API is provided.
+
+
+Governance classification for the group/payment APIs follows the existing domains: `saveModelGroup`, `saveUserGroup`, and `moveUserToGroup` are `group_access`. Enabling review for that domain blocks their direct execution with `APPROVAL_REQUIRED`; these new group commands are not yet implemented in the governed-change package transport, so that restriction must not be silently bypassed. `assignApiKeyModelGroup` follows the operational API-key update exception. Customer order creation and payer/operator verified rechecks follow the operational redemption exception; payer/global billing authorization and the provider-authenticated, frozen-target credit transaction still apply. Unknown mutations continue to fail closed even with governance disabled.

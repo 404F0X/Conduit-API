@@ -408,7 +408,7 @@ fn wire_to_gql_cal_unit(s: &str) -> APIKeyQuotaCalendarDurationUnit {
 // on-disk JSON (`objects.APIKeyProfile` camelCase + acronym renames).
 // ===========================================================================
 
-fn profile_input_to_core(p: APIKeyProfileInput) -> CoreProfile {
+pub(crate) fn profile_input_to_core(p: APIKeyProfileInput) -> CoreProfile {
     CoreProfile {
         name: p.name,
         model_mappings: p
@@ -1322,6 +1322,7 @@ mod postgres_tests {
             .create_api_key(
                 &ProfileTemplateServiceAdapter::db_context(&access_41, true)?.context,
                 RepoCreateApiKeyInput {
+                    model_group_id: None,
                     id: String::new(),
                     user_id: None,
                     project_id: project_id.to_string(),
@@ -1338,6 +1339,7 @@ mod postgres_tests {
             .create_api_key(
                 &ProfileTemplateServiceAdapter::db_context(&access_42, true)?.context,
                 RepoCreateApiKeyInput {
+                    model_group_id: None,
                     id: String::new(),
                     user_id: None,
                     project_id: "42".to_string(),

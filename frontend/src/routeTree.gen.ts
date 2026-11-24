@@ -25,6 +25,7 @@ import { Route as AuthenticatedSettingsRouteRouteImport } from './routes/_authen
 import { Route as AuthenticatedApiKeysIndexRouteImport } from './routes/_authenticated/api-keys/index'
 import { Route as AuthenticatedBillingIndexRouteImport } from './routes/_authenticated/billing/index'
 import { Route as AuthenticatedChangeSetsIndexRouteImport } from './routes/_authenticated/change-sets/index'
+import { Route as AuthenticatedChangeSetsChangeSetIdRouteImport } from './routes/_authenticated/change-sets/$changeSetId'
 import { Route as AuthenticatedChangelogIndexRouteImport } from './routes/_authenticated/changelog/index'
 import { Route as AuthenticatedChannelsIndexRouteImport } from './routes/_authenticated/channels/index'
 import { Route as AuthenticatedChatsIndexRouteImport } from './routes/_authenticated/chats/index'
@@ -143,6 +144,12 @@ const AuthenticatedChangeSetsIndexRoute =
   AuthenticatedChangeSetsIndexRouteImport.update({
     id: '/change-sets/',
     path: '/change-sets/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedChangeSetsChangeSetIdRoute =
+  AuthenticatedChangeSetsChangeSetIdRouteImport.update({
+    id: '/change-sets/$changeSetId',
+    path: '/change-sets/$changeSetId',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedChangelogIndexRoute =
@@ -371,6 +378,7 @@ export interface FileRoutesByFullPath {
   '/500': typeof errors500Route
   '/503': typeof errors503Route
   '/permission': typeof AuthenticatedPermissionRoute
+  '/change-sets/$changeSetId': typeof AuthenticatedChangeSetsChangeSetIdRoute
   '/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
   '/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
@@ -423,6 +431,7 @@ export interface FileRoutesByTo {
   '/503': typeof errors503Route
   '/permission': typeof AuthenticatedPermissionRoute
   '/': typeof AuthenticatedIndexRoute
+  '/change-sets/$changeSetId': typeof AuthenticatedChangeSetsChangeSetIdRoute
   '/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
   '/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
@@ -478,6 +487,7 @@ export interface FileRoutesById {
   '/(errors)/503': typeof errors503Route
   '/_authenticated/permission': typeof AuthenticatedPermissionRoute
   '/_authenticated/': typeof AuthenticatedIndexRoute
+  '/_authenticated/change-sets/$changeSetId': typeof AuthenticatedChangeSetsChangeSetIdRoute
   '/_authenticated/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
   '/_authenticated/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/_authenticated/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
@@ -533,6 +543,7 @@ export interface FileRouteTypes {
     | '/500'
     | '/503'
     | '/permission'
+    | '/change-sets/$changeSetId'
     | '/dashboard/channel-success-rates'
     | '/requests/$requestId'
     | '/settings/appearance'
@@ -585,6 +596,7 @@ export interface FileRouteTypes {
     | '/503'
     | '/permission'
     | '/'
+    | '/change-sets/$changeSetId'
     | '/dashboard/channel-success-rates'
     | '/requests/$requestId'
     | '/settings/appearance'
@@ -639,6 +651,7 @@ export interface FileRouteTypes {
     | '/(errors)/503'
     | '/_authenticated/permission'
     | '/_authenticated/'
+    | '/_authenticated/change-sets/$changeSetId'
     | '/_authenticated/dashboard/channel-success-rates'
     | '/_authenticated/requests/$requestId'
     | '/_authenticated/settings/appearance'
@@ -806,6 +819,13 @@ declare module '@tanstack/react-router' {
       path: '/change-sets'
       fullPath: '/change-sets/'
       preLoaderRoute: typeof AuthenticatedChangeSetsIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/change-sets/$changeSetId': {
+      id: '/_authenticated/change-sets/$changeSetId'
+      path: '/change-sets/$changeSetId'
+      fullPath: '/change-sets/$changeSetId'
+      preLoaderRoute: typeof AuthenticatedChangeSetsChangeSetIdRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/changelog/': {
@@ -1090,6 +1110,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedSettingsRouteRoute: typeof AuthenticatedSettingsRouteRouteWithChildren
   AuthenticatedPermissionRoute: typeof AuthenticatedPermissionRoute
   AuthenticatedIndexRoute: typeof AuthenticatedIndexRoute
+  AuthenticatedChangeSetsChangeSetIdRoute: typeof AuthenticatedChangeSetsChangeSetIdRoute
   AuthenticatedDashboardChannelSuccessRatesRoute: typeof AuthenticatedDashboardChannelSuccessRatesRoute
   AuthenticatedRequestsRequestIdRoute: typeof AuthenticatedRequestsRequestIdRoute
   AuthenticatedApiKeysIndexRoute: typeof AuthenticatedApiKeysIndexRoute
@@ -1129,6 +1150,8 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedSettingsRouteRoute: AuthenticatedSettingsRouteRouteWithChildren,
   AuthenticatedPermissionRoute: AuthenticatedPermissionRoute,
   AuthenticatedIndexRoute: AuthenticatedIndexRoute,
+  AuthenticatedChangeSetsChangeSetIdRoute:
+    AuthenticatedChangeSetsChangeSetIdRoute,
   AuthenticatedDashboardChannelSuccessRatesRoute:
     AuthenticatedDashboardChannelSuccessRatesRoute,
   AuthenticatedRequestsRequestIdRoute: AuthenticatedRequestsRequestIdRoute,

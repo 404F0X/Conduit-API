@@ -39,31 +39,73 @@ pub(crate) enum BillingEnforcementMode {
     HardEnforce,
 }
 
-impl BillingEnforcementMode {
-    pub(crate) fn from_env() -> Self {
-        match std::env::var("CONDUIT_BILLING_ENFORCEMENT_MODE")
-            .unwrap_or_else(|_| "shadow".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "hard" | "hard_enforce" => Self::HardEnforce,
-            "soft" | "soft_enforce" => Self::SoftEnforce,
-            _ => Self::Shadow,
-        }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BillingEnforcementConfig {
+    pub(crate) mode: BillingEnforcementMode,
+    project_scope: Option<std::collections::BTreeSet<i64>>,
+}
+
+impl BillingEnforcementConfig {
+    pub(crate) fn parse(mode: Option<&str>, projects: Option<&str>) -> Result<Self, String> {
+        let mode = match mode.unwrap_or("shadow").to_ascii_lowercase().as_str() {
+            "shadow" => BillingEnforcementMode::Shadow,
+            "soft" | "soft_enforce" => BillingEnforcementMode::SoftEnforce,
+            "hard" | "hard_enforce" => BillingEnforcementMode::HardEnforce,
+            _ => return Err("invalid CONDUIT_BILLING_ENFORCEMENT_MODE".into()),
+        };
+        let project_scope = projects.map(|raw| {
+            raw.split(',').map(|value| {
+                value.trim().parse::<i64>().ok().filter(|id| *id > 0)
+                    .ok_or_else(|| "invalid CONDUIT_BILLING_ENFORCEMENT_PROJECT_IDS: expected positive integer list".to_string())
+            }).collect::<Result<std::collections::BTreeSet<_>, _>>()
+        }).transpose()?;
+        Ok(Self {
+            mode,
+            project_scope,
+        })
     }
 
-    pub(crate) fn for_project(self, project_id: i64) -> Self {
-        let Ok(raw) = std::env::var("CONDUIT_BILLING_ENFORCEMENT_PROJECT_IDS") else {
-            return self;
-        };
-        if raw
-            .split(',')
-            .filter_map(|value| value.trim().parse::<i64>().ok())
-            .any(|value| value == project_id)
+    pub(crate) fn from_env() -> Result<Self, String> {
+        fn read(name: &str) -> Result<Option<String>, String> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    Err(format!("invalid {name}: expected Unicode"))
+                }
+            }
+        }
+        let config = Self::parse(
+            read("CONDUIT_BILLING_ENFORCEMENT_MODE")?.as_deref(),
+            read("CONDUIT_BILLING_ENFORCEMENT_PROJECT_IDS")?.as_deref(),
+        )?;
+        tracing::info!(
+            mode = match config.mode {
+                BillingEnforcementMode::Shadow => "shadow",
+                BillingEnforcementMode::SoftEnforce => "soft_enforce",
+                BillingEnforcementMode::HardEnforce => "hard_enforce",
+            },
+            project_scope = if config.project_scope.is_some() {
+                "list"
+            } else {
+                "all"
+            },
+            project_count = config.project_scope.as_ref().map(|ids| ids.len()),
+            outside_scope_mode = "shadow",
+            "billing enforcement configuration validated"
+        );
+        Ok(config)
+    }
+
+    pub(crate) fn for_project(&self, project_id: i64) -> BillingEnforcementMode {
+        if self
+            .project_scope
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&project_id))
         {
-            self
+            self.mode
         } else {
-            Self::Shadow
+            BillingEnforcementMode::Shadow
         }
     }
 }
@@ -89,5 +131,51 @@ pub(crate) fn usage_from_row(row: &UsageLogRow) -> Usage {
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod enforcement_config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_aliases_and_project_scope_are_explicit() {
+        let default = BillingEnforcementConfig::parse(None, None).unwrap();
+        assert_eq!(default.for_project(9), BillingEnforcementMode::Shadow);
+        for (alias, mode) in [
+            ("shadow", BillingEnforcementMode::Shadow),
+            ("soft", BillingEnforcementMode::SoftEnforce),
+            ("SOFT_ENFORCE", BillingEnforcementMode::SoftEnforce),
+            ("hard", BillingEnforcementMode::HardEnforce),
+            ("HARD_ENFORCE", BillingEnforcementMode::HardEnforce),
+        ] {
+            let all = BillingEnforcementConfig::parse(Some(alias), None).unwrap();
+            assert_eq!(all.for_project(9), mode);
+            let scoped = BillingEnforcementConfig::parse(Some(alias), Some(" 9, 2,9 ")).unwrap();
+            assert_eq!(scoped.project_scope.as_ref().unwrap().len(), 2);
+            assert_eq!(scoped.for_project(9), mode);
+            assert_eq!(scoped.for_project(3), BillingEnforcementMode::Shadow);
+        }
+    }
+
+    #[test]
+    fn invalid_configuration_never_silently_disables_enforcement() {
+        for mode in ["", " ", "had", "hard "] {
+            assert!(BillingEnforcementConfig::parse(Some(mode), None).is_err());
+        }
+        for projects in [
+            "",
+            " ",
+            ",",
+            "1,",
+            ",1",
+            "1,,2",
+            "0",
+            "-1",
+            "1,no",
+            "9223372036854775808",
+        ] {
+            assert!(BillingEnforcementConfig::parse(Some("hard"), Some(projects)).is_err());
+        }
     }
 }

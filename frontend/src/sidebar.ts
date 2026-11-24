@@ -28,9 +28,14 @@ export function useSidebarData(): SidebarData {
   const { t } = useTranslation();
   const { user: authUser } = useAuthStore((state) => state.auth);
   const { data: meData } = useMe();
-  const { mode } = useProductExperience();
+  const { mode, features } = useProductExperience();
   const { filterNavGroups } = useRoutePermissions();
   const user = meData || authUser;
+  const isAdministrator =
+    !!user?.isOwner ||
+    !!user?.scopes?.some(
+      (scope) => scope === '*' || ['read_dashboard', 'read_channels', 'read_users', 'read_settings', 'read_billing'].includes(scope)
+    );
 
   const getInitials = (firstName?: string, lastName?: string, email?: string) => {
     if (firstName && lastName) return `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase();
@@ -63,19 +68,24 @@ export function useSidebarData(): SidebarData {
     },
   ];
 
-  const simpleNavGroups: NavGroup[] = user?.isOwner
+  const simpleNavGroups: NavGroup[] = isAdministrator
     ? [
         {
           title: t('sidebar.groups.admin'),
           items: [
             { title: t('sidebar.items.dashboard'), url: '/', icon: IconLayoutDashboard } as NavLink,
-            { title: t('sidebar.items.operations'), url: '/operations', icon: IconReportMoney } as NavLink,
-            { title: t('sidebar.items.users'), url: '/users', icon: IconUsers } as NavLink,
-            { title: t('sidebar.items.groups'), url: '/groups', icon: IconUsersGroup } as NavLink,
-            { title: t('sidebar.items.billing'), url: '/billing', icon: IconWallet } as NavLink,
             { title: t('sidebar.items.channels'), url: '/channels', icon: IconAi } as NavLink,
-            { title: t('sidebar.items.changeSets'), url: '/change-sets', icon: ClipboardCheck } as NavLink,
-            { title: t('sidebar.items.changelog'), url: '/changelog', icon: History } as NavLink,
+            { title: t('sidebar.items.models'), url: '/models', icon: IconRobot } as NavLink,
+            {
+              title: `${t('sidebar.items.users')} / ${t('sidebar.items.groups')}`,
+              icon: IconUsers,
+              items: [
+                { title: t('sidebar.items.users'), url: '/users' },
+                { title: '用户组 / 模型组 / Project 规则', url: '/groups' },
+              ],
+            },
+            { title: t('sidebar.items.billing'), url: '/billing', icon: IconWallet } as NavLink,
+            { title: t('sidebar.items.requests'), url: '/project/requests', icon: IconActivity } as NavLink,
           ],
         },
       ]
@@ -133,7 +143,68 @@ export function useSidebarData(): SidebarData {
     },
   ];
 
-  const rawNavGroups = mode === 'SIMPLE' ? [...simpleNavGroups, ...sharedNavGroups] : [...enterpriseNavGroups, ...sharedNavGroups];
+  const featureRoutes: Record<string, string> = {
+    '/operations': 'operations_reports',
+    '/projects': 'projects',
+    '/roles': 'roles',
+    '/change-sets': 'change_sets',
+    '/groups': 'groups',
+    '/system': 'system',
+    '/prompt-protection-rules': 'prompt_protection',
+    '/data-storages': 'data_storages',
+    '/project/prompts': 'prompts',
+    '/project/traces': 'traces',
+    '/project/threads': 'threads',
+    '/project/playground': 'playground',
+  };
+  const isHidden = (url?: string) => !!url && features.find((feature) => feature.id === featureRoutes[url])?.visibility === 'OFF';
+  const primaryNavGroups = simpleNavGroups.map((group) => ({
+    ...group,
+    items: group.items
+      .filter((item) => !isHidden(item.url))
+      .map((item) => (item.items ? { ...item, items: item.items.filter((child) => !isHidden(child.url)) } : item))
+      .filter((item) => !item.items || item.items.length > 0),
+  }));
+  const primaryPaths = new Set(
+    primaryNavGroups.flatMap((group) => group.items.flatMap((item) => item.items?.map((child) => child.url) ?? [item.url]))
+  );
+  const advanced = filterNavGroups([...enterpriseNavGroups, ...sharedNavGroups])
+    .flatMap((group) => group.items)
+    .filter((item): item is NavLink => !!item.url && !primaryPaths.has(item.url));
+  const pinned = advanced.filter(
+    (item) => features.find((feature) => feature.id === featureRoutes[item.url as string])?.visibility === 'ON'
+  );
+  const hidden = advanced.filter((item) => !pinned.includes(item));
+  const rawNavGroups: NavGroup[] =
+    mode === 'SIMPLE'
+      ? [
+          ...primaryNavGroups,
+          ...(pinned.length ? [{ title: t('productFeatures.pinned', { defaultValue: 'Pinned features' }), items: pinned }] : []),
+          {
+            title: t('productFeatures.catalog', { defaultValue: 'Feature catalog' }),
+            items: [{ title: t('productFeatures.advanced', { defaultValue: 'Advanced features' }), icon: IconSettings, items: hidden }],
+          },
+        ]
+      : [
+          ...[...enterpriseNavGroups, ...sharedNavGroups].map((group) => ({
+            ...group,
+            items: group.items.filter((item) => !isHidden(item.url)),
+          })),
+          ...(advanced.some((item) => isHidden(item.url))
+            ? [
+                {
+                  title: t('productFeatures.catalog', { defaultValue: 'Feature catalog' }),
+                  items: [
+                    {
+                      title: t('productFeatures.advanced', { defaultValue: 'Advanced features' }),
+                      icon: IconSettings,
+                      items: advanced.filter((item) => isHidden(item.url)),
+                    },
+                  ],
+                },
+              ]
+            : []),
+        ];
   const filteredNavGroups = filterNavGroups(rawNavGroups).filter((group) => group.items.length > 0);
 
   return {

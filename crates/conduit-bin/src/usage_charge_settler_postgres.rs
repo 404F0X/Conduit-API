@@ -8,6 +8,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use conduit_core::objects::money::{AccountingSettings, CurrencyExchangeRate, STATION_CREDIT_CODE};
 use conduit_core::objects::pricing::ModelPrice;
+use conduit_core::objects::retail_price_plan::{
+    FACTS_VERSION, FrozenRetailPlan, RetailPriceDocument,
+};
 use conduit_db::row::UsageLogRow;
 use conduit_llm::Usage;
 use conduit_services::usage_service::compute_usage_cost_full;
@@ -20,12 +23,14 @@ use tracing::warn;
 
 use conduit_orchestrator::orchestrator::BillingAdmissionInput;
 
-use crate::usage_charge_settler::{BillingEnforcementMode, UsageChargeSettler, usage_from_row};
+use crate::usage_charge_settler::{
+    BillingEnforcementConfig, BillingEnforcementMode, UsageChargeSettler, usage_from_row,
+};
 
 #[derive(Clone)]
 pub(crate) struct PgUsageChargeSettler {
     pool: PgPool,
-    enforcement_mode: BillingEnforcementMode,
+    enforcement: BillingEnforcementConfig,
     wallet_gates: Arc<WalletAdmissionGates>,
     settlement_tx: mpsc::Sender<SettlementJob>,
     async_settlement: bool,
@@ -48,11 +53,219 @@ struct MoneySettingsWire {
     accounting_rate_version: Option<u64>,
 }
 
-pub(crate) async fn load_accounting_settings(pool: &PgPool) -> Result<AccountingSettings, String> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RetailPricingSnapshot {
+    version_id: i64,
+    reference: String,
+    currency: String,
+    #[serde(default)]
+    price: Option<ModelPrice>,
+    #[serde(default)]
+    frozen_plan: Option<FrozenRetailPlan>,
+    #[serde(default)]
+    frozen_plan_hash: Option<String>,
+    multiplier: Decimal,
+    accounting_settings: AccountingSettings,
+}
+
+impl RetailPricingSnapshot {
+    fn selected_price(&self, usage: &Usage) -> Result<Option<ModelPrice>, String> {
+        if let Some(plan) = &self.frozen_plan {
+            if self.frozen_plan_hash.as_deref() != Some(retail_plan_hash(plan)?.as_str())
+                || plan.price_version_id != self.version_id
+                || plan.price_reference != self.reference
+                || plan.project_multiplier != self.multiplier
+                || self.price.is_some()
+            {
+                return Err("invalid or inconsistent frozen retail pricing snapshot".into());
+            }
+            return plan
+                .select_price(&retail_usage_facts(usage)?)
+                .map(|price| price.cloned());
+        }
+        if self.frozen_plan_hash.is_some() {
+            return Err("frozen retail plan is missing".into());
+        }
+        self.price
+            .clone()
+            .map(Some)
+            .ok_or_else(|| "retail pricing snapshot payload is missing".into())
+    }
+}
+
+fn retail_plan_hash(plan: &FrozenRetailPlan) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(plan).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+fn legacy_retail_price(value: &Value) -> Result<ModelPrice, String> {
+    if value.get("schema").is_some() {
+        return Err("versioned retail plan requires its durable admission snapshot".into());
+    }
+    RetailPriceDocument::parse(value)?
+        .global
+        .ok_or_else(|| "legacy retail price is missing".into())
+}
+async fn retail_timezone_offset(pool: &PgPool, at: DateTime<Utc>) -> Result<i32, String> {
+    use chrono::Offset;
     let raw = sqlx::query_scalar::<_, String>(
         "SELECT value FROM systems WHERE key='system_general_settings' AND deleted_at=0 LIMIT 1",
     )
     .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let settings = raw
+        .map(|raw| serde_json::from_str::<Value>(&raw))
+        .transpose()
+        .map_err(|_| "invalid timezone settings")?;
+    let name = settings
+        .as_ref()
+        .and_then(|v| v.get("timezone"))
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("UTC");
+    let zone = name
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| "invalid retail timezone")?;
+    Ok(at.with_timezone(&zone).offset().fix().local_minus_utc())
+}
+fn retail_usage_facts(usage: &Usage) -> Result<std::collections::BTreeMap<String, i64>, String> {
+    let variants = usage
+        .prompt_details
+        .write_cached_tokens_5m
+        .checked_add(usage.prompt_details.write_cached_tokens_1h)
+        .ok_or("cache write facts overflow")?;
+    let writes = if variants > 0 {
+        variants
+    } else {
+        usage.prompt_details.write_cached_tokens
+    };
+    [
+        ("prompt_tokens", usage.prompt_tokens),
+        ("completion_tokens", usage.completion_tokens),
+        ("total_tokens", usage.total_tokens),
+        ("prompt_cached_tokens", usage.prompt_details.cached_tokens),
+        ("prompt_write_cached_tokens", writes),
+    ]
+    .into_iter()
+    .map(|(key, value)| {
+        Ok((
+            key.into(),
+            i64::try_from(value).map_err(|_| "actual token fact exceeds i64")?,
+        ))
+    })
+    .collect()
+}
+
+async fn reservation_pricing_snapshot(
+    pool: &PgPool,
+    usage_log_id: i64,
+    key: Option<&str>,
+    project: i64,
+    user: i64,
+    model: i64,
+) -> Result<Option<RetailPricingSnapshot>, String> {
+    // Expired holds are ignored for funding, but retain the admission price.
+    let value = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT r.pricing_snapshot FROM project_wallet_reservations r \
+         JOIN project_wallets w ON w.id=r.wallet_id WHERE r.request_id=COALESCE($1, \
+         (SELECT reservation_key FROM usage_charge_outbox WHERE usage_log_id=$2)) \
+         AND w.project_id=$3 AND r.user_id=$4 AND r.public_model_id=$5",
+    )
+    .bind(key)
+    .bind(usage_log_id)
+    .bind(project)
+    .bind(user)
+    .bind(model)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .flatten();
+    if value.is_none() {
+        let has_snapshot=sqlx::query_scalar::<_,bool>(
+            "SELECT EXISTS(SELECT 1 FROM project_wallet_reservations WHERE request_id=COALESCE($1, \
+             (SELECT reservation_key FROM usage_charge_outbox WHERE usage_log_id=$2)) AND pricing_snapshot IS NOT NULL)"
+        ).bind(key).bind(usage_log_id).fetch_one(pool).await.map_err(|e|e.to_string())?;
+        if has_snapshot {
+            return Err("reservation pricing snapshot identity mismatch: request key belongs to another user or public model".into());
+        }
+    }
+    value
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| "invalid reservation pricing snapshot".into())
+}
+
+pub(crate) async fn reservation_has_request_flat_fee(
+    pool: &PgPool,
+    key: &str,
+    request_id: i64,
+    project_id: i64,
+) -> Result<bool, String> {
+    let identity = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+        "SELECT k.user_id,COALESCE((SELECT r.public_model_id FROM project_wallet_reservations r \
+         JOIN project_wallets w ON w.id=r.wallet_id WHERE r.request_id=$3 \
+         AND w.project_id=q.project_id AND r.user_id=k.user_id), \
+         (SELECT m.id FROM models m WHERE m.model_id=q.model_id ORDER BY m.deleted_at,m.id DESC LIMIT 1)) \
+         FROM requests q LEFT JOIN api_keys k ON k.id=q.api_key_id WHERE q.id=$1 AND q.project_id=$2 \
+         AND EXISTS(SELECT 1 FROM project_wallet_reservations r WHERE r.request_id=$3)",
+    )
+    .bind(request_id)
+    .bind(project_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some((user, model)) = identity else {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM project_wallet_reservations WHERE request_id=$1)",
+        )
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        if exists {
+            return Err("flat-fee reservation request identity mismatch".into());
+        }
+        return Ok(false);
+    };
+    let snapshot = reservation_pricing_snapshot(
+        pool,
+        0,
+        Some(key),
+        project_id,
+        user.ok_or("missing flat-fee request user")?,
+        model.ok_or("missing flat-fee request model")?,
+    )
+    .await?
+    .ok_or("flat-fee reservation snapshot identity mismatch")?;
+    if snapshot.frozen_plan.is_none() {
+        return Ok(false);
+    }
+    Ok(snapshot
+        .selected_price(&Usage::default())?
+        .is_some_and(|price| {
+            price.items.iter().any(|item| {
+                item.pricing.mode == "flat_fee"
+                    && item.pricing.flat_fee.is_some_and(|fee| fee > Decimal::ZERO)
+            })
+        }))
+}
+
+pub(crate) async fn load_accounting_settings(pool: &PgPool) -> Result<AccountingSettings, String> {
+    load_accounting_settings_from(pool).await
+}
+
+pub(crate) async fn load_accounting_settings_from<'e, E>(
+    executor: E,
+) -> Result<AccountingSettings, String>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let raw = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM systems WHERE key='system_general_settings' AND deleted_at=0 LIMIT 1",
+    )
+    .fetch_optional(executor)
     .await
     .map_err(|error| error.to_string())?;
     let wire = match raw {
@@ -186,15 +399,21 @@ impl WalletAdmissionGates {
 }
 
 impl PgUsageChargeSettler {
+    #[cfg(test)]
     pub(crate) fn new(pool: PgPool) -> Self {
-        Self::create(pool, None)
+        Self::create(
+            pool,
+            None,
+            BillingEnforcementConfig::parse(None, None).expect("valid test config"),
+        )
     }
 
     pub(crate) fn new_supervised(
         pool: PgPool,
         tasks: Arc<conduit_scheduler::TaskSupervisor>,
-    ) -> Self {
-        Self::create(pool, Some(tasks))
+    ) -> Result<Self, String> {
+        let enforcement = BillingEnforcementConfig::from_env()?;
+        Ok(Self::create(pool, Some(tasks), enforcement))
     }
 
     pub(crate) fn with_reservation_ttl(mut self, ttl: Duration) -> Self {
@@ -202,7 +421,11 @@ impl PgUsageChargeSettler {
         self
     }
 
-    fn create(pool: PgPool, tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>) -> Self {
+    fn create(
+        pool: PgPool,
+        tasks: Option<Arc<conduit_scheduler::TaskSupervisor>>,
+        enforcement: BillingEnforcementConfig,
+    ) -> Self {
         let queue_capacity = std::env::var("CONDUIT_BILLING_SETTLEMENT_QUEUE_CAPACITY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -211,7 +434,7 @@ impl PgUsageChargeSettler {
         let (settlement_tx, settlement_rx) = mpsc::channel(queue_capacity);
         let settler = Self {
             pool,
-            enforcement_mode: BillingEnforcementMode::from_env(),
+            enforcement,
             wallet_gates: Arc::new(WalletAdmissionGates::default()),
             settlement_tx,
             async_settlement: tasks.is_some(),
@@ -355,11 +578,12 @@ impl PgUsageChargeSettler {
             let usage_project_id = row.project_id.parse::<i64>().map_err(|e| e.to_string())?;
             let effective_reservation_key = if let Some(key) = reservation_key.as_deref() {
                 let usage_request_id = row.request_id.parse::<i64>().map_err(|e| e.to_string())?;
+                // Incurred usage keeps the immutable owner of a retained key, including tombstones.
                 let expected_identity = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
                     "SELECT k.user_id, \
                      (SELECT m.id FROM models m WHERE m.model_id=r.model_id \
                       ORDER BY m.deleted_at,m.id DESC LIMIT 1) \
-                     FROM requests r LEFT JOIN api_keys k ON k.id=r.api_key_id AND k.deleted_at=0 \
+                     FROM requests r LEFT JOIN api_keys k ON k.id=r.api_key_id \
                      WHERE r.id=$1",
                 )
                 .bind(usage_request_id)
@@ -459,7 +683,7 @@ impl PgUsageChargeSettler {
         let wallets = sqlx::query(
             "SELECT DISTINCT w.id,w.project_id,w.currency FROM project_wallet_reservations r \
              JOIN project_wallets w ON w.id=r.wallet_id \
-             WHERE r.status IN ('reserved','shadow_reserved') AND r.expires_at<=$1",
+             WHERE r.status IN ('reserved','shadow_reserved','soft_insufficient') AND r.expires_at<=$1",
         )
         .bind(now)
         .fetch_all(&self.pool)
@@ -536,7 +760,7 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         input: &BillingAdmissionInput,
     ) -> Result<Option<String>, String> {
         let project_id = input.project_id.parse::<i64>().map_err(|e| e.to_string())?;
-        let enforcement_mode = self.enforcement_mode.for_project(project_id);
+        let enforcement_mode = self.enforcement.for_project(project_id);
         let api_key_id = match input.api_key_id.as_deref() {
             Some(value) => value.parse::<i64>().map_err(|e| e.to_string())?,
             None => return Ok(None),
@@ -555,6 +779,8 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         let Some(user_id) = user_id else {
             return Ok(None);
         };
+        let member_limit: Option<i64> = sqlx::query_scalar("SELECT limit_micros FROM project_member_spend_state WHERE project_id=$1 AND user_id=$2")
+            .bind(project_id).bind(user_id).fetch_optional(&self.pool).await.map_err(|e|e.to_string())?.flatten();
         // Resolve the public model and its active retail price in one round trip
         // on the hot path. The old implementation first selected `models.id`
         // and then queried the price book, doubling pool pressure before every
@@ -562,7 +788,7 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         // error path performs the fallback identity lookup so it can preserve
         // the more specific missing-model diagnostic.
         let priced_model = sqlx::query(
-            "SELECT m.id AS public_model_id,b.currency,i.price FROM models m \
+            "SELECT m.id AS public_model_id,v.id AS version_id,v.reference_id,b.currency,i.price FROM models m \
              JOIN price_book_items i ON i.public_model_id=m.id \
              JOIN price_book_versions v ON v.id=i.price_book_version_id \
              JOIN price_books b ON b.id=v.price_book_id \
@@ -584,7 +810,9 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
-            return if enforcement_mode == BillingEnforcementMode::HardEnforce {
+            return if enforcement_mode == BillingEnforcementMode::HardEnforce
+                || member_limit.is_some()
+            {
                 if model_exists {
                     Err(format!(
                         "billing admission rejected: model '{}' has no published retail price",
@@ -603,8 +831,7 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         let public_model_id: i64 = price_row.get("public_model_id");
         let price_currency: String = price_row.get("currency");
         let price_value: Value = price_row.get("price");
-        let price: ModelPrice = serde_json::from_value(price_value)
-            .map_err(|e| format!("invalid retail price JSON: {e}"))?;
+        let document = RetailPriceDocument::parse(&price_value)?;
         let multiplier =
             crate::wiring_project_access::resolve_effective_project_price_multiplier_postgres(
                 &self.pool, project_id, now,
@@ -619,12 +846,56 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                 .saturating_add(input.max_output_tokens),
             ..Usage::default()
         };
+        let legacy_price = if price_value.get("schema").is_none() {
+            document.global.clone()
+        } else {
+            None
+        };
+        let frozen_plan = if legacy_price.is_none() {
+            Some(
+                FrozenRetailPlan {
+                    facts_version: FACTS_VERSION.into(),
+                    document,
+                    model_group_id: input.model_group_id.clone(),
+                    model_group_revision: input.model_group_revision,
+                    price_version_id: price_row.get("version_id"),
+                    price_reference: price_row.get("reference_id"),
+                    effective_at: now,
+                    timezone_offset_seconds: retail_timezone_offset(&self.pool, now).await?,
+                    project_multiplier: multiplier,
+                    project_adjustment_source: format!(
+                        "effective_project_price_multiplier:{project_id}"
+                    ),
+                }
+                .freeze()?,
+            )
+        } else {
+            None
+        };
+        let estimated_amount = if let Some(plan) = &frozen_plan {
+            if !plan.has_complete_coverage()?
+                && (enforcement_mode == BillingEnforcementMode::HardEnforce
+                    || member_limit.is_some())
+            {
+                return Err(
+                    "billing admission rejected: conditional retail price requires a group base or global fallback for complete coverage".into(),
+                );
+            }
+            plan.maximum_estimated_charge(|price| {
+                Ok(compute_usage_cost_full(Some(&estimate), price).total)
+            })?
+        } else {
+            compute_usage_cost_full(
+                Some(&estimate),
+                legacy_price.as_ref().ok_or("legacy price missing")?,
+            )
+            .total
+                * multiplier
+        };
+        let plan_hash = frozen_plan.as_ref().map(retail_plan_hash).transpose()?;
         let accounting_settings = load_accounting_settings(&self.pool).await?;
-        let accounting_amount = accounting_price_amount(
-            compute_usage_cost_full(Some(&estimate), &price).total * multiplier,
-            &price_currency,
-            &accounting_settings,
-        )?;
+        let accounting_amount =
+            accounting_price_amount(estimated_amount, &price_currency, &accounting_settings)?;
         let amount = accounting_settings
             .accounting_to_credits(accounting_amount)?
             .round_dp(6);
@@ -634,9 +905,17 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             .to_i64()
             .ok_or_else(|| "retail reservation does not fit in i64 micros".to_string())?
             .max(0);
-        if amount_micros == 0 {
-            return Ok(None);
-        }
+        let pricing_snapshot = serde_json::to_value(RetailPricingSnapshot {
+            version_id: price_row.get("version_id"),
+            reference: price_row.get("reference_id"),
+            currency: price_currency,
+            price: legacy_price,
+            frozen_plan,
+            frozen_plan_hash: plan_hash,
+            multiplier,
+            accounting_settings: accounting_settings.clone(),
+        })
+        .map_err(|_| "invalid admission pricing snapshot")?;
 
         // Wait before acquiring a database connection. The wallet row lock
         // below still protects this operation across multiple Conduit API nodes.
@@ -680,11 +959,16 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             let status: String = existing.get("status");
             let existing_expires_at: DateTime<Utc> = existing.get("expires_at");
             tx.commit().await.map_err(|e| e.to_string())?;
-            return if matches!(status.as_str(), "reserved" | "shadow_reserved")
-                && existing_expires_at > now
+            return if matches!(
+                status.as_str(),
+                "reserved" | "shadow_reserved" | "soft_insufficient"
+            ) && existing_expires_at > now
             {
                 Ok(Some(input.request_key.clone()))
-            } else if matches!(status.as_str(), "reserved" | "shadow_reserved") {
+            } else if matches!(
+                status.as_str(),
+                "reserved" | "shadow_reserved" | "soft_insufficient"
+            ) {
                 Err("billing admission rejected: request key reservation has expired".into())
             } else {
                 Err(format!(
@@ -709,8 +993,8 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         wallet.credit_reserved_micros =
             wallet.credit_reserved_micros.saturating_sub(expired_credit);
         if enforcement_mode == BillingEnforcementMode::Shadow {
-            let reservation_id = sqlx::query_scalar::<_,i64>("INSERT INTO project_wallet_reservations(wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'shadow_reserved',$6,$7,$7) RETURNING id")
-                .bind(wallet.id).bind(user_id).bind(public_model_id).bind(&input.request_key).bind(amount_micros).bind(expires_at).bind(now)
+            let reservation_id = sqlx::query_scalar::<_,i64>("INSERT INTO project_wallet_reservations(wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at,pricing_snapshot) VALUES($1,$2,$3,$4,$5,'shadow_reserved',$6,$7,$7,$8) RETURNING id")
+                .bind(wallet.id).bind(user_id).bind(public_model_id).bind(&input.request_key).bind(amount_micros).bind(expires_at).bind(now).bind(sqlx::types::Json(pricing_snapshot.clone()))
                 .fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
             insert_pg_reservation_event(
                 &mut tx,
@@ -751,13 +1035,15 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                     subscription_available.saturating_add(credit_available)
                 ));
             }
-            sqlx::query("INSERT INTO project_wallet_reservations(wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'soft_insufficient',$6,$7,$7)")
-                .bind(wallet.id).bind(user_id).bind(public_model_id).bind(&input.request_key).bind(amount_micros).bind(expires_at).bind(now).execute(&mut *tx).await.map_err(|e|e.to_string())?;
+            sqlx::query("INSERT INTO project_wallet_reservations(wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at,pricing_snapshot) VALUES($1,$2,$3,$4,$5,'soft_insufficient',$6,$7,$7,$8)")
+                .bind(wallet.id).bind(user_id).bind(public_model_id).bind(&input.request_key).bind(amount_micros).bind(expires_at).bind(now).bind(sqlx::types::Json(pricing_snapshot.clone())).execute(&mut *tx).await.map_err(|e|e.to_string())?;
             tx.commit().await.map_err(|e| e.to_string())?;
-            return Ok(None);
+            // No funds are held, but the recorder and durable outbox still
+            // need the admission identity to retrieve its frozen price.
+            return Ok(Some(input.request_key.clone()));
         }
-        let reservation_id = sqlx::query_scalar::<_,i64>("INSERT INTO project_wallet_reservations(wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'reserved',$6,$7,$7) RETURNING id")
-            .bind(wallet.id).bind(user_id).bind(public_model_id).bind(&input.request_key).bind(amount_micros).bind(expires_at).bind(now).fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
+        let reservation_id = sqlx::query_scalar::<_,i64>("INSERT INTO project_wallet_reservations(wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at,pricing_snapshot) VALUES($1,$2,$3,$4,$5,'reserved',$6,$7,$7,$8) RETURNING id")
+            .bind(wallet.id).bind(user_id).bind(public_model_id).bind(&input.request_key).bind(amount_micros).bind(expires_at).bind(now).bind(sqlx::types::Json(pricing_snapshot.clone())).fetch_one(&mut *tx).await.map_err(|e|e.to_string())?;
         let mut remaining = amount_micros;
         for bucket in buckets {
             if remaining == 0 {
@@ -840,7 +1126,10 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         };
         let id: i64 = row.get("id");
         let status: String = row.get("status");
-        if !matches!(status.as_str(), "reserved" | "shadow_reserved") {
+        if !matches!(
+            status.as_str(),
+            "reserved" | "shadow_reserved" | "soft_insufficient"
+        ) {
             return Ok(());
         }
         if status == "reserved" {
@@ -923,13 +1212,20 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         // below is the authoritative exactly-once gate; a separate EXISTS was
         // an unavoidable extra round trip for every successful request and
         // still could not remove the race between check and insert.
+        // Admission requires a live key; incurred usage uses its retained immutable owner.
         let request = sqlx::query(
-            "SELECT k.user_id, \
+            "SELECT k.user_id,r.created_at AS request_created_at, \
+             COALESCE((SELECT pr.public_model_id FROM project_wallet_reservations pr \
+               JOIN project_wallets w ON w.id=pr.wallet_id \
+               WHERE pr.request_id=COALESCE($2,(SELECT reservation_key FROM usage_charge_outbox WHERE usage_log_id=$3)) \
+               AND w.project_id=r.project_id AND pr.user_id=k.user_id), \
              (SELECT m.id FROM models m WHERE m.model_id=r.model_id \
-              ORDER BY m.deleted_at,m.id DESC LIMIT 1) AS public_model_id \
-             FROM requests r LEFT JOIN api_keys k ON k.id=r.api_key_id AND k.deleted_at=0 WHERE r.id=$1",
+              ORDER BY m.deleted_at,m.id DESC LIMIT 1)) AS public_model_id \
+             FROM requests r LEFT JOIN api_keys k ON k.id=r.api_key_id WHERE r.id=$1",
         )
         .bind(request_id)
+        .bind(reservation_key)
+        .bind(usage_log_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -977,14 +1273,28 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                 )
                 .await;
         };
-        let price_row = sqlx::query(
+        let request_created_at: DateTime<Utc> = request.get("request_created_at");
+        let frozen = reservation_pricing_snapshot(
+            &self.pool,
+            usage_log_id,
+            reservation_key,
+            project_id,
+            user_id,
+            public_model_id,
+        )
+        .await?;
+        let price_row = if frozen.is_none() {
+            sqlx::query(
             "SELECT v.id AS version_id,v.reference_id,b.currency,i.price FROM price_books b \
              JOIN price_book_versions v ON v.price_book_id=b.id JOIN price_book_items i ON i.price_book_version_id=v.id \
-             WHERE b.is_default=TRUE AND b.status='enabled' AND v.status='published' AND i.public_model_id=$1 \
+             WHERE b.is_default=TRUE AND b.status='enabled' AND v.status IN ('published','archived') AND i.public_model_id=$1 \
              AND (v.effective_start_at IS NULL OR v.effective_start_at<=$2) \
              AND (v.effective_end_at IS NULL OR v.effective_end_at>$2) ORDER BY v.version DESC LIMIT 1",
-        ).bind(public_model_id).bind(log.created_at).fetch_optional(&self.pool).await.map_err(|e|e.to_string())?;
-        let Some(price_row) = price_row else {
+        ).bind(public_model_id).bind(request_created_at).fetch_optional(&self.pool).await.map_err(|e|e.to_string())?
+        } else {
+            None
+        };
+        if frozen.is_none() && price_row.is_none() {
             return self
                 .record_unsettled(
                     usage_log_id,
@@ -997,24 +1307,59 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                     "published_retail_price_not_found",
                 )
                 .await;
+        }
+        let snapshot = if let Some(snapshot) = frozen {
+            snapshot
+        } else {
+            let price_row = price_row.ok_or("retail price is unavailable")?;
+            let multiplier =
+                crate::wiring_project_access::resolve_effective_project_price_multiplier_postgres(
+                    &self.pool,
+                    project_id,
+                    request_created_at,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let accounting_settings = reservation_accounting_settings(&self.pool, reservation_key)
+                .await?
+                .unwrap_or(current_accounting_settings);
+            RetailPricingSnapshot {
+                version_id: price_row.get("version_id"),
+                reference: price_row.get("reference_id"),
+                currency: price_row.get("currency"),
+                price: Some(legacy_retail_price(&price_row.get::<Value, _>("price"))?),
+                frozen_plan: None,
+                frozen_plan_hash: None,
+                multiplier,
+                accounting_settings,
+            }
         };
-        let version_id: i64 = price_row.get("version_id");
-        let reference: String = price_row.get("reference_id");
-        let price_currency: String = price_row.get("currency");
-        let price: ModelPrice = serde_json::from_value(price_row.get::<Value, _>("price"))
-            .map_err(|e| format!("invalid retail price JSON: {e}"))?;
-        let multiplier =
-            crate::wiring_project_access::resolve_effective_project_price_multiplier_postgres(
-                &self.pool,
-                project_id,
-                log.created_at,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let selected_price = snapshot.selected_price(usage)?;
+        let RetailPricingSnapshot {
+            version_id,
+            reference,
+            currency: price_currency,
+            price: _,
+            multiplier,
+            accounting_settings,
+            frozen_plan,
+            frozen_plan_hash,
+        } = snapshot;
+        let Some(price) = selected_price else {
+            return self
+                .record_unsettled(
+                    usage_log_id,
+                    request_id,
+                    Some(public_model_id),
+                    Some(version_id),
+                    &unsettled_currency,
+                    "unpriced",
+                    usage,
+                    "frozen_retail_price_not_configured",
+                )
+                .await;
+        };
         let base = compute_usage_cost_full(Some(usage), &price);
-        let accounting_settings = reservation_accounting_settings(&self.pool, reservation_key)
-            .await?
-            .unwrap_or(current_accounting_settings);
         let accounting_amount = accounting_price_amount(
             base.total * multiplier,
             &price_currency,
@@ -1040,7 +1385,10 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             "credit_ledger_key": STATION_CREDIT_CODE,
             "price_reference_id": reference,
             "accounting_settings": accounting_settings,
-            "items": base.items
+            "items": base.items,
+            "frozen_retail_plan_hash":frozen_plan_hash,
+            "model_group_id":frozen_plan.as_ref().and_then(|p|p.model_group_id.as_deref()),
+            "model_group_revision":frozen_plan.as_ref().and_then(|p|p.model_group_revision)
         });
 
         // Admission occurs before `begin()`: waiters for a hot wallet do not
@@ -1122,7 +1470,7 @@ async fn expire_pg_wallet_reservations(
     now: DateTime<Utc>,
 ) -> Result<i64, String> {
     let mut released_credit_micros = 0_i64;
-    let expired=sqlx::query("SELECT id,status FROM project_wallet_reservations WHERE wallet_id=$1 AND status IN ('reserved','shadow_reserved') AND expires_at<=$2 FOR UPDATE")
+    let expired=sqlx::query("SELECT id,status FROM project_wallet_reservations WHERE wallet_id=$1 AND status IN ('reserved','shadow_reserved','soft_insufficient') AND expires_at<=$2 FOR UPDATE")
         .bind(wallet_id).bind(now).fetch_all(&mut **tx).await.map_err(|e|e.to_string())?;
     for row in expired {
         let id: i64 = row.get("id");
@@ -1210,7 +1558,10 @@ async fn begin_pg_reservation_capture(
     let id: i64 = row.get("id");
     let status: String = row.get("status");
     let expires_at: DateTime<Utc> = row.get("expires_at");
-    if !matches!(status.as_str(), "reserved" | "shadow_reserved") {
+    if !matches!(
+        status.as_str(),
+        "reserved" | "shadow_reserved" | "soft_insufficient"
+    ) {
         return Err(format!(
             "reservation capture rejected: request key is already finalized with status '{status}'"
         ));
@@ -1504,6 +1855,149 @@ async fn lock_project_wallet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retail_plan_snapshot_estimates_then_selects_actual_and_replays_without_current_price() {
+        let price = |rate: &str| json!({"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"usage_per_unit","usagePerUnit":rate}}]});
+        let group = "00000000-0000-0000-0000-000000000001";
+        let document=RetailPriceDocument::parse(&json!({"schema":"group-conditional-price-v1","global":price("1"),"groups":[{"modelGroupID":group,"base":price("3"),"rules":[{"id":"free","label":"small","condition":"prompt_tokens < 100","price":price("0")},{"id":"large","label":"large","condition":"prompt_tokens >= 100","price":price("9")}]}]})).unwrap();
+        let plan = FrozenRetailPlan {
+            facts_version: FACTS_VERSION.into(),
+            document,
+            model_group_id: Some(group.into()),
+            model_group_revision: Some(7),
+            price_version_id: 10,
+            price_reference: "old-reference".into(),
+            effective_at: DateTime::from_timestamp(0, 0).unwrap(),
+            timezone_offset_seconds: 0,
+            project_multiplier: Decimal::from(2),
+            project_adjustment_source: "project-test".into(),
+        }
+        .freeze()
+        .unwrap();
+        let estimate = Usage {
+            prompt_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        assert_eq!(
+            plan.maximum_estimated_charge(|price| Ok(compute_usage_cost_full(
+                Some(&estimate),
+                price
+            )
+            .total))
+                .unwrap(),
+            Decimal::from(18)
+        );
+        let hash = retail_plan_hash(&plan).unwrap();
+        let snapshot = RetailPricingSnapshot {
+            version_id: 10,
+            reference: "old-reference".into(),
+            currency: "CNY".into(),
+            price: None,
+            frozen_plan: Some(plan),
+            frozen_plan_hash: Some(hash.clone()),
+            multiplier: Decimal::from(2),
+            accounting_settings: AccountingSettings::default(),
+        };
+        let stored = serde_json::to_value(snapshot).unwrap();
+        let restored: RetailPricingSnapshot = serde_json::from_value(stored.clone()).unwrap();
+        let small = Usage {
+            prompt_tokens: 1,
+            ..Usage::default()
+        };
+        assert_eq!(
+            compute_usage_cost_full(
+                Some(&small),
+                &restored.selected_price(&small).unwrap().unwrap()
+            )
+            .total,
+            Decimal::ZERO
+        );
+        assert_eq!(
+            compute_usage_cost_full(
+                Some(&estimate),
+                &restored.selected_price(&estimate).unwrap().unwrap()
+            )
+            .total,
+            Decimal::from(9)
+        );
+        assert_eq!(restored.frozen_plan_hash.as_deref(), Some(hash.as_str()));
+        let mut tampered = stored;
+        tampered["frozen_plan"]["project_multiplier"] = json!("9");
+        assert!(
+            serde_json::from_value::<RetailPricingSnapshot>(tampered)
+                .unwrap()
+                .selected_price(&small)
+                .is_err()
+        );
+        assert!(legacy_retail_price(&price("1")).is_ok());
+    }
+
+    #[test]
+    fn retail_duplicate_legacy_and_wrapped_prices_keep_existing_calculation() {
+        let raw = json!({"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"flat_fee","flatFee":"2"}},{"itemCode":"prompt_tokens","pricing":{"mode":"flat_fee","flatFee":"3"}},{"itemCode":"prompt_write_cached_tokens","pricing":{"mode":"flat_fee","flatFee":"1"},"promptWriteCacheVariants":[{"variantCode":conduit_core::objects::pricing::prompt_write_cache_variant_code::FIVE_MIN,"pricing":{"mode":"flat_fee","flatFee":"7"}},{"variantCode":conduit_core::objects::pricing::prompt_write_cache_variant_code::FIVE_MIN,"pricing":{"mode":"flat_fee","flatFee":"9"}}]}]});
+        let mut usage = Usage::default();
+        usage.prompt_details.write_cached_tokens_5m = 1;
+        let original: ModelPrice = serde_json::from_value(raw.clone()).unwrap();
+        let legacy = legacy_retail_price(&raw).unwrap();
+        let wrapped = RetailPriceDocument::parse(
+            &json!({"schema":"group-conditional-price-v1","global":raw,"groups":[]}),
+        )
+        .unwrap()
+        .global
+        .unwrap();
+        assert_eq!(
+            compute_usage_cost_full(Some(&usage), &original).total,
+            Decimal::from(12)
+        );
+        for price in [legacy, wrapped] {
+            assert_eq!(price, original);
+            assert_eq!(
+                compute_usage_cost_full(Some(&usage), &price).total,
+                Decimal::from(12)
+            );
+        }
+    }
+
+    #[test]
+    fn retail_legacy_global_cost_and_actual_cache_facts_preserve_existing_units() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 500_000,
+            total_tokens: 1_500_000,
+            ..Usage::default()
+        };
+        let price=legacy_retail_price(&json!({"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"usage_per_unit","usagePerUnit":"2"}},{"itemCode":"completion_tokens","pricing":{"mode":"usage_per_unit","usagePerUnit":"4"}}]})).unwrap();
+        let snapshot = RetailPricingSnapshot {
+            version_id: 1,
+            reference: "legacy".into(),
+            currency: "CNY".into(),
+            price: Some(price.clone()),
+            frozen_plan: None,
+            frozen_plan_hash: None,
+            multiplier: Decimal::from(2),
+            accounting_settings: AccountingSettings::default(),
+        };
+        let selected = snapshot.selected_price(&usage).unwrap().unwrap();
+        assert_eq!(
+            compute_usage_cost_full(Some(&usage), &selected).total,
+            Decimal::from(4)
+        );
+        assert_eq!(
+            compute_usage_cost_full(Some(&usage), &price).total * Decimal::from(2),
+            Decimal::from(8)
+        );
+        let mut cached = usage;
+        cached.prompt_details.write_cached_tokens = 99;
+        cached.prompt_details.write_cached_tokens_5m = 2;
+        cached.prompt_details.write_cached_tokens_1h = 3;
+        assert_eq!(
+            retail_usage_facts(&cached).unwrap()["prompt_write_cached_tokens"],
+            5
+        );
+        cached.prompt_tokens = u64::MAX;
+        assert!(retail_usage_facts(&cached).is_err());
+    }
     use conduit_core::objects::money::{DEFAULT_ACCOUNTING_CURRENCY_CODE, STATION_CREDIT_CODE};
     use conduit_llm::TokenDetails;
 
@@ -1574,13 +2068,16 @@ mod tests {
         .bind(format!("snapshot-grant-{suffix}"))
         .execute(&isolated.pool)
         .await?;
+        let user_id:i64=sqlx::query_scalar("INSERT INTO users(email,password,status) VALUES($1,'test-hash','activated') RETURNING id").bind(format!("snapshot-member-{suffix}@contract.test")).fetch_one(&isolated.pool).await?;
+        sqlx::query("INSERT INTO user_projects(user_id,project_id,is_owner,scopes) VALUES($1,$2,false,'[]')").bind(user_id).bind(project_id).execute(&isolated.pool).await?;
         let reservation_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO project_wallet_reservations \
              (wallet_id,user_id,public_model_id,request_id,amount_micros,status,expires_at,created_at,updated_at) \
-             VALUES($1,0,0,$2,400000,'reserved',now()+interval '1 hour',now(),now()) RETURNING id",
+             VALUES($1,$3,0,$2,400000,'reserved',now()+interval '1 hour',now(),now()) RETURNING id",
         )
         .bind(wallet_id)
         .bind(format!("snapshot-request-{suffix}"))
+        .bind(user_id)
         .fetch_one(&isolated.pool)
         .await?;
         sqlx::query(
@@ -2114,7 +2611,7 @@ mod tests {
             request_key: &str,
         ) -> Result<i64, Box<dyn std::error::Error>> {
             let mut settler = PgUsageChargeSettler::new(self.isolated.pool.clone());
-            settler.enforcement_mode = BillingEnforcementMode::HardEnforce;
+            settler.enforcement.mode = BillingEnforcementMode::HardEnforce;
             let result = settler
                 .reserve_request(&BillingAdmissionInput {
                     request_key: request_key.to_owned(),
@@ -2123,6 +2620,8 @@ mod tests {
                     public_model: self.target_model_key.clone(),
                     estimated_input_tokens: 1_000_000,
                     max_output_tokens: 0,
+                    model_group_id: None,
+                    model_group_revision: None,
                 })
                 .await
                 .map_err(std::io::Error::other)?;
@@ -2230,6 +2729,994 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn postgres_retail_missing_snapshot_payload_repair_retries_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            eprintln!(
+                "SKIPPED missing snapshot payload regression: CONDUIT_TEST_POSTGRES_DSN is absent"
+            );
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 1_000_000_000_000).await?;
+        let pool = &fixture.isolated.pool;
+        let settler = PgUsageChargeSettler::new(pool.clone());
+        for null_fields in [false, true] {
+            let key = format!("missing-payload-{null_fields}");
+            fixture.reserve_estimate(&key).await?;
+            let original: Value = sqlx::query_scalar(
+                "SELECT pricing_snapshot FROM project_wallet_reservations WHERE request_id=$1",
+            )
+            .bind(&key)
+            .fetch_one(pool)
+            .await?;
+            assert!(
+                original["price"].is_object(),
+                "producer legacy snapshot has a price even when zero/unpriced plans use frozen_plan"
+            );
+            let mut corrupt = original.clone();
+            for field in ["price", "frozen_plan", "frozen_plan_hash"] {
+                if null_fields {
+                    corrupt[field] = Value::Null;
+                } else {
+                    corrupt.as_object_mut().unwrap().remove(field);
+                }
+            }
+            sqlx::query(
+                "UPDATE project_wallet_reservations SET pricing_snapshot=$1 WHERE request_id=$2",
+            )
+            .bind(sqlx::types::Json(corrupt))
+            .bind(&key)
+            .execute(pool)
+            .await?;
+            let id = fixture.insert_usage_log().await?;
+            let log = conduit_db::PgUsageRepo::new(pool.clone())
+                .find_by_id(id)
+                .await?
+                .unwrap();
+            let usage = usage_from_row(&log);
+            assert!(
+                settler
+                    .settle_usage(&log, &usage, Some(&key))
+                    .await
+                    .unwrap_err()
+                    .contains("snapshot payload is missing")
+            );
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM customer_charge_events WHERE usage_log_id=$1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+            assert_eq!(count, 0, "corruption must leave retry possible");
+            sqlx::query(
+                "UPDATE project_wallet_reservations SET pricing_snapshot=$1 WHERE request_id=$2",
+            )
+            .bind(sqlx::types::Json(original))
+            .bind(&key)
+            .execute(pool)
+            .await?;
+            settler.settle_usage(&log, &usage, Some(&key)).await?;
+            settler.settle_usage(&log, &usage, Some(&key)).await?;
+            let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM customer_charge_events WHERE usage_log_id=$1 AND status='settled'").bind(id).fetch_one(pool).await?;
+            assert_eq!(count, 1);
+            let debits:i64=sqlx::query_scalar("SELECT COUNT(*) FROM project_credit_ledger_entries WHERE reference_type='usage_log' AND reference_id=$1 AND entry_type='usage_charge'").bind(id.to_string()).fetch_one(pool).await?;
+            assert_eq!(debits, 1);
+        }
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_group_retail_flat_zero_usage_terminal_charges_once_and_no_flat_stays_unmetered()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_orchestrator::orchestrator::{OrchestratorContext, RequestRecorder};
+        use conduit_pipeline::pipeline::{AttemptRecord, ExecutionMode};
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 1_000_000_000_000).await?;
+        let pool = &fixture.isolated.pool;
+        let group = uuid::Uuid::new_v4().to_string();
+        let mut settler = PgUsageChargeSettler::new(pool.clone());
+        settler.enforcement.mode = BillingEnforcementMode::HardEnforce;
+        let settler = Arc::new(settler);
+        let recorder = crate::usage_log_recorder::UsageLogRecorder::new(Arc::new(
+            conduit_db::PgUsageRepo::new(pool.clone()),
+        ))
+        .with_charge_settler(settler.clone())
+        .with_postgres_stream_persistence(pool.clone());
+        let incomplete = json!({"schema":"group-conditional-price-v1","global":null,"groups":[{"modelGroupID":group,"base":null,"rules":[{"id":"partial","label":"partial","condition":"prompt_tokens < 100","price":{"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"flat_fee","flatFee":"0.5"}}]}}]}]});
+        sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2")
+            .bind(sqlx::types::Json(incomplete))
+            .bind(fixture.target_model_id)
+            .execute(pool)
+            .await?;
+        let missing = settler
+            .reserve_request(&BillingAdmissionInput {
+                request_key: "retail-missing-default".into(),
+                project_id: fixture.project_id.to_string(),
+                api_key_id: Some(fixture.api_key_id.to_string()),
+                public_model: fixture.target_model_key.clone(),
+                estimated_input_tokens: 1,
+                max_output_tokens: 0,
+                model_group_id: Some(group.clone()),
+                model_group_revision: Some(1),
+            })
+            .await;
+        assert!(
+            missing
+                .unwrap_err()
+                .contains("group base or global fallback")
+        );
+        let missing_hold:i64=sqlx::query_scalar("SELECT COUNT(*) FROM project_wallet_reservations WHERE request_id='retail-missing-default'").fetch_one(pool).await?;
+        assert_eq!(
+            missing_hold, 0,
+            "hard rejection must happen before reservation/provider I/O"
+        );
+        for (case, pricing, expected_logs) in [
+            (
+                "token",
+                json!({"mode":"usage_per_unit","usagePerUnit":"4"}),
+                0_i64,
+            ),
+            ("zero", json!({"mode":"flat_fee","flatFee":"0"}), 0),
+            ("flat", json!({"mode":"flat_fee","flatFee":"0.5"}), 1),
+        ] {
+            let document = json!({"schema":"group-conditional-price-v1","global":null,"groups":[{"modelGroupID":group,"rules":[],"base":{"items":[{"itemCode":"prompt_tokens","pricing":pricing}]}}]});
+            sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2")
+                .bind(sqlx::types::Json(document))
+                .bind(fixture.target_model_id)
+                .execute(pool)
+                .await?;
+            let key = format!("retail-flat-terminal-{case}");
+            settler
+                .reserve_request(&BillingAdmissionInput {
+                    request_key: key.clone(),
+                    project_id: fixture.project_id.to_string(),
+                    api_key_id: Some(fixture.api_key_id.to_string()),
+                    public_model: fixture.target_model_key.clone(),
+                    estimated_input_tokens: 1,
+                    max_output_tokens: 0,
+                    model_group_id: Some(group.clone()),
+                    model_group_revision: Some(1),
+                })
+                .await?;
+            let request:i64=sqlx::query_scalar("INSERT INTO requests(api_key_id,project_id,model_id,request_body,status) VALUES($1,$2,$3,'{}','completed') RETURNING id")
+                .bind(fixture.api_key_id).bind(fixture.project_id).bind(&fixture.target_model_key).fetch_one(pool).await?;
+            let durable: Value = sqlx::query_scalar(
+                "SELECT pricing_snapshot FROM project_wallet_reservations WHERE request_id=$1",
+            )
+            .bind(&key)
+            .fetch_one(pool)
+            .await?;
+            assert!(
+                durable["frozen_plan"].is_object(),
+                "{case} snapshot must exist even with zero reservation"
+            );
+            // Publication after admission must not change terminal flat selection or amount.
+            sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2").bind(sqlx::types::Json(json!({"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"flat_fee","flatFee":"999"}}]}))).bind(fixture.target_model_id).execute(pool).await?;
+            if case == "flat" {
+                sqlx::query("UPDATE api_keys SET deleted_at=1,status='disabled' WHERE id=$1")
+                    .bind(fixture.api_key_id)
+                    .execute(pool)
+                    .await?;
+                sqlx::query("UPDATE requests SET model_id='retail-upstream-alias' WHERE id=$1")
+                    .bind(request)
+                    .execute(pool)
+                    .await?;
+            }
+            let mut ctx = OrchestratorContext::new();
+            ctx.metadata
+                .insert("api_key_id".into(), fixture.api_key_id.to_string());
+            ctx.metadata
+                .insert("model".into(), fixture.target_model_key.clone());
+            ctx.metadata
+                .insert("billing_reservation_key".into(), key.clone());
+            if case == "flat" {
+                ctx.metadata
+                    .insert("actual_model".into(), "retail-upstream-alias".into());
+            }
+            let attempt = AttemptRecord {
+                sequence: 1,
+                channel_id: "internal".into(),
+                model_index: 0,
+                mode: ExecutionMode::NonStream,
+                outcome: Ok(conduit_llm::HttpResponse::default()),
+            };
+            recorder
+                .record_success(
+                    &ctx,
+                    &request.to_string(),
+                    &fixture.project_id.to_string(),
+                    &attempt,
+                    &conduit_llm::HttpResponse::default(),
+                )
+                .await?;
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs WHERE request_id=$1")
+                    .bind(request)
+                    .fetch_one(pool)
+                    .await?;
+            assert_eq!(count, expected_logs, "{case}");
+            let durable_after:bool=sqlx::query_scalar("SELECT pricing_snapshot IS NOT NULL FROM project_wallet_reservations WHERE request_id=$1").bind(&key).fetch_one(pool).await?;
+            assert!(
+                durable_after,
+                "zero/unmetered terminal must retain its frozen snapshot"
+            );
+            if expected_logs == 0 {
+                let charges: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM customer_charge_events WHERE request_id=$1",
+                )
+                .bind(request)
+                .fetch_one(pool)
+                .await?;
+                assert_eq!(
+                    charges, 0,
+                    "{case} must retain no-usage/no-flat billing policy"
+                );
+            }
+            if case == "flat" {
+                let log: i64 = sqlx::query_scalar("SELECT id FROM usage_logs WHERE request_id=$1")
+                    .bind(request)
+                    .fetch_one(pool)
+                    .await?;
+                let row = conduit_db::PgUsageRepo::new(pool.clone());
+                let usage = row.find_by_id(log).await?;
+                if let Some(row) = usage {
+                    settler
+                        .settle_usage(&row, &Usage::default(), Some(&key))
+                        .await?;
+                }
+                let charges: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM customer_charge_events WHERE request_id=$1",
+                )
+                .bind(request)
+                .fetch_one(pool)
+                .await?;
+                assert_eq!(charges, 1);
+                let charged_model: i64 = sqlx::query_scalar(
+                    "SELECT public_model_id FROM customer_charge_events WHERE request_id=$1",
+                )
+                .bind(request)
+                .fetch_one(pool)
+                .await?;
+                assert_eq!(
+                    charged_model, fixture.target_model_id,
+                    "upstream alias must not replace admitted public model"
+                );
+                let amount: String = sqlx::query_scalar(
+                    "SELECT amount::text FROM customer_charge_events WHERE request_id=$1",
+                )
+                .bind(request)
+                .fetch_one(pool)
+                .await?;
+                assert_eq!(
+                    amount.parse::<Decimal>()?,
+                    load_accounting_settings(pool)
+                        .await?
+                        .accounting_to_credits(Decimal::new(5, 1))?
+                        .round_dp(6)
+                );
+                let debits:i64=sqlx::query_scalar("SELECT COUNT(*) FROM project_credit_ledger_entries WHERE reference_type='usage_log' AND reference_id=$1 AND entry_type='usage_charge'").bind(log.to_string()).fetch_one(pool).await?;
+                assert_eq!(debits, 1);
+            }
+        }
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_tombstoned_key_keeps_incurred_usage_billable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            eprintln!("SKIPPED tombstone regression: CONDUIT_TEST_POSTGRES_DSN is absent");
+            return Ok(());
+        };
+        for case in [
+            "hard",
+            "soft",
+            "shadow",
+            "soft_no_hold",
+            "shadow_no_hold",
+            "expired",
+            "released",
+            "capture_failed",
+            "soft_insufficient",
+            "wrong_user",
+            "wrong_project",
+            "wrong_model",
+            "null_owner",
+            "missing_key",
+            "settled_before_delete",
+        ] {
+            // Join even on assertion panic so the owned schema is always cleaned up.
+            let fixture = Arc::new(ReservationFixture::new(&dsn, 200_000_000_000).await?);
+            let task_fixture = fixture.clone();
+            let result = tokio::spawn(async move {
+                tombstoned_key_case(&task_fixture, case)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            Arc::try_unwrap(fixture)
+                .ok()
+                .unwrap()
+                .isolated
+                .cleanup()
+                .await?;
+            result?.map_err(std::io::Error::other)?;
+            eprintln!("tombstone regression executed: {case}");
+        }
+        Ok(())
+    }
+
+    async fn tombstoned_key_case(
+        fixture: &ReservationFixture,
+        case: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = &fixture.isolated.pool;
+        let mut settler = PgUsageChargeSettler::new(pool.clone());
+        settler.enforcement.mode = match case {
+            "soft" | "soft_no_hold" | "soft_insufficient" => BillingEnforcementMode::SoftEnforce,
+            "shadow" | "shadow_no_hold" => BillingEnforcementMode::Shadow,
+            _ => BillingEnforcementMode::HardEnforce,
+        };
+        let no_hold = matches!(
+            case,
+            "soft_no_hold" | "shadow_no_hold" | "null_owner" | "missing_key"
+        );
+        if case == "soft_insufficient" {
+            sqlx::query("INSERT INTO project_credit_ledger_entries(wallet_id,amount_micros,entry_type,idempotency_key,metadata,created_at) VALUES($1,-200000000000,'admin_adjust','empty-wallet','{}',now())")
+                .bind(fixture.wallet_id).execute(pool).await?;
+        }
+        let input = BillingAdmissionInput {
+            request_key: "tombstone-hold".into(),
+            project_id: fixture.project_id.to_string(),
+            api_key_id: Some(fixture.api_key_id.to_string()),
+            public_model: fixture.target_model_key.clone(),
+            estimated_input_tokens: 1_000_000,
+            max_output_tokens: 0,
+            model_group_id: None,
+            model_group_revision: None,
+        };
+        let key = if no_hold {
+            None
+        } else {
+            settler.reserve_request(&input).await?
+        };
+        if !no_hold {
+            assert_eq!(key.as_deref(), Some("tombstone-hold"));
+        }
+        let id = fixture.insert_usage_log().await?;
+        let log = conduit_db::PgUsageRepo::new(pool.clone())
+            .find_by_id(id)
+            .await?
+            .unwrap();
+        let usage = usage_from_row(&log);
+        if case == "settled_before_delete" {
+            settler.settle_usage(&log, &usage, key.as_deref()).await?;
+        }
+        match case {
+            "expired" => {
+                sqlx::query("UPDATE project_wallet_reservations SET expires_at=now()-interval '1 second' WHERE request_id=$1")
+                    .bind(&key).execute(pool).await?;
+                assert_eq!(settler.cleanup_expired_reservations().await?, 1);
+            }
+            "released" | "capture_failed" => {
+                settler
+                    .release_request(key.as_deref().unwrap(), "test")
+                    .await?;
+                if case == "capture_failed" {
+                    sqlx::query("UPDATE project_wallet_reservations SET status='capture_failed' WHERE request_id=$1")
+                        .bind(&key).execute(pool).await?;
+                }
+            }
+            "wrong_user" => {
+                let other = insert_fixture_user(pool, "wrong-owner").await?;
+                sqlx::query(
+                    "UPDATE project_wallet_reservations SET user_id=$1 WHERE request_id=$2",
+                )
+                .bind(other)
+                .bind(&key)
+                .execute(pool)
+                .await?;
+            }
+            "wrong_project" => {
+                sqlx::query("UPDATE project_wallets SET project_id=project_id+1000000 WHERE id=$1")
+                    .bind(fixture.wallet_id)
+                    .execute(pool)
+                    .await?;
+            }
+            "wrong_model" => {
+                sqlx::query(
+                    "UPDATE project_wallet_reservations SET public_model_id=$1 WHERE request_id=$2",
+                )
+                .bind(fixture.other_model_id)
+                .bind(&key)
+                .execute(pool)
+                .await?;
+            }
+            "null_owner" => {
+                sqlx::query("UPDATE api_keys SET user_id=NULL WHERE id=$1")
+                    .bind(fixture.api_key_id)
+                    .execute(pool)
+                    .await?;
+            }
+            "missing_key" => {
+                sqlx::query("DELETE FROM api_keys WHERE id=$1")
+                    .bind(fixture.api_key_id)
+                    .execute(pool)
+                    .await?;
+            }
+            _ => {}
+        }
+        if !no_hold {
+            sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2")
+                .bind(sqlx::types::Json(json!({"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"usage_per_unit","usagePerUnit":"999"}}]})))
+                .bind(fixture.target_model_id).execute(pool).await?;
+        }
+        // Commit the deletion ordering before either identity query runs.
+        let mut tx = pool.begin().await?;
+        sqlx::query("UPDATE projects SET deleted_at=1,status='archived' WHERE id=$1")
+            .bind(fixture.project_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE api_keys SET deleted_at=1,status='archived' WHERE project_id=$1")
+            .bind(fixture.project_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM user_projects WHERE project_id=$1")
+            .bind(fixture.project_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        // The admission lookup still refuses a tombstoned key.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM api_keys WHERE id=$1 AND project_id=$2 AND deleted_at=0"
+            )
+            .bind(fixture.api_key_id)
+            .bind(fixture.project_id)
+            .fetch_one(pool)
+            .await?,
+            0
+        );
+        assert_eq!(settler.reserve_request(&input).await?, None);
+        settler.persist_outbox(id, key.as_deref()).await?;
+        let mismatch = case.starts_with("wrong_");
+        let terminal = matches!(
+            case,
+            "expired" | "released" | "capture_failed" | "soft_insufficient"
+        );
+        if !terminal && !mismatch {
+            // Direct and recovery workers may race; the charge/ledger gates must deduplicate.
+            let (direct, recovery) = tokio::join!(
+                settler.settle_usage(&log, &usage, key.as_deref()),
+                settler.reconcile_missing(10),
+            );
+            direct?;
+            recovery?;
+            settler.settle_usage(&log, &usage, key.as_deref()).await?;
+        } else {
+            settler.reconcile_missing(10).await?;
+        }
+        if mismatch {
+            if case == "wrong_user" {
+                assert!(
+                    settler
+                        .settle_usage(&log, &usage, key.as_deref())
+                        .await
+                        .unwrap_err()
+                        .contains("another user or public model")
+                );
+            }
+            let expected = if case == "wrong_project" {
+                "reservation_project_mismatch"
+            } else {
+                "reservation_identity_mismatch"
+            };
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT last_error FROM usage_charge_outbox WHERE usage_log_id=$1"
+                )
+                .bind(id)
+                .fetch_one(pool)
+                .await?,
+                expected
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM customer_charge_events WHERE usage_log_id=$1"
+                )
+                .bind(id)
+                .fetch_one(pool)
+                .await?,
+                0
+            );
+        } else if matches!(case, "null_owner" | "missing_key") {
+            assert_eq!(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM customer_charge_events WHERE usage_log_id=$1"
+                )
+                .bind(id)
+                .fetch_one(pool)
+                .await?,
+                "not_billable"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM charge_settlements")
+                    .fetch_one(pool)
+                    .await?,
+                0
+            );
+        } else {
+            assert_eq!(sqlx::query_as::<_, (Option<i64>, i64, i64, String)>(
+                "SELECT s.user_id,s.amount_micros,s.credit_amount_micros,s.status FROM charge_settlements s JOIN customer_charge_events e ON e.id=s.charge_event_id WHERE e.usage_log_id=$1")
+                .bind(id).fetch_one(pool).await?,
+                (Some(fixture.user_id),100_000_000_000,if case == "soft_insufficient" {0} else {100_000_000_000}, if case == "soft_insufficient" {"insufficient_funds".into()} else {"settled".into()}));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM customer_charge_events WHERE usage_log_id=$1"
+                )
+                .bind(id)
+                .fetch_one(pool)
+                .await?,
+                1
+            );
+            if terminal {
+                assert_eq!(
+                    sqlx::query_scalar::<_, String>(
+                        "SELECT status FROM project_wallet_reservations WHERE request_id=$1"
+                    )
+                    .bind(&key)
+                    .fetch_one(pool)
+                    .await?,
+                    case
+                );
+            }
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM project_credit_ledger_entries WHERE entry_type='usage_charge'"
+            )
+            .fetch_one(pool)
+            .await?,
+            if mismatch || matches!(case, "null_owner" | "missing_key" | "soft_insufficient") {
+                0
+            } else {
+                1
+            }
+        );
+        assert!(sqlx::query_scalar::<_, i64>("SELECT credit_balance_micros-credit_reserved_micros FROM project_wallets WHERE id=$1")
+            .bind(fixture.wallet_id).fetch_one(pool).await? >= 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_old_requests_and_delayed_outbox_keep_admission_price_across_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_admin_graphql::change_package::{
+            ChangePackageServices as _, ChangeSetAvailableAction as Action,
+        };
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 1_000_000_000_000).await?;
+        let pool = &fixture.isolated.pool;
+        sqlx::query("UPDATE users SET is_owner=true WHERE id=$1")
+            .bind(fixture.user_id)
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT INTO project_price_adjustments(project_id,multiplier_ppm,source_type,status,created_at,updated_at) VALUES($1,1500000,'test','active',now(),now())")
+            .bind(fixture.project_id).execute(pool).await?;
+        let active = fixture.reserve_estimate("formula-price-active").await?;
+        let expired = fixture.reserve_estimate("formula-price-outbox").await?;
+        let active_log = fixture.insert_usage_log().await?;
+        let expired_log = fixture.insert_usage_log().await?;
+        let historical_log = fixture.insert_usage_log().await?;
+        let original_version: i64 =
+            sqlx::query_scalar("SELECT id FROM price_book_versions WHERE status='published'")
+                .fetch_one(pool)
+                .await?;
+        let book: i64 = sqlx::query_scalar("SELECT id FROM price_books WHERE is_default")
+            .fetch_one(pool)
+            .await?;
+        let adapter = crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(pool.clone());
+        let base = adapter
+            .retail_edit_base(async_graphql::ID(book.to_string()))
+            .await?;
+        let draft = adapter
+            .create_retail(
+                fixture.user_id,
+                async_graphql::ID(book.to_string()),
+                async_graphql::ID(uuid::Uuid::new_v4().to_string()),
+                base.revision,
+            )
+            .await?;
+        let items=["prompt_tokens","completion_tokens","prompt_cached_tokens","prompt_write_cached_tokens"].into_iter().map(|code|json!({"itemCode":code,"pricing":{"mode":"usage_per_unit","usagePerUnit":"100"}})).collect::<Vec<_>>();
+        let saved = adapter
+            .save_retail_item(
+                fixture.user_id,
+                conduit_admin_graphql::change_set::SaveRetailPriceChangeSetItemInput {
+                    change_set_id: draft.summary.id.clone(),
+                    expected_revision: draft.summary.revision,
+                    public_model_id: async_graphql::ID(fixture.target_model_id.to_string()),
+                    price: async_graphql::Json(json!({"items":items})),
+                },
+            )
+            .await?;
+        let submitted = adapter
+            .transition(
+                fixture.user_id,
+                draft.summary.id,
+                saved.change_set_revision,
+                Action::Submit,
+                None,
+            )
+            .await?;
+        adapter
+            .transition(
+                fixture.user_id,
+                submitted.summary.id,
+                submitted.summary.revision,
+                Action::ApproveApply,
+                None,
+            )
+            .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM price_book_versions WHERE id=$1")
+                .bind(original_version)
+                .fetch_one(pool)
+                .await?,
+            "archived"
+        );
+        // Later project changes must not apply the multiplier a second time,
+        // or alter an already admitted request's selected price.
+        sqlx::query(
+            "UPDATE project_price_adjustments SET multiplier_ppm=5000000 WHERE project_id=$1",
+        )
+        .bind(fixture.project_id)
+        .execute(pool)
+        .await?;
+        let settler = PgUsageChargeSettler::new(pool.clone());
+        let repo = conduit_db::PgUsageRepo::new(pool.clone());
+        let log = repo.find_by_id(active_log).await?.unwrap();
+        settler
+            .settle_usage(&log, &usage_from_row(&log), Some("formula-price-active"))
+            .await?;
+        sqlx::query("UPDATE project_wallet_reservations SET expires_at=now()-interval '1 second' WHERE id=$1").bind(expired).execute(pool).await?;
+        assert_eq!(settler.cleanup_expired_reservations().await?, 1);
+        sqlx::query("INSERT INTO usage_charge_outbox(usage_log_id,reservation_key,status,available_at,created_at,updated_at) VALUES($1,'formula-price-outbox','pending',now(),now(),now())").bind(expired_log).execute(pool).await?;
+        assert_eq!(settler.reconcile_missing(10).await?, 1);
+        for id in [active_log, expired_log] {
+            let (version,amount,rules):(i64,Decimal,Value)=sqlx::query_as("SELECT price_book_version_id,amount,applied_rules_snapshot FROM customer_charge_events WHERE usage_log_id=$1").bind(id).fetch_one(pool).await?;
+            assert_eq!(version, original_version);
+            assert_eq!(
+                amount,
+                Decimal::from(150_000),
+                "10 base × 1.5 effective multiplier × 10000 credits"
+            );
+            assert_eq!(rules["price_multiplier"], "1.5");
+        }
+        let historical = repo.find_by_id(historical_log).await?.unwrap();
+        settler
+            .settle_usage(&historical, &usage_from_row(&historical), None)
+            .await?;
+        let version: i64 = sqlx::query_scalar(
+            "SELECT price_book_version_id FROM customer_charge_events WHERE usage_log_id=$1",
+        )
+        .bind(historical_log)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            version, original_version,
+            "legacy requests use the archived price effective at request start"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM project_wallet_reservations WHERE id=$1"
+            )
+            .bind(active)
+            .fetch_one(pool)
+            .await?,
+            "captured"
+        );
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_soft_insufficient_without_member_limit_keeps_direct_and_outbox_pricing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 0).await?;
+        let pool = &fixture.isolated.pool;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM project_member_spend_state WHERE project_id=$1 AND user_id=$2"
+            )
+            .bind(fixture.project_id)
+            .bind(fixture.user_id)
+            .fetch_one(pool)
+            .await?,
+            0
+        );
+        sqlx::query("INSERT INTO project_price_adjustments(project_id,multiplier_ppm,source_type,status,created_at,updated_at) VALUES($1,1500000,'test','active',now(),now())")
+            .bind(fixture.project_id).execute(pool).await?;
+        let mut settler = PgUsageChargeSettler::new(pool.clone());
+        settler.enforcement.mode = BillingEnforcementMode::SoftEnforce;
+        let input = |key: &str| BillingAdmissionInput {
+            request_key: key.into(),
+            project_id: fixture.project_id.to_string(),
+            api_key_id: Some(fixture.api_key_id.to_string()),
+            public_model: fixture.target_model_key.clone(),
+            estimated_input_tokens: 1_000_000,
+            max_output_tokens: 0,
+            model_group_id: None,
+            model_group_revision: None,
+        };
+        let direct_key = settler.reserve_request(&input("soft-price-direct")).await?;
+        let outbox_key = settler.reserve_request(&input("soft-price-outbox")).await?;
+        assert_eq!(direct_key.as_deref(), Some("soft-price-direct"));
+        assert_eq!(outbox_key.as_deref(), Some("soft-price-outbox"));
+        assert_eq!(
+            settler.reserve_request(&input("soft-price-direct")).await?,
+            direct_key
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_wallet_reservations WHERE wallet_id=$1 AND status='soft_insufficient' AND pricing_snapshot IS NOT NULL")
+            .bind(fixture.wallet_id).fetch_one(pool).await?, 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT credit_reserved_micros FROM project_wallets WHERE id=$1"
+            )
+            .bind(fixture.wallet_id)
+            .fetch_one(pool)
+            .await?,
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM project_wallet_reservation_allocations"
+            )
+            .fetch_one(pool)
+            .await?,
+            0,
+            "soft admission must not reserve funds"
+        );
+        let direct_log = fixture.insert_usage_log().await?;
+        let outbox_log = fixture.insert_usage_log().await?;
+        assert!(
+            !settler
+                .persist_outbox(outbox_log, outbox_key.as_deref())
+                .await?
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT reservation_key FROM usage_charge_outbox WHERE usage_log_id=$1"
+            )
+            .bind(outbox_log)
+            .fetch_one(pool)
+            .await?,
+            "soft-price-outbox"
+        );
+
+        sqlx::query(
+            "UPDATE project_price_adjustments SET multiplier_ppm=5000000 WHERE project_id=$1",
+        )
+        .bind(fixture.project_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("INSERT INTO systems(key,value,created_at,updated_at) VALUES('system_general_settings',$1,now(),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,deleted_at=0")
+            .bind(r#"{"accounting_currency_code":"CNY","credits_per_accounting_unit":"20000","accounting_rate_version":2}"#)
+            .execute(pool).await?;
+        // Funds added after soft admission remain selectable at settlement;
+        // the pricing identity does not turn them into an estimate hold.
+        fixture
+            .add_bucket(
+                "soft-price-general",
+                "GENERAL",
+                50_000_000_000,
+                Utc::now() + chrono::Duration::days(30),
+                None,
+            )
+            .await?;
+        sqlx::query("INSERT INTO project_credit_ledger_entries(wallet_id,amount_micros,entry_type,idempotency_key,metadata,created_at) VALUES($1,250000000000,'admin_grant','soft-price-grant','{}',now())")
+            .bind(fixture.wallet_id).execute(pool).await?;
+        let repo = conduit_db::PgUsageRepo::new(pool.clone());
+        let log = repo.find_by_id(direct_log).await?.unwrap();
+        settler
+            .settle_usage(&log, &usage_from_row(&log), direct_key.as_deref())
+            .await?;
+        settler
+            .settle_usage(&log, &usage_from_row(&log), direct_key.as_deref())
+            .await?;
+        sqlx::query("UPDATE project_wallet_reservations SET expires_at=now()-interval '1 second' WHERE request_id=$1")
+            .bind(outbox_key.as_deref()).execute(pool).await?;
+        assert_eq!(settler.cleanup_expired_reservations().await?, 1);
+        assert_eq!(settler.reconcile_missing(10).await?, 1);
+        assert_eq!(settler.reconcile_missing(10).await?, 0);
+        for id in [direct_log, outbox_log] {
+            let (amount, rules, calculation): (Decimal, Value, Value) = sqlx::query_as("SELECT amount,applied_rules_snapshot,calculation_snapshot FROM customer_charge_events WHERE usage_log_id=$1")
+                .bind(id).fetch_one(pool).await?;
+            assert_eq!(
+                amount,
+                Decimal::from(150_000),
+                "10 base × frozen 1.5 × frozen 10000 credits"
+            );
+            assert_eq!(rules["price_multiplier"], "1.5");
+            assert_eq!(
+                calculation["accounting_settings"]["credits_per_accounting_unit"],
+                "10000"
+            );
+            assert_eq!(calculation["accounting_settings"]["version"], 1);
+        }
+        let settlements = sqlx::query_as::<_, (i64, i64, String)>("SELECT s.subscription_amount_micros,s.credit_amount_micros,s.status FROM charge_settlements s JOIN customer_charge_events c ON c.id=s.charge_event_id ORDER BY c.usage_log_id")
+            .fetch_all(pool).await?;
+        assert_eq!(
+            settlements,
+            vec![
+                (50_000_000_000, 100_000_000_000, "settled".into()),
+                (0, 150_000_000_000, "settled".into())
+            ]
+        );
+        assert_eq!(sqlx::query_as::<_, (i64, i64)>("SELECT credit_balance_micros,credit_reserved_micros FROM project_wallets WHERE id=$1")
+            .bind(fixture.wallet_id).fetch_one(pool).await?, (0,0));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM usage_charge_outbox WHERE usage_log_id=$1"
+            )
+            .bind(outbox_log)
+            .fetch_one(pool)
+            .await?,
+            "completed"
+        );
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_budget_is_cross_key_atomic_and_captures_real_overestimate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_admin_graphql::billing::BillingServices as _;
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 1_000_000_000_000).await?;
+        let pool = &fixture.isolated.pool;
+        sqlx::query("INSERT INTO user_projects(user_id,project_id,is_owner) VALUES($1,$2,true)")
+            .bind(fixture.user_id)
+            .bind(fixture.project_id)
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT INTO project_member_spend_state(project_id,user_id,limit_micros) VALUES($1,$2,150000000000)").bind(fixture.project_id).bind(fixture.user_id).execute(pool).await?;
+        let second_key:i64=sqlx::query_scalar("INSERT INTO api_keys(user_id,project_id,key,name,type,status) VALUES($1,$2,'contract-second-key','second','user','enabled') RETURNING id").bind(fixture.user_id).bind(fixture.project_id).fetch_one(pool).await?;
+        let admission = |request: &str, key: i64| BillingAdmissionInput {
+            request_key: request.into(),
+            project_id: fixture.project_id.to_string(),
+            api_key_id: Some(key.to_string()),
+            public_model: fixture.target_model_key.clone(),
+            estimated_input_tokens: 1_000_000,
+            max_output_tokens: 0,
+            model_group_id: None,
+            model_group_revision: None,
+        };
+        let a = admission("member-budget-a", fixture.api_key_id);
+        let b = admission("member-budget-b", second_key);
+        let mut settler = PgUsageChargeSettler::new(pool.clone());
+        settler.enforcement.mode = BillingEnforcementMode::HardEnforce;
+        let (ra, rb) = tokio::join!(settler.reserve_request(&a), settler.reserve_request(&b));
+        assert_eq!(usize::from(ra.is_ok()) + usize::from(rb.is_ok()), 1);
+        let (accepted, rejected) = if ra.is_ok() {
+            (&a, rb.unwrap_err())
+        } else {
+            (&b, ra.unwrap_err())
+        };
+        assert!(rejected.contains("MEMBER_SPEND_LIMIT_EXCEEDED"));
+        assert_eq!(
+            settler.reserve_request(accepted).await?,
+            Some(accepted.request_key.clone())
+        );
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT reserved_micros FROM project_member_spend_state WHERE project_id=$1 AND user_id=$2").bind(fixture.project_id).bind(fixture.user_id).fetch_one(pool).await?,100_000_000_000);
+        settler
+            .release_request(&accepted.request_key, "contract failure")
+            .await?;
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT reserved_micros FROM project_member_spend_state WHERE project_id=$1 AND user_id=$2").bind(fixture.project_id).bind(fixture.user_id).fetch_one(pool).await?,0);
+        let c = admission("member-budget-c", second_key);
+        settler.reserve_request(&c).await?;
+        let usage = fixture.insert_usage_log().await?;
+        let funding = fixture
+            .capture(&c.request_key, 160_000_000_000, usage)
+            .await?;
+        assert_eq!(funding.funded_micros, 160_000_000_000);
+        assert_eq!(funding.shortfall_micros, 0);
+        let billing = crate::wiring_postgres_billing::PgBillingAdapter::new(pool.clone());
+        let funds = billing
+            .my_project_funds(
+                &fixture.user_id.to_string(),
+                &fixture.project_id.to_string(),
+                None,
+                Some(&second_key.to_string()),
+            )
+            .await?;
+        assert_eq!(funds.member_spent, "160000");
+        assert_eq!(funds.member_remaining.as_deref(), Some("0"));
+        assert_eq!(funds.member_reserved, "0");
+        assert_eq!(funds.dedicated_subscription_available, "0");
+        assert!(
+            settler
+                .reserve_request(&admission("member-budget-after", fixture.api_key_id))
+                .await
+                .unwrap_err()
+                .contains("MEMBER_SPEND_LIMIT_EXCEEDED")
+        );
+        sqlx::query("DELETE FROM user_projects WHERE project_id=$1 AND user_id=$2")
+            .bind(fixture.project_id)
+            .bind(fixture.user_id)
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT INTO user_projects(project_id,user_id,is_owner) VALUES($1,$2,true)")
+            .bind(fixture.project_id)
+            .bind(fixture.user_id)
+            .execute(pool)
+            .await?;
+        assert_eq!(
+            billing
+                .my_project_funds(
+                    &fixture.user_id.to_string(),
+                    &fixture.project_id.to_string(),
+                    None,
+                    None
+                )
+                .await?
+                .member_spent,
+            "160000"
+        );
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn member_zero_budget_blocks_hard_soft_and_shadow_admission()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 0).await?;
+        let pool = &fixture.isolated.pool;
+        sqlx::query("INSERT INTO project_member_spend_state(project_id,user_id,limit_micros) VALUES($1,$2,0)").bind(fixture.project_id).bind(fixture.user_id).execute(pool).await?;
+        for (index, mode) in [
+            BillingEnforcementMode::HardEnforce,
+            BillingEnforcementMode::SoftEnforce,
+            BillingEnforcementMode::Shadow,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut settler = PgUsageChargeSettler::new(pool.clone());
+            settler.enforcement.mode = mode;
+            let input = BillingAdmissionInput {
+                request_key: format!("zero-member-{index}"),
+                project_id: fixture.project_id.to_string(),
+                api_key_id: Some(fixture.api_key_id.to_string()),
+                public_model: fixture.target_model_key.clone(),
+                estimated_input_tokens: 1_000_000,
+                max_output_tokens: 0,
+                model_group_id: None,
+                model_group_revision: None,
+            };
+            assert!(settler.reserve_request(&input).await.is_err());
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_wallet_reservations")
+                .fetch_one(pool)
+                .await?,
+            0
+        );
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
     #[tokio::test]
     async fn postgres_reservation_allocates_matching_dedicated_then_general_then_credit_in_fefo_order_when_dsn_is_provided()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2706,11 +4193,13 @@ mod tests {
             .await?,
             estimated_input_tokens: 1_000_000,
             max_output_tokens: 0,
+            model_group_id: None,
+            model_group_revision: None,
         };
         let mut settler = PgUsageChargeSettler::new(pool.clone());
         let mut concurrent_settler = PgUsageChargeSettler::new(pool.clone());
-        settler.enforcement_mode = BillingEnforcementMode::HardEnforce;
-        concurrent_settler.enforcement_mode = BillingEnforcementMode::HardEnforce;
+        settler.enforcement.mode = BillingEnforcementMode::HardEnforce;
+        concurrent_settler.enforcement.mode = BillingEnforcementMode::HardEnforce;
         let (first_reservation, concurrent_retry) = tokio::join!(
             settler.reserve_request(&input),
             concurrent_settler.reserve_request(&input)
@@ -3580,7 +5069,7 @@ mod tests {
                  FROM project_wallet_reservation_allocations a \
                  JOIN project_wallet_reservations r ON r.id=a.reservation_id \
                  WHERE r.wallet_id=$1 AND a.source_type='project_credit' \
-                   AND r.status IN ('reserved','shadow_reserved') AND r.expires_at>$2",
+                   AND r.status IN ('reserved','shadow_reserved','soft_insufficient') AND r.expires_at>$2",
             )
             .bind(target_wallet_id)
             .bind(Utc::now())
@@ -3596,7 +5085,7 @@ mod tests {
                  FROM project_wallet_reservation_allocations a \
                  JOIN project_wallet_reservations r ON r.id=a.reservation_id \
                  WHERE r.wallet_id=$1 AND a.source_type='project_credit' \
-                   AND r.status IN ('reserved','shadow_reserved') AND r.expires_at>$2",
+                   AND r.status IN ('reserved','shadow_reserved','soft_insufficient') AND r.expires_at>$2",
             )
             .bind(target_wallet_id)
             .bind(Utc::now())

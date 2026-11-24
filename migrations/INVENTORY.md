@@ -66,3 +66,5 @@ cargo test -p conduit-db
 SQL files must match `NNNNNN_descriptive_name.sql` and must not contain
 placeholder/template content. Keep operational migration notes in
 `migrations/postgres/README.md`.
+
+- `000040_user_model_groups.sql`: independent UserGroup membership/grants, ModelGroup members/revision, unique Key group assignment. No inferred legacy grants or price/recharge migration.

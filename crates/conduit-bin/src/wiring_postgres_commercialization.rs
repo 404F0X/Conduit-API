@@ -11,7 +11,7 @@ use async_graphql::{ID, Json};
 use chrono::{DateTime, Utc};
 use conduit_admin_graphql::commercialization as gql;
 use conduit_core::objects::money::DEFAULT_ACCOUNTING_CURRENCY_CODE;
-use conduit_core::objects::pricing::ModelPrice;
+use conduit_core::objects::retail_price_plan::RetailPriceDocument;
 use conduit_db::row::ModelRow;
 use sqlx::{PgPool, Postgres, Row, Transaction, types::Json as SqlJson};
 
@@ -97,79 +97,10 @@ impl PgCommercializationAdapter {
         &self,
         channel_id_value: i64,
     ) -> Result<gql::ChannelModelMappingPreview, gql::CommercializationError> {
-        if !self.model_mapping_automation_enabled().await? {
-            return Err(gql::CommercializationError::Invalid(
-                "automatic channel model mapping is disabled in settings".into(),
-            ));
-        }
-        let row = sqlx::query(
-            "SELECT supported_models,settings,updated_at FROM channels \
-             WHERE id=$1 AND deleted_at=0",
-        )
-        .bind(channel_id_value)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage)?
-        .ok_or_else(|| {
-            gql::CommercializationError::NotFound(format!("channel {channel_id_value}"))
-        })?;
-        let supported_models = row
-            .try_get::<SqlJson<Vec<String>>, _>("supported_models")
-            .map_err(|error| {
-                gql::CommercializationError::Storage(format!(
-                    "channel supported models are invalid: {error}"
-                ))
-            })?
-            .0;
-        let settings = row
-            .try_get::<Option<SqlJson<
-                conduit_core::objects::channel_settings::ChannelSettings,
-            >>, _>("settings")
-            .map_err(|error| {
-                gql::CommercializationError::Storage(format!(
-                    "channel settings are invalid: {error}"
-                ))
-            })?
-            .map(|settings| settings.0)
-            .unwrap_or_default();
-        let route_rows = sqlx::query(
-            "SELECT m.model_id AS public_model_key,d.upstream_model_id \
-             FROM model_routes r \
-             JOIN models m ON m.id=r.public_model_id AND m.deleted_at=0 AND m.status='enabled' \
-             JOIN upstream_model_deployments d ON d.id=r.deployment_id AND d.status='enabled' \
-             WHERE d.channel_id=$1 AND r.status='enabled' \
-             ORDER BY LOWER(m.model_id),r.id",
-        )
-        .bind(channel_id_value)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage)?;
-        let routed = route_rows
-            .into_iter()
-            .map(|row| (row.get("public_model_key"), row.get("upstream_model_id")))
-            .collect::<Vec<(String, String)>>();
-        if let Some((from, to)) = routed
-            .iter()
-            .find(|(_, target)| !supported_models.iter().any(|model| model == target))
-        {
-            return Err(gql::CommercializationError::Invalid(format!(
-                "route {from:?} points to {to:?}, which is not in this channel's supported models; sync the channel models before applying aliases"
-            )));
-        }
-        let existing = settings
-            .model_mappings
-            .iter()
-            .map(|mapping| conduit_admin_graphql::channel::ModelMapping {
-                from: mapping.from.clone(),
-                to: mapping.to.clone(),
-            })
-            .collect::<Vec<_>>();
-        Ok(gql::build_channel_model_mapping_preview(
-            channel_id(channel_id_value),
-            wire_time(row.get("updated_at")),
-            &existing,
-            &routed,
-        ))
+        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let result = channel_mapping_preview_in_tx(&mut tx, channel_id_value).await?;
+        tx.commit().await.map_err(storage)?;
+        Ok(result)
     }
 
     async fn route(&self, route_id: i64) -> Result<gql::ModelRoute, gql::CommercializationError> {
@@ -384,7 +315,7 @@ impl gql::CommercializationServices for PgCommercializationAdapter {
              WHERE up.user_id=$1 AND up.is_owner=TRUE \
                AND u.status='activated' AND u.deleted_at=0 \
                AND p.status='active' AND p.deleted_at=0 \
-               AND cp.account_type='personal' AND cp.status='active' ORDER BY p.id",
+               AND cp.account_type='personal' AND cp.status='active' AND cp.owner_user_id=$1 ORDER BY p.id",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -509,355 +440,30 @@ impl gql::CommercializationServices for PgCommercializationAdapter {
         &self,
         input: gql::ApplyChannelModelMappingsInput,
     ) -> Result<gql::ChannelModelMappingPreview, gql::CommercializationError> {
-        let channel_id_value = parse_id(input.channel_id.as_str())?;
-        let preview = self.channel_mapping_preview(channel_id_value).await?;
-        if preview.expected_version != input.expected_version {
-            return Err(gql::CommercializationError::Invalid(
-                "channel changed after the preview; generate a new preview before applying".into(),
-            ));
-        }
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let row = sqlx::query(
-            "SELECT settings,updated_at FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE",
-        )
-        .bind(channel_id_value)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        .ok_or_else(|| {
-            gql::CommercializationError::NotFound(format!("channel {channel_id_value}"))
-        })?;
-        if wire_time(row.get("updated_at")) != input.expected_version {
-            return Err(gql::CommercializationError::Invalid(
-                "channel changed while aliases were being applied; generate a new preview".into(),
-            ));
-        }
-        let mut settings = row
-            .try_get::<Option<SqlJson<
-                conduit_core::objects::channel_settings::ChannelSettings,
-            >>, _>("settings")
-            .map_err(|error| {
-                gql::CommercializationError::Storage(format!(
-                    "channel settings are invalid: {error}"
-                ))
-            })?
-            .map(|settings| settings.0)
-            .unwrap_or_default();
-        let existing = settings
-            .model_mappings
-            .iter()
-            .map(|mapping| conduit_admin_graphql::channel::ModelMapping {
-                from: mapping.from.clone(),
-                to: mapping.to.clone(),
-            })
-            .collect::<Vec<_>>();
-        settings.model_mappings = gql::merge_channel_model_mappings(
-            &existing,
-            &preview,
-            input.replace_conflicts.unwrap_or(false),
-        )
-        .into_iter()
-        .map(
-            |mapping| conduit_core::objects::channel_settings::ModelMapping {
-                from: mapping.from,
-                to: mapping.to,
-            },
-        )
-        .collect();
-        sqlx::query("UPDATE channels SET settings=$1,updated_at=$2 WHERE id=$3")
-            .bind(SqlJson(settings))
-            .bind(Utc::now())
-            .bind(channel_id_value)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        let result = apply_channel_model_mappings_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
-        self.channel_mapping_preview(channel_id_value).await
+        Ok(result)
     }
 
     async fn upsert_model_route(
         &self,
         input: gql::UpsertModelRouteInput,
     ) -> Result<gql::ModelRoute, gql::CommercializationError> {
-        let public_model_id = parse_id(input.public_model_id.as_str())?;
-        let deployment_id = parse_id(input.deployment_id.as_str())?;
-        let editing_route_id = input
-            .id
-            .as_ref()
-            .map(|value| parse_id(value.as_str()))
-            .transpose()?;
-        let route_status = status_to_wire(input.status.unwrap_or(gql::CommercialStatus::Enabled));
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        if sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM models WHERE id=$1 AND deleted_at=0 FOR UPDATE",
-        )
-        .bind(public_model_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        .is_none()
-        {
-            return Err(gql::CommercializationError::NotFound(format!(
-                "public model SKU {public_model_id}"
-            )));
-        }
-        let selected = sqlx::query(
-            "SELECT channel_id,status FROM upstream_model_deployments WHERE id=$1 FOR SHARE",
-        )
-        .bind(deployment_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        .ok_or_else(|| {
-            gql::CommercializationError::NotFound(format!("deployment {deployment_id}"))
-        })?;
-        if route_status == "enabled" && selected.get::<String, _>("status") != "enabled" {
-            return Err(gql::CommercializationError::Invalid(
-                "an enabled route requires an enabled upstream deployment".into(),
-            ));
-        }
-        let selected_channel_id: i64 = selected.get("channel_id");
-        let (target_route_id, old_channel_id) = if let Some(route_id) = editing_route_id {
-            let old_channel_id = sqlx::query_scalar::<_, i64>(
-                "SELECT d.channel_id FROM model_routes r \
-                 JOIN upstream_model_deployments d ON d.id=r.deployment_id \
-                 WHERE r.id=$1 FOR UPDATE OF r",
-            )
-            .bind(route_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?
-            .ok_or_else(|| gql::CommercializationError::NotFound(format!("route {route_id}")))?;
-            (Some(route_id), Some(old_channel_id))
-        } else {
-            let existing = sqlx::query(
-                "SELECT r.id,d.channel_id FROM model_routes r \
-                 JOIN upstream_model_deployments d ON d.id=r.deployment_id \
-                 WHERE r.public_model_id=$1 AND r.deployment_id=$2 FOR UPDATE OF r",
-            )
-            .bind(public_model_id)
-            .bind(deployment_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?;
-            existing
-                .map(|row| (Some(row.get("id")), Some(row.get("channel_id"))))
-                .unwrap_or((None, None))
-        };
-        let same_channel = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM model_routes r \
-             JOIN upstream_model_deployments existing ON existing.id=r.deployment_id \
-             WHERE r.public_model_id=$1 AND existing.channel_id=$2 \
-               AND ($3::BIGINT IS NULL OR r.id<>$3) AND r.status<>'archived'",
-        )
-        .bind(public_model_id)
-        .bind(selected_channel_id)
-        .bind(target_route_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        if same_channel > 0 {
-            return Err(gql::CommercializationError::Invalid(
-                "a public model SKU can have only one route per channel; create a separate SKU for another deployment on the same channel".into(),
-            ));
-        }
-        let other_routes = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM model_routes WHERE public_model_id=$1 \
-             AND ($2::BIGINT IS NULL OR id<>$2) AND status<>'archived'",
-        )
-        .bind(public_model_id)
-        .bind(target_route_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        if other_routes > 0 && input.confirm_compatibility != Some(true) {
-            return Err(gql::CommercializationError::Invalid(
-                "this SKU already has another route; confirm compatibility (equivalent capability, quality and price) or create a separate SKU".into(),
-            ));
-        }
-        let now = Utc::now();
-        let route_id = if let Some(route_id) = target_route_id {
-            sqlx::query(
-                "UPDATE model_routes SET public_model_id=$1,deployment_id=$2,status=$3,updated_at=$4 \
-                 WHERE id=$5",
-            )
-            .bind(public_model_id)
-            .bind(deployment_id)
-            .bind(route_status)
-            .bind(now)
-            .bind(route_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-            route_id
-        } else {
-            sqlx::query_scalar::<_, i64>(
-                "INSERT INTO model_routes(public_model_id,deployment_id,status,created_at,updated_at) \
-                 VALUES($1,$2,$3,$4,$4) ON CONFLICT(public_model_id,deployment_id) \
-                 DO UPDATE SET status=EXCLUDED.status,updated_at=EXCLUDED.updated_at RETURNING id",
-            )
-            .bind(public_model_id)
-            .bind(deployment_id)
-            .bind(route_status)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(storage)?
-        };
-        let mut affected_channels = BTreeSet::from([selected_channel_id]);
-        affected_channels.extend(old_channel_id);
-        sqlx::query("UPDATE channels SET updated_at=$1 WHERE id=ANY($2)")
-            .bind(now)
-            .bind(affected_channels.into_iter().collect::<Vec<_>>())
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        let id = upsert_model_route_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
-        self.route(route_id).await
+        self.route(id).await
     }
 
     async fn create_public_model_with_routes(
         &self,
         input: gql::CreatePublicModelWithRoutesInput,
     ) -> Result<gql::CreatePublicModelWithRoutesPayload, gql::CommercializationError> {
-        if input.deployment_ids.is_empty() {
-            return Err(gql::CommercializationError::Invalid(
-                "select at least one upstream model deployment".into(),
-            ));
-        }
-        if input.deployment_ids.len() > 1 && input.confirm_compatibility != Some(true) {
-            return Err(gql::CommercializationError::Invalid(
-                "multiple upstream deployments require explicit compatibility confirmation".into(),
-            ));
-        }
-        let deployment_ids = input
-            .deployment_ids
-            .iter()
-            .map(|value| parse_id(value.as_str()))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        if deployment_ids.len() != input.deployment_ids.len() {
-            return Err(gql::CommercializationError::Invalid(
-                "the same upstream deployment cannot be selected twice".into(),
-            ));
-        }
-        let model_key = nonempty(input.model.model_id.clone(), "modelID")?;
-        let name = nonempty(input.model.name.clone(), "name")?;
-        let columns = crate::conv::create_model_columns(&input.model);
-        let model_status = if input.enabled.unwrap_or(true) {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        let mut channel_ids = BTreeSet::new();
-        for deployment_id in &deployment_ids {
-            let deployment = sqlx::query(
-                "SELECT channel_id,status FROM upstream_model_deployments WHERE id=$1 FOR SHARE",
-            )
-            .bind(deployment_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?
-            .ok_or_else(|| {
-                gql::CommercializationError::NotFound(format!(
-                    "upstream deployment {deployment_id}"
-                ))
-            })?;
-            if deployment.get::<String, _>("status") != "enabled" {
-                return Err(gql::CommercializationError::Invalid(format!(
-                    "upstream deployment {deployment_id} is not enabled"
-                )));
-            }
-            if !channel_ids.insert(deployment.get::<i64, _>("channel_id")) {
-                return Err(gql::CommercializationError::Invalid(
-                    "select at most one upstream deployment from each channel".into(),
-                ));
-            }
-        }
-        if let Some(conflict) = sqlx::query(
-            "SELECT model_id,name FROM models \
-             WHERE deleted_at=0 AND (model_id=$1 OR name=$2) LIMIT 1 FOR SHARE",
-        )
-        .bind(&model_key)
-        .bind(&name)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(storage)?
-        {
-            let field = if conflict.get::<String, _>("model_id") == model_key {
-                "model ID"
-            } else {
-                "display name"
-            };
-            return Err(gql::CommercializationError::Invalid(format!(
-                "{field} already exists"
-            )));
-        }
-        let public_model_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO models \
-             (developer,model_id,\"type\",name,icon,\"group\",model_card,settings,status, \
-              remark,created_at,updated_at,deleted_at) \
-             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,0) RETURNING id",
-        )
-        .bind(&input.model.developer)
-        .bind(&model_key)
-        .bind(&columns.model_type)
-        .bind(&name)
-        .bind(&input.model.icon)
-        .bind(&input.model.group)
-        .bind(SqlJson(columns.model_card))
-        .bind(SqlJson(columns.settings))
-        .bind(model_status)
-        .bind(&input.model.remark)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        for deployment_id in &deployment_ids {
-            sqlx::query(
-                "INSERT INTO model_routes(public_model_id,deployment_id,status,created_at,updated_at) \
-                 VALUES($1,$2,$3,$4,$4)",
-            )
-            .bind(public_model_id)
-            .bind(deployment_id)
-            .bind(model_status)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        }
-        sqlx::query("UPDATE channels SET updated_at=$1 WHERE id=ANY($2)")
-            .bind(now)
-            .bind(channel_ids.into_iter().collect::<Vec<_>>())
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        let model = sqlx::query_as::<_, ModelRow>(&format!(
-            "SELECT {MODEL_COLUMNS} FROM models WHERE id=$1"
-        ))
-        .bind(public_model_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        let routes = sqlx::query(
-            "SELECT r.id,r.public_model_id,m.model_id AS public_model_key,r.deployment_id, \
-                    d.internal_name AS deployment_name,d.channel_id,c.name AS channel_name, \
-                    d.upstream_model_id,r.status \
-             FROM model_routes r JOIN models m ON m.id=r.public_model_id AND m.deleted_at=0 \
-             JOIN upstream_model_deployments d ON d.id=r.deployment_id \
-             JOIN channels c ON c.id=d.channel_id AND c.deleted_at=0 \
-             WHERE r.public_model_id=$1 ORDER BY LOWER(c.name),r.id",
-        )
-        .bind(public_model_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(storage)?;
+        let result = create_public_model_with_routes_in_tx(&mut tx, input).await?;
         tx.commit().await.map_err(storage)?;
-        Ok(gql::CreatePublicModelWithRoutesPayload {
-            model: crate::conv::model_row_to_gql(model),
-            routes: routes.into_iter().map(route_from_row).collect(),
-        })
+        Ok(result)
     }
 
     async fn price_books(&self) -> Result<Vec<gql::PriceBook>, gql::CommercializationError> {
@@ -879,58 +485,10 @@ impl gql::CommercializationServices for PgCommercializationAdapter {
         actor_user_id: Option<i64>,
         input: gql::CreatePriceBookInput,
     ) -> Result<gql::PriceBook, gql::CommercializationError> {
-        let name = nonempty(input.name, "name")?;
-        let is_default = input.is_default.unwrap_or(false);
-        let now = Utc::now();
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        crate::wiring::lock_accounting_currency_price_writes(&mut tx)
-            .await
-            .map_err(storage)?;
-        let audit_settings = Self::pricing_audit_settings(&mut tx).await?;
-        let accounting_currency = &audit_settings.currency;
-        let currency = input
-            .currency
-            .unwrap_or_else(|| accounting_currency.to_string())
-            .trim()
-            .to_ascii_uppercase();
-        if currency != *accounting_currency {
-            return Err(gql::CommercializationError::Invalid(format!(
-                "retail price books must use accounting currency {accounting_currency}"
-            )));
-        }
-        let before_snapshot = price_book_catalog_snapshot(&mut tx).await?;
-        if is_default {
-            sqlx::query("UPDATE price_books SET is_default=FALSE,updated_at=$1")
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(storage)?;
-        }
-        let book_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO price_books(name,currency,status,is_default,created_at,updated_at) \
-             VALUES($1,$2,'enabled',$3,$4,$4) RETURNING id",
-        )
-        .bind(name)
-        .bind(currency)
-        .bind(is_default)
-        .bind(now)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        let after_snapshot = price_book_catalog_snapshot(&mut tx).await?;
-        insert_pricing_audit(
-            &mut tx,
-            actor_user_id,
-            "create_price_book",
-            "price_book",
-            &book_id.to_string(),
-            Some(before_snapshot),
-            Some(after_snapshot),
-            &audit_settings,
-        )
-        .await?;
+        let id = create_price_book_in_tx(&mut tx, actor_user_id, input).await?;
         tx.commit().await.map_err(storage)?;
-        self.price_book(book_id).await
+        self.price_book(id).await
     }
 }
 
@@ -1048,7 +606,7 @@ fn price_item_from_row(
             gql::CommercializationError::Storage(format!("stored price is invalid: {error}"))
         })?
         .0;
-    serde_json::from_value::<ModelPrice>(price.clone()).map_err(|error| {
+    RetailPriceDocument::parse(&price).map_err(|error| {
         gql::CommercializationError::Storage(format!("stored price is invalid: {error}"))
     })?;
     Ok(gql::PriceBookItem {
@@ -1143,7 +701,7 @@ mod tests {
                 developer: "commercial-test".into(),
                 model_id: model_key.into(),
                 model_type: Some(conduit_admin_graphql::model::ModelType::Chat),
-                name: format!("{model_key} display"),
+                name: "Same model display".into(),
                 icon: "Test".into(),
                 group: "commercial-test".into(),
                 model_card: Default::default(),
@@ -1157,12 +715,10 @@ mod tests {
     }
 
     fn price(item_code: &str, unit: &str) -> Json<serde_json::Value> {
-        Json(serde_json::json!({
-            "items": [{
-                "itemCode": item_code,
-                "pricing": {"mode": "usage_per_unit", "usagePerUnit": unit}
-            }]
-        }))
+        let items = ["prompt_tokens", "completion_tokens", "prompt_cached_tokens", "prompt_write_cached_tokens"].into_iter().map(|code| serde_json::json!({
+            "itemCode": code, "pricing": {"mode":"usage_per_unit", "usagePerUnit": if code == item_code {unit} else {"1"}}
+        })).collect::<Vec<_>>();
+        Json(serde_json::json!({"items": items}))
     }
 
     #[tokio::test]
@@ -1172,6 +728,7 @@ mod tests {
             return Ok(());
         };
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[1]).await?;
         let pool = database.pool.clone();
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let channel_a = sqlx::query_scalar::<_, i64>(
@@ -1378,6 +935,7 @@ mod tests {
             .save_retail_price_change_set_item(
                 1,
                 conduit_admin_graphql::change_set::SaveRetailPriceChangeSetItemInput {
+                    expected_revision: String::new(),
                     change_set_id: first_change_set.id.clone(),
                     public_model_id: public_one.model.id.clone(),
                     price: price("prompt_tokens", "1.25"),
@@ -1390,14 +948,45 @@ mod tests {
         change_sets
             .approve_change_set(1, first_change_set.id.clone(), None)
             .await?;
+        {
+            use conduit_admin_graphql::change_package::ChangePackageServices;
+            let detail = change_sets
+                .get_detail(
+                    conduit_admin_graphql::change_package::PackageViewer {
+                        actor_user_id: 1,
+                        can_write: true,
+                    },
+                    first_change_set.id.clone(),
+                )
+                .await?
+                .ok_or("missing approved package")?;
+            assert_eq!(
+                detail.summary.status,
+                conduit_admin_graphql::change_set::ChangeSetStatus::Approved
+            );
+            change_sets
+                .transition(
+                    1,
+                    first_change_set.id.clone(),
+                    detail.summary.revision,
+                    conduit_admin_graphql::change_package::ChangeSetAvailableAction::Publish,
+                    None,
+                )
+                .await?;
+        }
         let second_change_set = change_sets
             .create_retail_price_change_set(1, book.id.clone())
             .await?;
-        assert_eq!(second_change_set.items.len(), 1);
+        assert_eq!(
+            second_change_set.items.len(),
+            0,
+            "a new retail intent contains only its own deltas"
+        );
         change_sets
             .save_retail_price_change_set_item(
                 1,
                 conduit_admin_graphql::change_set::SaveRetailPriceChangeSetItemInput {
+                    expected_revision: String::new(),
                     change_set_id: second_change_set.id.clone(),
                     public_model_id: public_two.model.id.clone(),
                     price: price("completion_tokens", "2.50"),
@@ -1410,6 +999,32 @@ mod tests {
         change_sets
             .approve_change_set(1, second_change_set.id.clone(), None)
             .await?;
+        {
+            use conduit_admin_graphql::change_package::ChangePackageServices;
+            let detail = change_sets
+                .get_detail(
+                    conduit_admin_graphql::change_package::PackageViewer {
+                        actor_user_id: 1,
+                        can_write: true,
+                    },
+                    second_change_set.id.clone(),
+                )
+                .await?
+                .ok_or("missing approved package")?;
+            assert_eq!(
+                detail.summary.status,
+                conduit_admin_graphql::change_set::ChangeSetStatus::Approved
+            );
+            change_sets
+                .transition(
+                    1,
+                    second_change_set.id.clone(),
+                    detail.summary.revision,
+                    conduit_admin_graphql::change_package::ChangeSetAvailableAction::Publish,
+                    None,
+                )
+                .await?;
+        }
         let published = adapter.price_book(parse_id(book.id.as_str())?).await?;
         let published = published
             .versions
@@ -1426,8 +1041,7 @@ mod tests {
             BTreeSet::from([public_one.model.id.clone(), public_two.model.id.clone()])
         );
 
-        // Concurrent editor requests serialize on the price book and return
-        // the same inherited retail-price change set.
+        // Independent editor intents never reuse another same-scope draft.
         let mut draft_tasks = Vec::new();
         for _ in 0..6 {
             let change_sets =
@@ -1440,10 +1054,10 @@ mod tests {
         let mut draft_ids = BTreeSet::new();
         for task in draft_tasks {
             let draft = task.await??;
-            assert_eq!(draft.items.len(), 2);
+            assert_eq!(draft.items.len(), 0);
             draft_ids.insert(draft.id);
         }
-        assert_eq!(draft_ids.len(), 1);
+        assert_eq!(draft_ids.len(), 6);
         let audit_operations = sqlx::query_as::<_, (String, i64)>(
             "SELECT operation,COUNT(*) FROM pricing_change_audits \
              WHERE entity_type IN ('price_book','price_book_version','price_book_item') \
@@ -1568,4 +1182,474 @@ mod tests {
         database.cleanup().await?;
         Ok(())
     }
+}
+
+pub(crate) async fn upsert_model_route_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::UpsertModelRouteInput,
+) -> Result<i64, gql::CommercializationError> {
+    let public_model_id = parse_id(input.public_model_id.as_str())?;
+    let deployment_id = parse_id(input.deployment_id.as_str())?;
+    let editing_route_id = input
+        .id
+        .as_ref()
+        .map(|value| parse_id(value.as_str()))
+        .transpose()?;
+    let route_status = status_to_wire(input.status.unwrap_or(gql::CommercialStatus::Enabled));
+    if sqlx::query_scalar::<_, i64>("SELECT id FROM models WHERE id=$1 AND deleted_at=0 FOR UPDATE")
+        .bind(public_model_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .is_none()
+    {
+        return Err(gql::CommercializationError::NotFound(format!(
+            "public model SKU {public_model_id}"
+        )));
+    }
+    let selected = sqlx::query(
+        "SELECT channel_id,status FROM upstream_model_deployments WHERE id=$1 FOR SHARE",
+    )
+    .bind(deployment_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| gql::CommercializationError::NotFound(format!("deployment {deployment_id}")))?;
+    if route_status == "enabled" && selected.get::<String, _>("status") != "enabled" {
+        return Err(gql::CommercializationError::Invalid(
+            "an enabled route requires an enabled upstream deployment".into(),
+        ));
+    }
+    let selected_channel_id: i64 = selected.get("channel_id");
+    let (target_route_id, old_channel_id) = if let Some(route_id) = editing_route_id {
+        let old_channel_id = sqlx::query_scalar::<_, i64>(
+            "SELECT d.channel_id FROM model_routes r \
+                 JOIN upstream_model_deployments d ON d.id=r.deployment_id \
+                 WHERE r.id=$1 FOR UPDATE OF r",
+        )
+        .bind(route_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .ok_or_else(|| gql::CommercializationError::NotFound(format!("route {route_id}")))?;
+        (Some(route_id), Some(old_channel_id))
+    } else {
+        let existing = sqlx::query(
+            "SELECT r.id,d.channel_id FROM model_routes r \
+                 JOIN upstream_model_deployments d ON d.id=r.deployment_id \
+                 WHERE r.public_model_id=$1 AND r.deployment_id=$2 FOR UPDATE OF r",
+        )
+        .bind(public_model_id)
+        .bind(deployment_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?;
+        existing
+            .map(|row| (Some(row.get("id")), Some(row.get("channel_id"))))
+            .unwrap_or((None, None))
+    };
+    let same_channel = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM model_routes r \
+             JOIN upstream_model_deployments existing ON existing.id=r.deployment_id \
+             WHERE r.public_model_id=$1 AND existing.channel_id=$2 \
+               AND ($3::BIGINT IS NULL OR r.id<>$3) AND r.status<>'archived'",
+    )
+    .bind(public_model_id)
+    .bind(selected_channel_id)
+    .bind(target_route_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if same_channel > 0 {
+        return Err(gql::CommercializationError::Invalid(
+                "a public model SKU can have only one route per channel; create a separate SKU for another deployment on the same channel".into(),
+            ));
+    }
+    let other_routes = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM model_routes WHERE public_model_id=$1 \
+             AND ($2::BIGINT IS NULL OR id<>$2) AND status<>'archived'",
+    )
+    .bind(public_model_id)
+    .bind(target_route_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    if other_routes > 0 && input.confirm_compatibility != Some(true) {
+        return Err(gql::CommercializationError::Invalid(
+                "this SKU already has another route; confirm compatibility (equivalent capability, quality and price) or create a separate SKU".into(),
+            ));
+    }
+    let now = Utc::now();
+    let route_id = if let Some(route_id) = target_route_id {
+        sqlx::query(
+            "UPDATE model_routes SET public_model_id=$1,deployment_id=$2,status=$3,updated_at=$4 \
+                 WHERE id=$5",
+        )
+        .bind(public_model_id)
+        .bind(deployment_id)
+        .bind(route_status)
+        .bind(now)
+        .bind(route_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+        route_id
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO model_routes(public_model_id,deployment_id,status,created_at,updated_at) \
+                 VALUES($1,$2,$3,$4,$4) ON CONFLICT(public_model_id,deployment_id) \
+                 DO UPDATE SET status=EXCLUDED.status,updated_at=EXCLUDED.updated_at RETURNING id",
+        )
+        .bind(public_model_id)
+        .bind(deployment_id)
+        .bind(route_status)
+        .bind(now)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(storage)?
+    };
+    let mut affected_channels = BTreeSet::from([selected_channel_id]);
+    affected_channels.extend(old_channel_id);
+    sqlx::query("UPDATE channels SET updated_at=$1 WHERE id=ANY($2)")
+        .bind(now)
+        .bind(affected_channels.into_iter().collect::<Vec<_>>())
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    Ok(route_id)
+}
+
+pub(crate) async fn create_public_model_with_routes_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::CreatePublicModelWithRoutesInput,
+) -> Result<gql::CreatePublicModelWithRoutesPayload, gql::CommercializationError> {
+    if input.deployment_ids.is_empty() {
+        return Err(gql::CommercializationError::Invalid(
+            "select at least one upstream model deployment".into(),
+        ));
+    }
+    if input.deployment_ids.len() > 1 && input.confirm_compatibility != Some(true) {
+        return Err(gql::CommercializationError::Invalid(
+            "multiple upstream deployments require explicit compatibility confirmation".into(),
+        ));
+    }
+    let deployment_ids = input
+        .deployment_ids
+        .iter()
+        .map(|value| parse_id(value.as_str()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if deployment_ids.len() != input.deployment_ids.len() {
+        return Err(gql::CommercializationError::Invalid(
+            "the same upstream deployment cannot be selected twice".into(),
+        ));
+    }
+    let model_key = nonempty(input.model.model_id.clone(), "modelID")?;
+    let name = nonempty(input.model.name.clone(), "name")?;
+    let columns = crate::conv::create_model_columns(&input.model);
+    let model_status = if input.enabled.unwrap_or(true) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let now = Utc::now();
+    let mut channel_ids = BTreeSet::new();
+    for deployment_id in &deployment_ids {
+        let deployment = sqlx::query(
+            "SELECT channel_id,status FROM upstream_model_deployments WHERE id=$1 FOR SHARE",
+        )
+        .bind(deployment_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .ok_or_else(|| {
+            gql::CommercializationError::NotFound(format!("upstream deployment {deployment_id}"))
+        })?;
+        if deployment.get::<String, _>("status") != "enabled" {
+            return Err(gql::CommercializationError::Invalid(format!(
+                "upstream deployment {deployment_id} is not enabled"
+            )));
+        }
+        if !channel_ids.insert(deployment.get::<i64, _>("channel_id")) {
+            return Err(gql::CommercializationError::Invalid(
+                "select at most one upstream deployment from each channel".into(),
+            ));
+        }
+    }
+    if sqlx::query(
+        "SELECT model_id FROM models \
+             WHERE deleted_at=0 AND model_id=$1 LIMIT 1 FOR SHARE",
+    )
+    .bind(&model_key)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .is_some()
+    {
+        return Err(gql::CommercializationError::Invalid(
+            "model ID already exists".into(),
+        ));
+    }
+    let public_model_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO models \
+             (developer,model_id,\"type\",name,icon,\"group\",model_card,settings,status, \
+              remark,created_at,updated_at,deleted_at) \
+             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,0) RETURNING id",
+    )
+    .bind(&input.model.developer)
+    .bind(&model_key)
+    .bind(&columns.model_type)
+    .bind(&name)
+    .bind(&input.model.icon)
+    .bind(&input.model.group)
+    .bind(SqlJson(columns.model_card))
+    .bind(SqlJson(columns.settings))
+    .bind(model_status)
+    .bind(&input.model.remark)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    for deployment_id in &deployment_ids {
+        sqlx::query(
+            "INSERT INTO model_routes(public_model_id,deployment_id,status,created_at,updated_at) \
+                 VALUES($1,$2,$3,$4,$4)",
+        )
+        .bind(public_model_id)
+        .bind(deployment_id)
+        .bind(model_status)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    }
+    sqlx::query("UPDATE channels SET updated_at=$1 WHERE id=ANY($2)")
+        .bind(now)
+        .bind(channel_ids.into_iter().collect::<Vec<_>>())
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    let model =
+        sqlx::query_as::<_, ModelRow>(&format!("SELECT {MODEL_COLUMNS} FROM models WHERE id=$1"))
+            .bind(public_model_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(storage)?;
+    let routes = sqlx::query(
+        "SELECT r.id,r.public_model_id,m.model_id AS public_model_key,r.deployment_id, \
+                    d.internal_name AS deployment_name,d.channel_id,c.name AS channel_name, \
+                    d.upstream_model_id,r.status \
+             FROM model_routes r JOIN models m ON m.id=r.public_model_id AND m.deleted_at=0 \
+             JOIN upstream_model_deployments d ON d.id=r.deployment_id \
+             JOIN channels c ON c.id=d.channel_id AND c.deleted_at=0 \
+             WHERE r.public_model_id=$1 ORDER BY LOWER(c.name),r.id",
+    )
+    .bind(public_model_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(storage)?;
+    Ok(gql::CreatePublicModelWithRoutesPayload {
+        model: crate::conv::model_row_to_gql(model),
+        routes: routes.into_iter().map(route_from_row).collect(),
+    })
+}
+
+pub(crate) async fn create_price_book_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    actor_user_id: Option<i64>,
+    input: gql::CreatePriceBookInput,
+) -> Result<i64, gql::CommercializationError> {
+    let name = nonempty(input.name, "name")?;
+    let is_default = input.is_default.unwrap_or(false);
+    let now = Utc::now();
+    crate::wiring::lock_accounting_currency_price_writes(tx)
+        .await
+        .map_err(storage)?;
+    let audit_settings = PgCommercializationAdapter::pricing_audit_settings(tx).await?;
+    let accounting_currency = &audit_settings.currency;
+    let currency = input
+        .currency
+        .unwrap_or_else(|| accounting_currency.to_string())
+        .trim()
+        .to_ascii_uppercase();
+    if currency != *accounting_currency {
+        return Err(gql::CommercializationError::Invalid(format!(
+            "retail price books must use accounting currency {accounting_currency}"
+        )));
+    }
+    let before_snapshot = price_book_catalog_snapshot(tx).await?;
+    if is_default {
+        sqlx::query("UPDATE price_books SET is_default=FALSE,updated_at=$1")
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .map_err(storage)?;
+    }
+    let book_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO price_books(name,currency,status,is_default,created_at,updated_at) \
+             VALUES($1,$2,'enabled',$3,$4,$4) RETURNING id",
+    )
+    .bind(name)
+    .bind(currency)
+    .bind(is_default)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let after_snapshot = price_book_catalog_snapshot(tx).await?;
+    insert_pricing_audit(
+        tx,
+        actor_user_id,
+        "create_price_book",
+        "price_book",
+        &book_id.to_string(),
+        Some(before_snapshot),
+        Some(after_snapshot),
+        &audit_settings,
+    )
+    .await?;
+    Ok(book_id)
+}
+
+pub(crate) async fn channel_mapping_preview_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    channel_id_value: i64,
+) -> Result<gql::ChannelModelMappingPreview, gql::CommercializationError> {
+    if !sqlx::query_scalar::<_, String>("SELECT value FROM systems WHERE key=$1 AND deleted_at=0")
+        .bind(MODEL_MAPPING_AUTOMATION_KEY)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(storage)?
+        .is_some_and(|v| matches!(v.as_str(), "true" | "1"))
+    {
+        return Err(gql::CommercializationError::Invalid(
+            "automatic channel model mapping is disabled in settings".into(),
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT supported_models,settings,updated_at FROM channels \
+             WHERE id=$1 AND deleted_at=0",
+    )
+    .bind(channel_id_value)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| gql::CommercializationError::NotFound(format!("channel {channel_id_value}")))?;
+    let supported_models = row
+        .try_get::<SqlJson<Vec<String>>, _>("supported_models")
+        .map_err(|error| {
+            gql::CommercializationError::Storage(format!(
+                "channel supported models are invalid: {error}"
+            ))
+        })?
+        .0;
+    let settings = row
+        .try_get::<Option<SqlJson<conduit_core::objects::channel_settings::ChannelSettings>>, _>(
+            "settings",
+        )
+        .map_err(|error| {
+            gql::CommercializationError::Storage(format!("channel settings are invalid: {error}"))
+        })?
+        .map(|settings| settings.0)
+        .unwrap_or_default();
+    let route_rows = sqlx::query(
+        "SELECT m.model_id AS public_model_key,d.upstream_model_id \
+             FROM model_routes r \
+             JOIN models m ON m.id=r.public_model_id AND m.deleted_at=0 AND m.status='enabled' \
+             JOIN upstream_model_deployments d ON d.id=r.deployment_id AND d.status='enabled' \
+             WHERE d.channel_id=$1 AND r.status='enabled' \
+             ORDER BY LOWER(m.model_id),r.id",
+    )
+    .bind(channel_id_value)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(storage)?;
+    let routed = route_rows
+        .into_iter()
+        .map(|row| (row.get("public_model_key"), row.get("upstream_model_id")))
+        .collect::<Vec<(String, String)>>();
+    if let Some((from, to)) = routed
+        .iter()
+        .find(|(_, target)| !supported_models.iter().any(|model| model == target))
+    {
+        return Err(gql::CommercializationError::Invalid(format!(
+            "route {from:?} points to {to:?}, which is not in this channel's supported models; sync the channel models before applying aliases"
+        )));
+    }
+    let existing = settings
+        .model_mappings
+        .iter()
+        .map(|mapping| conduit_admin_graphql::channel::ModelMapping {
+            from: mapping.from.clone(),
+            to: mapping.to.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(gql::build_channel_model_mapping_preview(
+        channel_id(channel_id_value),
+        wire_time(row.get("updated_at")),
+        &existing,
+        &routed,
+    ))
+}
+pub(crate) async fn apply_channel_model_mappings_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    input: gql::ApplyChannelModelMappingsInput,
+) -> Result<gql::ChannelModelMappingPreview, gql::CommercializationError> {
+    let channel_id_value = parse_id(input.channel_id.as_str())?;
+    let preview = channel_mapping_preview_in_tx(tx, channel_id_value).await?;
+    if preview.expected_version != input.expected_version {
+        return Err(gql::CommercializationError::Invalid(
+            "channel changed after the preview; generate a new preview before applying".into(),
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT settings,updated_at FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE",
+    )
+    .bind(channel_id_value)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| gql::CommercializationError::NotFound(format!("channel {channel_id_value}")))?;
+    if wire_time(row.get("updated_at")) != input.expected_version {
+        return Err(gql::CommercializationError::Invalid(
+            "channel changed while aliases were being applied; generate a new preview".into(),
+        ));
+    }
+    let mut settings = row
+        .try_get::<Option<SqlJson<conduit_core::objects::channel_settings::ChannelSettings>>, _>(
+            "settings",
+        )
+        .map_err(|error| {
+            gql::CommercializationError::Storage(format!("channel settings are invalid: {error}"))
+        })?
+        .map(|settings| settings.0)
+        .unwrap_or_default();
+    let existing = settings
+        .model_mappings
+        .iter()
+        .map(|mapping| conduit_admin_graphql::channel::ModelMapping {
+            from: mapping.from.clone(),
+            to: mapping.to.clone(),
+        })
+        .collect::<Vec<_>>();
+    settings.model_mappings = gql::merge_channel_model_mappings(
+        &existing,
+        &preview,
+        input.replace_conflicts.unwrap_or(false),
+    )
+    .into_iter()
+    .map(
+        |mapping| conduit_core::objects::channel_settings::ModelMapping {
+            from: mapping.from,
+            to: mapping.to,
+        },
+    )
+    .collect();
+    sqlx::query("UPDATE channels SET settings=$1,updated_at=$2 WHERE id=$3")
+        .bind(SqlJson(settings))
+        .bind(Utc::now())
+        .bind(channel_id_value)
+        .execute(&mut **tx)
+        .await
+        .map_err(storage)?;
+    channel_mapping_preview_in_tx(tx, channel_id_value).await
 }

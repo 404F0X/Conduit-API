@@ -313,6 +313,14 @@ pub struct APIKey {
 
 #[ComplexObject]
 impl APIKey {
+    #[graphql(name = "modelGroupID")]
+    async fn model_group_id(&self, ctx: &Context<'_>) -> Result<Option<ID>, String> {
+        let project = crate::groups::project(ctx, false)?;
+        crate::groups::services(ctx)?
+            .key_group(crate::groups::numeric_id(self.id.as_str())?, project)
+            .await
+    }
+
     /// Resolve the creator shown by the retained API-key UI. API keys created
     /// without a user (for example service-owned/imported rows) return `null`.
     async fn user(&self, ctx: &Context<'_>) -> Result<Option<crate::user::User>, String> {
@@ -386,6 +394,8 @@ pub struct APIKeyConnection {
 #[derive(Debug, Clone, PartialEq, Eq, InputObject)]
 #[graphql(name = "CreateAPIKeyInput")]
 pub struct CreateAPIKeyInput {
+    #[graphql(name = "modelGroupID")]
+    pub model_group_id: Option<ID>,
     pub name: String,
     /// API Key type (nullable on input; service defaults to `user`).
     #[graphql(name = "type")]
@@ -770,13 +780,23 @@ pub struct APIKeyConnectionArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct APIKeyAccessScope {
     pub project_id: String,
+    pub actor_user_id: Option<i64>,
+    pub actor_api_key_id: Option<String>,
 }
 
 pub(crate) fn api_key_access_scope(ctx: &Context<'_>) -> Result<APIKeyAccessScope, String> {
     let project_id = crate::policy::request_context(ctx)
         .and_then(|request| request.project_id.clone())
         .ok_or_else(|| "current project is required; send X-Project-ID".to_string())?;
-    Ok(APIKeyAccessScope { project_id })
+    let actor_api_key_id = crate::policy::request_context(ctx)
+        .and_then(|r| r.principal.as_ref())
+        .filter(|p| p.kind == conduit_auth::PrincipalKind::ApiKey)
+        .and_then(|p| p.id.clone());
+    Ok(APIKeyAccessScope {
+        project_id,
+        actor_user_id: ctx.data_opt::<crate::me::CurrentUser>().map(|u| u.user_id),
+        actor_api_key_id,
+    })
 }
 
 /// Backs `Query.apiKeys` (Go `ent.resolvers.go:295`: `r.client.APIKey.Query()

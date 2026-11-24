@@ -4,9 +4,12 @@ import { createServer as createHttpServer } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { preparePaymentTLS, startPaymentFixture, FIXTURE_MERCHANT, FIXTURE_KEY } from './payment-fixture.mjs'
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = resolve(scriptDirectory, '..', '..')
@@ -43,6 +46,7 @@ Environment:
   CONDUIT_E2E_BACKEND_PORT      Backend port (default: 8099).
   CONDUIT_E2E_FRONTEND_PORT     Vite port (default: 9527).
   CONDUIT_E2E_MOCK_PORT         Local mock upstream port (default: 18099).
+  CONDUIT_E2E_PAYMENT_PORT      Local HTTPS reference gateway (default: 18443).
   CONDUIT_E2E_BACKEND_TIMEOUT_MS  Backend startup timeout (default: 300000).
 
 Safety:
@@ -147,7 +151,8 @@ function loadConfiguration() {
   const backendPort = readPort('CONDUIT_E2E_BACKEND_PORT', 8099)
   const frontendPort = readPort('CONDUIT_E2E_FRONTEND_PORT', 9527)
   const mockPort = readPort('CONDUIT_E2E_MOCK_PORT', 18099)
-  if (new Set([backendPort, frontendPort, mockPort]).size !== 3) {
+  const paymentPort = readPort('CONDUIT_E2E_PAYMENT_PORT', 18443)
+  if (new Set([backendPort, frontendPort, mockPort, paymentPort]).size !== 4) {
     throw new Error('backend, frontend, and mock ports must be distinct')
   }
 
@@ -158,6 +163,8 @@ function loadConfiguration() {
     backendPort,
     frontendPort,
     mockPort,
+    paymentPort,
+    paymentOrigin: `https://127.0.0.1:${paymentPort}`,
     backendTimeout: readTimeout(),
     backendUrl: `http://127.0.0.1:${backendPort}`,
     frontendUrl: `http://127.0.0.1:${frontendPort}`,
@@ -168,6 +175,10 @@ function loadConfiguration() {
 }
 
 function pnpmCliPath() {
+  const invokingCli = process.env.npm_execpath
+  if (invokingCli && /[/\\]pnpm\.c?js$/i.test(invokingCli) && existsSync(invokingCli)) {
+    return invokingCli
+  }
   const pathEntries = (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':')
   const roots = new Set([
     dirname(process.execPath),
@@ -242,9 +253,13 @@ function backendEnvironment(configuration) {
     CONDUIT_OIDC_PROVIDERS: '[]',
     CONDUIT_CACHE_ROUTE_AFFINITY_ENABLED: 'false',
     CONDUIT_API_AUTH_BCRYPT_COST: '4',
+    CONDUIT_USAGE_RECOVERY_DIRECTORY: join(configuration.runtimeDirectory, 'usage-journal'),
+    CONDUIT_LOG_DIRECTORY: join(configuration.runtimeDirectory, 'logs'),
     CONDUIT_LOG_LEVEL: 'warn',
     CONDUIT_LOG_STDOUT: 'true',
     CONDUIT_TEST_REAL_PROVIDER: '0',
+    // Explicit fixture-only enforcement; product defaults remain unchanged.
+    CONDUIT_BILLING_ENFORCEMENT_MODE: 'hard',
     CARGO_NET_OFFLINE: 'true',
     HTTP_PROXY: configuration.mockOrigin,
     HTTPS_PROXY: configuration.mockOrigin,
@@ -267,6 +282,10 @@ function playwrightEnvironment(configuration) {
     CONDUIT_E2E_FRONTEND_PORT: String(configuration.frontendPort),
     CONDUIT_E2E_MOCK_ORIGIN: configuration.mockOrigin,
     CONDUIT_E2E_MOCK_UPSTREAM_URL: configuration.mockUpstreamUrl,
+    CONDUIT_E2E_POSTGRES_DSN: configuration.database.rawDsn,
+    CONDUIT_E2E_ISOLATED: '1',
+    CONDUIT_E2E_PAYMENT_ORIGIN: configuration.paymentOrigin,
+    CONDUIT_E2E_PAYMENT_SPKI: configuration.paymentSPKI,
     CONDUIT_TEST_REAL_PROVIDER: '0',
     VITE_API_URL: configuration.backendUrl,
     VITE_PORT: String(configuration.frontendPort),
@@ -355,6 +374,7 @@ async function verifyPrerequisites() {
       'Playwright Chromium is not installed; run "pnpm --dir frontend exec playwright install chromium"',
     )
   }
+  await capture('openssl', ['version'])
   versions.push(`playwright: ${playwrightVersion.split(/\r?\n/, 1)[0]} (Chromium installed)`)
   return versions
 }
@@ -403,6 +423,7 @@ async function verifyPorts(configuration) {
   await verifyPortAvailable(configuration.backendPort, 'backend')
   await verifyPortAvailable(configuration.frontendPort, 'frontend')
   await verifyPortAvailable(configuration.mockPort, 'mock upstream')
+  await verifyPortAvailable(configuration.paymentPort, 'payment fixture')
 }
 
 async function resetDatabase(configuration, onCreated) {
@@ -474,9 +495,8 @@ function jsonResponse(response, status, value) {
 }
 
 async function startMockUpstream(configuration) {
-  const server = createHttpServer((request, response) => {
+  const server = createHttpServer(async (request, response) => {
     const url = new URL(request.url ?? '/', configuration.mockOrigin)
-    request.resume()
     response.setHeader('connection', 'close')
 
     if (!loopbackHosts.has(url.hostname)) {
@@ -501,6 +521,37 @@ async function startMockUpstream(configuration) {
       return
     }
     if (url.pathname.endsWith('/chat/completions')) {
+      let body
+      try {
+        let bytes = 0
+        const chunks = []
+        for await (const chunk of request) {
+          bytes += chunk.length
+          if (bytes > 1024 * 1024) throw new Error('request too large')
+          chunks.push(chunk)
+        }
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        jsonResponse(response, 400, { error: 'invalid local fixture request' })
+        return
+      }
+      if (body.stream === true) {
+        response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' })
+        response.flushHeaders()
+        const base = { id: 'chatcmpl-conduit-e2e-stream', object: 'chat.completion.chunk', created: 0, model: 'gpt-4o' }
+        for (const event of [
+          { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: 'local streaming ' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: { content: 'billing response' }, finish_reason: null }] },
+          { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+          { ...base, choices: [], usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } },
+        ]) {
+          if (response.destroyed) return
+          response.write(`data: ${JSON.stringify(event)}\n\n`)
+          await new Promise((resolve) => setTimeout(resolve, 20))
+        }
+        response.end('data: [DONE]\n\n')
+        return
+      }
       jsonResponse(response, 200, {
         id: 'chatcmpl-conduit-e2e',
         object: 'chat.completion',
@@ -552,6 +603,7 @@ async function startMockUpstream(configuration) {
 
 function redactLog(value) {
   return value
+    .replace(/(https?:\/\/[^\s"'<>?]+)\?[^\s"'<>]*/gi, '$1?[REDACTED_QUERY]')
     .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[REDACTED_POSTGRES_DSN]')
     .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [REDACTED]')
     .replace(/\b(?:sk|key)-[A-Za-z0-9._-]{8,}\b/g, '[REDACTED_TOKEN]')
@@ -585,7 +637,7 @@ function startBackend(configuration) {
       'conduit-api',
       '--',
       '--config',
-      configPath,
+      configuration.configPath ?? configPath,
     ],
     {
       cwd: repositoryRoot,
@@ -632,13 +684,16 @@ async function waitForBackend(configuration, child) {
 
 function startPlaywright(configuration, arguments_) {
   const resolved = invocation('pnpm', ['exec', 'playwright', 'test', ...arguments_])
-  return spawn(resolved.command, resolved.arguments, {
+  const child = spawn(resolved.command, resolved.arguments, {
     cwd: frontendDirectory,
     env: playwrightEnvironment(configuration),
-    stdio: 'inherit',
+    stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
     detached: process.platform !== 'win32',
   })
+  forwardRedacted(child.stdout, '[playwright] ')
+  forwardRedacted(child.stderr, '[playwright] ')
+  return child
 }
 
 function waitForChild(child, label) {
@@ -727,7 +782,7 @@ async function main() {
     return
   }
 
-  const resources = { backend: undefined, playwright: undefined, mock: undefined, database: false }
+  const resources = { backend: undefined, playwright: undefined, mock: undefined, payment: undefined, database: false, runtimeDirectory: undefined }
   let cleanupPromise
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise
@@ -735,6 +790,16 @@ async function main() {
       await stopChild(resources.playwright)
       await stopChild(resources.backend)
       await closeServer(resources.mock)
+      await closeServer(resources.payment)
+      if (resources.runtimeDirectory) {
+        const directory = resolve(resources.runtimeDirectory)
+        if (dirname(directory) !== resolve(tmpdir()) || !directory.startsWith(join(resolve(tmpdir()), 'conduit-e2e-'))) {
+          throw new Error('refusing to remove runtime directory outside the task temp root')
+        }
+        rmSync(directory, { recursive: true })
+        console.log(`Removed owned E2E runtime directory: ${directory}`)
+        resources.runtimeDirectory = undefined
+      }
       if (resources.database && !options.keepDatabase) {
         await dropDatabase(configuration)
         resources.database = false
@@ -762,6 +827,29 @@ async function main() {
       resources.database = true
     })
     resources.mock = await startMockUpstream(configuration)
+    resources.runtimeDirectory = mkdtempSync(join(tmpdir(), 'conduit-e2e-'))
+    configuration.runtimeDirectory = resources.runtimeDirectory
+    console.log(`Owned E2E runtime directory: ${resources.runtimeDirectory}`)
+    const tls = preparePaymentTLS(resources.runtimeDirectory, sanitizeEnvironment())
+    configuration.paymentSPKI = tls.spki
+    configuration.configPath = join(resources.runtimeDirectory, 'fixture-config.yml')
+    // JSON is a YAML subset. Defaults + explicit fixture environment supply all
+    // other settings; never copy user configuration or merchant credentials.
+    writeFileSync(configuration.configPath, JSON.stringify({ payments: {
+      enabled: true,
+      profile: 'epay-classic-md5-reference-a4d0f042',
+      gateway_base_url: `${configuration.paymentOrigin}/epay/`,
+      gateway_ca_certificate: tls.ca,
+      merchant_id: FIXTURE_MERCHANT,
+      merchant_key: FIXTURE_KEY,
+      merchant_identity: 'isolated-reference-fixture',
+      notify_url: `${configuration.paymentOrigin}/api/payments/epay/notify`,
+      return_url: `${configuration.paymentOrigin}/return`,
+      min_amount_minor: 1,
+      max_amount_minor: 10000000,
+      order_ttl_seconds: 900,
+    }}), { mode: 0o600 })
+    resources.payment = await startPaymentFixture(configuration, tls)
     resources.backend = startBackend(configuration)
     await waitForBackend(configuration, resources.backend)
     console.log('Backend and local mock are ready; starting Playwright...')

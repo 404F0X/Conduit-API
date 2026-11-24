@@ -1,8 +1,11 @@
-import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { z } from 'zod';
 import { useFieldArray, useForm, useWatch, type Control } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
+import { useQuery } from '@tanstack/react-query';
+import { useNavigate } from '@tanstack/react-router';
 import { IconAlertTriangle, IconCloudDownload, IconCoin, IconCopy, IconPlus, IconTrash } from '@tabler/icons-react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
@@ -18,6 +21,8 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { ModelPriceEditor } from '@/components/model-price-editor';
+import { getProviderBase, findProviderOperation } from '@/features/change-sets/data/change-sets';
+import { isDefinitePackageRejection } from '@/features/change-sets/price-view';
 import { useProvidersData } from '@/features/models/data/providers';
 import { type ProviderModel, type ProvidersData } from '@/features/models/data/providers.schema';
 import { useGeneralSettings } from '@/features/system/data/system';
@@ -228,7 +233,7 @@ type PriceFormData = z.infer<ReturnType<typeof createPriceFormSchema>>;
 
 type ChannelModelPrices = NonNullable<ReturnType<typeof useChannelModelPrices>['data']>;
 
-function buildAvailableModelsByIndex(prices: Array<PriceFormData['prices'][number] | undefined>, supportedModels: string[]) {
+function buildAvailableModelsByIndex(prices: Array<{ modelId: string } | undefined>, supportedModels: string[]) {
   return prices.map((p, currentIndex) => {
     const selectedModels = new Set(prices.map((p, i) => (i !== currentIndex ? p?.modelId : null)).filter(Boolean));
 
@@ -334,7 +339,7 @@ function buildItemsFromProviderModel(model: ProviderModel, multiplier: number = 
   if (items.length === 0) {
     items.push({
       itemCode: 'prompt_tokens',
-      pricing: { mode: 'usage_per_unit', usagePerUnit: '0' },
+      pricing: { mode: 'usage_per_unit', usagePerUnit: '' },
     });
   }
 
@@ -474,18 +479,17 @@ const PriceCard = memo(function PriceCard({
   onRemoveVariant: (priceIndex: number, itemIndex: number, variantIndex: number) => void;
 }) {
   return (
-    <Card className='overflow-hidden'>
-      <CardContent className='pt-6'>
-        {/* Mobile and tablet: single column layout */}
-        <div className='flex flex-col gap-3 lg:hidden'>
-          <div className='flex h-8 items-center justify-between'>
+    <Card data-testid='channel-price-card' data-price-index={priceIndex} className='overflow-hidden'>
+      <CardContent className='grid grid-cols-1 gap-3 pt-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,3fr)] lg:gap-x-4'>
+        <div className='min-w-0'>
+          <div className='mb-3 flex h-8 min-w-0 items-center justify-between gap-2'>
             <div className='flex min-w-0 items-center gap-2'>
               <FormLabel className='truncate'>{t('price.model')}</FormLabel>
               <Badge variant='outline' className='shrink-0 font-mono text-[10px] tabular-nums'>
                 {currencyCode}
               </Badge>
             </div>
-            <div className='flex gap-1'>
+            <div className='flex shrink-0 gap-1'>
               <Button
                 type='button'
                 variant='ghost'
@@ -513,7 +517,7 @@ const PriceCard = memo(function PriceCard({
                   value={field.value}
                 >
                   <FormControl>
-                    <SelectTrigger size='sm' className='h-8 w-full' title={field.value || ''}>
+                    <SelectTrigger size='sm' className='h-8 w-full min-w-0' title={field.value || ''}>
                       <SelectValue placeholder={t('price.model')} className='truncate' />
                     </SelectTrigger>
                   </FormControl>
@@ -529,7 +533,9 @@ const PriceCard = memo(function PriceCard({
               </FormItem>
             )}
           />
-          <div className='flex h-8 items-center'>
+        </div>
+        <div className='min-w-0'>
+          <div className='mb-3 flex h-8 items-center'>
             <FormLabel className='truncate'>{t('price.items')}</FormLabel>
           </div>
           <ModelPriceEditor
@@ -543,84 +549,6 @@ const PriceCard = memo(function PriceCard({
             onRemoveVariant={onRemoveVariant}
           />
         </div>
-
-        {/* Desktop: grid layout */}
-        <div className='hidden lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(0,3fr)_auto] lg:gap-x-4 lg:gap-y-3'>
-          <div className='flex h-8 min-w-0 items-center justify-between gap-2'>
-            <div className='flex min-w-0 items-center gap-2'>
-              <FormLabel className='truncate'>{t('price.model')}</FormLabel>
-              <Badge variant='outline' className='shrink-0 font-mono text-[10px] tabular-nums'>
-                {currencyCode}
-              </Badge>
-            </div>
-            <Button
-              type='button'
-              variant='ghost'
-              size='icon-sm'
-              onClick={() => onDuplicatePrice(priceIndex)}
-              title={t('common.actions.duplicate')}
-            >
-              <IconCopy size={14} />
-            </Button>
-          </div>
-
-          <div className='flex h-8 min-w-0 items-center'>
-            <FormLabel className='truncate'>{t('price.items')}</FormLabel>
-          </div>
-
-          <div className='flex items-start justify-end'>
-            <Button type='button' variant='ghost' size='icon-sm' className='text-destructive' onClick={() => onRemovePrice(priceIndex)}>
-              <IconTrash size={16} />
-            </Button>
-          </div>
-
-          <div className='min-w-0'>
-            <FormField
-              control={control}
-              name={`prices.${priceIndex}.modelId`}
-              render={({ field }) => (
-                <FormItem>
-                  <Select
-                    onValueChange={(value) => {
-                      field.onChange(value);
-                      onModelSelected(priceIndex, value);
-                    }}
-                    value={field.value}
-                  >
-                    <FormControl>
-                      <SelectTrigger size='sm' className='h-8 w-full min-w-0' title={field.value || ''}>
-                        <SelectValue placeholder={t('price.model')} className='truncate' />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      {availableModels.map((model) => (
-                        <SelectItem key={model} value={model} title={model}>
-                          {model}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-          </div>
-
-          <div className='min-w-0'>
-            <ModelPriceEditor
-              control={control}
-              priceIndex={priceIndex}
-              currencyCode={currencyCode}
-              hideHeader
-              onAddItem={onAddItem}
-              onRemoveItem={onRemoveItem}
-              onAddVariant={onAddVariant}
-              onRemoveVariant={onRemoveVariant}
-            />
-          </div>
-
-          <div />
-        </div>
       </CardContent>
     </Card>
   );
@@ -628,12 +556,23 @@ const PriceCard = memo(function PriceCard({
 
 export function ChannelsModelPriceDialog() {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const { open, setOpen, currentRow, selectedPriceModelID, setSelectedPriceModelID } = useChannels();
   const { data: settings } = useGeneralSettings();
   const defaultRowCurrency = normalizeCurrencyCode(settings?.accountingCurrencyCode || DEFAULT_ACCOUNTING_CURRENCY_CODE);
   const isOpen = open === 'price';
-  const { data: currentPrices, isLoading } = useChannelModelPrices(currentRow?.id || '');
   const createPriceDraft = useCreateProviderPriceChangeSet();
+  const [operationID, setOperationID] = useState(() => crypto.randomUUID());
+  const pendingIntent = useRef<Parameters<typeof createPriceDraft.mutateAsync>[0] | null>(null);
+  const editBase = useQuery({
+    queryKey: ['providerPriceEditBase', currentRow?.id],
+    queryFn: () => getProviderBase(currentRow!.id),
+    enabled: isOpen && Boolean(currentRow),
+    staleTime: 0,
+  });
+  const { data: editBaseData, isFetching: editBaseFetching, isError: editBaseError } = editBase;
+  const currentPrices = editBaseData?.prices as ChannelModelPrices | undefined;
+  const isLoading = editBase.isLoading;
   const probeNewApiPricing = useProbeNewApiPricing();
   const [dialogContent, setDialogContent] = useState<HTMLDivElement | null>(null);
   const [newApiPAT, setNewApiPAT] = useState('');
@@ -645,6 +584,8 @@ export function ChannelsModelPriceDialog() {
   const form = useForm<PriceFormData>({
     resolver: zodResolver(formSchema),
     mode: 'onChange',
+    // Scrolling unmounts editors; the complete draft must remain in form state.
+    shouldUnregister: false,
     defaultValues: {
       prices: [],
     },
@@ -657,8 +598,37 @@ export function ChannelsModelPriceDialog() {
     name: 'prices',
   });
 
+  const [priceScrollElement, setPriceScrollElement] = useState<HTMLDivElement | null>(null);
+  const priceListRef = useRef<HTMLDivElement>(null);
+  const [priceListOffset, setPriceListOffset] = useState(0);
+  const priceCards = useVirtualizer({
+    count: fields.length,
+    getScrollElement: () => priceScrollElement,
+    getItemKey: (index) => fields[index].id,
+    estimateSize: () => 400,
+    overscan: 2,
+    scrollMargin: priceListOffset,
+    enabled: isOpen,
+  });
+  useLayoutEffect(() => {
+    if (!priceScrollElement || !priceListRef.current) return;
+    const measureOffset = () => {
+      if (priceListRef.current) {
+        setPriceListOffset(
+          priceListRef.current.getBoundingClientRect().top - priceScrollElement.getBoundingClientRect().top + priceScrollElement.scrollTop
+        );
+      }
+    };
+    measureOffset();
+    const observer = new ResizeObserver(measureOffset);
+    // Preview/reference panels can change height independently of the price list.
+    for (const child of priceScrollElement.children) observer.observe(child);
+    observer.observe(priceScrollElement);
+    return () => observer.disconnect();
+  }, [priceScrollElement]);
+
   const supportedModels = useMemo(() => currentRow?.supportedModels || [], [currentRow?.supportedModels]);
-  const watchedPrices = useWatch({ control, name: 'prices' });
+  const watchedPrices = useWatch({ control, name: 'prices', compute: (prices) => prices.map(({ modelId }) => ({ modelId })) });
   const availableModelsByIndex = useMemo(
     () => buildAvailableModelsByIndex(watchedPrices || [], supportedModels),
     [supportedModels, watchedPrices]
@@ -720,7 +690,7 @@ export function ChannelsModelPriceDialog() {
               items: [
                 {
                   itemCode: 'prompt_tokens',
-                  pricing: { mode: 'usage_per_unit', usagePerUnit: '0' },
+                  pricing: { mode: 'usage_per_unit', usagePerUnit: '' },
                 },
               ],
             },
@@ -748,6 +718,7 @@ export function ChannelsModelPriceDialog() {
       (model) =>
         supported.has(model.modelId) &&
         !['unsupported', 'unavailable'].includes(model.quality) &&
+        !model.provenance?.issues?.some((issue) => issue.severity === 'BLOCKING') &&
         buildItemsFromNewApiPrice(model).length > 0
     );
   }, [newApiPreview, supportedModels]);
@@ -814,7 +785,7 @@ export function ChannelsModelPriceDialog() {
 
   const onSubmit = useCallback(
     async (data: PriceFormData) => {
-      if (!currentRow) return;
+      if (!currentRow || !editBaseData || editBaseFetching || editBaseError) return;
 
       try {
         const input = data.prices.map((p) => ({
@@ -857,16 +828,36 @@ export function ChannelsModelPriceDialog() {
           },
         }));
 
-        await createPriceDraft.mutateAsync({
-          channelId: currentRow.id,
+        const intent = pendingIntent.current ?? {
+          channelID: currentRow.id,
+          operationID,
+          expectedBaseRevision: editBaseData.revision,
           input,
-        });
+        };
+        const wasPending = pendingIntent.current !== null;
+        pendingIntent.current = intent;
+        let result = wasPending ? await findProviderOperation(intent.operationID) : null;
+        if (!result) {
+          if (JSON.stringify(input) !== JSON.stringify(intent.input)) throw new Error(t('eventPackages.pendingIntent'));
+          result = await createPriceDraft.mutateAsync(intent);
+        } else toast.info(t('eventPackages.recovered'));
+        pendingIntent.current = null;
+        toast[result.outcome === 'NO_CHANGE' ? 'info' : 'success'](
+          t(result.outcome === 'NO_CHANGE' ? 'eventPackages.noChange' : 'channels.messages.priceDraftCreated')
+        );
+        setOperationID(crypto.randomUUID());
+        if (result.changeSetDetail)
+          void navigate({ to: '/change-sets/$changeSetId', params: { changeSetId: result.changeSetDetail.summary.id } });
         handleClose();
-      } catch (_error) {
-        // Error handled by mutation
+      } catch (error) {
+        if (isDefinitePackageRejection(error)) {
+          pendingIntent.current = null;
+          setOperationID(crypto.randomUUID());
+        }
+        toast.error(error instanceof Error ? error.message : t('eventPackages.error'));
       }
     },
-    [createPriceDraft, currentRow, handleClose]
+    [createPriceDraft, currentRow, handleClose, editBaseData, editBaseFetching, editBaseError, operationID, t, navigate]
   );
 
   const addPrice = useCallback(() => {
@@ -877,7 +868,7 @@ export function ChannelsModelPriceDialog() {
         items: [
           {
             itemCode: 'prompt_tokens',
-            pricing: { mode: 'usage_per_unit', usagePerUnit: '0' },
+            pricing: { mode: 'usage_per_unit', usagePerUnit: '' },
           },
         ],
       },
@@ -959,7 +950,7 @@ export function ChannelsModelPriceDialog() {
           ...currentItems,
           {
             itemCode: nextCode,
-            pricing: { mode: 'usage_per_unit', usagePerUnit: '0' },
+            pricing: { mode: 'usage_per_unit', usagePerUnit: '' },
           },
         ]);
       }
@@ -996,7 +987,7 @@ export function ChannelsModelPriceDialog() {
         ...currentVariants,
         {
           variantCode: nextCode,
-          pricing: { mode: 'usage_per_unit', usagePerUnit: '0' },
+          pricing: { mode: 'usage_per_unit', usagePerUnit: '' },
         },
       ]);
     },
@@ -1047,6 +1038,11 @@ export function ChannelsModelPriceDialog() {
           </DialogDescription>
         </DialogHeader>
 
+        {editBase.isError && (
+          <p role='alert' className='text-destructive text-sm'>
+            {editBase.error.message}
+          </p>
+        )}
         {selectedPriceModelID && (
           <div className='bg-muted/30 flex shrink-0 items-center gap-2 border px-3 py-2 text-sm'>
             <IconCoin className='text-muted-foreground size-4 shrink-0' />
@@ -1060,8 +1056,9 @@ export function ChannelsModelPriceDialog() {
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className='flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'>
             <div
+              ref={setPriceScrollElement}
               data-testid='model-price-dialog-body'
-              className={cn('flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain pr-1', !selectedPriceModelID && 'md:contents')}
+              className='flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain pr-1'
             >
               <Card className='mb-3 shrink-0 border-emerald-500/30 bg-emerald-500/[0.04]'>
                 <CardContent className='space-y-3 pt-4'>
@@ -1245,33 +1242,38 @@ export function ChannelsModelPriceDialog() {
                   </div>
                 </CardContent>
               </Card>
-              <div
-                className={cn(
-                  'w-full min-w-0',
-                  selectedPriceModelID
-                    ? 'order-first shrink-0 md:flex-none md:overflow-visible md:pr-1'
-                    : 'md:min-h-0 md:flex-1 md:overflow-y-auto md:pr-1'
-                )}
-              >
-                <div className='space-y-4 py-4 md:pr-3'>
-                  {fields.map((field, index) => (
-                    <PriceCard
-                      key={field.id}
-                      availableModels={availableModelsByIndex[index] || supportedModels}
-                      control={control}
-                      t={t}
-                      priceIndex={index}
-                      currencyCode={field.currencyCode || defaultRowCurrency}
-                      onAddItem={addItem}
-                      onModelSelected={onModelSelected}
-                      onDuplicatePrice={duplicatePrice}
-                      onRemoveItem={removeItem}
-                      onRemovePrice={removePrice}
-                      onAddVariant={addVariant}
-                      onRemoveVariant={removeVariant}
-                    />
-                  ))}
-
+              <div className={cn('w-full min-w-0', 'shrink-0', selectedPriceModelID && 'order-first')}>
+                <div ref={priceListRef} className='relative my-4 w-full' style={{ height: priceCards.getTotalSize() }}>
+                  {priceCards.getVirtualItems().map((virtualRow) => {
+                    const index = virtualRow.index;
+                    const field = fields[index];
+                    return (
+                      <div
+                        key={field.id}
+                        data-index={index}
+                        ref={priceCards.measureElement}
+                        className='absolute top-0 left-0 w-full pb-4 md:pr-3'
+                        style={{ transform: `translateY(${virtualRow.start - priceListOffset}px)` }}
+                      >
+                        <PriceCard
+                          availableModels={availableModelsByIndex[index] || supportedModels}
+                          control={control}
+                          t={t}
+                          priceIndex={index}
+                          currencyCode={field.currencyCode || defaultRowCurrency}
+                          onAddItem={addItem}
+                          onModelSelected={onModelSelected}
+                          onDuplicatePrice={duplicatePrice}
+                          onRemoveItem={removeItem}
+                          onRemovePrice={removePrice}
+                          onAddVariant={addVariant}
+                          onRemoveVariant={removeVariant}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+                <div>
                   {fields.length === 0 && !isLoading && (
                     <div className='text-muted-foreground flex flex-col items-center justify-center py-12'>
                       <p>{t('price.noPrices')}</p>
@@ -1293,7 +1295,7 @@ export function ChannelsModelPriceDialog() {
                 <Button type='button' variant='ghost' onClick={handleClose}>
                   {t('common.buttons.cancel')}
                 </Button>
-                <Button type='submit' disabled={createPriceDraft.isPending}>
+                <Button type='submit' disabled={createPriceDraft.isPending || !editBase.data || editBase.isFetching || editBase.isError}>
                   {t('price.createDraft')}
                 </Button>
               </div>

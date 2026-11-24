@@ -25,6 +25,7 @@ const PRICING_CONFIGURATION_TABLES: &[&str] = &[
     "price_book_versions",
     "price_book_items",
     "price_tiers",
+    "retail_price_formulas",
     "project_commercial_profiles",
     "project_price_adjustments",
     "provider_price_snapshots",
@@ -967,7 +968,10 @@ async fn restore_pricing_configuration(
         "project_commercial_profiles",
         "project_price_adjustments",
         "channel_model_price_versions",
+        "retail_price_formulas",
     ];
+    let mut formula_heads = Vec::new();
+    let mut formula_ids = HashMap::new();
     for table in ORDERED_TABLES {
         let Some(rows) = sections.get(*table).and_then(Value::as_array) else {
             continue;
@@ -982,6 +986,63 @@ async fn restore_pricing_configuration(
             if *table == "project_commercial_profiles" {
                 restore_row_with_identity(tx, table, &columns, object, strategy, "project_id")
                     .await?;
+            } else if *table == "retail_price_formulas" {
+                let id = json_integer_key(object, "id")?
+                    .ok_or("retail_price_formulas backup row has no id")?;
+                let book = json_integer_key(object, "price_book_id")?
+                    .ok_or("retail_price_formulas backup row has no price_book_id")?;
+                let model = json_integer_key(object, "public_model_id")?
+                    .ok_or("retail_price_formulas backup row has no public_model_id")?;
+                let binding_id = sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM retail_price_formulas WHERE price_book_id=$1 AND public_model_id=$2 FOR UPDATE",
+                )
+                .bind(book)
+                .bind(model)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|error| error.to_string())?;
+                let mut restored_id = binding_id.unwrap_or(id);
+                let skip = matches!(
+                    strategy,
+                    conduit_admin_graphql::backup_ext::BackupConflictStrategy::Skip
+                );
+                if formula_ids.contains_key(&id) {
+                    return Err(format!(
+                        "retail_price_formulas backup contains duplicate id {id}"
+                    ));
+                }
+                if skip && binding_id.is_some() {
+                    formula_ids.insert(id, restored_id);
+                    continue;
+                }
+                let primary_collision = skip
+                    && binding_id.is_none()
+                    && sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM retail_price_formulas WHERE id=$1)",
+                    )
+                    .bind(id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // Formula configuration and its latest draft have circular
+                // references. Keep a conflicting binding's target identity,
+                // then restore the head after history IDs are mapped.
+                let mut configuration = object.clone();
+                configuration.insert("id".into(), restored_id.into());
+                configuration.insert("last_change_set_id".into(), Value::Null);
+                if primary_collision {
+                    // This ID belongs to another binding. Preserve it under
+                    // Skip and allocate an independent ID for the new binding.
+                    reset_id_sequence(tx, table)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    configuration.retain(|name, _| columns.contains(name));
+                    restored_id = restore_history_row(tx, table, configuration).await?;
+                } else {
+                    restore_row(tx, table, &columns, &configuration, strategy).await?;
+                }
+                formula_ids.insert(id, restored_id);
+                formula_heads.push((restored_id, json_integer_key(object, "last_change_set_id")?));
             } else {
                 restore_row(tx, table, &columns, object, strategy).await?;
             }
@@ -990,7 +1051,22 @@ async fn restore_pricing_configuration(
             .await
             .map_err(|error| error.to_string())?;
     }
-    restore_provider_pricing_history(tx, sections).await?;
+    let change_set_ids = restore_provider_pricing_history(tx, sections, &formula_ids).await?;
+    for (formula_id, source_head) in formula_heads {
+        let head = source_head
+            .map(|source| {
+                change_set_ids.get(&source).copied().ok_or_else(|| {
+                    format!("retail_price_formulas references missing change set {source}")
+                })
+            })
+            .transpose()?;
+        sqlx::query("UPDATE retail_price_formulas SET last_change_set_id=$2 WHERE id=$1")
+            .bind(formula_id)
+            .bind(head)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1003,7 +1079,8 @@ struct HistoryReference<'a> {
 async fn restore_provider_pricing_history(
     tx: &mut Transaction<'_, Postgres>,
     sections: &Map<String, Value>,
-) -> Result<(), String> {
+    formula_ids: &HashMap<i64, i64>,
+) -> Result<HashMap<i64, i64>, String> {
     let snapshot_ids =
         restore_history_section(tx, sections, "provider_price_snapshots", &[]).await?;
     let row_ids = restore_history_section(
@@ -1035,9 +1112,17 @@ async fn restore_provider_pricing_history(
         ],
     )
     .await?;
-    let change_set_ids = restore_history_section_with(tx, sections, "change_sets", &[], |object| {
-        remap_provider_change_set_source_revision(object, &snapshot_ids)
-    })
+    let change_set_ids = restore_history_section_with(
+        tx,
+        sections,
+        "change_sets",
+        &[HistoryReference {
+            column: "formula_id",
+            ids: formula_ids,
+            required: false,
+        }],
+        |object| remap_provider_change_set_source_revision(object, &snapshot_ids),
+    )
     .await?;
     restore_history_section_with(
         tx,
@@ -1049,6 +1134,13 @@ async fn restore_provider_pricing_history(
             required: true,
         }],
         |object| {
+            remap_history_json_reference(
+                "change_set_items",
+                object,
+                "source_snapshot",
+                "formulaID",
+                formula_ids,
+            )?;
             remap_history_json_reference(
                 "change_set_items",
                 object,
@@ -1076,6 +1168,13 @@ async fn restore_provider_pricing_history(
             required: true,
         }],
         |object| {
+            remap_history_json_reference(
+                "change_set_events",
+                object,
+                "detail",
+                "formulaID",
+                formula_ids,
+            )?;
             remap_history_json_reference(
                 "change_set_events",
                 object,
@@ -1116,7 +1215,7 @@ async fn restore_provider_pricing_history(
         ],
     )
     .await?;
-    Ok(())
+    Ok(change_set_ids)
 }
 
 async fn restore_history_section(
@@ -2202,6 +2301,7 @@ mod tests {
                 "price_book_versions",
                 "price_book_items",
                 "price_tiers",
+                "retail_price_formulas",
                 "project_commercial_profiles",
                 "project_price_adjustments",
                 "provider_price_snapshots",
@@ -2383,12 +2483,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pricing_formula_restore_skip_preserves_bindings_and_reallocates_primary_collisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let target = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        target.owners(&[42]).await?;
+        sqlx::query("INSERT INTO models(id,model_id,name,developer,type,\"group\",icon,model_card,settings,status) VALUES(60,'restore-model','Restore model','test','chat','test','','{}','{}','enabled')")
+            .execute(&target.pool).await?;
+        sqlx::query("INSERT INTO upstream_model_deployments(id,channel_id,upstream_model_id,internal_name,variant,status,source) VALUES(650,70,'restore-upstream','deployment','','enabled','discovered')")
+            .execute(&target.pool).await?;
+        sqlx::query("INSERT INTO price_books(id,name,currency,status,is_default) VALUES(800,'restore-book','CNY','enabled',false)")
+            .execute(&target.pool).await?;
+        sqlx::query("INSERT INTO retail_price_formulas(id,price_book_id,public_model_id,deployment_id,expression,parameters,enabled,revision,created_by,status,last_fingerprint) VALUES(821,800,60,650,'cost * local','{\"local\":\"9\"}',true,11,42,'DRAFT_READY','local-input')")
+            .execute(&target.pool).await?;
+        sqlx::query("INSERT INTO change_sets(id,operation_id,kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,formula_id,created_at,updated_at) VALUES(830,'00000000-0000-4000-8000-000000000831','retail_price','price_book','800','Local draft','draft','local-base','local-input',42,821,now(),now())")
+            .execute(&target.pool).await?;
+        sqlx::query("UPDATE retail_price_formulas SET last_change_set_id=830 WHERE id=821")
+            .execute(&target.pool)
+            .await?;
+        sqlx::query("INSERT INTO change_set_items(id,change_set_id,item_key,action,after_snapshot,source_snapshot,created_at,updated_at) VALUES(831,830,'local','create','{\"items\":[]}','{\"formulaID\":821}',now(),now())")
+            .execute(&target.pool).await?;
+        sqlx::query("INSERT INTO change_set_events(id,change_set_id,event_type,actor_type,detail,created_at) VALUES(832,830,'local_created','system','{\"formulaID\":821}',now())")
+            .execute(&target.pool).await?;
+        let before: Value =
+            sqlx::query_scalar("SELECT to_jsonb(f) FROM retail_price_formulas f WHERE id=821")
+                .fetch_one(&target.pool)
+                .await?;
+        let mut configuration = serde_json::json!({
+            "retail_price_formulas": [{
+                "id":820,"price_book_id":800,"public_model_id":60,"deployment_id":650,
+                "expression":"cost * markup","parameters":{"markup":"1.5"},
+                "enabled":true,"revision":1,"created_by":42,"status":"DRAFT_READY",
+                "last_fingerprint":"archived-input","last_change_set_id":830
+            }],
+            "change_sets": [{
+                "id":830,"operation_id":"00000000-0000-4000-8000-000000000830",
+                "kind":"retail_price","scope_type":"price_book","scope_id":"800",
+                "title":"Imported draft","status":"draft","base_revision":"archived-base",
+                "source_revision":"archived-input","created_by":42,"formula_id":820
+            }],
+            "change_set_items": [{
+                "id":831,"change_set_id":830,"item_key":"60","action":"create",
+                "after_snapshot":{"items":[]},"source_snapshot":{
+                    "formulaID":820,"formulaRevision":1,"inputFingerprint":"archived-input"
+                }
+            }],
+            "change_set_events": [{
+                "id":832,"change_set_id":830,"event_type":"created","actor_type":"system",
+                "detail":{"origin":"AUTOMATIC_SYNC","formulaID":820,"formulaRevision":1}
+            }]
+        });
+        // Real backup rows include every persisted column, including defaults
+        // and PostgreSQL's canonical timestamp representation.
+        for (table, id) in [
+            ("retail_price_formulas", 821),
+            ("change_sets", 830),
+            ("change_set_items", 831),
+            ("change_set_events", 832),
+        ] {
+            let mut archived: Value =
+                sqlx::query_scalar(&format!("SELECT to_jsonb(t) FROM {table} t WHERE id=$1"))
+                    .bind(id)
+                    .fetch_one(&target.pool)
+                    .await?;
+            archived
+                .as_object_mut()
+                .unwrap()
+                .extend(configuration[table][0].as_object().unwrap().clone());
+            configuration[table][0] = archived;
+        }
+        // Replay also checks history deduplication after both the formula and
+        // the conflicting draft ID have been mapped to the target database.
+        for _ in 0..2 {
+            let mut tx = target.pool.begin().await?;
+            restore_pricing_configuration(
+                &mut tx,
+                Some(&configuration),
+                BackupConflictStrategy::Skip,
+            )
+            .await?;
+            tx.commit().await?;
+            let after: Value =
+                sqlx::query_scalar("SELECT to_jsonb(f) FROM retail_price_formulas f WHERE id=821")
+                    .fetch_one(&target.pool)
+                    .await?;
+            assert_eq!(
+                after, before,
+                "Skip preserves all target configuration and its local head"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retail_price_formulas")
+                    .fetch_one(&target.pool)
+                    .await?,
+                1
+            );
+            let (imported_id, formula_id): (i64, i64) = sqlx::query_as(
+                "SELECT id,formula_id FROM change_sets WHERE title='Imported draft'",
+            )
+            .fetch_one(&target.pool)
+            .await?;
+            assert_ne!(
+                imported_id, 830,
+                "append-only history cannot replace the local draft"
+            );
+            assert_eq!(formula_id, 821);
+            let (item_head, source): (i64, Value) = sqlx::query_as(
+                "SELECT change_set_id,source_snapshot FROM change_set_items WHERE item_key='60'",
+            )
+            .fetch_one(&target.pool)
+            .await?;
+            assert_eq!(item_head, imported_id);
+            assert_eq!(source["formulaID"], 821);
+            assert_eq!(
+                source["formulaRevision"], 1,
+                "archived revision remains authoritative"
+            );
+            let (event_head, detail): (i64, Value) = sqlx::query_as(
+                "SELECT change_set_id,detail FROM change_set_events WHERE event_type='created'",
+            )
+            .fetch_one(&target.pool)
+            .await?;
+            assert_eq!(event_head, imported_id);
+            assert_eq!(detail["formulaID"], 821);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM change_sets")
+                    .fetch_one(&target.pool)
+                    .await?,
+                2
+            );
+        }
+        // The archive now uses the local formula's primary ID for a different
+        // model, with no existing natural binding in the target database.
+        sqlx::query("INSERT INTO models(id,model_id,name,developer,type,\"group\",icon,model_card,settings,status) VALUES(61,'restore-other-model','Other restore model','test','chat','test','','{}','{}','enabled')")
+            .execute(&target.pool).await?;
+        let mut primary_collision = configuration.clone();
+        let formula = &mut primary_collision["retail_price_formulas"][0];
+        formula["id"] = 821.into();
+        formula["public_model_id"] = 61.into();
+        formula["parameters"] = serde_json::json!({"markup":"2"});
+        formula["last_change_set_id"] = 833.into();
+        let package = &mut primary_collision["change_sets"][0];
+        package["id"] = 833.into();
+        package["operation_id"] = "00000000-0000-4000-8000-000000000833".into();
+        package["title"] = "Other imported draft".into();
+        package["formula_id"] = 821.into();
+        let item = &mut primary_collision["change_set_items"][0];
+        item["id"] = 834.into();
+        item["change_set_id"] = 833.into();
+        item["item_key"] = "61".into();
+        item["source_snapshot"]["formulaID"] = 821.into();
+        item["source_snapshot"]["publicModelID"] = 61.into();
+        let event = &mut primary_collision["change_set_events"][0];
+        event["id"] = 835.into();
+        event["change_set_id"] = 833.into();
+        event["detail"]["formulaID"] = 821.into();
+        let mut imported_identity = None;
+        for _ in 0..2 {
+            let mut tx = target.pool.begin().await?;
+            restore_pricing_configuration(
+                &mut tx,
+                Some(&primary_collision),
+                BackupConflictStrategy::Skip,
+            )
+            .await?;
+            tx.commit().await?;
+            let local: Value =
+                sqlx::query_scalar("SELECT to_jsonb(f) FROM retail_price_formulas f WHERE id=821")
+                    .fetch_one(&target.pool)
+                    .await?;
+            assert_eq!(
+                local, before,
+                "a primary collision must never overwrite the unrelated formula"
+            );
+            let (id, head, parameters): (i64, i64, Value) = sqlx::query_as("SELECT id,last_change_set_id,parameters FROM retail_price_formulas WHERE price_book_id=800 AND public_model_id=61")
+                .fetch_one(&target.pool).await?;
+            assert_ne!(id, 821, "the imported binding needs its own identity");
+            if let Some(previous) = imported_identity {
+                assert_eq!(id, previous);
+            }
+            imported_identity = Some(id);
+            assert_eq!(parameters, serde_json::json!({"markup":"2"}));
+            let (package_id, formula_id): (i64, i64) = sqlx::query_as(
+                "SELECT id,formula_id FROM change_sets WHERE title='Other imported draft'",
+            )
+            .fetch_one(&target.pool)
+            .await?;
+            assert_eq!(head, package_id);
+            assert_eq!(formula_id, id);
+            let (item_head, source): (i64, Value) = sqlx::query_as(
+                "SELECT change_set_id,source_snapshot FROM change_set_items WHERE item_key='61'",
+            )
+            .fetch_one(&target.pool)
+            .await?;
+            assert_eq!(item_head, head);
+            assert_eq!(source["formulaID"], id);
+            assert_eq!(source["publicModelID"], 61);
+            let (event_head, detail): (i64, Value) =
+                sqlx::query_as("SELECT change_set_id,detail FROM change_set_events WHERE id=835")
+                    .fetch_one(&target.pool)
+                    .await?;
+            assert_eq!(event_head, head);
+            assert_eq!(detail["formulaID"], id);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM retail_price_formulas")
+                    .fetch_one(&target.pool)
+                    .await?,
+                2
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM change_sets")
+                    .fetch_one(&target.pool)
+                    .await?,
+                3
+            );
+        }
+        target.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pricing_configuration_round_trips_between_isolated_databases_when_dsn_is_provided()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
             return Ok(());
         };
         let source = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        source.owners(&[42]).await?;
+        sqlx::query("INSERT INTO models(id,model_id,name,developer,type,\"group\",icon,model_card,settings,status) VALUES(60,'backup-model','Backup model','test','chat','test','','{}','{}','enabled')")
+            .execute(&source.pool).await?;
         sqlx::query(
             "INSERT INTO systems(key,value,created_at,updated_at) VALUES \
              ($1,$2,now(),now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, \
@@ -2448,6 +2772,13 @@ mod tests {
         )
         .execute(&source.pool)
         .await?;
+        sqlx::query("INSERT INTO retail_price_formulas(id,price_book_id,public_model_id,deployment_id,expression,parameters,enabled,created_by,status,last_fingerprint) VALUES(820,800,60,650,'cost * markup','{\"markup\":\"1.5\"}',true,42,'DRAFT_READY','backup-formula-input')")
+            .execute(&source.pool).await?;
+        sqlx::query("INSERT INTO change_sets(id,operation_id,kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,formula_id,created_at,updated_at) VALUES(830,'00000000-0000-4000-8000-000000000830','retail_price','price_book','800','Formula draft','draft','backup-retail-v1','backup-formula-input',42,820,now(),now())")
+            .execute(&source.pool).await?;
+        sqlx::query("UPDATE retail_price_formulas SET last_change_set_id=830 WHERE id=820")
+            .execute(&source.pool)
+            .await?;
         sqlx::query(
             "INSERT INTO pricing_change_audits \
              (id,actor_type,actor_id,operation,entity_type,entity_id,before_snapshot,after_snapshot, \
@@ -2504,6 +2835,9 @@ mod tests {
         );
 
         let target = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        target.owners(&[42]).await?;
+        sqlx::query("INSERT INTO models(id,model_id,name,developer,type,\"group\",icon,model_card,settings,status) VALUES(60,'backup-model','Backup model','test','chat','test','','{}','{}','enabled')")
+            .execute(&target.pool).await?;
         let target_system = Arc::new(conduit_services::SystemService::from_system_repo(
             Arc::new(conduit_db::PgSystemRepo::new(target.pool.clone())),
             Arc::new(NoopCache::new()),
@@ -2558,6 +2892,19 @@ mod tests {
                 .fetch_one(&target.pool)
                 .await?,
             "CNY"
+        );
+        let formula = sqlx::query("SELECT f.expression,f.parameters,f.enabled,c.formula_id,c.source_revision FROM retail_price_formulas f JOIN change_sets c ON c.id=f.last_change_set_id WHERE f.id=820")
+            .fetch_one(&target.pool).await?;
+        assert_eq!(formula.get::<String, _>("expression"), "cost * markup");
+        assert_eq!(
+            formula.get::<Value, _>("parameters"),
+            serde_json::json!({"markup":"1.5"})
+        );
+        assert!(formula.get::<bool, _>("enabled"));
+        assert_eq!(formula.get::<i64, _>("formula_id"), 820);
+        assert_eq!(
+            formula.get::<String, _>("source_revision"),
+            "backup-formula-input"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(

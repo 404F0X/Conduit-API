@@ -452,6 +452,10 @@ pub fn build_router_with_asset_source(
     let base_path = state.base_path().to_string();
 
     let mut router = Router::new();
+    router = router.route(
+        &mount_path(&base_path, "/api/payments/epay/notify"),
+        get(crate::payment_handlers::epay_notify),
+    );
 
     // Health follows the same mount contract as every other endpoint. With a
     // non-empty base path it is available at `<base_path>/health`; the legacy

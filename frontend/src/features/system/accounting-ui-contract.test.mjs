@@ -33,9 +33,14 @@ test('channel price queries and editor preserve required row currencies', () => 
   const dialog = readSource('features', 'channels', 'components', 'channels-model-price-dialog.tsx');
   const catalog = readSource('features', 'models', 'components', 'model-catalog.tsx');
   const channelMenu = readSource('features', 'channels', 'components', 'channel-overflow-menu.tsx');
+  const packageData = readSource('features', 'change-sets', 'data', 'change-sets.ts');
 
   assert.match(channelData, /channelModelPrices\s*\{\s*id\s*modelID\s*currencyCode/);
-  assert.match(channelData, /createProviderPriceChangeSet\(channelID: \$channelID, input: \$input\)/);
+  assert.match(
+    packageData,
+    /createProviderPriceChangeSet\(channelID: \$channelID, operationID: \$operationID, expectedBaseRevision: \$expectedBaseRevision, input: \$input/
+  );
+  assert.match(packageData, /providerPriceEditBase\(channelID: \$channelID\)[\s\S]*prices \{ id modelID currencyCode price/);
   assert.match(catalogData, /channelModelPrices\s*\{\s*id\s*modelID\s*currencyCode/);
   assert.match(dialog, /modelId:\s*p\.modelID,\s*currencyCode:\s*p\.currencyCode/);
   assert.match(dialog, /modelId:\s*p\.modelId,\s*currencyCode:\s*p\.currencyCode/);
@@ -46,13 +51,15 @@ test('channel price queries and editor preserve required row currencies', () => 
   assert.match(channelMenu, /hasSystemScope\('write_commercialization'\)[\s\S]*?openDialog\('price'\)/);
 });
 
-test('the review queue fetches every actionable status before client-side search', () => {
+test('the review queue pages complete packages with status and search bound on the server', () => {
   const page = readSource('features', 'change-sets', 'change-set-page.tsx');
   const data = readSource('features', 'change-sets', 'data', 'change-sets.ts');
 
-  assert.match(page, /statuses:\s*status === 'ACTIONABLE' \? ACTIONABLE_CHANGE_SET_STATUSES : undefined/);
-  assert.match(page, /status:\s*status !== 'ALL' && status !== 'ACTIONABLE' \? status : undefined/);
-  assert.match(data, /Promise\.all\([\s\S]*?new Set\(statuses\)[\s\S]*?\{ \.\.\.variables, status \}/);
+  assert.match(page, /statuses:\s*status === 'ALL' \? \[\] : \[status\]/);
+  assert.match(page, /search: deferredSearch \|\| undefined/);
+  assert.match(page, /'PENDING_REVIEW', 'APPROVED', 'DRAFT', 'INVALID', 'ALL'/);
+  assert.match(data, /changeSets\(filter: \$filter, after: \$after, first: \$first\)/);
+  assert.match(data, /totalCount statusCounts \{ status count \}/);
 });
 
 test('retail approval is only exposed by the unified review workbench', () => {
@@ -87,7 +94,7 @@ test('procurement drafts refresh the review queue and approved pricing refreshes
   assert.doesNotMatch(createProviderPriceDraft, /queryKey: \['generalSettings'\]/);
   assert.match(commercialization, /invalidatesAccountingCurrency/);
   assert.match(commercialization, /export function useCreatePriceBook\(\)[\s\S]*?true\s*\n\s*\);/);
-  assert.match(changeSets, /invalidateQueries\(\{ queryKey: \['generalSettings'\] \}\)/);
+  assert.match(changeSets, /'generalSettings'[\s\S]*\.map\(\(key\) => client.invalidateQueries\(\{ queryKey: \[key\] \}\)\)/);
   for (const hook of ['useCreateRetailPriceChangeSet', 'useSaveRetailPriceChangeSetItem', 'useSubmitChangeSet', 'useApproveChangeSet']) {
     assert.match(changeSets, new RegExp(`export function ${hook}\\(\\)`));
   }

@@ -4,13 +4,11 @@ import { useAuthStore } from '@/stores/authStore';
 import { useSelectedProjectId } from '@/stores/projectStore';
 import { type NavGroup, type NavItem } from '@/components/layout/types';
 import { useMe } from '@/features/auth/data/auth';
-import { isProductModeAllowed, useProductExperience } from '@/features/product-experience';
 
 export function useRoutePermissions() {
   const { user: authUser } = useAuthStore((state) => state.auth);
   const { data: meData } = useMe();
   const selectedProjectId = useSelectedProjectId();
-  const { mode: productMode } = useProductExperience();
 
   // Use data from me query if available, otherwise fall back to auth store
   const user = meData || authUser;
@@ -29,10 +27,6 @@ export function useRoutePermissions() {
   // 检查路由权限（根据 scopeLevel 决定检查哪个级别的权限）
   const hasRouteAccess = useCallback(
     (routeConfig: RouteConfig, groupScopeLevel?: ScopeLevel): boolean => {
-      if (!isProductModeAllowed(productMode, routeConfig.productModes)) {
-        return false;
-      }
-
       if (!routeConfig.requiredScopes || routeConfig.requiredScopes.length === 0) {
         return true;
       }
@@ -59,7 +53,7 @@ export function useRoutePermissions() {
       const predicate = (scope: string) => scopesToCheck.includes(scope);
       return routeConfig.scopeMatch === 'all' ? routeConfig.requiredScopes.every(predicate) : routeConfig.requiredScopes.some(predicate);
     },
-    [isOwner, productMode, projectScopes, systemScopes]
+    [isOwner, projectScopes, systemScopes]
   );
 
   // 检查路由组权限
@@ -108,6 +102,9 @@ export function useRoutePermissions() {
           return true;
         })
         .map((item) => {
+          if (item.items) {
+            return { ...item, items: item.items.filter((child) => checkRouteAccess(child.url as string).hasAccess) };
+          }
           if ('url' in item) {
             const access = checkRouteAccess(item.url as string);
 
@@ -118,7 +115,8 @@ export function useRoutePermissions() {
           }
 
           return item;
-        });
+        })
+        .filter((item) => !item.items || item.items.length > 0);
     };
   }, [checkRouteAccess]);
 

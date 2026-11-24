@@ -1,5 +1,32 @@
 # 操作、流程与证据导航
 
+当前分组、定价、Key 和支付增量见[知识入口](index.md)、[前端操作](frontend.md)及[后端契约](backend.md)；完整字段以[实际 SDL](../../tests/contracts/admin_graphql_schema.graphql)为准。下方日期与数量是对应历史探索基线。
+
+<a id="lite-full-current"></a>
+## Lite／Full 操作基线（2026-10-09）
+
+| 操作 | 用户入口 | 服务与失败恢复 |
+| --- | --- | --- |
+| Lite 六／五默认入口与全部高级功能 | 系统模式与三态覆盖；高级功能展开 | [操作步骤](frontend.md#lite-full-current)；仍需原权限 |
+| 十领域管理提案与独立审核／发布 | 常用表单保存→原因→草稿详情；高级固定命令 | [API](admin-graphql.md#lite-full-current)；版本变化重新读取，未知结果沿用原 operation ID |
+| 本人模型权益与成员累计限额 | 项目钱包选择模型；成员管理限额 | [账务与边界](backend.md#lite-full-current)；真实结算、跨 key、移除再加入历史不重置 |
+| 模块执行关闭与既发行权益 | 系统功能覆盖 | [运行控制](backend.md#lite-full-current)；拒绝新管理／发行但保留既有结算／兑换 |
+| NEWAPI 发现与人工快照 | 渠道保存后初始化；人工余额快照折叠 | 观察不先上线；回执含供给包并复用完成阶段 |
+
+机器字段与动作分别由 [SDL](../../tests/contracts/admin_graphql_schema.graphql)、[治理矩阵](../../tests/contracts/governance_mutations.json) 绑定。当前索引由本次授权实现者统一维护，身份与覆盖见 [索引](indexing.md)；旧 r3 索引禁令是历史合同，已失效。作者检查和模拟浏览器证据不等同于独立验收。
+
+## r3 高频导航历史基线
+
+| 操作 | 当前入口与步骤 | 契约/流程 |
+| --- | --- | --- |
+| 创建NEWAPI/统一地址编辑 | /channels文字创建；地址预览→保存→自动显式发现 | [发现步骤](frontend.md#newapi-discovery-r3)、[阶段回执图](frontend.md#flow-newapi-discovery-r3) |
+| 主动同步/本次结果 | 渠道行文字入口；新operation或读取原回执→仅失败阶段重试 | read/write_channels；历史重建另需商业写 |
+| 查看包/逐项差异/活动 | 结果精确ID→/change-sets/$changeSetId；新鲜详情/分页/返回筛选页 | [事件包](frontend.md#event-packages-r3) |
+| 手工价/指定草稿/修正/选定历史重建 | 原版完整基线/operation/revision；原包历史与其他意图保留 | [事务](backend.md#operation-packages-r3)、[全包流程](frontend.md#flow-event-package-r3) |
+| 送审/审核通过/发布/拒绝 | 当前detail动作与完整N项确认；失败重读持久终态 | read/write_commercialization；不扩大Owner、自审或项目权限 |
+
+新接口的实际机器契约见[19份文档fixture](../../tests/contracts/change-package-operations.json)。下方旧254/268/50页统计及原探索machine bindings是历史基线；当前新增精确包详情路由和商业/发现字段不能由旧清单担保。源内容身份见[当前输入](source-manifest.md)，旧 r3 图及禁令只属历史；当前授权统一维护见索引页。隔离PG/mock/门禁作者证据由r3候选绑定；真实NEWAPI/浏览器业务未运行，作者实现不是独立接受。
+
 所有操作均绑定当前[1366源输入](source-manifest.md)。用户操作、API入口和自动业务族口径分别保持；公共根字段、method/path与模板逐项列出，可复用Mermaid但不省略各自步骤。公共功能清单复用静态探索；本轮21项修复另有隔离PG与本地mock回归，未运行真实上游或浏览器业务。
 
 | 操作类别 | 逐项入口与流程 | 数量口径 |

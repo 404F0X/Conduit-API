@@ -966,72 +966,16 @@ fn unique_violation(error: &sqlx::Error) -> bool {
 #[async_trait]
 impl UserMutationServices for PostgresUserServiceAdapter {
     async fn create_user(&self, input: CreateUserInput) -> Result<User, UserServiceError> {
-        validate_create_user_input(&input)?;
-        let password = if input.password == OIDC_ONLY_PLACEHOLDER {
-            OIDC_ONLY_PLACEHOLDER.to_string()
-        } else {
-            encode_password_bcrypt_hex(&input.password, self.bcrypt_cost)
-                .map_err(|error| UserServiceError::Create(error.to_string()))?
-        };
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::Create(error.to_string()))?;
-        let result = sqlx::query_as::<_, UserRow>(&format!(
-            "INSERT INTO users (email, password, status, prefer_language, \
-             first_name, last_name, avatar, is_owner, scopes) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             RETURNING {USER_COLUMNS}"
-        ))
-        .bind(&input.email)
-        .bind(password)
-        .bind(status_to_wire(
-            input.status.unwrap_or(UserStatus::Activated),
-        ))
-        .bind(
-            input
-                .prefer_language
-                .clone()
-                .unwrap_or_else(|| "en".to_owned()),
-        )
-        .bind(input.first_name.clone().unwrap_or_default())
-        .bind(input.last_name.clone().unwrap_or_default())
-        .bind(input.avatar.clone())
-        .bind(input.is_owner.unwrap_or(false))
-        .bind(sqlx::types::Json(input.scopes.clone().unwrap_or_default()))
-        .fetch_one(&mut *tx)
-        .await;
-        let row = match result {
-            Ok(row) => row,
-            Err(error) if unique_violation(&error) => {
-                return Err(UserServiceError::DuplicateEmail(input.email));
-            }
-            Err(error) => return Err(UserServiceError::Create(error.to_string())),
-        };
-        if let Some(project_ids) = &input.project_ids {
-            add_project_memberships(
-                &mut tx,
-                db_id(&row.id)?,
-                project_ids,
-                UserServiceError::Create,
-            )
-            .await?;
-        }
-        if let Some(role_ids) = &input.role_ids {
-            add_roles(
-                &mut tx,
-                db_id(&row.id)?,
-                role_ids,
-                None,
-                UserServiceError::Create,
-            )
-            .await?;
-        }
+            .map_err(|e| UserServiceError::Create(e.to_string()))?;
+        let result = create_user_in_tx(&mut tx, self.bcrypt_cost, input).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::Create(error.to_string()))?;
-        Ok(user_to_gql(row))
+            .map_err(|e| UserServiceError::Create(e.to_string()))?;
+        Ok(result)
     }
 
     async fn update_user(
@@ -1039,141 +983,16 @@ impl UserMutationServices for PostgresUserServiceAdapter {
         id: &str,
         input: UpdateUserInput,
     ) -> Result<User, UserServiceError> {
-        validate_update_user_input(&input)?;
-        let user_id = db_id(id)?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::Update(error.to_string()))?;
-        let current: Option<(sqlx::types::Json<Vec<String>>, bool, String)> = sqlx::query_as(
-            "SELECT scopes, is_owner, status FROM users \
-             WHERE id = $1 AND deleted_at = 0 FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::Update(error.to_string()))?;
-        let Some((current_scopes, current_owner, current_status)) = current else {
-            return Err(UserServiceError::Update("user not found".to_string()));
-        };
-        let demoting_active_owner =
-            input.is_owner == Some(false) && current_owner && current_status == "activated";
-        let deactivating_owner = input.status == Some(UserStatus::Deactivated)
-            && current_owner
-            && current_status == "activated";
-        if demoting_active_owner || deactivating_owner {
-            ensure_not_last_system_owner(&mut tx, user_id, current_owner, UserServiceError::Update)
-                .await?;
-        }
-        let scopes = if input.clear_scopes == Some(true) {
-            Some(Vec::new())
-        } else if input.scopes.is_some() || input.append_scopes.is_some() {
-            let mut scopes = input.scopes.clone().unwrap_or(current_scopes.0);
-            scopes.extend(input.append_scopes.clone().unwrap_or_default());
-            Some(scopes)
-        } else {
-            None
-        };
-        let avatar = if input.clear_avatar == Some(true) {
-            Some(None)
-        } else {
-            input.avatar.clone().map(Some)
-        };
-        let password = match input.password.as_ref() {
-            Some(password) => Some(
-                encode_password_bcrypt_hex(password, self.bcrypt_cost)
-                    .map_err(|error| UserServiceError::Update(error.to_string()))?,
-            ),
-            None => None,
-        };
-        let mut builder = QueryBuilder::<Postgres>::new("UPDATE users SET ");
-        let mut set = builder.separated(", ");
-        if let Some(value) = input.email.clone() {
-            set.push("email = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = input.status {
-            set.push("status = ")
-                .push_bind_unseparated(status_to_wire(value));
-        }
-        if let Some(value) = input.prefer_language.clone() {
-            set.push("prefer_language = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = input.first_name.clone() {
-            set.push("first_name = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = input.last_name.clone() {
-            set.push("last_name = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = avatar {
-            set.push("avatar = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = input.is_owner {
-            set.push("is_owner = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = scopes {
-            set.push("scopes = ")
-                .push_bind_unseparated(sqlx::types::Json(value));
-        }
-        if let Some(value) = password {
-            set.push("password = ").push_bind_unseparated(value);
-        }
-        set.push("updated_at = now()");
-        drop(set);
-        builder
-            .push(" WHERE id = ")
-            .push_bind(user_id)
-            .push(" AND deleted_at = 0");
-        if let Err(error) = builder.build().execute(&mut *tx).await {
-            if unique_violation(&error) {
-                return Err(UserServiceError::DuplicateEmail(
-                    input.email.unwrap_or_default(),
-                ));
-            }
-            return Err(UserServiceError::Update(error.to_string()));
-        }
-        if input.clear_projects == Some(true) {
-            clear_project_memberships(&mut tx, user_id, UserServiceError::Update).await?;
-        } else {
-            if let Some(add) = &input.add_project_ids {
-                add_project_memberships(&mut tx, user_id, add, UserServiceError::Update).await?;
-            }
-            if let Some(remove) = &input.remove_project_ids {
-                for project_id in remove {
-                    remove_project_membership(
-                        &mut tx,
-                        user_id,
-                        db_id(project_id.as_str())?,
-                        UserServiceError::Update,
-                    )
-                    .await?;
-                }
-            }
-        }
-        if input.clear_roles == Some(true) {
-            sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|error| UserServiceError::Update(error.to_string()))?;
-        }
-        if let Some(add) = &input.add_role_ids {
-            add_roles(&mut tx, user_id, add, None, UserServiceError::Update).await?;
-        }
-        if let Some(remove) = &input.remove_role_ids {
-            remove_roles(&mut tx, user_id, remove, None, UserServiceError::Update).await?;
-        }
-        let row = sqlx::query_as::<_, UserRow>(&format!(
-            "SELECT {USER_COLUMNS} FROM users WHERE id = $1 AND deleted_at = 0"
-        ))
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::Update(error.to_string()))?;
+            .map_err(|e| UserServiceError::Update(e.to_string()))?;
+        let result = update_user_in_tx(&mut tx, self.bcrypt_cost, id, input).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::Update(error.to_string()))?;
-        Ok(user_to_gql(row))
+            .map_err(|e| UserServiceError::Update(e.to_string()))?;
+        Ok(result)
     }
 
     async fn update_user_status(
@@ -1181,329 +1000,77 @@ impl UserMutationServices for PostgresUserServiceAdapter {
         id: &str,
         status: UserStatus,
     ) -> Result<User, UserServiceError> {
-        let user_id = db_id(id)?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::UpdateStatus(error.to_string()))?;
-        let current: Option<(bool, String)> = sqlx::query_as(
-            "SELECT is_owner, status FROM users \
-             WHERE id = $1 AND deleted_at = 0 FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::UpdateStatus(error.to_string()))?;
-        let Some((is_owner, current_status)) = current else {
-            return Err(UserServiceError::UpdateStatus("user not found".to_string()));
-        };
-        if status == UserStatus::Deactivated && current_status == "activated" {
-            ensure_not_last_system_owner(
-                &mut tx,
-                user_id,
-                is_owner,
-                UserServiceError::UpdateStatus,
-            )
-            .await?;
-        }
-        let row = sqlx::query_as::<_, UserRow>(&format!(
-            "UPDATE users SET status = $1, updated_at = now() \
-             WHERE id = $2 AND deleted_at = 0 RETURNING {USER_COLUMNS}"
-        ))
-        .bind(status_to_wire(status))
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::UpdateStatus(error.to_string()))?
-        .ok_or_else(|| UserServiceError::UpdateStatus("user not found".to_string()))?;
+            .map_err(|e| UserServiceError::UpdateStatus(e.to_string()))?;
+        let result = update_user_status_in_tx(&mut tx, id, status).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::UpdateStatus(error.to_string()))?;
-        Ok(user_to_gql(row))
+            .map_err(|e| UserServiceError::UpdateStatus(e.to_string()))?;
+        Ok(result)
     }
 
     async fn delete_user(&self, id: &str) -> Result<(), UserServiceError> {
-        let user_id = db_id(id)?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::Delete(error.to_string()))?;
-        let user: Option<(String, bool)> = sqlx::query_as(
-            "SELECT email, is_owner FROM users \
-             WHERE id = $1 AND deleted_at = 0 FOR UPDATE",
-        )
-        .bind(user_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::Delete(error.to_string()))?;
-        let Some((email, is_owner)) = user else {
-            return Err(UserServiceError::Delete("failed to get user".to_string()));
-        };
-        if is_owner {
-            return Err(UserServiceError::Delete(
-                "cannot delete owner user, transfer ownership first".to_string(),
-            ));
-        }
-        let memberships: Vec<(i64, bool)> = sqlx::query_as(
-            "SELECT project_id, is_owner FROM user_projects \
-             WHERE user_id = $1 ORDER BY project_id",
-        )
-        .bind(user_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::Delete(error.to_string()))?;
-        for (project_id, membership_owner) in memberships {
-            ensure_not_last_project_owner(
-                &mut tx,
-                user_id,
-                project_id,
-                membership_owner,
-                UserServiceError::Delete,
-            )
-            .await?;
-        }
-        sqlx::query("DELETE FROM user_projects WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| UserServiceError::Delete(error.to_string()))?;
-        sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| UserServiceError::Delete(error.to_string()))?;
-        let max_deleted: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(deleted_at), 0) FROM users WHERE email = $1")
-                .bind(email)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|error| UserServiceError::Delete(error.to_string()))?;
-        let deleted_at = chrono::Utc::now()
-            .timestamp()
-            .max(max_deleted.saturating_add(1));
-        sqlx::query(
-            "UPDATE users SET deleted_at = $1, status = 'deactivated', updated_at = now() \
-             WHERE id = $2 AND deleted_at = 0",
-        )
-        .bind(deleted_at)
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+            .map_err(|e| UserServiceError::Delete(e.to_string()))?;
+        let result = delete_user_in_tx(&mut tx, id).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::Delete(error.to_string()))
+            .map_err(|e| UserServiceError::Delete(e.to_string()))?;
+        Ok(result)
     }
 
     async fn add_user_to_project(
         &self,
         input: AddUserToProjectInput,
     ) -> Result<UserProject, UserServiceError> {
-        let user_id = db_id(input.user_id.as_str())?;
-        let project_id = db_id(input.project_id.as_str())?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::AddToProject(error.to_string()))?;
-        let valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND deleted_at = 0) \
-             AND EXISTS(SELECT 1 FROM projects WHERE id = $2 AND deleted_at = 0)",
-        )
-        .bind(user_id)
-        .bind(project_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::AddToProject(error.to_string()))?;
-        if !valid {
-            return Err(UserServiceError::AddToProject(
-                "user or project not found".to_string(),
-            ));
-        }
-        let result = sqlx::query_as::<_, UserProjectRow>(&format!(
-            "INSERT INTO user_projects (user_id, project_id, is_owner, scopes) \
-             VALUES ($1, $2, $3, $4) RETURNING {USER_PROJECT_COLUMNS}"
-        ))
-        .bind(user_id)
-        .bind(project_id)
-        .bind(input.is_owner.unwrap_or(false))
-        .bind(sqlx::types::Json(input.scopes.unwrap_or_default()))
-        .fetch_one(&mut *tx)
-        .await;
-        let row = match result {
-            Ok(row) => row,
-            Err(error) if unique_violation(&error) => {
-                return Err(UserServiceError::AddToProject(format!(
-                    "user {user_id} is already a member of project {project_id}"
-                )));
-            }
-            Err(error) => return Err(UserServiceError::AddToProject(error.to_string())),
-        };
-        if let Some(role_ids) = &input.role_ids {
-            add_roles(
-                &mut tx,
-                user_id,
-                role_ids,
-                Some(project_id),
-                UserServiceError::AddToProject,
-            )
-            .await?;
-        }
+            .map_err(|e| UserServiceError::AddToProject(e.to_string()))?;
+        let result = add_user_to_project_in_tx(&mut tx, input).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::AddToProject(error.to_string()))?;
-        Ok(user_project_to_gql(row))
+            .map_err(|e| UserServiceError::AddToProject(e.to_string()))?;
+        Ok(result)
     }
 
     async fn remove_user_from_project(
         &self,
         input: RemoveUserFromProjectInput,
     ) -> Result<(), UserServiceError> {
-        let user_id = db_id(input.user_id.as_str())?;
-        let project_id = db_id(input.project_id.as_str())?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
-        let memberships: Vec<(i64, bool)> = sqlx::query_as(
-            "SELECT user_id, is_owner FROM user_projects \
-             WHERE project_id = $1 ORDER BY user_id FOR UPDATE",
-        )
-        .bind(project_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
-        let Some(is_owner) = memberships
-            .iter()
-            .find_map(|(member_id, is_owner)| (*member_id == user_id).then_some(*is_owner))
-        else {
-            tx.commit()
-                .await
-                .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
-            return Ok(());
-        };
-        ensure_not_last_project_owner(
-            &mut tx,
-            user_id,
-            project_id,
-            is_owner,
-            UserServiceError::RemoveFromProject,
-        )
-        .await?;
-        sqlx::query("DELETE FROM user_projects WHERE user_id = $1 AND project_id = $2")
-            .bind(user_id)
-            .bind(project_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
-        sqlx::query(
-            "DELETE FROM user_roles WHERE user_id = $1 \
-             AND role_id IN (SELECT id FROM roles WHERE project_id = $2)",
-        )
-        .bind(user_id)
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
+            .map_err(|e| UserServiceError::RemoveFromProject(e.to_string()))?;
+        let result = remove_user_from_project_in_tx(&mut tx, input).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))
+            .map_err(|e| UserServiceError::RemoveFromProject(e.to_string()))?;
+        Ok(result)
     }
 
     async fn update_project_user(
         &self,
         input: UpdateProjectUserInput,
     ) -> Result<UserProject, UserServiceError> {
-        let user_id = db_id(input.user_id.as_str())?;
-        let project_id = db_id(input.project_id.as_str())?;
         let mut tx = self
             .pool
             .begin()
             .await
-            .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
-        let memberships: Vec<(i64, bool)> = sqlx::query_as(
-            "SELECT user_id, is_owner FROM user_projects \
-             WHERE project_id = $1 ORDER BY user_id FOR UPDATE",
-        )
-        .bind(project_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
-        let Some(current_owner) = memberships
-            .iter()
-            .find_map(|(member_id, is_owner)| (*member_id == user_id).then_some(*is_owner))
-        else {
-            return Err(UserServiceError::UpdateProjectUser(
-                "failed to find user project relationship".to_string(),
-            ));
-        };
-        if current_owner && input.is_owner == Some(false) {
-            ensure_not_last_project_owner(
-                &mut tx,
-                user_id,
-                project_id,
-                true,
-                UserServiceError::UpdateProjectUser,
-            )
-            .await?;
-        }
-        let mut builder = QueryBuilder::<Postgres>::new("UPDATE user_projects SET ");
-        let mut set = builder.separated(", ");
-        if let Some(value) = input.is_owner {
-            set.push("is_owner = ").push_bind_unseparated(value);
-        }
-        if let Some(value) = input.scopes.clone() {
-            set.push("scopes = ")
-                .push_bind_unseparated(sqlx::types::Json(value));
-        }
-        set.push("updated_at = now()");
-        drop(set);
-        builder
-            .push(" WHERE user_id = ")
-            .push_bind(user_id)
-            .push(" AND project_id = ")
-            .push_bind(project_id);
-        builder
-            .build()
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
-        if let Some(add) = &input.add_role_ids {
-            add_roles(
-                &mut tx,
-                user_id,
-                add,
-                Some(project_id),
-                UserServiceError::UpdateProjectUser,
-            )
-            .await?;
-        }
-        if let Some(remove) = &input.remove_role_ids {
-            remove_roles(
-                &mut tx,
-                user_id,
-                remove,
-                Some(project_id),
-                UserServiceError::UpdateProjectUser,
-            )
-            .await?;
-        }
-        let row = sqlx::query_as::<_, UserProjectRow>(&format!(
-            "SELECT {USER_PROJECT_COLUMNS} FROM user_projects \
-             WHERE user_id = $1 AND project_id = $2"
-        ))
-        .bind(user_id)
-        .bind(project_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
+            .map_err(|e| UserServiceError::UpdateProjectUser(e.to_string()))?;
+        let result = update_project_user_in_tx(&mut tx, input).await?;
         tx.commit()
             .await
-            .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
-        Ok(user_project_to_gql(row))
+            .map_err(|e| UserServiceError::UpdateProjectUser(e.to_string()))?;
+        Ok(result)
     }
 }
 
@@ -1744,4 +1311,495 @@ mod tests {
         isolated.cleanup().await?;
         Ok(())
     }
+}
+
+pub(crate) async fn create_user_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    bcrypt_cost: u32,
+    input: CreateUserInput,
+) -> Result<User, UserServiceError> {
+    validate_create_user_input(&input)?;
+    let password = if input.password == OIDC_ONLY_PLACEHOLDER {
+        OIDC_ONLY_PLACEHOLDER.to_string()
+    } else {
+        encode_password_bcrypt_hex(&input.password, bcrypt_cost)
+            .map_err(|error| UserServiceError::Create(error.to_string()))?
+    };
+    create_user_prepared_in_tx(tx, input, password).await
+}
+pub(crate) async fn create_user_prepared_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    input: CreateUserInput,
+    password: String,
+) -> Result<User, UserServiceError> {
+    validate_create_user_input(&input)?;
+    let result = sqlx::query_as::<_, UserRow>(&format!(
+        "INSERT INTO users (email, password, status, prefer_language, \
+             first_name, last_name, avatar, is_owner, scopes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING {USER_COLUMNS}"
+    ))
+    .bind(&input.email)
+    .bind(password)
+    .bind(status_to_wire(
+        input.status.unwrap_or(UserStatus::Activated),
+    ))
+    .bind(
+        input
+            .prefer_language
+            .clone()
+            .unwrap_or_else(|| "en".to_owned()),
+    )
+    .bind(input.first_name.clone().unwrap_or_default())
+    .bind(input.last_name.clone().unwrap_or_default())
+    .bind(input.avatar.clone())
+    .bind(input.is_owner.unwrap_or(false))
+    .bind(sqlx::types::Json(input.scopes.clone().unwrap_or_default()))
+    .fetch_one(&mut **tx)
+    .await;
+    let row = match result {
+        Ok(row) => row,
+        Err(error) if unique_violation(&error) => {
+            return Err(UserServiceError::DuplicateEmail(input.email));
+        }
+        Err(error) => return Err(UserServiceError::Create(error.to_string())),
+    };
+    if let Some(project_ids) = &input.project_ids {
+        add_project_memberships(tx, db_id(&row.id)?, project_ids, UserServiceError::Create).await?;
+    }
+    if let Some(role_ids) = &input.role_ids {
+        add_roles(
+            tx,
+            db_id(&row.id)?,
+            role_ids,
+            None,
+            UserServiceError::Create,
+        )
+        .await?;
+    }
+    Ok(user_to_gql(row))
+}
+
+pub(crate) async fn update_user_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    bcrypt_cost: u32,
+    id: &str,
+    input: UpdateUserInput,
+) -> Result<User, UserServiceError> {
+    validate_update_user_input(&input)?;
+    let user_id = db_id(id)?;
+    let current: Option<(sqlx::types::Json<Vec<String>>, bool, String)> = sqlx::query_as(
+        "SELECT scopes, is_owner, status FROM users \
+             WHERE id = $1 AND deleted_at = 0 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::Update(error.to_string()))?;
+    let Some((current_scopes, current_owner, current_status)) = current else {
+        return Err(UserServiceError::Update("user not found".to_string()));
+    };
+    let demoting_active_owner =
+        input.is_owner == Some(false) && current_owner && current_status == "activated";
+    let deactivating_owner = input.status == Some(UserStatus::Deactivated)
+        && current_owner
+        && current_status == "activated";
+    if demoting_active_owner || deactivating_owner {
+        ensure_not_last_system_owner(tx, user_id, current_owner, UserServiceError::Update).await?;
+    }
+    let scopes = if input.clear_scopes == Some(true) {
+        Some(Vec::new())
+    } else if input.scopes.is_some() || input.append_scopes.is_some() {
+        let mut scopes = input.scopes.clone().unwrap_or(current_scopes.0);
+        scopes.extend(input.append_scopes.clone().unwrap_or_default());
+        Some(scopes)
+    } else {
+        None
+    };
+    let avatar = if input.clear_avatar == Some(true) {
+        Some(None)
+    } else {
+        input.avatar.clone().map(Some)
+    };
+    let password = match input.password.as_ref() {
+        Some(password) => Some(
+            encode_password_bcrypt_hex(password, bcrypt_cost)
+                .map_err(|error| UserServiceError::Update(error.to_string()))?,
+        ),
+        None => None,
+    };
+    let mut builder = QueryBuilder::<Postgres>::new("UPDATE users SET ");
+    let mut set = builder.separated(", ");
+    if let Some(value) = input.email.clone() {
+        set.push("email = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = input.status {
+        set.push("status = ")
+            .push_bind_unseparated(status_to_wire(value));
+    }
+    if let Some(value) = input.prefer_language.clone() {
+        set.push("prefer_language = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = input.first_name.clone() {
+        set.push("first_name = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = input.last_name.clone() {
+        set.push("last_name = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = avatar {
+        set.push("avatar = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = input.is_owner {
+        set.push("is_owner = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = scopes {
+        set.push("scopes = ")
+            .push_bind_unseparated(sqlx::types::Json(value));
+    }
+    if let Some(value) = password {
+        set.push("password = ").push_bind_unseparated(value);
+    }
+    set.push("updated_at = now()");
+    drop(set);
+    builder
+        .push(" WHERE id = ")
+        .push_bind(user_id)
+        .push(" AND deleted_at = 0");
+    if let Err(error) = builder.build().execute(&mut **tx).await {
+        if unique_violation(&error) {
+            return Err(UserServiceError::DuplicateEmail(
+                input.email.unwrap_or_default(),
+            ));
+        }
+        return Err(UserServiceError::Update(error.to_string()));
+    }
+    if input.clear_projects == Some(true) {
+        clear_project_memberships(tx, user_id, UserServiceError::Update).await?;
+    } else {
+        if let Some(add) = &input.add_project_ids {
+            add_project_memberships(tx, user_id, add, UserServiceError::Update).await?;
+        }
+        if let Some(remove) = &input.remove_project_ids {
+            for project_id in remove {
+                remove_project_membership(
+                    tx,
+                    user_id,
+                    db_id(project_id.as_str())?,
+                    UserServiceError::Update,
+                )
+                .await?;
+            }
+        }
+    }
+    if input.clear_roles == Some(true) {
+        sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| UserServiceError::Update(error.to_string()))?;
+    }
+    if let Some(add) = &input.add_role_ids {
+        add_roles(tx, user_id, add, None, UserServiceError::Update).await?;
+    }
+    if let Some(remove) = &input.remove_role_ids {
+        remove_roles(tx, user_id, remove, None, UserServiceError::Update).await?;
+    }
+    let row = sqlx::query_as::<_, UserRow>(&format!(
+        "SELECT {USER_COLUMNS} FROM users WHERE id = $1 AND deleted_at = 0"
+    ))
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::Update(error.to_string()))?;
+    Ok(user_to_gql(row))
+}
+
+pub(crate) async fn add_user_to_project_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    input: AddUserToProjectInput,
+) -> Result<UserProject, UserServiceError> {
+    let user_id = db_id(input.user_id.as_str())?;
+    let project_id = db_id(input.project_id.as_str())?;
+
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND deleted_at = 0) \
+             AND EXISTS(SELECT 1 FROM projects WHERE id = $2 AND deleted_at = 0)",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::AddToProject(error.to_string()))?;
+    if !valid {
+        return Err(UserServiceError::AddToProject(
+            "user or project not found".to_string(),
+        ));
+    }
+    let result = sqlx::query_as::<_, UserProjectRow>(&format!(
+        "INSERT INTO user_projects (user_id, project_id, is_owner, scopes) \
+             VALUES ($1, $2, $3, $4) RETURNING {USER_PROJECT_COLUMNS}"
+    ))
+    .bind(user_id)
+    .bind(project_id)
+    .bind(input.is_owner.unwrap_or(false))
+    .bind(sqlx::types::Json(input.scopes.unwrap_or_default()))
+    .fetch_one(&mut **tx)
+    .await;
+    let row = match result {
+        Ok(row) => row,
+        Err(error) if unique_violation(&error) => {
+            return Err(UserServiceError::AddToProject(format!(
+                "user {user_id} is already a member of project {project_id}"
+            )));
+        }
+        Err(error) => return Err(UserServiceError::AddToProject(error.to_string())),
+    };
+    if let Some(role_ids) = &input.role_ids {
+        add_roles(
+            tx,
+            user_id,
+            role_ids,
+            Some(project_id),
+            UserServiceError::AddToProject,
+        )
+        .await?;
+    }
+
+    Ok(user_project_to_gql(row))
+}
+pub(crate) async fn remove_user_from_project_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    input: RemoveUserFromProjectInput,
+) -> Result<(), UserServiceError> {
+    let user_id = db_id(input.user_id.as_str())?;
+    let project_id = db_id(input.project_id.as_str())?;
+
+    let memberships: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT user_id, is_owner FROM user_projects \
+             WHERE project_id = $1 ORDER BY user_id FOR UPDATE",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
+    let Some(is_owner) = memberships
+        .iter()
+        .find_map(|(member_id, is_owner)| (*member_id == user_id).then_some(*is_owner))
+    else {
+        return Ok(());
+    };
+    ensure_not_last_project_owner(
+        tx,
+        user_id,
+        project_id,
+        is_owner,
+        UserServiceError::RemoveFromProject,
+    )
+    .await?;
+    sqlx::query("DELETE FROM user_projects WHERE user_id = $1 AND project_id = $2")
+        .bind(user_id)
+        .bind(project_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
+    sqlx::query(
+        "DELETE FROM user_roles WHERE user_id = $1 \
+             AND role_id IN (SELECT id FROM roles WHERE project_id = $2)",
+    )
+    .bind(user_id)
+    .bind(project_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::RemoveFromProject(error.to_string()))?;
+    Ok(())
+}
+pub(crate) async fn update_project_user_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    input: UpdateProjectUserInput,
+) -> Result<UserProject, UserServiceError> {
+    let user_id = db_id(input.user_id.as_str())?;
+    let project_id = db_id(input.project_id.as_str())?;
+
+    let memberships: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT user_id, is_owner FROM user_projects \
+             WHERE project_id = $1 ORDER BY user_id FOR UPDATE",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
+    let Some(current_owner) = memberships
+        .iter()
+        .find_map(|(member_id, is_owner)| (*member_id == user_id).then_some(*is_owner))
+    else {
+        return Err(UserServiceError::UpdateProjectUser(
+            "failed to find user project relationship".to_string(),
+        ));
+    };
+    if current_owner && input.is_owner == Some(false) {
+        ensure_not_last_project_owner(
+            tx,
+            user_id,
+            project_id,
+            true,
+            UserServiceError::UpdateProjectUser,
+        )
+        .await?;
+    }
+    let mut builder = QueryBuilder::<Postgres>::new("UPDATE user_projects SET ");
+    let mut set = builder.separated(", ");
+    if let Some(value) = input.is_owner {
+        set.push("is_owner = ").push_bind_unseparated(value);
+    }
+    if let Some(value) = input.scopes.clone() {
+        set.push("scopes = ")
+            .push_bind_unseparated(sqlx::types::Json(value));
+    }
+    set.push("updated_at = now()");
+    drop(set);
+    builder
+        .push(" WHERE user_id = ")
+        .push_bind(user_id)
+        .push(" AND project_id = ")
+        .push_bind(project_id);
+    builder
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
+    if let Some(add) = &input.add_role_ids {
+        add_roles(
+            tx,
+            user_id,
+            add,
+            Some(project_id),
+            UserServiceError::UpdateProjectUser,
+        )
+        .await?;
+    }
+    if let Some(remove) = &input.remove_role_ids {
+        remove_roles(
+            tx,
+            user_id,
+            remove,
+            Some(project_id),
+            UserServiceError::UpdateProjectUser,
+        )
+        .await?;
+    }
+    let row = sqlx::query_as::<_, UserProjectRow>(&format!(
+        "SELECT {USER_PROJECT_COLUMNS} FROM user_projects \
+             WHERE user_id = $1 AND project_id = $2"
+    ))
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::UpdateProjectUser(error.to_string()))?;
+
+    Ok(user_project_to_gql(row))
+}
+pub(crate) async fn delete_user_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    id: &str,
+) -> Result<(), UserServiceError> {
+    let user_id = db_id(id)?;
+
+    let user: Option<(String, bool)> = sqlx::query_as(
+        "SELECT email, is_owner FROM users \
+             WHERE id = $1 AND deleted_at = 0 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+    let Some((email, is_owner)) = user else {
+        return Err(UserServiceError::Delete("failed to get user".to_string()));
+    };
+    if is_owner {
+        return Err(UserServiceError::Delete(
+            "cannot delete owner user, transfer ownership first".to_string(),
+        ));
+    }
+    let memberships: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT project_id, is_owner FROM user_projects \
+             WHERE user_id = $1 ORDER BY project_id",
+    )
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+    for (project_id, membership_owner) in memberships {
+        ensure_not_last_project_owner(
+            tx,
+            user_id,
+            project_id,
+            membership_owner,
+            UserServiceError::Delete,
+        )
+        .await?;
+    }
+    sqlx::query("DELETE FROM user_projects WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+    sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+    let max_deleted: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(deleted_at), 0) FROM users WHERE email = $1")
+            .bind(email)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+    let deleted_at = chrono::Utc::now()
+        .timestamp()
+        .max(max_deleted.saturating_add(1));
+    sqlx::query(
+        "UPDATE users SET deleted_at = $1, status = 'deactivated', updated_at = now() \
+             WHERE id = $2 AND deleted_at = 0",
+    )
+    .bind(deleted_at)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::Delete(error.to_string()))?;
+    Ok(())
+}
+pub(crate) async fn update_user_status_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    id: &str,
+    status: UserStatus,
+) -> Result<User, UserServiceError> {
+    let user_id = db_id(id)?;
+
+    let current: Option<(bool, String)> = sqlx::query_as(
+        "SELECT is_owner, status FROM users \
+             WHERE id = $1 AND deleted_at = 0 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::UpdateStatus(error.to_string()))?;
+    let Some((is_owner, current_status)) = current else {
+        return Err(UserServiceError::UpdateStatus("user not found".to_string()));
+    };
+    if status == UserStatus::Deactivated && current_status == "activated" {
+        ensure_not_last_system_owner(tx, user_id, is_owner, UserServiceError::UpdateStatus).await?;
+    }
+    let row = sqlx::query_as::<_, UserRow>(&format!(
+        "UPDATE users SET status = $1, updated_at = now() \
+             WHERE id = $2 AND deleted_at = 0 RETURNING {USER_COLUMNS}"
+    ))
+    .bind(status_to_wire(status))
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| UserServiceError::UpdateStatus(error.to_string()))?
+    .ok_or_else(|| UserServiceError::UpdateStatus("user not found".to_string()))?;
+
+    Ok(user_to_gql(row))
 }

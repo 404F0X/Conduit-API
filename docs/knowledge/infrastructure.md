@@ -4,6 +4,12 @@
 
 主 router 的 HTTP 路径须加 `server.base_path`；metrics 使用独立 listener 及自身配置路径，不自动加主服务前缀。配置源是 [模型](../../crates/conduit-config/src/model.rs)、[加载器](../../crates/conduit-config/src/loader.rs)、[验证器](../../crates/conduit-config/src/validate.rs) 和 [完整示例](../../config.example.yml)；运行中的管理设置还可能来自 PostgreSQL，不把所有 UI 设置等同于配置文件。
 
+## 在线支付配置
+
+`payments` 目前仅支持 YAML 配置，不自动映射 `CONDUIT_PAYMENTS_*`。默认 `enabled: false`；启用时固定 profile 为 `epay-classic-md5-reference-a4d0f042`，设置 gateway_base_url（HTTPS、尾部 `/`）、merchant_id、merchant_key、merchant_identity、notify_url、return_url、min_amount_minor、max_amount_minor、order_ttl_seconds。notify 路径为 `/api/payments/epay/notify`；金额限额是 CNY fen 整数。准确字段和校验以配置模型/验证器为准，merchant_key 不写进知识或诊断日志。
+
+可选 `gateway_ca_certificate` 仅向支付 provider client 附加 PEM CA，仍校验证书链及 hostname；无全局 trust 修改或跳过 TLS 开关。回调签名、checkout/query URL 和 merchant_key 不进通用日志。固定第三方 reference 的本地 TLS 模拟验证不等真实商户兼容；部署者需配置自己的可信 HTTPS 地址与商户资料。
+
 ## 配置方式
 
 优先级为默认值 → 配置 YAML → `CONDUIT_*` 环境变量 → loader 的调用方 overrides。当前可执行程序只暴露 `--config`，没有 `--port`；不能将 loader 的 `CliOverrides.server_port` 误写成实际命令行参数。默认缺少 `config.yml` 时依次搜索当前目录、`/etc/conduit`、用户 `.config/conduit`、`./conf`；显式指定的文件必须存在。

@@ -90,11 +90,20 @@ use crate::conv::channel_row_to_gql;
 /// [`ChannelMutationServices`].
 pub struct ChannelCrudAdapter {
     channel_repo: Arc<dyn ChannelRepo>,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl ChannelCrudAdapter {
     pub fn new(channel_repo: Arc<dyn ChannelRepo>) -> Self {
-        Self { channel_repo }
+        Self {
+            channel_repo,
+            pool: None,
+        }
+    }
+
+    pub fn with_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Materialize every live (non-deleted) channel row, paging through the repo
@@ -243,57 +252,59 @@ impl ChannelQueryServices for ChannelCrudAdapter {
 impl ChannelMutationServices for ChannelCrudAdapter {
     async fn create_channel(
         &self,
+        actor_user_id: Option<i64>,
         input: CreateChannelInput,
     ) -> Result<GqlChannel, ChannelServiceError> {
-        let ctx = boot_request_context();
-        let now = chrono::Utc::now().to_rfc3339();
-        // Retain the name for the duplicate-name error (the repo's
-        // `NameConflict` maps to Go `xerrors.DuplicateNameError("channel", …)`).
         let name = input.name.clone();
-        validate_official_openai_credentials(
-            channel_type_to_wire(input.channel_type),
-            input.base_url.as_deref(),
-            &input.credentials,
-        )
-        .map_err(ChannelServiceError::Create)?;
-        let website_url = normalize_website_url(input.website_url.clone())
-            .map_err(ChannelServiceError::Create)?;
-        let quota_currency = normalize_quota_currency(input.quota_currency.clone(), true)
-            .map_err(ChannelServiceError::Create)?;
-        let actual_quota_used = normalize_quota_amount(input.actual_quota_used.clone())
-            .map_err(ChannelServiceError::Create)?;
-        let quota_remaining = normalize_quota_amount(input.quota_remaining.clone())
-            .map_err(ChannelServiceError::Create)?;
-
-        let repo_input = RepoCreateChannelInput {
-            // PostgreSQL owns the generated PK; `id` is ignored on
-            // insert (read-back uses the DB id).
-            id: String::new(),
-            channel_type: channel_type_to_wire(input.channel_type).to_string(),
-            name: input.name,
-            base_url: input.base_url,
-            website_url,
-            quota_currency,
-            actual_quota_used,
-            quota_remaining,
-            credentials: credentials_input_to_json(input.credentials),
-            supported_models: input.supported_models,
-            manual_models: input.manual_models.unwrap_or_default(),
-            default_test_model: input.default_test_model,
-            auto_sync_supported_models: input.auto_sync_supported_models.unwrap_or(false),
-            auto_sync_model_pattern: input.auto_sync_model_pattern.unwrap_or_default(),
-            tags: input.tags.unwrap_or_default(),
-            policies: input.policies.map(policies_input_to_json),
-            settings: input.settings.map(settings_input_to_json),
-            endpoints: input
-                .endpoints
-                .map(|v| v.into_iter().map(endpoint_input_to_json).collect())
-                .unwrap_or_default(),
-            remark: input.remark,
-            ordering_weight: input.ordering_weight.unwrap_or(0),
-            created_at: now,
-        };
-
+        let ctx = boot_request_context();
+        let (repo_input, new_api, operation) = prepare_channel_create(actor_user_id, input)?;
+        if new_api {
+            let operation = operation
+                .ok_or_else(|| ChannelServiceError::Create("operationID required".into()))?;
+            let pool = self.pool.as_ref().ok_or_else(|| {
+                ChannelServiceError::Create("PostgreSQL operation persistence unavailable".into())
+            })?;
+            let mut intent = repo_input.clone();
+            intent.created_at.clear();
+            use sha2::Digest;
+            let fingerprint = format!(
+                "{:x}",
+                sha2::Sha256::digest(format!("{:?}:{:?}", actor_user_id, intent).as_bytes())
+            );
+            let mut tx = pool.begin().await.map_err(|_| {
+                ChannelServiceError::Create("STORAGE_FAILED: creation transaction failed".into())
+            })?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+                .bind(format!("channel-operation:{operation}"))
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| {
+                    ChannelServiceError::Create("STORAGE_FAILED: creation lock failed".into())
+                })?;
+            if let Some((channel,recorded,kind))=sqlx::query_as::<_,(i64,String,String)>("SELECT channel_id,request_fingerprint,operation_type FROM channel_operation_receipts WHERE operation_id=$1").bind(operation).fetch_optional(&mut *tx).await.map_err(|_|ChannelServiceError::Create("STORAGE_FAILED: creation receipt unavailable".into()))? {
+                if recorded!=fingerprint||kind!="NEW_API_DISCOVERY"{return Err(ChannelServiceError::Create("OPERATION_CONFLICT: creation intent differs".into()));}
+                let row=conduit_db::PgChannelRepo::find_channel_in_tx(&mut tx,&channel.to_string()).await.map_err(|_|ChannelServiceError::Create("STORAGE_FAILED: created channel unavailable".into()))?.ok_or_else(||ChannelServiceError::Create("OPERATION_CONFLICT: created channel is no longer available".into()))?;
+                tx.commit().await.map_err(|_|ChannelServiceError::Create("STORAGE_FAILED: receipt commit failed".into()))?;return Ok(channel_row_to_gql(row));
+            }
+            let row = conduit_db::PgChannelRepo::create_channel_in_tx(&mut tx, repo_input)
+                .await
+                .map_err(|e| match e {
+                    RepoError::NameConflict => ChannelServiceError::DuplicateName(name),
+                    _ => ChannelServiceError::Create(
+                        "STORAGE_FAILED: channel could not be saved".into(),
+                    ),
+                })?;
+            let stages = crate::wiring_postgres_channel_discovery::initial_results(
+                &[
+                    conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Models,
+                    conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Prices,
+                ],
+                None,
+            );
+            sqlx::query("INSERT INTO channel_operation_receipts(operation_id,channel_id,operation_type,origin,created_by,request_fingerprint,state,stage_results,created_at,updated_at) VALUES($1,$2,'NEW_API_DISCOVERY','CHANNEL_CREATE',$3,$4,'NOT_STARTED',$5,now(),now())").bind(operation).bind(row.id.parse::<i64>().map_err(|_|ChannelServiceError::Create("invalid channel ID".into()))?).bind(actor_user_id).bind(fingerprint).bind(sqlx::types::Json(stages)).execute(&mut *tx).await.map_err(|_|ChannelServiceError::Create("STORAGE_FAILED: creation receipt could not be saved".into()))?;
+            tx.commit().await.map_err(|_|ChannelServiceError::Create("STORAGE_FAILED: creation commit could not be confirmed; query the same operationID".into()))?;
+            return Ok(channel_row_to_gql(row));
+        }
         let row = self
             .channel_repo
             .create_channel(&ctx, repo_input)
@@ -310,6 +321,7 @@ impl ChannelMutationServices for ChannelCrudAdapter {
         id: &str,
         input: UpdateChannelInput,
     ) -> Result<GqlChannel, ChannelServiceError> {
+        let input = input;
         let ctx = boot_request_context();
         let db_id = channel_db_id(id).ok_or_else(|| {
             ChannelServiceError::Update(ChannelServiceError::NotFound.to_string())
@@ -326,114 +338,8 @@ impl ChannelMutationServices for ChannelCrudAdapter {
             .ok_or_else(|| {
                 ChannelServiceError::Update(ChannelServiceError::NotFound.to_string())
             })?;
-        let now = chrono::Utc::now().to_rfc3339();
-        // Name (if any) retained for the duplicate-name error.
         let name = input.name.clone();
-        let website_url = if input.clear_website_url.unwrap_or(false) {
-            Some(None)
-        } else if input.website_url.is_some() {
-            Some(
-                normalize_website_url(input.website_url.clone())
-                    .map_err(ChannelServiceError::Update)?,
-            )
-        } else {
-            None
-        };
-        let quota_currency = if input.quota_currency.is_some() {
-            Some(
-                normalize_quota_currency(input.quota_currency.clone(), false)
-                    .map_err(ChannelServiceError::Update)?,
-            )
-        } else {
-            None
-        };
-        let actual_quota_used = if input.clear_actual_quota_used.unwrap_or(false) {
-            Some(None)
-        } else if input.actual_quota_used.is_some() {
-            Some(
-                normalize_quota_amount(input.actual_quota_used.clone())
-                    .map_err(ChannelServiceError::Update)?,
-            )
-        } else {
-            None
-        };
-        let quota_remaining = if input.clear_quota_remaining.unwrap_or(false) {
-            Some(None)
-        } else if input.quota_remaining.is_some() {
-            Some(
-                normalize_quota_amount(input.quota_remaining.clone())
-                    .map_err(ChannelServiceError::Update)?,
-            )
-        } else {
-            None
-        };
-        if let Some(credentials) = input.credentials.as_ref() {
-            let channel_type = input
-                .channel_type
-                .map(channel_type_to_wire)
-                .unwrap_or(existing.channel_type.as_str());
-            let base_url = input.base_url.as_deref().or(existing.base_url.as_deref());
-            validate_official_openai_credentials(channel_type, base_url, credentials)
-                .map_err(ChannelServiceError::Update)?;
-        }
-
-        // auto_sync_model_pattern: Go else-if — clear wins over a simultaneous
-        // set. The repo stores an empty string as the cleared value.
-        let auto_sync_model_pattern = if input.clear_auto_sync_model_pattern.unwrap_or(false) {
-            Some(None)
-        } else {
-            input.auto_sync_model_pattern.map(Some)
-        };
-        // remark: Go SetRemark then ClearRemark — clear wins.
-        let remark = if input.clear_remark.unwrap_or(false) {
-            Some(None)
-        } else {
-            input.remark.map(Some)
-        };
-        // error_message: Go applies ClearErrorMessage only (never a Set).
-        let error_message = if input.clear_error_message.unwrap_or(false) {
-            Some(None)
-        } else {
-            None
-        };
-        let mut settings = input.settings.map(settings_input_to_json);
-        if let Some(settings) = settings.as_mut() {
-            preserve_redacted_proxy_password(settings, &existing.settings);
-        }
-
-        let repo_input = RepoUpdateChannelInput {
-            channel_type: input
-                .channel_type
-                .map(|t| channel_type_to_wire(t).to_string()),
-            name: input.name,
-            // Set-only (Go does not apply `clearBaseURL`).
-            base_url: input.base_url.map(Some),
-            website_url,
-            quota_currency,
-            actual_quota_used,
-            quota_remaining,
-            credentials: input.credentials.map(credentials_input_to_json),
-            // Not present on `UpdateChannelInput`; managed elsewhere.
-            disabled_api_keys: None,
-            supported_models: input.supported_models,
-            manual_models: input.manual_models,
-            auto_sync_supported_models: input.auto_sync_supported_models,
-            auto_sync_model_pattern,
-            tags: input.tags,
-            default_test_model: input.default_test_model,
-            policies: input.policies.map(policies_input_to_json),
-            settings,
-            endpoints: input
-                .endpoints
-                .map(|v| v.into_iter().map(endpoint_input_to_json).collect()),
-            remark,
-            ordering_weight: input.ordering_weight,
-            error_message,
-            // Go's `UpdateChannel` does not touch `status`.
-            status: None,
-            updated_at: now,
-        };
-
+        let repo_input = prepare_channel_update(input, &existing)?;
         let row = self
             .channel_repo
             .update_channel(&ctx, &db_id, repo_input)
@@ -468,6 +374,262 @@ impl ChannelMutationServices for ChannelCrudAdapter {
             })?;
         Ok(())
     }
+}
+
+pub(crate) fn prepare_channel_create(
+    actor_user_id: Option<i64>,
+    input: CreateChannelInput,
+) -> Result<(RepoCreateChannelInput, bool, Option<uuid::Uuid>), ChannelServiceError> {
+    let mut input = input;
+    let new_api = input
+        .settings
+        .as_ref()
+        .and_then(|s| s.management_adapter.as_deref())
+        == Some("new_api");
+    let operation = input
+        .operation_id
+        .as_ref()
+        .map(|id| uuid::Uuid::parse_str(id.as_str()))
+        .transpose()
+        .map_err(|_| {
+            ChannelServiceError::Create("OPERATION_CONFLICT: operationID must be a UUID".into())
+        })?;
+    if new_api {
+        if !matches!(
+            channel_type_to_wire(input.channel_type),
+            "openai" | "openai_responses"
+        ) {
+            return Err(ChannelServiceError::Create(
+                "NEWAPI management requires OpenAI or OpenAI Responses".into(),
+            ));
+        }
+        let root = canonical_new_api_url(
+            input
+                .base_url
+                .as_deref()
+                .or(input.website_url.as_deref())
+                .unwrap_or_default(),
+        )
+        .map_err(ChannelServiceError::Create)?;
+        input.base_url = Some(root.clone());
+        input.website_url = Some(root);
+        if operation.is_none() || actor_user_id.is_none() {
+            return Err(ChannelServiceError::Create(
+                "NEWAPI creation requires operationID and authenticated actor".into(),
+            ));
+        }
+    }
+    validate_new_api_account(&input.credentials).map_err(ChannelServiceError::Create)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    // Retain the name for the duplicate-name error (the repo's
+    // `NameConflict` maps to Go `xerrors.DuplicateNameError("channel", …)`).
+    validate_official_openai_credentials(
+        channel_type_to_wire(input.channel_type),
+        input.base_url.as_deref(),
+        &input.credentials,
+    )
+    .map_err(ChannelServiceError::Create)?;
+    let website_url =
+        normalize_website_url(input.website_url.clone()).map_err(ChannelServiceError::Create)?;
+    let quota_currency = normalize_quota_currency(input.quota_currency.clone(), true)
+        .map_err(ChannelServiceError::Create)?;
+    let actual_quota_used = normalize_quota_amount(input.actual_quota_used.clone())
+        .map_err(ChannelServiceError::Create)?;
+    let quota_remaining = normalize_quota_amount(input.quota_remaining.clone())
+        .map_err(ChannelServiceError::Create)?;
+
+    let repo_input = RepoCreateChannelInput {
+        // PostgreSQL owns the generated PK; `id` is ignored on
+        // insert (read-back uses the DB id).
+        id: String::new(),
+        channel_type: channel_type_to_wire(input.channel_type).to_string(),
+        name: input.name,
+        base_url: input.base_url,
+        website_url,
+        quota_currency,
+        actual_quota_used,
+        quota_remaining,
+        credentials: credentials_input_to_json(input.credentials),
+        supported_models: input.supported_models,
+        manual_models: input.manual_models.unwrap_or_default(),
+        default_test_model: input.default_test_model,
+        auto_sync_supported_models: input.auto_sync_supported_models.unwrap_or(false),
+        auto_sync_model_pattern: input.auto_sync_model_pattern.unwrap_or_default(),
+        tags: input.tags.unwrap_or_default(),
+        policies: input.policies.map(policies_input_to_json),
+        settings: input.settings.map(settings_input_to_json),
+        endpoints: input
+            .endpoints
+            .map(|v| v.into_iter().map(endpoint_input_to_json).collect())
+            .unwrap_or_default(),
+        remark: input.remark,
+        ordering_weight: input.ordering_weight.unwrap_or(0),
+        created_at: now,
+    };
+
+    Ok((repo_input, new_api, operation))
+}
+pub(crate) fn prepare_channel_update(
+    input: UpdateChannelInput,
+    existing: &ChannelRow,
+) -> Result<RepoUpdateChannelInput, ChannelServiceError> {
+    let mut input = input;
+    let new_api = input
+        .settings
+        .as_ref()
+        .and_then(|s| s.management_adapter.as_deref())
+        .or_else(|| {
+            existing
+                .settings
+                .get("managementAdapter")
+                .and_then(Value::as_str)
+        })
+        == Some("new_api");
+    if new_api {
+        let kind = input
+            .channel_type
+            .map(channel_type_to_wire)
+            .unwrap_or(existing.channel_type.as_str());
+        if !matches!(kind, "openai" | "openai_responses") {
+            return Err(ChannelServiceError::Update(
+                "NEWAPI management requires OpenAI or OpenAI Responses".into(),
+            ));
+        }
+        let root = canonical_new_api_url(
+            input
+                .base_url
+                .as_deref()
+                .or(input.website_url.as_deref())
+                .or(existing.base_url.as_deref())
+                .or(existing.website_url.as_deref())
+                .unwrap_or_default(),
+        )
+        .map_err(ChannelServiceError::Update)?;
+        input.base_url = Some(root.clone());
+        input.website_url = Some(root);
+        input.clear_website_url = Some(false);
+    }
+    if let Some(credentials) = &input.credentials {
+        validate_new_api_account(credentials).map_err(ChannelServiceError::Update)?;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    // Name (if any) retained for the duplicate-name error.
+    let website_url = if input.clear_website_url.unwrap_or(false) {
+        Some(None)
+    } else if input.website_url.is_some() {
+        Some(
+            normalize_website_url(input.website_url.clone())
+                .map_err(ChannelServiceError::Update)?,
+        )
+    } else {
+        None
+    };
+    let quota_currency = if input.quota_currency.is_some() {
+        Some(
+            normalize_quota_currency(input.quota_currency.clone(), false)
+                .map_err(ChannelServiceError::Update)?,
+        )
+    } else {
+        None
+    };
+    let actual_quota_used = if input.clear_actual_quota_used.unwrap_or(false) {
+        Some(None)
+    } else if input.actual_quota_used.is_some() {
+        Some(
+            normalize_quota_amount(input.actual_quota_used.clone())
+                .map_err(ChannelServiceError::Update)?,
+        )
+    } else {
+        None
+    };
+    let quota_remaining = if input.clear_quota_remaining.unwrap_or(false) {
+        Some(None)
+    } else if input.quota_remaining.is_some() {
+        Some(
+            normalize_quota_amount(input.quota_remaining.clone())
+                .map_err(ChannelServiceError::Update)?,
+        )
+    } else {
+        None
+    };
+    if let Some(credentials) = input.credentials.as_ref() {
+        let channel_type = input
+            .channel_type
+            .map(channel_type_to_wire)
+            .unwrap_or(existing.channel_type.as_str());
+        let base_url = input.base_url.as_deref().or(existing.base_url.as_deref());
+        validate_official_openai_credentials(channel_type, base_url, credentials)
+            .map_err(ChannelServiceError::Update)?;
+    }
+
+    // auto_sync_model_pattern: Go else-if — clear wins over a simultaneous
+    // set. The repo stores an empty string as the cleared value.
+    let auto_sync_model_pattern = if input.clear_auto_sync_model_pattern.unwrap_or(false) {
+        Some(None)
+    } else {
+        input.auto_sync_model_pattern.map(Some)
+    };
+    // remark: Go SetRemark then ClearRemark — clear wins.
+    let remark = if input.clear_remark.unwrap_or(false) {
+        Some(None)
+    } else {
+        input.remark.map(Some)
+    };
+    // error_message: Go applies ClearErrorMessage only (never a Set).
+    let error_message = if input.clear_error_message.unwrap_or(false) {
+        Some(None)
+    } else {
+        None
+    };
+    let mut settings = input.settings.map(settings_input_to_json);
+    if let Some(settings) = settings.as_mut() {
+        preserve_redacted_proxy_password(settings, &existing.settings);
+    }
+
+    let repo_input = RepoUpdateChannelInput {
+        channel_type: input
+            .channel_type
+            .map(|t| channel_type_to_wire(t).to_string()),
+        name: input.name,
+        // Set-only (Go does not apply `clearBaseURL`).
+        base_url: input.base_url.map(Some),
+        website_url,
+        quota_currency,
+        actual_quota_used,
+        quota_remaining,
+        credentials: input.credentials.map(|credentials| {
+            let mut json = credentials_input_to_json(credentials);
+            for key in ["newApiPat", "newApiUserID"] {
+                if json.get(key).is_none() {
+                    if let Some(value) = existing.credentials.get(key) {
+                        json[key] = value.clone();
+                    }
+                }
+            }
+            json
+        }),
+        // Not present on `UpdateChannelInput`; managed elsewhere.
+        disabled_api_keys: None,
+        supported_models: input.supported_models,
+        manual_models: input.manual_models,
+        auto_sync_supported_models: input.auto_sync_supported_models,
+        auto_sync_model_pattern,
+        tags: input.tags,
+        default_test_model: input.default_test_model,
+        policies: input.policies.map(policies_input_to_json),
+        settings,
+        endpoints: input
+            .endpoints
+            .map(|v| v.into_iter().map(endpoint_input_to_json).collect()),
+        remark,
+        ordering_weight: input.ordering_weight,
+        error_message,
+        // Go's `UpdateChannel` does not touch `status`.
+        status: None,
+        updated_at: now,
+    };
+
+    Ok(repo_input)
 }
 
 pub(crate) fn normalize_website_url(value: Option<String>) -> Result<Option<String>, String> {
@@ -545,7 +707,7 @@ fn validate_official_openai_credentials(
 
 /// GraphQL `ChannelType` → the snake_case wire literal stored in the `type`
 /// column. Exact reverse of `conv::channel_type_from_str`.
-fn channel_type_to_wire(t: ChannelType) -> &'static str {
+pub(crate) fn channel_type_to_wire(t: ChannelType) -> &'static str {
     match t {
         ChannelType::Openai => "openai",
         ChannelType::OpenaiResponses => "openai_responses",
@@ -641,7 +803,7 @@ fn proxy_type_to_wire(p: ProxyType) -> &'static str {
 // exact shape `conv::channel_row_to_gql` reads back).
 // ---------------------------------------------------------------------------
 
-fn policies_input_to_json(p: ChannelPoliciesInput) -> Value {
+pub(crate) fn policies_input_to_json(p: ChannelPoliciesInput) -> Value {
     let core = core_ch::ChannelPolicies {
         stream: p
             .stream
@@ -662,7 +824,7 @@ fn endpoint_input_to_json(e: ChannelEndpointInput) -> Value {
     serde_json::to_value(core).unwrap_or_else(|_| Value::Object(JsonMap::new()))
 }
 
-fn settings_input_to_json(s: ChannelSettingsInput) -> Value {
+pub(crate) fn settings_input_to_json(s: ChannelSettingsInput) -> Value {
     let core = core_ch::ChannelSettings {
         management_adapter: s
             .management_adapter
@@ -866,6 +1028,8 @@ fn preserve_redacted_proxy_password(incoming_settings: &mut Value, stored_settin
 /// ChannelCredentials` parity: `apiKey`/`apiKeys`/`gcp`/`oauth`). Credentials
 /// are sensitive and never surfaced back on the GraphQL `Channel` type.
 fn credentials_input_to_json(c: ChannelCredentialsInput) -> Value {
+    let pat = c.new_api_pat.clone();
+    let user_id = c.new_api_user_id.clone();
     let core = core_ch::ChannelCredentials {
         api_key: c.api_key.unwrap_or_default(),
         oauth: c.oauth.map(oauth_input_to_json),
@@ -877,7 +1041,14 @@ fn credentials_input_to_json(c: ChannelCredentialsInput) -> Value {
             json_data: g.json_data,
         }),
     };
-    serde_json::to_value(core).unwrap_or_else(|_| Value::Object(JsonMap::new()))
+    let mut value = serde_json::to_value(core).unwrap_or_else(|_| Value::Object(JsonMap::new()));
+    if let Some(pat) = pat {
+        value["newApiPat"] = Value::String(pat);
+    }
+    if let Some(id) = user_id {
+        value["newApiUserID"] = Value::String(id);
+    }
+    value
 }
 
 /// Lower an `OAuthCredentialsInput` into the raw oauth JSON (Go
@@ -1398,4 +1569,37 @@ mod proxy_secret_tests {
 
         assert_eq!(incoming["proxy"]["password"], "");
     }
+}
+
+pub(crate) fn canonical_new_api_url(raw: &str) -> Result<String, String> {
+    let mut url =
+        url::Url::parse(raw.trim()).map_err(|_| "NEWAPI base URL must be an absolute HTTP URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("NEWAPI base URL must be HTTP(S) without embedded credentials".into());
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/');
+    let path = path.strip_suffix("/v1").unwrap_or(path).to_string();
+    url.set_path(&path);
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+fn validate_new_api_account(c: &ChannelCredentialsInput) -> Result<(), String> {
+    if c.new_api_user_id
+        .as_ref()
+        .is_some_and(|id| id.parse::<i64>().map_or(true, |id| id <= 0))
+    {
+        return Err("NEWAPI user ID must be a positive integer".into());
+    }
+    if c.new_api_pat
+        .as_ref()
+        .is_some_and(|pat| pat.trim().is_empty())
+    {
+        return Err("NEWAPI PAT must not be empty".into());
+    }
+    Ok(())
 }

@@ -1,8 +1,114 @@
 # 前端页面、用户操作与流程
 
-绑定[源码输入清单](source-manifest.md)，原静态研究来源FRONTEND_RESEARCH a2/r2；本轮修复另有前端单元/构建及隔离PG回归，未运行浏览器或真实上游。50页面+2布局、31 feature目录。每个UI操作有入口/权限/步骤/失败说明；组合ID是同段不同操作的别名。根字段的独立操作与精确参数见[管理GraphQL](admin-graphql.md)，客户端所有模板见[268文档](frontend-client-operations.md)。
+## 同名模型键与价格公式（2026-10-13）
 
-Playground前端交互已实现，但生产缺POST /admin/playground/chat；GET /admin/playground是另一个GraphQL调试入口。占位表单、Fake chats、静态Help/Permission、缺/requests与/project/usage-logs页面均按当前实现标明。
+在模型目录查看显示名、唯一模型键和映射渠道；显示名可以重复，创建、批量创建和编辑仍要求模型键唯一。模型选择使用内部对象 ID，显示名称与键，不按同名覆盖另一个模型。渠道改名不会改变公共键。
+
+打开已配置公共模型详情，选择“自动定价公式”。选定明确的已启用映射来源，编辑例如 `cost * markup`，常量填写 `{"markup":"1.2"}`，可启用／停用并先运行服务器预览。每个价格簿和模型独立保存配置；Token 项按每百万 Tokens，按次项按每次，缓存／阶梯分别计算并保留结构。保存后查看状态和最近价格包，再按既有治理发布；基础价之外，项目有效倍率在收费时乘一次。预览及草稿不会即时改客户收费。来源变动或不可用需重新核对并保存，服务器不会另选渠道；停用保留最后有效价格。手工改价后的项目解除派生标记。
+
+<a id="lite-full-current"></a>
+## Lite／Full 操作与审批基线（2026-10-09）
+
+两种模式使用相同产品功能。新初始化选择 Lite（`SIMPLE`）且审批关闭；升级保留已有模式、覆盖项、旧三类审批选择及历史包。没有配置的旧实例继续按 Full（`ENTERPRISE`）投影。Owner 在系统设置选择模式和功能覆盖：`INHERIT` 使用模式默认，`ON` 固定显示或执行，`OFF` 收入高级入口或停止该模块。切换模式不清空覆盖项。
+
+Lite 管理默认六入口：概览、渠道、模型、用户／分组、计费、请求；普通成员默认五入口：项目概览、API key、模型市场、钱包、请求。展开“高级功能”可访问权限允许的其余入口；显式显示的功能另列固定入口。隐藏不会撤销权限，URL、API、审批策略分别验证。Full 也保留显式隐藏功能的高级入口。执行控制只用于运营报表、自动模型同步、上游观察、兑换码发行、订阅管理；停止发行或管理后，既发行兑换码仍能兑换，既有订阅周期和普通结算继续运行。
+
+在系统设置展开“审批策略与提案”，选择需要审批的十类领域。启用时明确选择允许合资格管理员自审，或要求另一合资格审核者；后者缺少审核者时明确拒绝保存或送审。角色分别授予领域写入、`review_changes`、`publish_changes`、`manage_governance`。Project owner 不因此取得系统授信或系统策略权限。
+
+常用原生表单保存遇到审批要求时，弹出提案原因，使用同一份表单创建草稿；页面跳转到精确包 ID，表单不会伪装成已经上线。详情“送审”→“审核通过”只进入 `APPROVED`，再“发布”才上线。`ApproveApply` API 便捷动作要求两项职责并在一个事务内完成审核和发布；`Approve` 与 `approveChangeSet` 始终只审核。审批关闭时草稿可直接发布，并如实显示没有审核步骤。来源改变、权限撤回或任一项目失败时整包拒绝，重读持久状态；网络响应丢失沿用原操作 ID 和原基线。
+
+密码、渠道凭据、生成的 key／兑换码不出现在公开项目、活动或错误中。创建者在发布后可以通过一次性私密领取查看生成值；领取后不能再次读取。高级固定命令编辑器沿用权限与相同发布事务，动作及字段由服务器固定注册，不接受任意 SQL 或解析器重放。
+
+钱包显示本人在当前 Project 的资金。未选模型时仅显示本人通用额度；输入模型并确认后，服务器核对访问资格、正式报价和本人定向额度。共用 Project 余额、本人通用／定向额度、成员预算剩余和最终准入分别显示，不把其他成员订阅算给本人。预算为空表示无限，0 表示禁止新请求；成员管理可修改累计 Credits 限额，累计已结算消费和当前预留另列。移除再加入、换 key 不重置累计消费。
+
+渠道创建／编辑保留 NEWAPI 单址和完整支持模型操作，人工余额快照默认折叠，并明确这是上游余额快照而非站内 Credits。采购价的 103 行滚动编辑、真实零价、缓存和阶梯价格继续保留。
+
+```mermaid
+flowchart TD
+ A[常用表单 保存配置] --> B{该领域需要审批}
+ B -->|否| C[授权校验后直接事务写入]
+ B -->|是| D[填原因 创建独立草稿]
+ D --> E[整包送审]
+ E --> F[合资格审核者 审核通过]
+ F --> G[APPROVED 尚未上线]
+ G --> H[合资格发布者 校验当前权限和来源]
+ H --> I{全部命令成功}
+ I -->|是| J[一次提交 上线与审计]
+ I -->|否| K[全部回滚 保存失败状态]
+```
+
+<a id="event-packages-r3"></a>
+## 当前事件包与 NEWAPI 发现（2026-10-08）
+
+本节是 `/change-sets`、`/changelog`、`/change-sets/$changeSetId` 与 NEWAPI 渠道流程的当前约定，替代下方原探索中的 `limit` 列表、全量详情 dialog 和不带 revision 的审批步骤。一次用户操作按一个 kind/一个 scope 创建独立包；不同操作不会按标题、时间或同渠道合并。模型映射和采购价分别审批。旧事件来源无法证明时显示未知，不伪造操作历史。
+
+1. 在“草稿与审批”选择待审批、草稿、需处理或全部；按类型、范围和搜索筛选。每页20个包，计数来自完整服务端结果，不是当前页的行数。摘要显示渠道/价格簿名、来源、发起者、时间、完整项数与需处理项数；新增、修改、删除使用明确的项目计数文字，省略零项。长列表通过页面滚动查看完整最后一行及其后的分页，目标名称与摘要可换行。未创建任何包与筛选无匹配分别提示；筛选为空时可一键清除搜索、类型、范围和状态，回全部历史。状态计数跨队列但仍保留类型/范围/搜索条件，不能将筛选计数当全库为空。未创建任何包与筛选无匹配分别提示；筛选为空时可一键清除搜索、类型、范围和状态，回全部历史。状态计数跨队列但仍保留类型/范围/搜索条件，不能将筛选计数当全库为空。
+2. 打开精确包ID。详情重新读取当前状态、revision 和可用动作；概览、变更、活动分别加载，变更和活动每页50项。列表不下载全部 snapshot。打开单项先看改动字段的原值、提议值、当前生效值及单位；按量、固定、分段累计和按总量档位均显示本身计费方式、档位上限/无上限及真实单价；缓存5分钟/1小时变体单独列出，只有变体变化也属于差异。未改值折叠，技术 JSON 可核对完整原值、提议值、当前值和来源。活动展示真实主体与时间：有名字则使用名字，否则显示完整actorID，无法证明的旧主体保留未知。返回保留状态、范围、搜索和服务端页游标；共享详情地址不会产生外部跳转。
+3. 采购价弹窗的大批量价格按实际滚动位置挂载单套编辑器，全部行及缓存/档位值保留在本地表单；“应用到草稿”仍只是填入表单，点击“创建草稿”才提交完整价格集合。手工采购价新编辑读取完整当前价及版本，使用新的 operationID 创建独立包；继续编辑指定 DRAFT 使用它的 expectedRevision。全包价格集合校验，缓存价缺失与真实零价分别处理。无差异有持久 NO_CHANGE 回执，无空审批包。零售价编辑以价格簿当前基线为准，只保存本包增量；发布保留未修改模型价格。简单编辑器仅支持唯一的四类 Token 单价项或单个 request 固定费；阶梯、混合、缓存变体、扩展或未知结构以完整 JSON 只读展示，禁止保存部分替换，并提供零售价价格包入口。零值可编辑；保存仍仅写草稿。
+4. 整包有效且非空才能送审，保存与送审均尚未生效。“审核通过”不写正式配置，之后“发布 N 项”始终提交整个包，详情筛选不会缩小批准范围。读取失败/刷新中不可批准；revision、来源或基线变化需重读。失败或响应丢失后重新查询持久状态，包括实际已APPLIED的结果；终态/动作失效时关闭旧确认框，保留本地审核意见并提示重读结果。按钮及执行函数再次检查最新可用动作，不能继续批准已终止包。
+5. INVALID/SUPERSEDED 原包保持历史。采购价修正需加载全部项目，明确排除项、原因和原包 revision，创建新的修正操作；模型映射问题回当前渠道配置后重新发现。选定历史观测包可显式重新核对来源；必须是同渠道可重建观测来源且 revision 匹配，不能重建手工/import/correction。仅显式选择并确认的来源在新观测成功后 supersede，其他包保持原状。
+6. 网络结果未知时保留原 operationID、原输入及 revision，先查询回执/包。发现旧请求已成功时明确“新编辑尚未保存”；不将新表单套用到旧请求，也不为未知结果换 UUID 重复创建。明确业务拒绝后才允许修正新意图。异步/部分结果不显示为整体生效。
+
+商业读取/写入分别要求 `read_commercialization` / `write_commercialization`；NEWAPI 保存和发现要求 `write_channels`，回执读取要求 `read_channels`。历史观测重建另要求商业写入。Owner 与现有自审规则不扩展；前端可见性不能代替后端 scope。审核返回 APPROVED，随后明确发布返回 APPLIED；详情以当前可用动作和职责为准。
+
+<a id="flow-event-package-r3"></a>
+```mermaid
+flowchart TD
+ A[一次明确操作 选择类型与范围] --> B[读取当前完整基线与版本]
+ B --> C[operationID 创建独立包或NO_CHANGE回执]
+ C --> D[精确ID读取概览 按需分页差异与活动]
+ D --> E{整包非空有效且基线可用}
+ E -->|否| F[定位字段问题 编辑指定草稿或创建修正包]
+ F --> D
+ E -->|是| G[expectedRevision 送审 尚未生效]
+ G --> H[审核通过后确认发布完整N项]
+ H --> I{事务校验与全量应用}
+ I -->|成功| J[APPLIED 审计与真实目标链接]
+ I -->|来源变化| K[SUPERSEDED 重读当前配置]
+ I -->|无效或应用失败| L[INVALID 回滚全部正式写入]
+ K --> F
+ L --> F
+ H -->|网络结果未知| M[先查询当前包 不盲目重复批准]
+ M --> D
+```
+
+<a id="newapi-discovery-r3"></a>
+### NEWAPI 创建、同步和结果
+
+在渠道页点击文字“创建 NEWAPI 渠道”，填写名称、一个 NEWAPI 地址、模型 API key，以及适用的采购账单币种/充值倍率。账户 PAT 与正整数账户ID是可选的更强来源核对，不是模型key，也不以 quotaVerified 作为首次发现前置。点击“创建并发现”后，创建事务返回后、等待初始化之前，同一区域立即显示已保存渠道链接、channelID和operationID，以及模型、价格和包校验阶段。请求中状态属于客户端提示；持久阶段仍按真实回执显示，不用虚构成功或零结果；不会因一个阶段失败丢掉已保存渠道或成功模型。
+
+NEWAPI 创建/编辑规范化同一根地址并同时保存 baseURL/websiteURL。终末 `/v1/` 去掉，`/gateway/v1` 保留 `/gateway`，`/gateway/v1proxy` 保留完整前缀；query/fragment 去掉，拒绝内嵌 URL 凭据。界面预览最终地址。旧渠道两地址不同则显示原控制台地址，只有显式保存才统一。非 NEWAPI 官网字段保持原用途。
+
+已有渠道行有文字“同步模型与价格”“本次结果”“草稿与审批”，窄屏换行仍可达。新主动同步有独立 operationID；本次结果读取持久回执，成功包链接为精确ID，商业读取权限不足时不暴露差异。复制/代理/转换/归档/删除留在次级菜单。模型测试独立，本任务不发起收费推理。
+
+模型或价格阶段失败/租约中断：先“查询本次结果”，由原创建者按 expectedAttempt 只重试失败/中断阶段。其他用户重试返回 FORBIDDEN，不会领取尝试、替换渠道凭据或使用原作者的定价权限；由其他获授权用户操作时，发起新的初始化，保留旧回执与待审包。原创建者在网络阶段完成前撤权仍阻止正式价格/映射即时发布。成功阶段不重新请求，保存不会重复创建渠道。临时PAT不持久化；刷新后只恢复操作身份和获准的结果。没有新差异明确完成而没有新包。后台自动模型同步与周期报价开关是另外的当前设置，不以手动发现成功假称周期任务已开启。
+
+固定 NEWAPI `c2b7a9a9e0b548c2051a949fceabb59029adcb49` legacy 合同、版本/单位适用时，缺缓存读/写倍率分别为1/1.25并标 VERSION_DEFAULT，显式0保持0。37.5公共倍率来源不明标估算，表达式/未识别版本或单位标 unsupported/unknown；组适用性未经验证是阻止应用的问题。保留来源USD参考、实际采购币种、CHANNEL_BALANCE_UNIT、FX与充值倍率的换算链，参考USD不能替代正式采购成本。
+
+<a id="flow-newapi-discovery-r3"></a>
+```mermaid
+flowchart TD
+ A[一个NEWAPI地址 模型认证及采购设置] --> B[事务保存渠道与NOT_STARTED回执]
+ B --> P[立即显示已保存渠道 操作身份与阶段区域]
+ P --> C[显式初始化同一operationID]
+ C --> D[短事务claim与attempt租约]
+ D --> E[有界模型发现]
+ E --> F[持久模型阶段与模型映射包]
+ F --> G[有界价格发现与来源核对]
+ G --> H[持久价格阶段与采购价包]
+ H --> I{阶段结果}
+ I -->|完成| J[精确包链接或无新差异]
+ I -->|部分失败或需处理| K[渠道已保存 保留成功阶段与错误]
+ K --> L[原创建者读取回执 expectedAttempt重试失败阶段]
+ L --> D
+ C -->|请求结果未知| M[先查询operation回执]
+ M --> I
+ J --> N[商业权限下进入包详情 独立送审应用]
+```
+
+绑定[源码输入清单](source-manifest.md)，原静态研究来源FRONTEND_RESEARCH a2/r2；本轮修复另有前端单元/构建及隔离PG回归，r3 attempt2另有同一构建的7项隔离Chromium/假GraphQL回归，涵盖审批恢复、窄屏入口、审计、价格及创建中结果区；未操作真实8090/3000或提供商。此作者检查不替代独立验收。50页面+2布局、31 feature目录。每个UI操作有入口/权限/步骤/失败说明；组合ID是同段不同操作的别名。根字段的独立操作与精确参数见[管理GraphQL](admin-graphql.md)，客户端所有模板见[268文档](frontend-client-operations.md)。
+
+Playground使用真实API-key认证的GET /v1/models和POST /v1/chat/completions；GET /admin/playground是另一个GraphQL调试入口。占位表单、Fake chats、静态Help/Permission、缺/requests与/project/usage-logs页面均按当前实现标明。
 
 优先事实：APIKey Load Template已改变服务器key；Models仅单项Archive/Delete和bulk Enable/Disable，bulkArchiveModels/bulkDeleteModels为API-only；profile头像无显式大小/MIME校验，profile保存不直接切换i18n；财务引导先保存General再标完成。下文已按这些纠正组织。
 
@@ -119,6 +225,7 @@ flowchart TD
 | /api-keys | _authenticated/api-keys/index.tsx:13 | read_api_keys | [UI-apikeys](#UI-apikeys)/[flow-read](#flow-read) + [flow-write](#flow-write) | 非主导航入口 |
 | /billing | _authenticated/billing/index.tsx:13 | read_billing或read_subscriptions | [UI-billing](#UI-billing)/[flow-read](#flow-read) + [flow-write](#flow-write) | 真实 |
 | /change-sets | _authenticated/change-sets/index.tsx:16 | read_commercialization | [UI-changesets](#UI-changesets)/[flow-changeset](#flow-changeset) | 真实 |
+| /change-sets/$changeSetId | _authenticated/change-sets/$changeSetId.tsx | read_commercialization | [精确包详情](#event-packages-r3) | 真实；返回上下文与按需分页 |
 | /changelog | _authenticated/changelog/index.tsx:16 | read_commercialization | [UI-changelog](#UI-changelog)/[flow-read](#flow-read) | 真实 |
 | /channels | _authenticated/channels/index.tsx:13 | read_channels | [UI-channels](#UI-channels)/[flow-read](#flow-read) + [flow-write](#flow-write) | 真实 |
 | /chats | _authenticated/chats/index.tsx:4 | 登录 | [UI-chats](#UI-chats)/[flow-local](#flow-local) | Fake Data演示 |
@@ -134,7 +241,7 @@ flowchart TD
 | /project/api-keys | _authenticated/project/api-keys/index.tsx:16 | read_api_keys+选Project | [UI-apikeys](#UI-apikeys)/[flow-read](#flow-read) + [flow-write](#flow-write) | 真实 |
 | /project/dashboard | _authenticated/project/dashboard/index.tsx:16 | read_requests+选Project | [UI-projectdashboard](#UI-projectdashboard)/[flow-read](#flow-read) | 真实 |
 | /project/models | _authenticated/project/models/index.tsx:4 | 登录，页面处理Project | [UI-modelmarket](#UI-modelmarket)/[flow-read](#flow-read) | 真实 |
-| /project/playground | _authenticated/project/playground/index.tsx:16 | write_requests或read_channels+Project+ENTERPRISE，HTTP另鉴权 | [UI-playground](#UI-playground)/[flow-playground](#flow-playground) | 前端已实现，生产POST入口缺失 |
+| /project/playground | _authenticated/project/playground/index.tsx:16 | write_requests或read_channels+Project+ENTERPRISE，HTTP另鉴权 | [UI-playground](#UI-playground)/[flow-playground](#flow-playground) | API-key公开推理链与标准OpenAI SSE |
 | /project/prompts | _authenticated/project/prompts/index.tsx:16 | read_prompts+Project+ENTERPRISE | [UI-prompts](#UI-prompts)/[flow-read](#flow-read) + [flow-write](#flow-write) | 真实 |
 | /project/requests/$requestId | _authenticated/project/requests/$requestId.tsx:16 | read_requests+Project | [UI-requestdetail](#UI-requestdetail)/[flow-read](#flow-read) + [flow-local](#flow-local) | 真实 |
 | /project/requests | _authenticated/project/requests/index.tsx:16 | read_requests+Project | [UI-requests](#UI-requests)/[flow-read](#flow-read) | 真实 |
@@ -219,7 +326,7 @@ flow-read-write由flow-read与flow-write两图组成，不存在单独图锚。
 | UI操作ID | 用户步骤、结果及失败处理 | GraphQL/REST与证据 | 流程 |
 | --- | --- | --- | --- |
 | <a id="UI-channels"></a><a id="UI-channel-list"></a>[UI-channels](#UI-channels)；[UI-channel-list](#UI-channel-list) | 进入页→provider/type tab、名称/model/tag/adapter、状态/错误筛选、排序分页→名单/error count/health points；失败toast清条件或查权限 | queryChannels/countChannelsByType/allChannelTags/allChannelSummarys/channels/channelProbeData；channels/index.tsx:21、data/channels.ts:901/2091 | [flow-read](#flow-read) |
-| <a id="UI-channel-create"></a><a id="UI-channel-edit"></a><a id="UI-channel-duplicate"></a>[UI-channel-create](#UI-channel-create)；[UI-channel-edit](#UI-channel-edit)；[UI-channel-duplicate](#UI-channel-duplicate) | New或Edit/Duplicate→provider/API格式/name/baseURL/websiteURL/key或OAuth/models/test model/tags/ordering/remark，可quota/currency→校验保存→刷新；错留表单修重复名/类型/模型/凭据 | createChannel/updateChannel(id,input)/duplicateChannel(sourceID,input)；channels-action-dialog.tsx:87；channel.rs:1493/1524 | [flow-write](#flow-write) |
+| <a id="UI-channel-create"></a><a id="UI-channel-edit"></a><a id="UI-channel-duplicate"></a>[UI-channel-create](#UI-channel-create)；[UI-channel-edit](#UI-channel-edit)；[UI-channel-duplicate](#UI-channel-duplicate) | New→选择服务商→下一步配置渠道；Edit/Duplicate直接进入配置。宽版弹窗保留服务商摘要，可上一步更换；第二步分连接与模型、额度与计费、请求与响应、其他设置四类。桌面连接/认证与模型两列，侧栏打开折为单列；切类与往返保留表单及模型/OAuth草稿。连接含API格式/name/baseURL/key或OAuth/models/test model/代理，计费含采购币种/充值倍率/额度快照与账户网址，请求含三态流策略/三态透传/重试，其他含tags/remark→校验保存→刷新；schema及手动校验错自动切分类、展开目标折叠区并聚焦，失败保留草稿。窄屏模型侧栏独占主体，关闭后返回配置 | createChannel/updateChannel(id,input)/duplicateChannel(sourceID,input)；channels-action-dialog.tsx（ChannelsActionDialog）；channel.rs:1493/1524 | [flow-write](#flow-write) |
 | <a id="UI-channel-status"></a><a id="UI-channel-archive"></a><a id="UI-channel-recover"></a><a id="UI-channel-delete"></a>UI-channel-status；UI-channel-archive；UI-channel-recover；UI-channel-delete | 行状态或Archive/Recover/Delete→确认→保存并刷新；归档保留记录，删除引用约束由服务执行；失败刷新再选 | updateChannelStatus/deleteChannel；status-dialog:18、archive-dialog:15、delete-dialog:19 | [flow-write](#flow-write) |
 | <a id="UI-channel-bulk-enable"></a><a id="UI-channel-bulk-disable"></a><a id="UI-channel-bulk-archive"></a><a id="UI-channel-bulk-recover"></a><a id="UI-channel-bulk-delete"></a>UI-channel-bulk-enable；UI-channel-bulk-disable；UI-channel-bulk-archive；UI-channel-bulk-recover；UI-channel-bulk-delete | 勾选→工具栏对应操作→核对名单数量→确认→检查逐条结果并刷新；失败不假定全处理 | bulkEnableChannels/bulkDisableChannels/bulkArchiveChannels/bulkRecoverChannels/bulkDeleteChannels；bulk dialogs:9 | [flow-write](#flow-write) |
 | <a id="UI-channel-import"></a>[UI-channel-import](#UI-channel-import) | Bulk Import→粘贴/上传导出JSON→解析核对列表名字→导入→看结果；格式错修改JSON，服务错核对已导入项 | bulkImportChannels(input.channels)；bulk-import-dialog.tsx:28、channel_ext2.rs:144；bulkCreateChannels无当前tsx caller，API-only | [flow-write](#flow-write) |
@@ -340,7 +447,7 @@ read_channels读列表/关联；write_channels模型CRUD/路由；read/write_com
 
 ### /project/models
 
-<a id="UI-modelmarket"></a>UI-modelmarket：已登录，authenticated myModelCatalog按身份/selectedproject取有效模型/价/倍率/healthVisible→本地搜索name/id/developer，type筛选、name/price排序→卡片/Enter详情→复制modelID或转API key页→Back。没有mutation；unpriced不算零价，health可隐藏，错Retry、空目录正常。frontend/src/features/model-market/index.tsx:165、data.ts；lib.rs208。flow-read+flow-local。
+<a id="UI-modelmarket"></a>UI-modelmarket：已登录，authenticated myModelCatalog按身份/selectedproject取有效模型/价/倍率/healthVisible→本地搜索name/id/developer，type筛选、name/price排序→卡片/Enter详情→复制modelID或转API key页→Back。没有mutation；价格来自当前有效默认价格簿的已发布版本与当前Project倍率。单价卡片保留零值；固定请求费、分段阶梯、总量阶梯、混合条目与缓存时长变体显示结构化摘要，详情保留所有有序条目、精确金额、阶梯上下界与变体条件。Token费率按百万Token、固定费用按次请求；缺价或空条目为UNPRICED，格式损坏、未知字段/模式或无法转换为UNAVAILABLE，不当作免费。四类旧单价字段只在无重复/无变体的简单Token价格时提供，复杂价格不按输入单价排序。billable只说明市场投影可用，不是请求计费准入结论。health可隐藏，错Retry、空目录正常。frontend/src/features/model-market/index.tsx:165、data.ts；lib.rs208。flow-read+flow-local。
 
 ### /groups
 
@@ -352,11 +459,11 @@ read_channels读列表/关联；write_channels模型CRUD/路由；read/write_com
 
 ### /change-sets与/changelog
 
-<a id="UI-changesets"></a><a id="UI-changelog"></a>UI-changesets/UI-changelog：read_commercialization→kind/status/scopeType/scopeID/limit过滤→详情看version/diff/validationErrors/audit；Changelog主要已处理历史。change-set/workbench/changelog-page与detail-dialog18；lib109。flow-read。
+<a id="UI-changesets"></a><a id="UI-changelog"></a>UI-changesets/UI-changelog：当前摘要分页、按ID新鲜详情、返回上下文、逐项差异及活动步骤见[事件包](#event-packages-r3)。
 
 
 
-<a id="UI-changeset-submit"></a><a id="UI-changeset-review"></a>UI-changeset-submit/UI-changeset-review：write_commercialization；DRAFT显示Submit，PENDING_REVIEW Approve/Reject，INVALID仅Reject，终态无操作→确认，reviewNote最多2000字→submitChangeSet/approveChangeSet/rejectChangeSet→toast+refresh；前端不承诺独立审查人隔离，后端约束；失败留窗口，pending非已发布、过期重建draft。change-set-actions15/review-dialog20；mutation824-855。flow-price。
+<a id="UI-changeset-submit"></a><a id="UI-changeset-review"></a>UI-changeset-submit/UI-changeset-review：按[完整包流程](#flow-event-package-r3)携带 expectedRevision；批准并应用全包，失败重读终态。
 
 <a id="flow-price"></a>
 
@@ -556,7 +663,7 @@ flowchart TD
 | <a id="UI-request-ip-ban"></a>UI-request-ip-ban | 请求列表需read_requests；已读securitySettings且showRequestLogIPBanIcon才显示，操作需write_settings；点IP封禁把非空trim IP去重加入blockedIPs，解封则移除→updateSecuritySettings持久保存；已封禁同IP提示并跳过重复写入 | [flow-write](#flow-write)；保存结果以mutation和重读设置为准，失败按设置错误核对权限/IP后重试；只改封禁策略，不重试或删除请求。requests-columns.tsx40-65/258-291；入口与异常策略见[系统安全](#UI-system-security) |
 | <a id="UI-threads"></a><a id="UI-thread-detail"></a>UI-threads；UI-thread-detail /project/threads与/$threadId | ENTERPRISE/read_requests+project；threads ID/time/metadata/filter/sort/page/autoRefresh→详情node Thread+traces；打开trace drawer、Refresh/Back保留搜索 | 无写入，错/无实体选正确Project重查；threads/index/thread-detail-page30/58/94/trace-drawer |
 | <a id="UI-traces"></a><a id="UI-trace-detail"></a>UI-traces；UI-trace-detail /project/traces与/$traceId | ENTERPRISE/read_requests+project；traces过滤/page/autoRefresh→node Trace segments/requestSpans/responseSpans；flat/flow/tree、select span、fullscreen、Refresh/Back | 实体权限，无创建删除；trace-detail-page25/38/61/data |
-| <a id="UI-playground"></a>UI-playground /project/playground | ENTERPRISE+project；RouteGuard write_requests或read_channels（nav仅read_channels）；source channel/model_gateway，读channel或enabled chat模型（read_channels），systemPrompt/temp0.6/maxTokens4096/prompt→Send | DefaultChatTransport POST /admin/playground/chat Bearer+Project/direct X-Channel-ID，body model/temp/max_tokens/system；流消息、Stop SDK.stop、Clear local、Retry去末assistant/regenerate、Copy local；重复Send禁用。frontend/features/playground/index31/99-123/188-230。HTTP注册清单缺此路由，最终须标生产入口缺口，不能据UI发送代码宣称可推理 |
+| <a id="UI-playground"></a>UI-playground /project/playground | ENTERPRISE+project；RouteGuard write_requests或read_channels。输入创建时复制的遮蔽API key→Load available models→选模型→设systemPrompt/temperature/max_tokens→Send | GET /v1/models与POST /v1/chat/completions使用API-key Bearer、credentials omit、标准messages和OpenAI SSE，不发送管理JWT/Project header或强选渠道。费用和访问由key所属Project决定，控制台当前Project不能覆盖。key仅存在页面内存，换key/换Project/登出/离页清空并abort；Stop取消当前请求，Retry发起一次新的正常计费请求；使用已有Create/manage API keys入口获得新key，不能取回旧secret。标准流支持usage/[DONE]，错误不回显上游原文。frontend/src/features/playground/index.tsx、chat-client.ts。隔离浏览器闭环见scripts/e2e/README.md；本地/远程CI实际检查分别记录。 |
 | UI-onboarding | onboarding-provider.tsx22是mode driver；onboarding-flow17 Start跳/system高亮brand/retry等并导览页面；各真实设置仍各页recipe；完成/Skip completeOnboarding默认done输入 | 不是自动createChannel；done不证明逐项配置完成 |
 | UI-onboarding-models；UI-onboarding-auto-disable | models/components/models-onboarding-flow13/auto-disable-channel-onboarding-flow17 driver导览，结束各complete mutation | 标done而非自动配置 |
 
@@ -1002,3 +1109,26 @@ flowchart TD
 Create/Edit返回DuplicateEmail时显示邮箱字段错误并聚焦邮箱；权限拒绝显示联系管理员或核对项目/权限的可行动提示。Create/Update hook显式覆盖应用QueryClient的默认mutation onError；同一次失败由表单处理一次，不另发通用toast；其它失败保留输入。真实QueryClient默认回调、hook options和表单catch的邮件/权限/未知错误回归覆盖此约束。见users-action-dialog.tsx、data/users.ts与data/save-error.test.mjs。
 
 Remember me只改变密码登录的浏览器存储期限，不改变JWT有效期；浏览器可能恢复上一会话的sessionStorage。注册和OIDC保留原默认持久会话。登出和过期同时清两种存储；它们不是服务端令牌撤销。
+
+### Group management and Key configuration
+
+`/groups` has separate UserGroup, ModelGroup and retained Project rules panels. UserGroup controls one user classification and ModelGroup access. ModelGroup organizes public models; it owns no routes. Project rules retain the existing AccessPlan/PriceTier interface. Key creation requires one permitted ModelGroup; editing can explicitly configure an old unassigned Key. Key lists show pending configuration when no persisted assignment exists. Server authorization is authoritative and intersects Project/profile rules. UserGroup recharge multiplier applies only to newly created online-payment orders; it does not multiply admin grants, redemption codes or subscriptions. The existing Project rules panel remains separate.
+
+Model retail-price editing retains draft/review/publish: select a ModelGroup branch, evaluate ordered time/token conditions first, then group base, then global base. Zero is a price; invalid rules error instead of falling back. Simple/raw leaf editing retains complex tiers, volume and cache dimensions. Request-start time is frozen in system timezone; available facts include token counts and local hour/minute/weekday (Monday=0)/month/day/date (YYYYMMDD).
+
+The market lists authorized group and current-Project owned-Key `priceScopes`. `myModelCatalog(modelGroupID: ID, apiKeyID: ID)` accepts one selector; server authorization validates the group grant or Key owner/Project/group/revision, then intersects Project routes. Without a selected scope it does not guess a quote. Display scope never changes a request's Key-fixed ModelGroup. The full conditional tree remains visible; no cross-group minimum is chosen, and existing Project adjustment applies once.
+
+Key creation and profile editing use separate **management metadata** catalogs, not the market price-scope hook. Creation derives the actual prospective billing member; profiles derive the existing target Key owner. An administrator who has Key-management authority can configure another member's Key without needing that member's personal market price access. Model/channel candidates contain no retail prices, preserve current rule values when configuration is pending, and do not lock legal profile expansion to its current narrowed scope. Group/profile enforcement remains server-side.
+
+
+### Online payment top-ups and UserGroup multiplier
+
+Payment state and query keys are bound to both payer and Project. Switching either clears the old receipt/checkout intent; late async responses from the old context cannot become the new payer's order. Local TLS gateway browser checks covered both channels, pending browser return, repeated signed confirmation, one credit and a real same-Project Key debit. This does not verify a real merchant.
+
+The existing Project wallet page contains online top-up creation and the logged-in payer's orders for the selected Project. `paymentCapabilities` controls enabled state, CNY minor-unit limits and Alipay/WeChat choices; unavailable capabilities disable creation. Amount input converts CNY yuan to integer fen using strings/BigInt. No payer, target Project, paid status, accounting settings or recharge multiplier is accepted from a browser override. `createPaymentOrder` commits the local order and returns its frozen amount, credited microcredits, target Project, multiplier and accounting version; the UI shows those values before an explicit cashier link. An unresolved create retries the same idempotency identity and input, retaining the intent within the tab session. There is no new route or user-wallet balance.
+
+Cashier return only reopens the wallet; browser query parameters never mark an order paid. Order queries refresh from the server on focus or explicit refresh. Recheck asks the server to verify with the configured provider and never accepts a force-paid value. Only `credited` represents the server's confirmed wallet credit. Closed, credited and review-required orders do not expose a payment link. Order history is paginated and restricted by the server to the payer and current Project. Checkout links require HTTPS and exclude URL credentials; tokens/signatures are not copied into UI diagnostic messages.
+
+The supported configured gateway profile is the fixed `maajiko/Epay@a4d0f0421cfcbc573913c8007bde3d0c04a5713a` classic-MD5 reference server, not a claim of official Epay or all-vendor compatibility. Payments are disabled by default. Local simulated-gateway checks and real merchant conformance are separate evidence; no real merchant/payment verification is implied by frontend unit tests or a browser return.
+
+UserGroup editing displays a decimal multiplier (default 1×, positive through 1000× with at most six decimal places), converts it exactly to `rechargeMultiplierPPM` (1 through 1000000000), and sends the captured string `expectedRechargeRevision` for an existing group's multiplier update. A conflict preserves the form and requires reloading; it cannot silently overwrite a newer multiplier. The server chooses the payer's group and freezes its PPM when creating each order. Later membership or multiplier edits do not recalculate existing orders; unassigned users retain the server's default 1×.

@@ -5,6 +5,7 @@ import { pageInfoSchema } from '@/gql/pagination';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { useErrorHandler } from '@/hooks/use-error-handler';
+import { createProviderPackage } from '@/features/change-sets/data/change-sets';
 import {
   Channel,
   ChannelConnection,
@@ -24,7 +25,6 @@ import {
   ChannelSettings,
   ChannelPolicies,
   ChannelModelPrice,
-  SaveChannelModelPriceInput,
   channelModelPriceSchema,
   TestChannelAPIKeysPayload,
   testChannelAPIKeysPayloadSchema,
@@ -759,17 +759,6 @@ const GET_CHANNEL_MODEL_PRICES_QUERY = `
 }
 `;
 
-const CREATE_PROVIDER_PRICE_CHANGE_SET_MUTATION = `
-  mutation CreateProviderPriceChangeSet($channelID: ID!, $input: [SaveChannelModelPriceInput!]!) {
-    createProviderPriceChangeSet(channelID: $channelID, input: $input) {
-      id
-      status
-      title
-      items { id }
-    }
-  }
-`;
-
 const BULK_UPDATE_CHANNEL_ORDERING_MUTATION = `
   mutation BulkUpdateChannelOrdering($input: BulkUpdateChannelOrderingInput!) {
     bulkUpdateChannelOrdering(input: $input) {
@@ -1125,7 +1114,8 @@ const PROBE_NEW_API_PRICING_MUTATION = `
       matchedKeyCount
       warnings
       models {
-        modelId
+        provenance
+      modelId
         billingKind
         quality
         groupRatio
@@ -1224,26 +1214,7 @@ export function useChannelModelPrices(channelId: string) {
 
 export function useCreateProviderPriceChangeSet() {
   const queryClient = useQueryClient();
-  const { t } = useTranslation();
-  const { handleError } = useErrorHandler();
-
-  return useMutation({
-    mutationFn: async ({ channelId, input }: { channelId: string; input: SaveChannelModelPriceInput[] }) => {
-      try {
-        const data = await graphqlRequest<{
-          createProviderPriceChangeSet: { id: string; status: string; title: string; items: Array<{ id: string }> };
-        }>(CREATE_PROVIDER_PRICE_CHANGE_SET_MUTATION, { channelID: channelId, input });
-        return data.createProviderPriceChangeSet;
-      } catch (error) {
-        handleError(error, { context: 'Create Provider Price Change Set' });
-        throw error;
-      }
-    },
-    onSuccess: async () => {
-      await Promise.all([queryClient.invalidateQueries({ queryKey: ['changeSets'] })]);
-      toast.success(t('channels.messages.priceDraftCreated'));
-    },
-  });
+  return useMutation({ mutationFn: createProviderPackage, onSettled: () => queryClient.invalidateQueries({ queryKey: ['changeSets'] }) });
 }
 
 // Use this hook to query channels with pagination and filtering
@@ -1346,6 +1317,7 @@ export function useCreateChannel() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['allChannelTags'] }),
         queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
         queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
       ]);
@@ -1370,6 +1342,7 @@ export function useDuplicateChannel() {
     onSuccess: async () => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['allChannelTags'] }),
         queryClient.invalidateQueries({ queryKey: ['changeSets'] }),
       ]);
       toast.success(t('common.success.duplicated'));
@@ -1412,6 +1385,7 @@ export function useBulkCreateChannels() {
     },
     onSuccess: (channels) => {
       queryClient.invalidateQueries({ queryKey: ['channels'] });
+      queryClient.invalidateQueries({ queryKey: ['allChannelTags'] });
       toast.success(t('channels.messages.batchCreateSuccess', { count: channels.length }));
     },
   });
@@ -1430,6 +1404,7 @@ export function useUpdateChannel() {
     onSuccess: async (data) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['channels'] }),
+        queryClient.invalidateQueries({ queryKey: ['allChannelTags'] }),
         queryClient.invalidateQueries({ queryKey: ['channel', data.id] }),
         queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
         queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),

@@ -493,7 +493,13 @@ impl OidcPersistence for PostgresOidcPersistence {
         first_name: &str,
         last_name: &str,
     ) -> Result<i64, String> {
-        sqlx::query_scalar(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| "OIDC registration transaction unavailable")?;
+        sqlx::query("SELECT pg_advisory_xact_lock(4850181378862437889),set_config('conduit.auth_registration','authorized',true)").execute(&mut *tx).await.map_err(|_|"OIDC registration authority failed")?;
+        let id = sqlx::query_scalar(
             "INSERT INTO users (email, status, prefer_language, password, first_name, \
              last_name, is_owner, scopes) \
              VALUES ($1, 'activated', 'en', $2, $3, $4, FALSE, '[]'::jsonb) RETURNING id",
@@ -502,9 +508,13 @@ impl OidcPersistence for PostgresOidcPersistence {
         .bind(password)
         .bind(first_name)
         .bind(last_name)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|error| format!("failed to create OIDC user: {error}"))
+        .map_err(|_| "failed to create OIDC user".to_string())?;
+        tx.commit()
+            .await
+            .map_err(|_| "OIDC registration commit failed")?;
+        Ok(id)
     }
 
     async fn upsert_identity(

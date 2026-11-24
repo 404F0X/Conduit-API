@@ -10,6 +10,22 @@ pub(crate) struct IsolatedPostgres {
 }
 
 impl IsolatedPostgres {
+    pub(crate) async fn owners(&self, ids: &[i64]) -> Result<(), sqlx::Error> {
+        for id in ids {
+            sqlx::query("INSERT INTO users(id,email,password,status,is_owner) VALUES($1,$2,'fixture','activated',true)")
+                .bind(id)
+                .bind(format!("owner-{id}@fixture.invalid"))
+                .execute(&self.pool)
+                .await?;
+        }
+        sqlx::query(
+            "SELECT setval(pg_get_serial_sequence('users','id'), (SELECT MAX(id) FROM users))",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn new(dsn: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let admin_pool = PgPool::connect(dsn).await?;
         let schema = format!("conduit_test_{}", uuid::Uuid::new_v4().simple());

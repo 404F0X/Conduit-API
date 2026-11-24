@@ -235,8 +235,24 @@ mod tests {
 
         let services = build_postgres_openapi_services(pool.clone(), "conduit".to_string());
         let schema = conduit_openapi_graphql::build_openapi_schema(services);
-        let principal_one = caller("openapi-owner-one", project_one);
-        let principal_two = caller("openapi-owner-two", project_two);
+        async fn billing_caller(
+            pool: &PgPool,
+            project: i64,
+            suffix: &str,
+        ) -> Result<Principal, TestError> {
+            let user:i64=sqlx::query_scalar("INSERT INTO users(email,password,status) VALUES($1,'fixture','activated') RETURNING id").bind(format!("openapi-{project}-{suffix}@fixture.invalid")).fetch_one(pool).await?;
+            sqlx::query(
+                "INSERT INTO user_projects(user_id,project_id,is_owner) VALUES($1,$2,false)",
+            )
+            .bind(user)
+            .bind(project)
+            .execute(pool)
+            .await?;
+            let key:i64=sqlx::query_scalar("INSERT INTO api_keys(user_id,project_id,name,key,\"type\",status,scopes) VALUES($1,$2,'caller',$3,'service_account','enabled','[\"read_api_keys\",\"write_api_keys\"]') RETURNING id").bind(user).bind(project).bind(format!("caller-{project}-{suffix}")).fetch_one(pool).await?;
+            Ok(caller(&key.to_string(), project))
+        }
+        let principal_one = billing_caller(&pool, project_one, &suffix).await?;
+        let principal_two = billing_caller(&pool, project_two, &suffix).await?;
 
         let (key_one_id, key_one_guid, key_one_secret) =
             create_key(&schema, &principal_one, &format!("OpenAPI Key P1 {suffix}")).await?;

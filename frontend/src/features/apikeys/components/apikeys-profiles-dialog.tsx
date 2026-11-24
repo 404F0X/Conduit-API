@@ -3,13 +3,11 @@ import { format, type Locale } from 'date-fns';
 import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { IconPlus, IconTrash, IconSettings, IconChevronDown, IconChevronUp } from '@tabler/icons-react';
-import { useQueryModels } from '@/gql/models';
 import { zhCN, enUS } from 'date-fns/locale';
 import { useTranslation } from 'react-i18next';
 import { useSelectedProjectId } from '@/stores/projectStore';
 import { extractNumberIDAsNumber } from '@/lib/utils';
 import { useDebounce } from '@/hooks/use-debounce';
-import { usePermissions } from '@/hooks/usePermissions';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -20,9 +18,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { TagsAutocompleteInput } from '@/components/ui/tags-autocomplete-input';
 import { AutoComplete } from '@/components/auto-complete';
-import { useMyModelCatalog } from '@/features/model-market/data';
 import { useApiKeysContext } from '../context/apikeys-context';
-import { useApiKeyQuotaUsages } from '../data/apikeys';
+import { useApiKeyProfileCatalog, useApiKeyQuotaUsages } from '../data/apikeys';
 import {
   updateApiKeyProfilesInputSchemaFactory,
   type ApiKeyProfile,
@@ -85,17 +82,9 @@ interface ApiKeyProfilesDialogProps {
 export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = false, initialData }: ApiKeyProfilesDialogProps) {
   const { t, i18n } = useTranslation();
   const { selectedApiKey } = useApiKeysContext();
-  const { modelPermissions } = usePermissions();
   const selectedProjectId = useSelectedProjectId();
-  const { data: availableModels, mutate: fetchModels } = useQueryModels();
-  const modelCatalog = useMyModelCatalog();
-  const availableChannels = useMemo(() => {
-    const channels = new Map<string, string>();
-    for (const model of modelCatalog.data?.models || []) {
-      for (const route of model.routes) channels.set(route.channelID, route.channelName);
-    }
-    return [...channels].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
-  }, [modelCatalog.data]);
+  const profileCatalog = useApiKeyProfileCatalog(selectedApiKey?.id);
+  const availableChannels = profileCatalog.data?.channels || [];
   const [templateLoadPending, setTemplateLoadPending] = useState(false);
   // 用于解决 Dialog 内 Popover 无法滚动的问题
   const [dialogContent, setDialogContent] = useState<HTMLDivElement | null>(null);
@@ -116,16 +105,6 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
   // Template save/load state
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [saveTemplateProfileIndex, setSaveTemplateProfileIndex] = useState<number | null>(null);
-
-  useEffect(() => {
-    if (open && modelPermissions.canRead) {
-      fetchModels({
-        statusIn: ['enabled'],
-        includeMapping: true,
-        includePrefix: true,
-      });
-    }
-  }, [open, modelPermissions.canRead, fetchModels]);
 
   const defaultValues = useMemo(
     () => ({
@@ -308,6 +287,16 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
               name: selectedApiKey?.name,
             })}
           </DialogDescription>
+          {profileCatalog.isError && (
+            <p role='alert' className='text-destructive text-sm'>
+              无法加载该 Key 的模型组管理候选，请重试。
+            </p>
+          )}
+          {profileCatalog.data && !profileCatalog.data.configured && (
+            <p role='status' className='text-muted-foreground text-sm'>
+              模型组待配置或授权不可用；请先配置该 Key 计费用户的用户组与模型组。现有规则将保留。
+            </p>
+          )}
         </DialogHeader>
 
         <div className='flex min-h-0 flex-1 flex-col'>
@@ -365,7 +354,7 @@ export function ApiKeyProfilesDialog({ open, onOpenChange, onSubmit, loading = f
                               form={form}
                               onRemove={() => removeProfileHandler(profileIndex)}
                               canRemove={profileFields.length > 1}
-                              availableModels={availableModels?.map((model) => model.id) || []}
+                              availableModels={profileCatalog.data?.modelIDs || []}
                               availableChannels={availableChannels}
                               t={t}
                               locale={locale}

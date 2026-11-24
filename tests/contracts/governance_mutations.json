@@ -1,0 +1,1390 @@
+{
+  "revision": "lite-full-r1",
+  "actions": [
+    {
+      "action": "channel.duplicate_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.endpoints_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.ordering_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.batch_form",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.mapping_automation",
+      "kind": "model_mapping",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "channel.aliases_form",
+      "kind": "model_mapping",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "model.route_form",
+      "kind": "model_supply",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "model.public_form",
+      "kind": "model_supply",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "price_book.create_form",
+      "kind": "retail_price",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "system.brand_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.general_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.model_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.channel_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.security_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.storage_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.retry_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.webhook_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.video_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.backup_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.quota_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.proxy_save",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.proxy_delete",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "system.public_health_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "project.profiles_form",
+      "kind": "project_configuration",
+      "domain_scope": "write_projects"
+    },
+    {
+      "action": "key_template.create_form",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "key_template.update_form",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "channel_template.create_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel_template.update_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "api_key.create_form",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "api_key.update_form",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "api_key.profiles_form",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "storage.create_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_data_storages"
+    },
+    {
+      "action": "storage.update_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_data_storages"
+    },
+    {
+      "action": "protection.create_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "protection.update_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "member.add_form",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "member.update_form",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "member.remove_form",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "model.create_form",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.update_form",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "user.create_form",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "user.update_form",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "project.create_form",
+      "kind": "project_configuration",
+      "domain_scope": "write_projects"
+    },
+    {
+      "action": "project.update_form",
+      "kind": "project_configuration",
+      "domain_scope": "write_projects"
+    },
+    {
+      "action": "role.create_form",
+      "kind": "identity_access",
+      "domain_scope": "write_roles"
+    },
+    {
+      "action": "role.update_form",
+      "kind": "identity_access",
+      "domain_scope": "write_roles"
+    },
+    {
+      "action": "channel.bulk_create_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.import_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.create_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.update_form",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.batch",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.duplicate",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.keys",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel_template.write",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel_template.delete",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel_template.apply",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel_template.clear",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.batch",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.create_with_routes",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "key_template.write",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "key_template.delete",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "key_template.load",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "protection.write",
+      "kind": "system_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "protection.delete",
+      "kind": "system_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "storage.write",
+      "kind": "system_configuration",
+      "domain_scope": "write_data_storages"
+    },
+    {
+      "action": "access_plan.write",
+      "kind": "project_configuration",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "price_tier.write",
+      "kind": "retail_price",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "project.grant",
+      "kind": "project_configuration",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "project.entitlement",
+      "kind": "project_configuration",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "project.adjustment",
+      "kind": "retail_price",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "channel.write",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "channel.delete",
+      "kind": "channel_configuration",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.write",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.delete",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.supply",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "project.write",
+      "kind": "project_configuration",
+      "domain_scope": "write_projects"
+    },
+    {
+      "action": "project.delete",
+      "kind": "project_configuration",
+      "domain_scope": "write_projects"
+    },
+    {
+      "action": "project.member_limit",
+      "kind": "project_configuration",
+      "domain_scope": "write_billing"
+    },
+    {
+      "action": "user.write",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "user.delete",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "role.write",
+      "kind": "identity_access",
+      "domain_scope": "write_roles"
+    },
+    {
+      "action": "role.delete",
+      "kind": "identity_access",
+      "domain_scope": "write_roles"
+    },
+    {
+      "action": "member.write",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "member.remove",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "group.create",
+      "kind": "group_access",
+      "domain_scope": "write_groups"
+    },
+    {
+      "action": "group.update",
+      "kind": "group_access",
+      "domain_scope": "write_groups"
+    },
+    {
+      "action": "group.assign",
+      "kind": "group_access",
+      "domain_scope": "write_groups"
+    },
+    {
+      "action": "group.models",
+      "kind": "group_access",
+      "domain_scope": "write_groups"
+    },
+    {
+      "action": "group.price",
+      "kind": "group_access",
+      "domain_scope": "write_groups"
+    },
+    {
+      "action": "group.delete",
+      "kind": "group_access",
+      "domain_scope": "write_groups"
+    },
+    {
+      "action": "system.setting",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings"
+    },
+    {
+      "action": "subscription_plan.create",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription_plan.update",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription.assign",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription.cancel",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "project.credit",
+      "kind": "project_credit",
+      "domain_scope": "grant_credit"
+    },
+    {
+      "action": "subscription.refresh",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription.pause",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription.resume",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription.renew",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "subscription.auto_renew",
+      "kind": "system_configuration",
+      "domain_scope": "write_subscriptions"
+    },
+    {
+      "action": "redemption.create",
+      "kind": "system_configuration",
+      "domain_scope": "grant_credit"
+    },
+    {
+      "action": "redemption.revoke",
+      "kind": "system_configuration",
+      "domain_scope": "grant_credit"
+    },
+    {
+      "action": "api_key.write",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "api_key.rotate",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "api_key.delete",
+      "kind": "identity_access",
+      "domain_scope": "write_api_keys"
+    },
+    {
+      "action": "user.roles",
+      "kind": "identity_access",
+      "domain_scope": "write_users"
+    },
+    {
+      "action": "model.route",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "model.deployment",
+      "kind": "model_supply",
+      "domain_scope": "write_channels"
+    },
+    {
+      "action": "project.commercial",
+      "kind": "project_configuration",
+      "domain_scope": "write_commercialization"
+    },
+    {
+      "action": "system.product_experience_form",
+      "kind": "system_configuration",
+      "domain_scope": "write_settings",
+      "owner_required": true
+    }
+  ],
+  "atomic_publish": true,
+  "review_only": [
+    "APPROVE",
+    "approveChangeSet"
+  ],
+  "combined_action": {
+    "name": "APPROVE_APPLY",
+    "required_duties": [
+      "review_changes",
+      "publish_changes"
+    ],
+    "same_transaction": true
+  },
+  "exceptions": [
+    "reads/observations",
+    "self-profile and restricted self-key",
+    "signup fixed personal workspace",
+    "issued redemption and issued entitlement lifecycle",
+    "ordinary accounting/reserve/settle/reconcile",
+    "monotonic emergency or health restriction",
+    "onboarding flags and presentation only",
+    "backup/restore/cache/GC maintenance with existing strong permissions"
+  ],
+  "composite_policies": [
+    "channel import/create/duplicate with supply",
+    "channel settings with aliases",
+    "group price and group PriceTier linkage",
+    "group membership with Project configuration",
+    "Project creation with fixed membership/roles"
+  ],
+  "admin_mutations": [
+    {
+      "field": "setProjectMemberSpendLimit",
+      "classification": "ProjectConfiguration"
+    },
+    {
+      "field": "claimGovernedChangeSecrets",
+      "classification": "exception",
+      "guard": "one-time private receipt; actual recipient, current domain authority and applied package rechecked; public items/events omit secrets"
+    },
+    {
+      "field": "updateGovernanceSettings",
+      "classification": "exception",
+      "guard": "current Owner; explicit self/strict choice, qualified reviewer count, CAS; reductions require policy proposal except audited recovery"
+    },
+    {
+      "field": "proposeGovernedChange",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "validateChangeSet",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "reviewChangeSet",
+      "classification": "exception",
+      "guard": "state machine rechecks domain, Project, duties and separation; ApproveApply explicitly requires review_changes + publish_changes and performs both steps in one transaction"
+    },
+    {
+      "field": "publishChangeSet",
+      "classification": "exception",
+      "guard": "formal atomic transaction only; Approved or explicit approval-OFF draft, publish duty, policy/version/target/module rechecks; no per-target commits"
+    },
+    {
+      "field": "recoverGovernancePolicy",
+      "classification": "exception",
+      "guard": "current Owner; explicit self/strict choice, qualified reviewer count, CAS; reductions require policy proposal except audited recovery"
+    },
+    {
+      "field": "emergencyRestrictAccess",
+      "classification": "exception",
+      "guard": "audited authorized monotonic restriction only; cannot enable access or mutate unrelated fields"
+    },
+    {
+      "field": "initializeNewApiChannel",
+      "classification": "exception",
+      "guard": "model/price discovery observations precede policy-controlled packages; ModelSupply/ProviderPrice/ModelMapping gates apply before supported models/deployments/routes/formal price changes"
+    },
+    {
+      "field": "retryNewApiChannelDiscovery",
+      "classification": "exception",
+      "guard": "model/price discovery observations precede policy-controlled packages; ModelSupply/ProviderPrice/ModelMapping gates apply before supported models/deployments/routes/formal price changes"
+    },
+    {
+      "field": "updateProductExperienceSettings",
+      "classification": "exception",
+      "guard": "current Owner + revision; mode/visibility only exempt; execution selections require SystemConfiguration when enabled, native system.product_experience_form available; SQL compares named selections including UPSERT"
+    },
+    {
+      "field": "grantUserCredit",
+      "classification": "exception",
+      "guard": "legacy user-wallet credit operation unsupported; spendable grants use Project ledger/project.credit under ProjectCredit policy"
+    },
+    {
+      "field": "grantProjectCredit",
+      "classification": "ProjectCredit"
+    },
+    {
+      "field": "createCreditRedemptionCodes",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "revokeCreditRedemptionCode",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "redeemCreditCode",
+      "classification": "exception",
+      "guard": "already-issued code redemption and ledger settlement; existing identity/Project/idempotency/max-use/expiry constraints; issuance remains SystemConfiguration"
+    },
+    {
+      "field": "createSubscriptionPlan",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateSubscriptionPlan",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "assignUserSubscription",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "refreshSubscriptionAllowance",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "pauseUserSubscription",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "resumeUserSubscription",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "cancelUserSubscription",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "renewUserSubscription",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "setSubscriptionAutoRenew",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "upsertModelRoute",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "createPublicModelWithRoutes",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "applyChannelModelMappings",
+      "classification": "ModelMapping"
+    },
+    {
+      "field": "setChannelModelMappingAutomation",
+      "classification": "ModelMapping"
+    },
+    {
+      "field": "createPriceBook",
+      "classification": "RetailPrice"
+    },
+    {
+      "field": "createRetailPriceChangeSet",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "createProviderPriceChangeSet",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "saveProviderPriceChangeSet",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "saveRetailPriceChangeSetItem",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "submitChangeSet",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "approveChangeSet",
+      "classification": "exception",
+      "guard": "review-only: Approved; requires current domain/review authority and proposer separation policy; never publishes"
+    },
+    {
+      "field": "rejectChangeSet",
+      "classification": "exception",
+      "guard": "package-only change; current domain/Project authority, revision, operation intent and state checks; no formal business write"
+    },
+    {
+      "field": "createSimpleGroup",
+      "classification": "GroupAccess"
+    },
+    {
+      "field": "updateSimpleGroup",
+      "classification": "GroupAccess"
+    },
+    {
+      "field": "assignSimpleGroupUsers",
+      "classification": "GroupAccess"
+    },
+    {
+      "field": "updateSimpleGroupModels",
+      "classification": "GroupAccess"
+    },
+    {
+      "field": "updateSimpleGroupPrice",
+      "classification": "GroupAccess",
+      "also_requires": [
+        "RetailPrice for linked PriceTier writes"
+      ]
+    },
+    {
+      "field": "deleteSimpleGroup",
+      "classification": "GroupAccess"
+    },
+    {
+      "field": "restore",
+      "classification": "exception",
+      "guard": "existing strong maintenance/Owner permissions and retention/storage constraints; operational maintenance, not a governance policy exemption for new administrative writes"
+    },
+    {
+      "field": "triggerAutoBackup",
+      "classification": "exception",
+      "guard": "existing strong maintenance/Owner permissions and retention/storage constraints; operational maintenance, not a governance policy exemption for new administrative writes"
+    },
+    {
+      "field": "triggerGcCleanup",
+      "classification": "exception",
+      "guard": "existing strong maintenance/Owner permissions and retention/storage constraints; operational maintenance, not a governance policy exemption for new administrative writes"
+    },
+    {
+      "field": "clearCache",
+      "classification": "exception",
+      "guard": "existing strong maintenance/Owner permissions and retention/storage constraints; operational maintenance, not a governance policy exemption for new administrative writes"
+    },
+    {
+      "field": "bulkCreateModels",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "updateModelStatus",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "bulkArchiveModels",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "bulkDisableModels",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "bulkEnableModels",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "bulkDeleteModels",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "saveChannelModelPrices",
+      "classification": "ProviderPrice"
+    },
+    {
+      "field": "checkProviderQuotas",
+      "classification": "exception",
+      "guard": "upstream/quota observations or observation-only reset; actual provider-observation execution gate and original domain permission retained; no spendable Project credit write"
+    },
+    {
+      "field": "probeChannelQuota",
+      "classification": "exception",
+      "guard": "upstream/quota observations or observation-only reset; actual provider-observation execution gate and original domain permission retained; no spendable Project credit write"
+    },
+    {
+      "field": "confirmChannelQuotaProbe",
+      "classification": "exception",
+      "guard": "upstream/quota observations or observation-only reset; actual provider-observation execution gate and original domain permission retained; no spendable Project credit write"
+    },
+    {
+      "field": "probeNewApiPricing",
+      "classification": "exception",
+      "guard": "upstream/quota observations or observation-only reset; actual provider-observation execution gate and original domain permission retained; no spendable Project credit write"
+    },
+    {
+      "field": "resetChannelQuotaNow",
+      "classification": "exception",
+      "guard": "upstream/quota observations or observation-only reset; actual provider-observation execution gate and original domain permission retained; no spendable Project credit write"
+    },
+    {
+      "field": "updateQuotaEnforcementSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "createChannel",
+      "classification": "ChannelConfiguration",
+      "also_requires": [
+        "ModelSupply for supplied models",
+        "ModelMapping for alias rules",
+        "ProviderPrice for copied/imported procurement prices"
+      ]
+    },
+    {
+      "field": "updateChannel",
+      "classification": "ChannelConfiguration",
+      "also_requires": [
+        "ModelSupply for supplied models",
+        "ModelMapping for alias rules",
+        "ProviderPrice for copied/imported procurement prices"
+      ]
+    },
+    {
+      "field": "deleteChannel",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "createModel",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "updateModel",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "deleteModel",
+      "classification": "ModelSupply"
+    },
+    {
+      "field": "createAPIKey",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "updateAPIKey",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "updateAPIKeyStatus",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "rotateAPIKey",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "updateAPIKeyProfiles",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "bulkDisableAPIKeys",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "bulkEnableAPIKeys",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "bulkArchiveAPIKeys",
+      "classification": "exception",
+      "guard": "restricted self-owned user keys only: existing scope/profile/ownership ceilings and mixed-batch atomicity; all other administration IdentityAccess; SQL gate remains"
+    },
+    {
+      "field": "createChannelOverrideTemplate",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "updateChannelOverrideTemplate",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "deleteChannelOverrideTemplate",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "applyChannelOverrideTemplate",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "clearChannelOverrideTemplates",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "createApiKeyProfileTemplate",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "updateApiKeyProfileTemplate",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "deleteApiKeyProfileTemplate",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "loadApiKeyProfileTemplate",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "createProject",
+      "classification": "ProjectConfiguration"
+    },
+    {
+      "field": "updateProject",
+      "classification": "ProjectConfiguration"
+    },
+    {
+      "field": "updateProjectStatus",
+      "classification": "ProjectConfiguration"
+    },
+    {
+      "field": "updateProjectProfiles",
+      "classification": "ProjectConfiguration"
+    },
+    {
+      "field": "deleteProject",
+      "classification": "ProjectConfiguration"
+    },
+    {
+      "field": "createUser",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "updateUser",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "updateUserStatus",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "deleteUser",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "addUserToProject",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "removeUserFromProject",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "updateProjectUser",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "createRole",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "updateRole",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "deleteRole",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "bulkDeleteRoles",
+      "classification": "IdentityAccess"
+    },
+    {
+      "field": "createPrompt",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "updatePrompt",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "deletePrompt",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "updatePromptStatus",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "bulkDeletePrompts",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "bulkEnablePrompts",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "bulkDisablePrompts",
+      "classification": "exception",
+      "guard": "Project-owned prompt content, original write_prompts scope/Project isolation; platform prompt-protection configuration remains SystemConfiguration"
+    },
+    {
+      "field": "createPromptProtectionRule",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updatePromptProtectionRule",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "deletePromptProtectionRule",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updatePromptProtectionRuleStatus",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "bulkDeletePromptProtectionRules",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "bulkEnablePromptProtectionRules",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "bulkDisablePromptProtectionRules",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "previewPromptProtectionRule",
+      "classification": "exception",
+      "guard": "authorized deterministic preview/probe or monotonic health restriction only; observation does not approve or publish supply/price/configuration"
+    },
+    {
+      "field": "createDataStorage",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateDataStorage",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "completeOnboarding",
+      "classification": "exception",
+      "guard": "onboarding flags only; financial/general/supply configuration side writes still obey their own policy; presentation flag cannot authorize settings changes"
+    },
+    {
+      "field": "completeFinancialSetupOnboarding",
+      "classification": "exception",
+      "guard": "onboarding flags only; financial/general/supply configuration side writes still obey their own policy; presentation flag cannot authorize settings changes"
+    },
+    {
+      "field": "updateSecuritySettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "saveProxyPreset",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "deleteProxyPreset",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateBrandSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateStoragePolicy",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateRetryPolicy",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateUserAgentPassThroughSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateDefaultDataStorage",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateSystemGeneralSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateSystemModelSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateSystemChannelSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updatePublicChannelHealthSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updatePassThroughSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateChannelStatus",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "duplicateChannel",
+      "classification": "ChannelConfiguration",
+      "also_requires": [
+        "ModelSupply for supplied models",
+        "ModelMapping for alias rules",
+        "ProviderPrice for copied/imported procurement prices"
+      ]
+    },
+    {
+      "field": "saveChannelEndpoints",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "testChannel",
+      "classification": "exception",
+      "guard": "authorized deterministic preview/probe or monotonic health restriction only; observation does not approve or publish supply/price/configuration"
+    },
+    {
+      "field": "testChannelAPIKey",
+      "classification": "exception",
+      "guard": "authorized deterministic preview/probe or monotonic health restriction only; observation does not approve or publish supply/price/configuration"
+    },
+    {
+      "field": "testChannelAPIKeys",
+      "classification": "exception",
+      "guard": "authorized deterministic preview/probe or monotonic health restriction only; observation does not approve or publish supply/price/configuration"
+    },
+    {
+      "field": "bulkArchiveChannels",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "bulkDisableChannels",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "bulkEnableChannels",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "bulkRecoverChannels",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "bulkDeleteChannels",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "syncChannelModels",
+      "classification": "exception",
+      "guard": "model/price discovery observations precede policy-controlled packages; ModelSupply/ProviderPrice/ModelMapping gates apply before supported models/deployments/routes/formal price changes"
+    },
+    {
+      "field": "bulkCreateChannels",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "bulkImportChannels",
+      "classification": "ChannelConfiguration",
+      "also_requires": [
+        "ModelSupply for supplied models",
+        "ModelMapping for alias rules",
+        "ProviderPrice for copied/imported procurement prices"
+      ]
+    },
+    {
+      "field": "bulkUpdateChannelOrdering",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "disableChannelAPIKey",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "enableChannelAPIKey",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "enableAllChannelAPIKeys",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "enableSelectedChannelAPIKeys",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "deleteDisabledChannelAPIKeys",
+      "classification": "ChannelConfiguration"
+    },
+    {
+      "field": "updateVideoStorageSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateWebhookNotifierConfig",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "updateAutoBackupSettings",
+      "classification": "SystemConfiguration"
+    },
+    {
+      "field": "backup",
+      "classification": "exception",
+      "guard": "existing strong maintenance/Owner permissions and retention/storage constraints; operational maintenance, not a governance policy exemption for new administrative writes"
+    },
+    {
+      "field": "completeSystemModelSettingOnboarding",
+      "classification": "exception",
+      "guard": "onboarding flags only; financial/general/supply configuration side writes still obey their own policy; presentation flag cannot authorize settings changes"
+    },
+    {
+      "field": "completeAutoDisableChannelOnboarding",
+      "classification": "exception",
+      "guard": "onboarding flags only; financial/general/supply configuration side writes still obey their own policy; presentation flag cannot authorize settings changes"
+    },
+    {
+      "field": "updateMe",
+      "classification": "exception",
+      "guard": "trusted authenticated user modifies own profile/password/OIDC link only; cannot alter Owner, scopes, membership or another user"
+    },
+    {
+      "field": "updateMyPassword",
+      "classification": "exception",
+      "guard": "trusted authenticated user modifies own profile/password/OIDC link only; cannot alter Owner, scopes, membership or another user"
+    },
+    {
+      "field": "unlinkOIDCIdentity",
+      "classification": "exception",
+      "guard": "trusted authenticated user modifies own profile/password/OIDC link only; cannot alter Owner, scopes, membership or another user"
+    },
+    {
+      "field": "saveRetailPriceFormula",
+      "classification": "exception",
+      "guard": "persist fixed-source configuration and draft only; current write_commercialization, revision and source checks; generated base retail prices retain submit/review/publish governance"
+    }
+  ],
+  "admin_mutation_count": 161,
+  "native_and_worker_guards": "migration 000038 and production transaction/domain gates",
+  "entry_families": [
+    {
+      "entry": "GraphQL/UI single, bulk, native form, canonical command",
+      "enforcement": "root authz + typed domain/target classification + transaction policy/version/module check + SQL row guards"
+    },
+    {
+      "entry": "OpenAPI user/project/role/channel administration",
+      "enforcement": "same native repositories/transaction and domain classification; user-key trusted-self exception does not apply to service-account callers"
+    },
+    {
+      "entry": "NEWAPI discovery, recurring model/pricing workers",
+      "enforcement": "separate observations; stages typed supply/mapping/provider packages before formal publication"
+    },
+    {
+      "entry": "signup/OIDC personal workspace initialization",
+      "enforcement": "transaction authority bound to actual new user and exact workspace, restricted user/project-role scopes; ordinary platform administration still governed"
+    },
+    {
+      "entry": "quota/usage billing/redemption/issued subscriptions maintenance",
+      "enforcement": "Project ledger remains authority; existing obligations and accounting idempotency continue; new issuance/admin changes retain module/policy checks"
+    }
+  ],
+  "side_write_authority": {
+    "human_observed_price_and_mapping": {
+      "current_transaction_scopes": [
+        "write_channels",
+        "write_commercialization"
+      ],
+      "without_authority": "observation + pending package + publication_blocked; no formal publication",
+      "producer": "human actor preserved even for background completion; system only actor absent + AUTOMATIC_SYNC"
+    },
+    "native_channel_price_copy": {
+      "current_transaction_scopes": [
+        "write_channels",
+        "write_commercialization"
+      ],
+      "denial": "entire copy transaction rolled back"
+    },
+    "group_multiplier": {
+      "actions": [
+        "group.price",
+        "group.create",
+        "group.update"
+      ],
+      "when": "RetailPrice requires review",
+      "current_scope": "write_commercialization",
+      "rechecked": [
+        "author",
+        "reviewer",
+        "publisher"
+      ]
+    }
+  },
+  "target_dependency_guards": {
+    "group_configuration": [
+      "actual linked PriceTier",
+      "linked AccessPlan",
+      "published AccessPlan versions",
+      "published model/route items",
+      "existing group/project relations"
+    ],
+    "runtime_excluded": [
+      "member spent/reserved Credits"
+    ],
+    "stale_review": "SOURCE_CHANGED; preserve newer published price"
+  }
+}

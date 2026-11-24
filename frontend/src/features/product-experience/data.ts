@@ -7,6 +7,8 @@ const PRODUCT_EXPERIENCE_SETTINGS_QUERY = `
   query ProductExperienceSettings {
     productExperienceSettings {
       mode
+      revision
+      features { id visibility execution visible enabled dependencies }
     }
   }
 `;
@@ -15,6 +17,8 @@ const UPDATE_PRODUCT_EXPERIENCE_SETTINGS_MUTATION = `
   mutation UpdateProductExperienceSettings($input: UpdateProductExperienceSettingsInput!) {
     updateProductExperienceSettings(input: $input) {
       mode
+      revision
+      features { id visibility execution visible enabled dependencies }
     }
   }
 `;
@@ -23,6 +27,22 @@ export const productExperienceQueryKey = ['productExperienceSettings'] as const;
 
 export interface ProductExperienceSettings {
   mode: ProductMode;
+  revision: string;
+  features: ProductFeature[];
+}
+export type FeatureOverride = 'INHERIT' | 'ON' | 'OFF';
+export interface ProductFeature {
+  id: string;
+  visibility: FeatureOverride;
+  execution: FeatureOverride;
+  visible: boolean;
+  enabled: boolean;
+  dependencies: string[];
+}
+export interface UpdateProductExperienceInput {
+  mode: ProductMode;
+  expectedRevision?: string;
+  overrides?: { id: string; visibility?: FeatureOverride; execution?: FeatureOverride }[];
 }
 
 export async function fetchProductExperienceSettings(): Promise<ProductExperienceSettings> {
@@ -52,10 +72,15 @@ export function useUpdateProductExperienceSettings() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: async (mode: ProductMode) => {
+    mutationFn: async (input: ProductMode | UpdateProductExperienceInput) => {
       const data = await graphqlRequest<{ updateProductExperienceSettings: ProductExperienceSettings }>(
         UPDATE_PRODUCT_EXPERIENCE_SETTINGS_MUTATION,
-        { input: { mode } }
+        {
+          input:
+            typeof input === 'string'
+              ? { mode: input, expectedRevision: queryClient.getQueryData<ProductExperienceSettings>(productExperienceQueryKey)?.revision }
+              : input,
+        }
       );
       return data.updateProductExperienceSettings;
     },

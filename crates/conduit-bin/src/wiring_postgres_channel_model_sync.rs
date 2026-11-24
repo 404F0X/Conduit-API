@@ -54,6 +54,12 @@ impl PgChannelModelSyncAdapter {
     }
 
     pub(crate) async fn run(&self) -> Result<(), String> {
+        if !crate::wiring_product_experience::feature_enabled(&self.pool, "automatic_model_sync")
+            .await?
+        {
+            tracing::debug!("automatic model sync skipped: FEATURE_DISABLED");
+            return Ok(());
+        }
         if !self.should_run_for_current_settings(Utc::now()).await {
             return Ok(());
         }
@@ -69,6 +75,14 @@ impl PgChannelModelSyncAdapter {
         .map_err(|error| error.to_string())?;
         let mut failures = Vec::new();
         for channel in channels {
+            if !crate::wiring_product_experience::feature_enabled(
+                &self.pool,
+                "automatic_model_sync",
+            )
+            .await?
+            {
+                break;
+            }
             let settings = match &self.system {
                 Some(system) => Some(
                     system
@@ -156,86 +170,115 @@ impl PgChannelModelSyncAdapter {
                 failures.join("; ")
             )
         })?;
-        let regex = channel
-            .auto_sync_model_pattern
-            .as_deref()
-            .filter(|pattern| !pattern.is_empty())
-            .map(regex::Regex::new)
-            .transpose()
-            .map_err(|error| format!("invalid auto-sync model pattern: {error}"))?;
-        let settings: ChannelSettings = serde_json::from_value(channel.settings.0.clone())
-            .map_err(|error| format!("invalid channel settings: {error}"))?;
-        let mapping_rules = compile_auto_model_mapping_rules(settings.auto_model_mapping_rules)?;
-        let mut merged = channel
-            .manual_models
-            .as_ref()
-            .map(|models| models.0.clone())
-            .unwrap_or_default();
-        let mut discovered = Vec::new();
-        for model in fetched.model_ids {
-            if regex
-                .as_ref()
-                .is_some_and(|filter| !filter.is_match(&model))
-            {
-                continue;
-            }
-            if !merged.contains(&model) {
-                merged.push(model.clone());
-            }
-            discovered.push(model);
-        }
-        let mut tx = self.pool.begin().await.map_err(|error| error.to_string())?;
-        sqlx::query("UPDATE channels SET supported_models=$1,updated_at=now() WHERE id=$2")
-            .bind(Json(&merged))
-            .bind(channel.id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| error.to_string())?;
-        sqlx::query(
-            "UPDATE upstream_model_deployments SET status='disabled',updated_at=now() \
-             WHERE channel_id=$1 AND source='discovered' AND status='enabled' \
-               AND NOT (upstream_model_id=ANY($2))",
+        persist_fetched_models(
+            &self.pool,
+            channel,
+            fetched,
+            &crate::wiring_postgres_change_sets::OperationContext::automatic(),
+            None,
         )
-        .bind(channel.id)
-        .bind(&merged)
-        .execute(&mut *tx)
         .await
-        .map_err(|error| error.to_string())?;
-        sqlx::query(
-            "UPDATE model_routes route SET status='disabled',updated_at=now() \
-             FROM upstream_model_deployments deployment \
-             WHERE route.deployment_id=deployment.id AND deployment.channel_id=$1 \
-               AND deployment.status='disabled' AND route.status='enabled'",
-        )
-        .bind(channel.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| error.to_string())?;
-        sqlx::query(
-            "WITH superseded AS (\
-               UPDATE change_sets cs SET status='superseded',reviewed_at=now(),\
-                      review_note='upstream deployment is no longer available',updated_at=now() \
-               WHERE cs.kind='model_mapping' AND cs.scope_type='channel' AND cs.scope_id=$1 \
-                 AND cs.status='pending_review' AND EXISTS(\
-                   SELECT 1 FROM change_set_items item \
-                   JOIN upstream_model_deployments deployment \
-                     ON deployment.id=CAST(item.after_snapshot->>'deploymentID' AS BIGINT) \
-                   WHERE item.change_set_id=cs.id AND deployment.status<>'enabled') \
-               RETURNING cs.id) \
-             INSERT INTO change_set_events(change_set_id,event_type,actor_type,detail,created_at) \
-             SELECT id,'superseded','system','{\"reason\":\"upstream_removed\"}'::jsonb,now() FROM superseded",
-        )
-        .bind(channel.id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| error.to_string())?;
-        for upstream_model_id in discovered {
-            apply_auto_model_mapping_rules(&mut tx, channel, &upstream_model_id, &mapping_rules)
-                .await?;
-        }
-        tx.commit().await.map_err(|error| error.to_string())?;
-        Ok(())
+        .map(|_| ())
     }
+}
+
+pub(crate) async fn commit_model_discovery(
+    pool: &PgPool,
+    channel_id: i64,
+    fetched: crate::model_fetch::FetchedModels,
+    context: &crate::wiring_postgres_change_sets::OperationContext,
+    fence: Option<&crate::wiring_postgres_channel_discovery::DiscoveryFence>,
+) -> Result<usize, String> {
+    let channel=sqlx::query_as::<_,AutoSyncChannel>("SELECT id,name,\"type\" AS channel_type,base_url,credentials,COALESCE(disabled_api_keys,'[]'::jsonb) AS disabled_api_keys,manual_models,auto_sync_model_pattern,settings FROM channels WHERE id=$1 AND deleted_at=0").bind(channel_id).fetch_one(pool).await.map_err(|e|e.to_string())?;
+    persist_fetched_models(pool, &channel, fetched, context, fence).await
+}
+async fn persist_fetched_models(
+    pool: &PgPool,
+    channel: &AutoSyncChannel,
+    fetched: crate::model_fetch::FetchedModels,
+    context: &crate::wiring_postgres_change_sets::OperationContext,
+    fence: Option<&crate::wiring_postgres_channel_discovery::DiscoveryFence>,
+) -> Result<usize, String> {
+    let regex = channel
+        .auto_sync_model_pattern
+        .as_deref()
+        .filter(|pattern| !pattern.is_empty())
+        .map(regex::Regex::new)
+        .transpose()
+        .map_err(|error| format!("invalid auto-sync model pattern: {error}"))?;
+    let settings: ChannelSettings = serde_json::from_value(channel.settings.0.clone())
+        .map_err(|error| format!("invalid channel settings: {error}"))?;
+    let mapping_rules = compile_auto_model_mapping_rules(settings.auto_model_mapping_rules)?;
+    let mut merged = channel
+        .manual_models
+        .as_ref()
+        .map(|models| models.0.clone())
+        .unwrap_or_default();
+    let mut discovered = Vec::new();
+    for model in fetched.model_ids {
+        if regex
+            .as_ref()
+            .is_some_and(|filter| !filter.is_match(&model))
+        {
+            continue;
+        }
+        if !merged.contains(&model) {
+            merged.push(model.clone());
+        }
+        discovered.push(model);
+    }
+    let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+    let policy = crate::wiring_governance::lock_policy(&mut tx).await?;
+    if let Some(fence) = fence {
+        crate::wiring_postgres_channel_discovery::lock_fence(&mut tx, fence).await?;
+    }
+    crate::wiring_postgres_provider_pricing::lock_provider_pricing_channel(&mut tx, channel.id)
+        .await?;
+    let discovered_count = discovered.len();
+    let observation:i64=sqlx::query_scalar("INSERT INTO channel_model_observations(channel_id,supported_models) VALUES($1,$2) RETURNING id").bind(channel.id).bind(Json(&merged)).fetch_one(&mut *tx).await.map_err(|_|"model observation storage failed")?;
+    let supply_package = crate::wiring_governance_commands::stage_supply(
+        &mut tx,
+        context,
+        channel.id,
+        merged.clone(),
+        observation,
+        &policy,
+    )
+    .await?;
+    let mut proposals = Vec::new();
+    for upstream_model_id in discovered {
+        if let Some(proposal) =
+            apply_auto_model_mapping_rules(&mut tx, channel, &upstream_model_id, &mapping_rules)
+                .await?
+        {
+            proposals.push(proposal);
+        }
+    }
+    let package = crate::wiring_postgres_change_sets::packages::stage_observed(
+        &mut tx,
+        context,
+        "model_mapping",
+        channel.id,
+        &format!("Model mapping discovery: {}", channel.name),
+        &Utc::now().timestamp_micros().to_string(),
+        &proposals,
+        Utc::now(),
+    )
+    .await?;
+    if let Some(fence) = fence {
+        crate::wiring_postgres_channel_discovery::finish_models(
+            &mut tx,
+            fence,
+            discovered_count,
+            package.as_ref(),
+        )
+        .await?;
+    }
+    if let (Some(fence), Some(supply)) = (fence, supply_package) {
+        sqlx::query("UPDATE channel_operation_receipts SET stage_results=jsonb_set(stage_results,'{models,supplyChangeSetID}',to_jsonb($2::bigint)) WHERE operation_id=$1").bind(fence.operation_id).bind(supply).execute(&mut *tx).await.map_err(|_|"supply receipt failed")?;
+    }
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok(discovered_count)
 }
 
 fn enabled_model_sync_api_keys(
@@ -314,9 +357,9 @@ async fn apply_auto_model_mapping_rules(
     channel: &AutoSyncChannel,
     upstream_model_id: &str,
     rules: &[CompiledAutoModelMappingRule],
-) -> Result<(), String> {
+) -> Result<Option<crate::wiring_postgres_change_sets::packages::Proposal>, String> {
     let Some((compiled, captures)) = first_matching_rule(rules, upstream_model_id) else {
-        return Ok(());
+        return Ok(None);
     };
     let public_model_key = expand_template(&captures, &compiled.rule.public_model_id_template);
     if public_model_key.trim().is_empty() {
@@ -325,23 +368,11 @@ async fn apply_auto_model_mapping_rules(
             upstream_model_id,
             "auto model mapping produced an empty public model id"
         );
-        return Ok(());
+        return Ok(None);
     }
     let public_model_key = public_model_key.trim().to_string();
 
-    let deployment_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO upstream_model_deployments \
-         (channel_id,upstream_model_id,internal_name,variant,status,source,created_at,updated_at) \
-         VALUES($1,$2,$3,'','enabled','discovered',now(),now()) \
-         ON CONFLICT(channel_id,upstream_model_id,variant) DO UPDATE SET \
-           status='enabled',internal_name=EXCLUDED.internal_name,updated_at=now() RETURNING id",
-    )
-    .bind(channel.id)
-    .bind(upstream_model_id)
-    .bind(format!("{} / {upstream_model_id}", channel.name))
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
+    let deployment_id=sqlx::query_scalar::<_,i64>("SELECT id FROM upstream_model_deployments WHERE channel_id=$1 AND upstream_model_id=$2 AND variant='' LIMIT 1").bind(channel.id).bind(upstream_model_id).fetch_optional(&mut **tx).await.map_err(|_|"deployment observation lookup failed")?;
 
     let existing = sqlx::query(
         "SELECT id,status,developer,\"type\",name,\"group\" FROM models \
@@ -361,10 +392,10 @@ async fn apply_auto_model_mapping_rules(
             public_model_id = %public_model_key,
             "auto model mapping skipped an archived public model"
         );
-        return Ok(());
+        return Ok(None);
     }
     if existing.is_none() && !compiled.rule.create_draft {
-        return Ok(());
+        return Ok(None);
     }
     let existing_route_status = match existing.as_ref() {
         Some(row) => sqlx::query_scalar::<_, String>(
@@ -378,15 +409,7 @@ async fn apply_auto_model_mapping_rules(
         None => None,
     };
     if existing_route_status.as_deref() == Some("enabled") {
-        supersede_model_mapping_change_sets(
-            tx,
-            &channel.id.to_string(),
-            upstream_model_id,
-            None,
-            chrono::Utc::now(),
-        )
-        .await?;
-        return Ok(());
+        return Ok(None);
     }
     let developer = expanded_or(
         &captures,
@@ -417,121 +440,21 @@ async fn apply_auto_model_mapping_rules(
             "group": group,
         }
     });
-    stage_model_mapping_change_set(
-        tx,
-        channel,
-        upstream_model_id,
-        before_snapshot,
-        after_snapshot,
-    )
-    .await
-}
-
-async fn stage_model_mapping_change_set(
-    tx: &mut Transaction<'_, Postgres>,
-    channel: &AutoSyncChannel,
-    upstream_model_id: &str,
-    before_snapshot: Option<serde_json::Value>,
-    after_snapshot: serde_json::Value,
-) -> Result<(), String> {
-    let scope_id = channel.id.to_string();
-    let duplicate = sqlx::query_scalar::<_, i64>(
-        "SELECT cs.id FROM change_sets cs JOIN change_set_items item ON item.change_set_id=cs.id \
-         WHERE cs.kind='model_mapping' AND cs.scope_type='channel' AND cs.scope_id=$1 \
-           AND cs.status='pending_review' AND item.item_key=$2 AND item.after_snapshot=$3 \
-           AND item.before_snapshot IS NOT DISTINCT FROM $4 \
-         ORDER BY cs.id DESC LIMIT 1",
-    )
-    .bind(&scope_id)
-    .bind(upstream_model_id)
-    .bind(Json(&after_snapshot))
-    .bind(before_snapshot.as_ref().map(Json))
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    let now = chrono::Utc::now();
-    if let Some(id) = duplicate {
-        supersede_model_mapping_change_sets(tx, &scope_id, upstream_model_id, Some(id), now)
-            .await?;
-        sqlx::query("UPDATE change_sets SET source_revision=$2,updated_at=$3 WHERE id=$1")
-            .bind(id)
-            .bind(now.timestamp_micros().to_string())
-            .bind(now)
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-    supersede_model_mapping_change_sets(tx, &scope_id, upstream_model_id, None, now).await?;
-    let change_set_id = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO change_sets \
-         (kind,scope_type,scope_id,title,status,source_revision,submitted_at,created_at,updated_at) \
-         VALUES('model_mapping','channel',$1,$2,'pending_review',$3,$4,$4,$4) RETURNING id",
-    )
-    .bind(&scope_id)
-    .bind(format!("Model mapping: {upstream_model_id}"))
-    .bind(now.timestamp_micros().to_string())
-    .bind(now)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    sqlx::query(
-        "INSERT INTO change_set_items \
-         (change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,created_at,updated_at) \
-         VALUES($1,$2,$3,$4,$5,$6,$7,$7)",
-    )
-    .bind(change_set_id)
-    .bind(upstream_model_id)
-    .bind(if before_snapshot.is_some() { "update" } else { "create" })
-    .bind(before_snapshot.map(Json))
-    .bind(Json(after_snapshot))
-    .bind(Json(serde_json::json!({
-        "channelID": channel.id,
-        "channelName": channel.name,
-        "upstreamModelID": upstream_model_id,
-    })))
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    sqlx::query(
-        "INSERT INTO change_set_events(change_set_id,event_type,actor_type,detail,created_at) \
-         VALUES($1,'submitted','system','{}'::jsonb,$2)",
-    )
-    .bind(change_set_id)
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
-async fn supersede_model_mapping_change_sets(
-    tx: &mut Transaction<'_, Postgres>,
-    scope_id: &str,
-    upstream_model_id: &str,
-    except_id: Option<i64>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), String> {
-    sqlx::query(
-        "WITH superseded AS (\
-           UPDATE change_sets cs SET status='superseded',reviewed_at=$4,\
-                  review_note='superseded by newer model discovery',updated_at=$4 \
-           WHERE cs.kind='model_mapping' AND cs.scope_type='channel' AND cs.scope_id=$1 \
-             AND cs.status='pending_review' AND ($3::BIGINT IS NULL OR cs.id<>$3) \
-             AND EXISTS(SELECT 1 FROM change_set_items item WHERE item.change_set_id=cs.id AND item.item_key=$2) \
-           RETURNING cs.id) \
-         INSERT INTO change_set_events(change_set_id,event_type,actor_type,detail,created_at) \
-         SELECT id,'superseded','system','{}'::jsonb,$4 FROM superseded",
-    )
-    .bind(scope_id)
-    .bind(upstream_model_id)
-    .bind(except_id)
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(Some(
+        crate::wiring_postgres_change_sets::packages::Proposal {
+            key: upstream_model_id.to_string(),
+            action: if before_snapshot.is_some() {
+                "update"
+            } else {
+                "create"
+            }
+            .into(),
+            before: before_snapshot,
+            after: Some(after_snapshot),
+            source: serde_json::json!({"source":"observed","channelID":channel.id,"channelName":channel.name,"upstreamModelID":upstream_model_id}),
+            error: None,
+        },
+    ))
 }
 
 fn first_matching_rule<'r, 'm>(
@@ -616,6 +539,70 @@ mod tests {
         Ok(())
     }
 
+    async fn publish_reviewed_mapping(
+        pool: &PgPool,
+        id: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_admin_graphql::change_package::{
+            ChangePackageServices, ChangeSetAvailableAction, PackageViewer,
+        };
+        let adapter = crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(pool.clone());
+        let detail = adapter
+            .get_detail(
+                PackageViewer {
+                    actor_user_id: 1,
+                    can_write: true,
+                },
+                async_graphql::ID(id.to_string()),
+            )
+            .await?
+            .ok_or("missing observed package")?;
+        assert_eq!(
+            detail.summary.status,
+            conduit_admin_graphql::change_set::ChangeSetStatus::Approved
+        );
+        adapter
+            .transition(
+                1,
+                detail.summary.id,
+                detail.summary.revision,
+                ChangeSetAvailableAction::Publish,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+    async fn publish_observed_supply(
+        pool: &PgPool,
+        channel: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_admin_graphql::change_package::{
+            ChangePackageServices, ChangeSetAvailableAction, PackageViewer,
+        };
+        let id:i64=sqlx::query_scalar("SELECT id FROM change_sets WHERE kind='model_supply' AND scope_id=$1 AND status='pending_review' ORDER BY id DESC LIMIT 1").bind(channel.to_string()).fetch_one(pool).await?;
+        let adapter = crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(pool.clone());
+        let detail = adapter
+            .get_detail(
+                PackageViewer {
+                    actor_user_id: 1,
+                    can_write: true,
+                },
+                async_graphql::ID(id.to_string()),
+            )
+            .await?
+            .ok_or("missing supply package")?;
+        adapter
+            .transition(
+                1,
+                detail.summary.id,
+                detail.summary.revision,
+                ChangeSetAvailableAction::ApproveApply,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn postgres_model_sync_tracks_provider_removal_and_recovery_when_dsn_is_provided()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -639,6 +626,7 @@ mod tests {
             .mount(&server)
             .await;
         let database = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        database.owners(&[1]).await?;
         let pool = database.pool.clone();
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let public_model_prefix = format!("sync-draft-{suffix}");
@@ -668,6 +656,18 @@ mod tests {
 
         let adapter = PgChannelModelSyncAdapter::new(pool.clone());
         tokio::task::spawn_blocking(move || adapter.sync_models()).await??;
+        assert_eq!(
+            sqlx::query_scalar::<_, Json<Vec<String>>>(
+                "SELECT supported_models FROM channels WHERE id=$1"
+            )
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await?
+            .0,
+            Vec::<String>::new(),
+            "discovery must leave online supply unchanged before publication"
+        );
+        publish_observed_supply(&pool, channel_id).await?;
         let models = sqlx::query_scalar::<_, Json<Vec<String>>>(
             "SELECT supported_models FROM channels WHERE id=$1",
         )
@@ -709,10 +709,20 @@ mod tests {
             ]
         );
         let change_sets = crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(pool.clone());
-        for (id, _, _) in pending_mappings {
+        let package_ids = pending_mappings
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            package_ids.len(),
+            1,
+            "one synchronization produces one complete mapping package"
+        );
+        for id in package_ids {
             change_sets
                 .approve_change_set(1, id.to_string().into(), None)
                 .await?;
+            publish_reviewed_mapping(&pool, id).await?;
         }
         let applied_mappings = sqlx::query_as::<_, (String, String, String)>(
             "SELECT model.model_id,model.status,route.status FROM models model \
@@ -783,6 +793,18 @@ mod tests {
             .await;
         let adapter = PgChannelModelSyncAdapter::new(pool.clone());
         tokio::task::spawn_blocking(move || adapter.sync_models()).await??;
+        assert_eq!(
+            sqlx::query_scalar::<_, Json<Vec<String>>>(
+                "SELECT supported_models FROM channels WHERE id=$1"
+            )
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await?
+            .0,
+            models,
+            "removal observations must await publication"
+        );
+        publish_observed_supply(&pool, channel_id).await?;
         let models_after_removal = sqlx::query_scalar::<_, Json<Vec<String>>>(
             "SELECT supported_models FROM channels WHERE id=$1",
         )
@@ -831,6 +853,7 @@ mod tests {
             .await;
         let adapter = PgChannelModelSyncAdapter::new(pool.clone());
         tokio::task::spawn_blocking(move || adapter.sync_models()).await??;
+        publish_observed_supply(&pool, channel_id).await?;
         let recovered_deployments = sqlx::query_as::<_, (String, String)>(
             "SELECT upstream_model_id,status FROM upstream_model_deployments \
              WHERE channel_id=$1 ORDER BY upstream_model_id",
@@ -841,9 +864,10 @@ mod tests {
         assert_eq!(
             recovered_deployments,
             vec![
-                ("gpt-cheap".into(), "enabled".into()),
+                ("gpt-cheap".into(), "disabled".into()),
                 ("gpt-expensive".into(), "disabled".into())
-            ]
+            ],
+            "an observed recovery does not enable a deployment before its mapping is published"
         );
         let recovered_change_set_id = sqlx::query_scalar::<_, i64>(
             "SELECT cs.id FROM change_sets cs JOIN change_set_items item ON item.change_set_id=cs.id \
@@ -857,6 +881,7 @@ mod tests {
         change_sets
             .approve_change_set(1, recovered_change_set_id.to_string().into(), None)
             .await?;
+        publish_reviewed_mapping(&pool, recovered_change_set_id).await?;
         let recovered_routes = sqlx::query_as::<_, (String, String)>(
             "SELECT deployment.upstream_model_id,route.status FROM model_routes route \
              JOIN upstream_model_deployments deployment ON deployment.id=route.deployment_id \
@@ -885,6 +910,10 @@ mod tests {
             .execute(&pool)
             .await?;
         sqlx::query("DELETE FROM upstream_model_deployments WHERE channel_id=$1")
+            .bind(channel_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM channel_model_observations WHERE channel_id=$1")
             .bind(channel_id)
             .execute(&pool)
             .await?;

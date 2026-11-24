@@ -13,9 +13,9 @@ It performs these steps in order:
    `CREATEDB` permission, occupied ports, and non-loopback URL literals in
    `frontend/tests/*.ts`.
 2. Drops and recreates one dedicated PostgreSQL database.
-3. Starts a loopback-only mock upstream and the Conduit API backend.
+3. Creates an owned temporary journal/log directory and starts a loopback-only mock upstream and the Conduit API backend.
 4. Waits for `/health`; Playwright then starts Vite and runs the browser suite.
-5. Stops all child processes and drops the isolated database, including on
+5. Stops all child processes, removes only the owned temporary runtime directory, and drops the isolated database, including on
    test failure or interruption.
 
 The default database is `conduit_e2e` on the local PostgreSQL instance used by
@@ -88,3 +88,56 @@ the backend receives the same proxy boundary through standard proxy variables,
 and HTTPS tunnelling is rejected. Run the normal Rust/frontend dependency
 installation steps before the harness because its child processes cannot fetch
 packages from the public network.
+
+## Playground billing regression
+
+`frontend/tests/playground-billing.spec.ts` is collected by the existing Chromium
+project and the release-gates job's `pnpm test:e2e -- --reporter=line` command.
+No separate CI invocation or skipped/missing-DSN success path is used. For focused
+local diagnostics only, pass `playground-billing.spec.ts --reporter=line`.
+
+The harness explicitly starts the isolated fixture backend in Hard billing mode;
+this does not change the product's default mode. Its local OpenAI mock supports
+both buffered responses and deterministic SSE (including the final usage event
+and `[DONE]`). It never echoes prompts or authentication data.
+
+Each financial fixture creates a dedicated test Project wallet and a normal user API key created
+and revealed through the browser, a published retail price of 2/4 CNY per million
+input/output tokens, 10000 station credits per CNY, and Project multiplier 1.5.
+The stream reports 100 input and 20 output tokens: exactly 4.2 credits (4200000
+microcredits). The browser checks market prices, sends a real Playground request,
+then opens request activity and the wallet. Bounded SQL polling checks this key's
+one usage, charge, settlement and ledger debit, exact remaining balance, and zero
+active reservation. Only test prerequisites are seeded through SQL in the guarded
+isolated database; inference, authentication and settlement use the real backend.
+Screenshots, traces and video are disabled for this spec so its one-time key is
+not retained in diagnostic artifacts. Missing harness isolation/DSN fails the test.
+
+### Payment reference fixture
+
+The same isolated harness starts an HTTPS-only reference cashier on loopback
+(default port 18443; `CONDUIT_E2E_PAYMENT_PORT` overrides it). OpenSSL is required.
+A fresh task-owned CA, server certificate and private keys are created inside the
+run's temporary directory. Only the payment provider client receives that CA.
+Chromium receives a single-run SHA256 SPKI pin under the isolated harness marker;
+Playwright uses a separate temporary browser profile. System trust and global
+certificate verification settings are unchanged. The fixture configuration, keys,
+servers and journal/log files are removed by the harness on exit. `--check` only
+checks prerequisites and free ports; it does not generate certificates or start
+services.
+
+This gateway implements only the pinned maajiko/Epay a4d0f042 classic-MD5
+reference profile. It accepts hosted checkout, sends signed GET notifications
+and answers order queries with the reference Shanghai-local endtime. No real
+merchant, real provider or real money is used. Local simulated gateway success
+does not establish compatibility with an unspecified merchant installation.
+Never log full checkout, notification or query URLs: they contain signatures or
+merchant keys. Payment browser tests disable trace, video and screenshots.
+
+The suite also collects `group-pricing.spec.ts` (ordered group condition pricing,
+complete draft save/reopen preservation, and unchanged published charge before
+publication) and both channels in `payment-topup.spec.ts`. Each payment case
+checks an unpaid return, frozen 1-fen/1.5x receipt, verified 150-credit top-up,
+repeated reconciliation without duplicate credit, then a real normal-key local
+upstream request charging exactly 4.2 credits in that same Project with one debit
+and zero remaining reservation. Collection is not proof that these cases ran.

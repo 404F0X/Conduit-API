@@ -96,5 +96,10 @@
   "users.messages.removeFromProjectSuccess": "用户已成功从项目中移除",
   "users.errors.insufficientPermissions": "您没有足够的权限编辑此用户",
   "users.errors.duplicateEmail": "此邮箱已被注册，请使用其他邮箱。",
-  "users.errors.saveForbidden": "无法保存这些用户权限。请联系平台 Owner 获取授权，或移除你无权授予的权限。"
+  "users.errors.saveForbidden": "无法保存这些用户权限。请联系平台 Owner 获取授权，或移除你无权授予的权限。",
+  "users.groups.recharge.description": "每位用户最多属于一个用户组；用户组授予模型访问范围，并设置新支付充值订单的到账倍率。",
+  "users.groups.recharge.label": "充值倍率（×）",
+  "users.groups.recharge.hint": "默认 1×，大于 0 且不超过 1000×，最多六位小数。创建订单时冻结，修改不会重算旧订单；并发修改冲突后请重新加载再保存。",
+  "users.groups.recharge.invalid": "请输入大于 0、不超过 1000 的倍率，最多六位小数；若用户组已修改，请先重新加载。",
+  "users.groups.recharge.summary": "充值倍率 {{multiplier}}× · {{ppm}} PPM"
 }

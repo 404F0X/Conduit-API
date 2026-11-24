@@ -21,5 +21,12 @@
   "playground.errors.noChannelsAvailable": "没有可用渠道",
   "playground.errors.noModelsAvailable": "没有可用模型",
   "playground.modelsAvailable": "{{count}} 个模型可用，跨 {{channels}} 个渠道",
-  "playground.modelPageModelsAvailable": "{{count}} 个模型网关模型可用"
+  "playground.modelPageModelsAvailable": "{{count}} 个模型网关模型可用",
+  "playground.settings.apiKey": "API 密钥",
+  "playground.settings.keyNotice": "粘贴创建时复制的密钥，仅保存在当前页面；切换项目或离开会清除。访问权限与费用由密钥所属项目决定。",
+  "playground.settings.createKey": "创建或管理 API 密钥",
+  "playground.settings.loadModels": "加载可用模型",
+  "playground.errors.http": "请求失败（HTTP {{status}}），请检查密钥、权限与余额。",
+  "playground.errors.request": "请求失败或流意外中断，请检查连接和参数。重试会发送新的计费请求。",
+  "playground.chat.retryNotice": "重试会发送新请求，并按正常用量计费。"
 }

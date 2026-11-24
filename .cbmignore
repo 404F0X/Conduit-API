@@ -32,3 +32,4 @@ test-results/
 *.ready.tmp
 journal.wal
 journal.lock
+/SillyTavern/

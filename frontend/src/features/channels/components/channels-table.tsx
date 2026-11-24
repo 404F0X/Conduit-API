@@ -43,6 +43,7 @@ import { ChannelExpandedRow } from './channel-expanded-row';
 import { ChannelManagementAdapterBadge } from './channel-management-adapter-badge';
 import { ChannelOverflowMenu } from './channel-overflow-menu';
 import { DataTableToolbar } from './data-table-toolbar';
+import { NewApiChannelActions } from './new-api-discovery';
 
 const MotionTableRow = motion.create(TableRow);
 const MotionExpandedRow = motion.create(TableRow);
@@ -366,6 +367,11 @@ export function ChannelsTable({
                   <Badge variant='destructive'>{t(`channels.operations.failureKinds.${channel.operationalIssue.category}`)}</Badge>
                 )}
               </div>
+              {channel.settings?.managementAdapter === 'new_api' && (
+                <div className='mt-4 border-t pt-3'>
+                  <NewApiChannelActions channel={channel} />
+                </div>
+              )}
               <div className='mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3'>
                 <Button
                   size='sm'

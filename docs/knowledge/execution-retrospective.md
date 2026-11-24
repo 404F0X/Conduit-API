@@ -1,6 +1,55 @@
 # 执行反思与检查边界
 
+## Lite / Full attempt 3：跨用户重试身份
+
+对最终副写事务的当前权限断言，必须同时覆盖实际入口传递的身份；原作者审计字段不是重试者的授权。当前选择限定原创建者重试，在锁定回执时先于凭据补写和 claim 拒绝换人；run_claimed 继续明确核创建者一致性，并使用真实请求者建立发布上下文。初始化、失败重试、租约过期恢复共用该边界；无作者的历史人工回执不能当作自动生产者。
+
+新增两个确定性 stub + 隔离 PG 用例直接调用真实 ChannelDiscoveryServices retry。覆盖 Prices/Models、A高权限创建/B低权限重试拒绝、正常创建者重试、过期租约恢复、原作者与凭据不变及 stale attempt。异步响应由 Notify 阻塞，只有提交实际重试者撤权后才释放，证明完成时仍复核权限；保留观测/待审和拒绝事件。所有审批 OFF；跨用户拒绝时全部正式配置不变，合法作者保留渠道写权限时供给仍沿已有 OFF 政策，撤销商业权限阻止价格/映射发布。ModelSupply ON 会同时阻止映射即时发布，不能把该复合策略当作商业权限拒绝证据。
+
+早期 fixture 的价格版本表名、渠道唯一名与供给审批配置失败按真实日志保留；修正隔离配置并保留权限/正式数据断言，未弱化生产保护。最终 Rust 门禁、候选、一次索引维护及退出状态见 implementation-a3 五产物。未变 R2/R3、前端132 unit/19 mock browser 按输入复用；真实 provider/payment 未执行，tsc整体基线和原生metadata诊断仍未知。
+
+a1/a2产物不可改，当前日志仅存a3；复用旧55438数据和C生成缓存的真实attempt1 owner，不新建实例/缓存。G删除策略拒绝不重试，Root继续唯一维护TODO/ledger。本次是同任务第二次/最终允许返工，不另起编号掩盖未闭合风险。
+
+## 历史 a2 与更早执行记录
+
+
+## Lite / Full attempt 2 返工
+
+冻结源码审查发现三项事务缺口：矩阵分类不能代替 OFF 即时副写权限检查；复合分组调价须复用相同实际定价域；事务串行化不能代替关联 PriceTier/已发布准入版本与条目哈希。修复集中在原 helper 与真实事务，不改 UI 或扩大到未知基线 tsc。
+
+新增三项确定性隔离 PG 用例覆盖缺权限/正向、ON/撤权、A→B 源冲突及运行计数不误报。第一轮新 fixture 编译失败，第二轮严格策略拒绝不具备其他合格审核者的 fixture；修正独立审核者设置，没有弱化保护。最终检查与候选见 implementation-a2/checks.json，旧候选检查保留且按依赖明确复用或失效。UI 未变化，沿用 a1 132 单测及 19 mock browser；真实提供商集成仍未执行。
+
+同一自有 PG55438 和 C 生成缓存复用，a1 attempt 标记保留真实所有权。a1 五产物和日志不改；a2 启停、检查、覆盖与候选产物另存，最终进程终态与数据/缓存移交见 implementation-a2/resources.json。历史 G 删除策略拒绝不重试，不为原生图元数据诊断循环刷新。Root 继续唯一维护 TODO/ledger。
+
+## 历史 a1 与更早执行记录
+
+
+## Lite / Full 当前作者证据（2026-10-09）
+
+本轮 MODE_CODE a1 / lite-full-r1 的输入、改动与最终指纹见 [作者报告](../../.codex-workflow/runs/lite-full-implementation-20261008/artifacts/implementation/report.md)、[候选](../../.codex-workflow/runs/lite-full-implementation-20261008/artifacts/implementation/candidate.json)、[实际检查](../../.codex-workflow/runs/lite-full-implementation-20261008/artifacts/implementation/checks.json)。同一任务没有另建实现者或验证者，Root 继续唯一维护 TODO/ledger。当前迁移仅新增 `000038_product_governance.sql`；历史迁移与用户数据库保持原样。
+
+治理/成员资金关键检查连接任务自有 PostgreSQL 18（127.0.0.1:55438），完整 workspace 测试包含实际数据库用例；早期 fixture/触发器/权限失败与最终通过日志分开保留。`APPROVE_APPLY` 同事务复核两项职责并记录审核、发布两事件；review-only API 明确返回 Approved。授权撤回、价格独立策略、组合侧写、原子失败、同操作重试、真实超估结算与未来预留限制均按实际行为验证。
+
+G 盘输出不足导致第二轮 workspace 编译失败；三个任务 incremental 目录的删除命令在 CreateProcess 阶段被策略拒绝，原因仅为 `blocked by policy`，没有启动或删除，没有改写/换工具重试。随后 Root 授权 C 盘新建专属输出目录，仅生成输出；保留用户 G target，使用 incremental=0、dev/test debug=0，原 workspace test/clippy 命令和断言不变。
+
+浏览器用 agent-browser 检查同一 production build 和任务自有 loopback18468合成 API，包括六/五入口、三态、权限、本人模型资金、运行开关提案、103 价格末行输入与 NEWAPI 单址/阶段回执。合成 API 不证明真实提供商/支付集成；真实 PostgreSQL 是资金与事务行为证据。资源退出与保留原因见最终作者报告；作者不能替独立验收作结论。
+
+改进：同类写入口分类必须跟随每一个受治理的侧写；SQL JSON 比较必须保留模块名称；UPSERT 的 BEFORE INSERT 也需比较原配置；目录解析错误使用 Result 传播，避免生产 panic。检查结论须绑定真实候选与依赖，不把早期通过或跳过数据库当作最终通过。
+
+
 本页先保留project-exploration-20261005及acceptance运行的历史反思，再记录quality-repair-20261006的21项实现。原始Root /root持续协调，用户唯一源码项目G:/fubox_API；当前源码绑定[输入清单](source-manifest.md)。探索阶段仅改文档，修复阶段明确修改产品行为；两者的检查与资源事实分别记录，没有创建后代、提交或线上操作。
+
+## 2026-10-08：事件包 r3 的集中界面修正
+
+唯一独立验证者对A1冻结候选提出7项发现：14项AC通过、10项AC尚未满足。编译与单元门禁通过没有发现窄屏独立renderer缺少入口、缓存变体只读投影遗漏、初始化完成前结果区缺失和响应已提交后的旧确认框。作者本轮按7项真实失败集中修正，没有再探索后端或重复旧21项。
+
+A1精确58文件归档并逐SHA回读，83份旧作者产物保持字节；新的产物使用attempt2命名。[保存证据](../../.codex-workflow/runs/quality-repair-20261006/artifacts/draft-implement-r3-a2-preservation.json)绑定580个未变非前端输入。GraphQL传输模块/19个前端文档及变量没有改变，精确fixture回归仍通过；Rust6274测试、隔离PG及schema门禁按未变输入复用，未把新前端表现当新PG验证。
+
+本轮前端四项门禁真实exit0：单元130通过，lint为0error/71warning，构建保留大chunk警告。[7项UI回归](../../.codex-workflow/runs/quality-repair-20261006/artifacts/draft-implement-r3-a2-browser-checks.json)使用本次唯一build、任务自有loopback18464假数据与一次性Chromium，含390×844和1280×900；没有生产登录/创建/同步/批准或真实KEY/PAT。假API只能证明显示与请求交互，不能替代后端事务/真实provider。浏览器关闭，假服务正常退出；已有用户服务和PG未触碰。
+
+额外tsc的A1 exit2/80诊断是历史事实，依赖级基线归因UNKNOWN；本次未重复该非必需命令，也不宣称当前全量类型检查通过。知识图仍STALE，当前源清单另绑定；旧v6/v7/v8失败与被拒清理保持原样。最终功能结论仍由同一独立验证者检查增量，作者不批准自己的候选。
+
+改进：前端差异投影按完整价格项核对，包含档位和变体；共享高频动作同时接入桌面与窄屏renderer；持久成功回执先呈现再等待后续请求；网络结果未知后的按钮行为用实际React回归，而不只测试后端状态锁或纯请求函数。
 
 ## 真实问题、影响与改进
 

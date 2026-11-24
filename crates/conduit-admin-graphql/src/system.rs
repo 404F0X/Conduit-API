@@ -329,7 +329,9 @@ impl From<UpdateStoragePolicyInput> for StoragePolicy {
 
 /// GraphQL `UpstreamErrorPolicy` (snapshot lines 9474-9477). Mirrors Go
 /// `biz.UpstreamErrorPolicy` (`system.go:343-349`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, SimpleObject)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, SimpleObject, serde::Serialize, serde::Deserialize,
+)]
 #[graphql(name = "UpstreamErrorPolicy")]
 pub struct UpstreamErrorPolicy {
     pub mode: String,
@@ -346,7 +348,7 @@ pub struct UpstreamErrorPolicyInput {
 
 /// GraphQL `AutoDisableChannelStatus` (snapshot lines 9401-9404). Mirrors Go
 /// `biz.AutoDisableChannelStatus` (`system.go:359-365`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SimpleObject)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SimpleObject, serde::Serialize, serde::Deserialize)]
 #[graphql(name = "AutoDisableChannelStatus")]
 pub struct AutoDisableChannelStatus {
     pub status: i32,
@@ -363,7 +365,7 @@ pub struct AutoDisableChannelStatusInput {
 
 /// GraphQL `AutoDisableChannel` (snapshot lines 9406-9409). Mirrors Go
 /// `biz.AutoDisableChannel` (`system.go:351-357`).
-#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject, serde::Serialize, serde::Deserialize)]
 #[graphql(name = "AutoDisableChannel")]
 pub struct AutoDisableChannel {
     pub enabled: bool,
@@ -380,7 +382,7 @@ pub struct AutoDisableChannelInput {
 
 /// GraphQL `RetryPolicy` (snapshot lines 9461-9472). Mirrors Go
 /// `biz.RetryPolicy` (`system.go:309-341`).
-#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject, serde::Serialize, serde::Deserialize)]
 #[graphql(name = "RetryPolicy")]
 pub struct RetryPolicy {
     pub max_channel_retries: i32,

@@ -6,6 +6,7 @@ import { AppHeader } from '@/components/layout/app-header';
 import { AppSidebar } from '@/components/layout/app-sidebar';
 import { RouteGuard } from '@/components/route-guard';
 import SkipToMain from '@/components/skip-to-main';
+import { GovernanceProposalDialog } from '@/features/change-sets/proposal-dialog';
 import { OnboardingProvider } from '@/features/onboarding';
 import { useSidebarData } from './sidebar';
 
@@ -20,6 +21,7 @@ export function AuthenticatedLayout({ children }: Props) {
   return (
     <SidebarProvider defaultOpen={defaultOpen} className='h-screen flex-col overflow-hidden'>
       <AppHeader />
+      <GovernanceProposalDialog />
       <div className='flex flex-1 overflow-hidden'>
         <SkipToMain />
         <AppSidebar sidebarData={sidebarData} />

@@ -105,6 +105,9 @@ impl ApiKeyExtension {
 /// raw key; this struct carries the validated identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ValidatedApiKeyMetadata {
+    /// Trusted, server-resolved Key model scope; revision covers group membership/status.
+    pub model_group_id: String,
+    pub model_group_revision: i64,
     /// Database ID of the API key (Go `apiKey.ID`).
     pub api_key_id: i64,
     /// Human-readable name of the key (Go `apiKey.Name`).
@@ -164,6 +167,8 @@ pub trait ApiKeyValidationService: Send + Sync {
 /// the values are serialized as `serde_json::Value::String` / `Number` on
 /// the `HttpRequest.metadata` map (`BTreeMap<String, Value>`).
 pub mod api_key_meta_keys {
+    pub const MODEL_GROUP_ID: &str = "model_group_id";
+    pub const MODEL_GROUP_REVISION: &str = "model_group_revision";
     /// `i64` — database ID of the API key.
     pub const API_KEY_ID: &str = "api_key_id";
     /// `String` — human-readable name of the key.

@@ -52,7 +52,7 @@ import type { Model } from '../data/schema';
 import { type ModelsCatalogSearch, validateModelsSearch } from '../model-search';
 import { CommercializationPanel, type CommercializationAction } from './commercialization-panel';
 import { aggregatePublicModelHealth, aggregateUpstreamModelHealth, getHealth } from './model-catalog-health';
-import { priceColumns } from './model-catalog-pricing';
+import { priceColumns, retailPriceValues } from './model-catalog-pricing';
 import { createColumns } from './models-columns';
 import { ModelsTable } from './models-table';
 
@@ -214,30 +214,27 @@ function developerLabel(developer: string, providers: ProvidersData | undefined,
   return t(key, { defaultValue: developer === 'unknown' ? t('models.catalog.unknownDeveloper') : developer });
 }
 
-const RETAIL_TOKEN_ITEMS = [
-  { code: 'prompt_tokens', label: 'models.catalog.retailInput' },
-  { code: 'completion_tokens', label: 'models.catalog.retailOutput' },
-  { code: 'prompt_cached_tokens', label: 'models.catalog.retailCacheRead' },
-  { code: 'prompt_write_cached_tokens', label: 'models.catalog.retailCacheWrite' },
-] as const;
-
-function retailPriceValues(item?: PriceBookItem) {
-  if (!item) return null;
-  const flatFee = item.price.items.find((entry) => entry.pricing.mode === 'flat_fee')?.pricing.flatFee;
-  if (flatFee !== undefined && flatFee !== '') return { mode: 'request' as const, flatFee };
-  const values = RETAIL_TOKEN_ITEMS.map(({ code, label }) => {
-    const value = item.price.items.find((entry) => entry.itemCode === code)?.pricing.usagePerUnit;
-    return { code, label, value: value === '' ? undefined : value };
-  });
-  return { mode: 'tokens' as const, values };
-}
-
 function RetailPriceSummary({ item, currency }: { item?: PriceBookItem; currency: string }) {
   const { t } = useTranslation();
   const display = useAdminPriceDisplay(currency);
   const price = retailPriceValues(item);
   if (!price) {
     return <div className='text-xs font-medium text-amber-600 dark:text-amber-400'>{t('models.catalog.retailMissing')}</div>;
+  }
+  if (price.mode === 'unavailable' || price.mode === 'structured') {
+    return (
+      <div className='text-xs font-medium'>{t(`models.catalog.retail${price.mode === 'unavailable' ? 'Unavailable' : 'Structured'}`)}</div>
+    );
+  }
+  if (price.mode === 'grouped') {
+    return (
+      <div className='space-y-1 text-xs'>
+        <div className='font-medium'>{t('models.catalog.retailGrouped')}</div>
+        <div className='text-muted-foreground'>
+          {t(price.globalFallback ? 'models.catalog.retailGlobalConfigured' : 'models.catalog.retailGlobalAbsent')}
+        </div>
+      </div>
+    );
   }
   if (price.mode === 'request') {
     const value = scaleDisplayAmount(price.flatFee, display.factor);
@@ -989,6 +986,15 @@ function ModelDetailDialog({
             >
               <IconPlus className='size-4' />
               {t('models.catalog.addRoute')}
+            </Button>
+          )}
+          {model?.configuredModel && canWriteCommercialization && (
+            <Button
+              variant='outline'
+              className='w-full sm:w-auto'
+              onClick={() => onCommercializationAction({ kind: 'formula', publicModelID: model.configuredModel!.id })}
+            >
+              自动定价公式
             </Button>
           )}
           {model?.configuredModel && canWriteCommercialization && (

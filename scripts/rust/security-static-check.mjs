@@ -67,6 +67,8 @@ function rustFiles(directory) {
 // Inline unit-test modules in this repository are conventionally at the end
 // of a source file. Integration tests live under tests/ and are never scanned.
 function productionPrefix(source) {
+  // External unit-test modules can also declare their own whole-file guard.
+  if (/^\s*#!\[cfg\(test\)\]/.test(maskCommentsAndLiterals(source))) return "";
   const marker = source.search(/^\s*#\[cfg\(test\)\]\s*$/m);
   return marker === -1 ? source : source.slice(0, marker);
 }
@@ -384,7 +386,19 @@ function selfTest() {
     scanSource("crates/conduit-llm/src/client.rs", "builder.danger_accept_invalid_certs(true);")[0].rule,
     "RUST-TLS-006",
   );
-  process.stdout.write("Rust security static check self-test passed (8 cases).\n");
+  assert.equal(
+    scanSource("crates/conduit-bin/src/job_tests.rs", "#![cfg(test)]\nfn f() { Principal::test(); }").length,
+    0,
+  );
+  assert.equal(
+    scanSource("crates/conduit-bin/src/job_tests.rs", "fn f() { Principal::test(); }")[0].rule,
+    "RUST-AUTH-001",
+  );
+  assert.equal(
+    scanSource("crates/conduit-bin/src/job.rs", '// #![cfg(test)]\nfn f() { Principal::test(); }')[0].rule,
+    "RUST-AUTH-001",
+  );
+  process.stdout.write("Rust security static check self-test passed (11 cases).\n");
 }
 
 if (process.argv.includes("--self-test")) {

@@ -15,7 +15,7 @@ const INITIALIZE_LOCK_KEY: i64 = 0x434f_4e44_5549_5401;
 /// Number of writes made by a bootstrap with a non-empty version. Kept for the
 /// fault-injection regression so every mutation boundary is exercised.
 #[cfg(test)]
-const BOOTSTRAP_WRITE_COUNT: usize = 14;
+const BOOTSTRAP_WRITE_COUNT: usize = 16;
 
 pub(crate) async fn initialize_system(
     pool: &PgPool,
@@ -199,6 +199,17 @@ async fn initialize_in_transaction(
     write_system_value(tx, system_key::ONBOARDED, &onboarding).await?;
     checkpoint(&mut write_number, fail_after_write)?;
 
+    write_system_value(
+        tx,
+        system_key::PRODUCT_EXPERIENCE_SETTINGS,
+        r#"{"mode":"simple","revision":0,"overrides":{}}"#,
+    )
+    .await?;
+    checkpoint(&mut write_number, fail_after_write)?;
+    write_system_value(tx, "system_governance_settings",
+        r#"{"revision":0,"enabled":false,"reviewKinds":[],"allowSelfReview":false,"legacyReviewScopes":false}"#).await?;
+    checkpoint(&mut write_number, fail_after_write)?;
+
     // The initialized flag is the final mutation in the same transaction.
     write_system_value(tx, system_key::INITIALIZED, "true").await?;
     checkpoint(&mut write_number, fail_after_write)?;
@@ -352,7 +363,7 @@ mod tests {
         assert_eq!(count(&database.pool, "roles").await?, 3);
         assert_eq!(count(&database.pool, "user_projects").await?, 1);
         assert_eq!(count(&database.pool, "data_storages").await?, 1);
-        assert_eq!(count(&database.pool, "systems").await?, 7);
+        assert_eq!(count(&database.pool, "systems").await?, 9);
         let stored = sqlx::query_scalar::<_, String>(
             "SELECT value FROM systems WHERE key = $1 AND deleted_at = 0",
         )

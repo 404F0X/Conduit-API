@@ -46,6 +46,108 @@ impl PgChannelRepo {
         .map_err(|e| error("find in transaction", e))
     }
 
+    pub async fn update_channel_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        v: &str,
+        i: UpdateChannelInput,
+    ) -> RepoResult<ChannelRow> {
+        let channel_id = id(v)?;
+        let mut b = QueryBuilder::<Postgres>::new("UPDATE channels SET ");
+        let mut s = b.separated(", ");
+        macro_rules! set {
+            ($field:expr,$value:expr) => {{
+                s.push($field).push_bind_unseparated($value);
+            }};
+        }
+        if let Some(v) = i.channel_type {
+            set!("\"type\"=", v)
+        }
+        if let Some(v) = i.name {
+            set!("name=", v)
+        }
+        if let Some(v) = i.base_url {
+            set!("base_url=", v)
+        }
+        if let Some(v) = i.website_url {
+            set!("website_url=", v)
+        }
+        if let Some(v) = i.quota_currency {
+            set!("quota_currency=", v)
+        }
+        if let Some(v) = i.actual_quota_used {
+            s.push("actual_quota_used=NULLIF(")
+                .push_bind_unseparated(v)
+                .push_unseparated("::text,'')::numeric");
+        }
+        if let Some(v) = i.quota_remaining {
+            s.push("quota_remaining=NULLIF(")
+                .push_bind_unseparated(v)
+                .push_unseparated("::text,'')::numeric");
+        }
+        if let Some(v) = i.credentials {
+            set!("credentials=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.disabled_api_keys {
+            set!("disabled_api_keys=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.supported_models {
+            set!("supported_models=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.manual_models {
+            set!("manual_models=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.auto_sync_supported_models {
+            set!("auto_sync_supported_models=", v)
+        }
+        if let Some(v) = i.auto_sync_model_pattern {
+            set!("auto_sync_model_pattern=", v)
+        }
+        if let Some(v) = i.tags {
+            set!("tags=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.default_test_model {
+            set!("default_test_model=", v)
+        }
+        if let Some(v) = i.policies {
+            set!("policies=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.settings {
+            set!("settings=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.endpoints {
+            set!("endpoints=", sqlx::types::Json(v))
+        }
+        if let Some(v) = i.remark {
+            set!("remark=", v)
+        }
+        if let Some(v) = i.ordering_weight {
+            set!("ordering_weight=", v)
+        }
+        if let Some(v) = i.error_message {
+            set!("error_message=", v)
+        }
+        if let Some(v) = i.status {
+            set!("status=", v)
+        }
+        s.push("updated_at=now()");
+        drop(s);
+        b.push(" WHERE id=")
+            .push_bind(channel_id)
+            .push(" AND deleted_at=0");
+        if b.build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| error("update", e))?
+            .rows_affected()
+            == 0
+        {
+            return Err(RepoError::NotFound("channel"));
+        }
+        Self::find_channel_in_tx(tx, &channel_id.to_string())
+            .await?
+            .ok_or(RepoError::NotFound("channel"))
+    }
+
     pub async fn create_channel_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         input: CreateChannelInput,
@@ -238,101 +340,15 @@ impl ChannelRepo for PgChannelRepo {
         v: &str,
         i: UpdateChannelInput,
     ) -> RepoResult<ChannelRow> {
-        let channel_id = id(v)?;
-        let mut b = QueryBuilder::<Postgres>::new("UPDATE channels SET ");
-        let mut s = b.separated(", ");
-        macro_rules! set {
-            ($field:expr,$value:expr) => {{
-                s.push($field).push_bind_unseparated($value);
-            }};
-        }
-        if let Some(v) = i.channel_type {
-            set!("\"type\"=", v)
-        }
-        if let Some(v) = i.name {
-            set!("name=", v)
-        }
-        if let Some(v) = i.base_url {
-            set!("base_url=", v)
-        }
-        if let Some(v) = i.website_url {
-            set!("website_url=", v)
-        }
-        if let Some(v) = i.quota_currency {
-            set!("quota_currency=", v)
-        }
-        if let Some(v) = i.actual_quota_used {
-            s.push("actual_quota_used=NULLIF(")
-                .push_bind_unseparated(v)
-                .push_unseparated("::text,'')::numeric");
-        }
-        if let Some(v) = i.quota_remaining {
-            s.push("quota_remaining=NULLIF(")
-                .push_bind_unseparated(v)
-                .push_unseparated("::text,'')::numeric");
-        }
-        if let Some(v) = i.credentials {
-            set!("credentials=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.disabled_api_keys {
-            set!("disabled_api_keys=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.supported_models {
-            set!("supported_models=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.manual_models {
-            set!("manual_models=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.auto_sync_supported_models {
-            set!("auto_sync_supported_models=", v)
-        }
-        if let Some(v) = i.auto_sync_model_pattern {
-            set!("auto_sync_model_pattern=", v)
-        }
-        if let Some(v) = i.tags {
-            set!("tags=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.default_test_model {
-            set!("default_test_model=", v)
-        }
-        if let Some(v) = i.policies {
-            set!("policies=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.settings {
-            set!("settings=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.endpoints {
-            set!("endpoints=", sqlx::types::Json(v))
-        }
-        if let Some(v) = i.remark {
-            set!("remark=", v)
-        }
-        if let Some(v) = i.ordering_weight {
-            set!("ordering_weight=", v)
-        }
-        if let Some(v) = i.error_message {
-            set!("error_message=", v)
-        }
-        if let Some(v) = i.status {
-            set!("status=", v)
-        }
-        s.push("updated_at=now()");
-        drop(s);
-        b.push(" WHERE id=")
-            .push_bind(channel_id)
-            .push(" AND deleted_at=0");
-        if b.build()
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| error("update", e))?
-            .rows_affected()
-            == 0
-        {
-            return Err(RepoError::NotFound("channel"));
-        }
-        self.find_channel_unchecked(ctx, &channel_id.to_string())
-            .await?
-            .ok_or(RepoError::NotFound("channel"))
+            .map_err(|e| error("update begin", e))?;
+        let row = Self::update_channel_in_tx(&mut tx, v, i).await?;
+        tx.commit().await.map_err(|e| error("update commit", e))?;
+        let _ = ctx;
+        Ok(row)
     }
     async fn soft_delete_channel_unchecked(
         &self,

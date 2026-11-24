@@ -239,7 +239,7 @@ pub(crate) fn validate_channel_billing_snapshot(
     }
 }
 
-fn validate_approved_conversion(
+pub(crate) fn validate_approved_conversion(
     source: &Value,
     accounting: &AccountingSettings,
 ) -> Result<(), String> {
@@ -326,7 +326,10 @@ fn decimal_snapshot(source: &Value, field: &str) -> Result<Option<Decimal>, Stri
         .map_err(|error| format!("invalid {field} in approved procurement price: {error}"))
 }
 
-fn validate_price_coverage(price: &ModelPrice, request_type: RequestType) -> Result<(), String> {
+pub(crate) fn validate_price_coverage(
+    price: &ModelPrice,
+    request_type: RequestType,
+) -> Result<(), String> {
     if price.items.is_empty() {
         return Err("procurement price has no items".into());
     }
