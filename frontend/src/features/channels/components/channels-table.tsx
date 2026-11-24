@@ -92,10 +92,13 @@ interface DataTableProps {
   onRetry?: () => void;
 }
 
+// 默认只显示 7 列以内：名称、类型、状态、模型、健康度、操作；其余列在“列设置”里可以打开
 const DEFAULT_COLUMN_VISIBILITY: VisibilityState = {
   tags: false,
   proxy: false,
   model: false,
+  orderingWeight: false,
+  createdAt: false,
 };
 
 export function ChannelsTable({

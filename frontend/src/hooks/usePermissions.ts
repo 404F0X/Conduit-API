@@ -1,108 +1,32 @@
 import { useCallback, useMemo } from 'react';
-import { useAuthStore } from '@/stores/authStore';
-import { useSelectedProjectId } from '@/stores/projectStore';
-import { useMe } from '@/features/auth/data/auth';
+import { holdsScope, satisfiesScopes } from '@/lib/permission-core';
+import { useScopeSets } from '@/hooks/useScopeSets';
 
 /**
  * Hook for checking user permissions based on scopes
  * Provides utilities to check if user has specific permissions for actions
- * Supports both system-level and project-level scopes
+ * Supports both system-level and project-level scopes.
+ *
+ * 判断规则统一在 lib/permission-core.ts（站长全权、'*' 全权、其余完全相等）。
  */
 export function usePermissions() {
-  const { user: authUser } = useAuthStore((state) => state.auth);
-  const { data: meData } = useMe();
-  const selectedProjectId = useSelectedProjectId();
-
-  // Use data from me query if available, otherwise fall back to auth store
-  const user = meData || authUser;
-  const isOwner = user?.isOwner || false;
-
-  // Get project-level scopes for the selected project
-  const projectScopes = useMemo(() => {
-    if (!selectedProjectId || !user?.projects) {
-      return [];
-    }
-    const project = user.projects.find((p) => p.projectID === selectedProjectId);
-    return project?.scopes || [];
-  }, [selectedProjectId, user?.projects]);
+  const scopeSets = useScopeSets();
+  const { user, isOwner } = scopeSets;
 
   // Check if user has a specific scope at system level only
-  const hasSystemScope = useCallback(
-    (requiredScope: string): boolean => {
-      // Owner has all permissions
-      if (isOwner) {
-        return true;
-      }
+  const hasSystemScope = useCallback((requiredScope: string): boolean => holdsScope(scopeSets, requiredScope, 'system'), [scopeSets]);
 
-      // Check for wildcard permission at system level
-      if (user?.scopes?.includes('*')) {
-        return true;
-      }
-
-      // Check for specific scope at system level only
-      if (user?.scopes?.includes(requiredScope)) {
-        return true;
-      }
-
-      return false;
-    },
-    [user, isOwner]
-  );
-
-  // Check if user has a specific scope at project level only
-  const hasProjectScope = useCallback(
-    (requiredScope: string): boolean => {
-      // Owner has all permissions
-      if (isOwner) {
-        return true;
-      }
-
-      // Check for wildcard permission at system level (applies to all projects)
-      if (user?.scopes?.includes('*')) {
-        return true;
-      }
-
-      // Check for specific scope at project level only
-      if (projectScopes.includes(requiredScope)) {
-        return true;
-      }
-
-      return false;
-    },
-    [user, isOwner, projectScopes]
-  );
+  // Check if user has a specific scope at project level only (system-level '*' applies to every project)
+  const hasProjectScope = useCallback((requiredScope: string): boolean => holdsScope(scopeSets, requiredScope, 'project'), [scopeSets]);
 
   // Check if user has a specific scope (system-level or project-level)
-  const hasScope = useCallback(
-    (requiredScope: string): boolean => {
-      return hasSystemScope(requiredScope) || hasProjectScope(requiredScope);
-    },
-    [hasSystemScope, hasProjectScope]
-  );
+  const hasScope = useCallback((requiredScope: string): boolean => holdsScope(scopeSets, requiredScope, 'any'), [scopeSets]);
 
   // Check if user has any of the required scopes
-  const hasAnyScope = useCallback(
-    (requiredScopes: string[]): boolean => {
-      if (requiredScopes.length === 0) {
-        return true;
-      }
-
-      return requiredScopes.some((scope) => hasScope(scope));
-    },
-    [hasScope]
-  );
+  const hasAnyScope = useCallback((requiredScopes: string[]): boolean => satisfiesScopes(scopeSets, requiredScopes, 'any'), [scopeSets]);
 
   // Check if user has all of the required scopes
-  const hasAllScopes = useCallback(
-    (requiredScopes: string[]): boolean => {
-      if (requiredScopes.length === 0) {
-        return true;
-      }
-
-      return requiredScopes.every((scope) => hasScope(scope));
-    },
-    [hasScope]
-  );
+  const hasAllScopes = useCallback((requiredScopes: string[]): boolean => satisfiesScopes(scopeSets, requiredScopes, 'all'), [scopeSets]);
 
   // Common permission checks for channel operations
   const channelPermissions = useMemo(

@@ -16,7 +16,9 @@ interface DataStorageActionsProps {
 export function DataStorageActions({ dataStorage, defaultDataStorageID }: DataStorageActionsProps) {
   const { t } = useTranslation();
   const { setEditingDataStorage, setIsEditDialogOpen, setArchiveDataStorage, setIsArchiveDialogOpen } = useDataStoragesContext();
-  const { isOwner } = usePermissions();
+  const { hasSystemScope } = usePermissions();
+  // 站长自动拥有该权限（见 lib/permission-core.ts）
+  const canWrite = hasSystemScope('write_data_storages');
 
   const handleEdit = () => {
     setEditingDataStorage(dataStorage);
@@ -28,8 +30,8 @@ export function DataStorageActions({ dataStorage, defaultDataStorageID }: DataSt
     setIsArchiveDialogOpen(true);
   };
 
-  // Don't show menu if user is not owner
-  if (!isOwner) {
+  // Don't show menu without write permission
+  if (!canWrite) {
     return null;
   }
 

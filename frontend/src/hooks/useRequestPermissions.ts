@@ -1,7 +1,6 @@
 import { useMemo } from 'react';
-import { useAuthStore } from '@/stores/authStore';
-import { useSelectedProjectId } from '@/stores/projectStore';
-import { useMe } from '@/features/auth/data/auth';
+import { holdsScope } from '@/lib/permission-core';
+import { useScopeSets } from '@/hooks/useScopeSets';
 
 export interface RequestPermissions {
   canViewUsers: boolean;
@@ -10,46 +9,20 @@ export interface RequestPermissions {
   canViewRoles: boolean;
 }
 
+/**
+ * 决定 GraphQL 查询里要不要带上用户、Key、渠道、角色这些关联字段。
+ * 判断规则和 usePermissions 相同，都来自 lib/permission-core.ts。
+ */
 export function useRequestPermissions(): RequestPermissions {
-  const { user: authUser } = useAuthStore((state) => state.auth);
-  const { data: meData } = useMe();
-  const selectedProjectId = useSelectedProjectId();
+  const scopeSets = useScopeSets();
 
-  // Use data from me query if available, otherwise fall back to auth store
-  const user = meData || authUser;
-  const systemScopes = user?.scopes || [];
-  const isOwner = user?.isOwner || false;
-
-  // Get project-level scopes for the selected project
-  const projectScopes = useMemo(() => {
-    if (!selectedProjectId || !user?.projects) {
-      return [];
-    }
-    const project = user.projects.find((p) => p.projectID === selectedProjectId);
-    return project?.scopes || [];
-  }, [selectedProjectId, user?.projects]);
-
-  const permissions = useMemo(() => {
-    // 合并系统级和项目级权限
-    const userScopes = [...systemScopes, ...projectScopes];
-
-    // Owner用户拥有所有权限
-    if (isOwner || userScopes.includes('*')) {
-      return {
-        canViewUsers: true,
-        canViewApiKeys: true,
-        canViewChannels: true,
-        canViewRoles: true,
-      };
-    }
-
-    return {
-      canViewUsers: userScopes.includes('read_users'),
-      canViewApiKeys: userScopes.includes('read_api_keys'),
-      canViewChannels: userScopes.includes('read_channels'),
-      canViewRoles: userScopes.includes('read_roles'),
-    };
-  }, [systemScopes, projectScopes, isOwner]);
-
-  return permissions;
+  return useMemo(
+    () => ({
+      canViewUsers: holdsScope(scopeSets, 'read_users'),
+      canViewApiKeys: holdsScope(scopeSets, 'read_api_keys'),
+      canViewChannels: holdsScope(scopeSets, 'read_channels'),
+      canViewRoles: holdsScope(scopeSets, 'read_roles'),
+    }),
+    [scopeSets]
+  );
 }

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { type DateTimeRangeValue } from '@/utils/date-range';
+import { buildDateRangeWhereClause, type DateTimeRangeValue } from '@/utils/date-range';
 import { useDebounce } from '@/hooks/use-debounce';
 import { usePaginationSearch } from '@/hooks/use-pagination-search';
 import { usePermissions } from '@/hooks/usePermissions';
@@ -56,9 +56,11 @@ function ApiKeysContent() {
     if (userFilter.length > 0 && userFilter[0]) {
       where.userID = userFilter[0]; // API expects single userID
     }
+    // 以前日期筛选只改了界面，没有带进查询条件
+    Object.assign(where, buildDateRangeWhereClause(dateRange));
 
     // Add AND condition to combine OR search with other filters
-    if (where.or && (where.typeIn || where.statusIn || where.userID)) {
+    if (where.or && Object.keys(where).length > 1) {
       const orCondition = where.or;
       delete where.or;
       return {

@@ -1,5 +1,6 @@
 import { useCallback, useState, memo, useRef, useEffect } from 'react';
 import { format } from 'date-fns';
+import { Link } from '@tanstack/react-router';
 import { ColumnDef, Row, Table } from '@tanstack/react-table';
 import {
   IconPlayerPlay,
@@ -151,7 +152,14 @@ const NameCell = memo(({ row }: { row: Row<Channel> }) => {
       {row.getValue('name')}
     </a>
   ) : (
-    <div className={cn('min-w-0 truncate font-medium', hasError && 'text-destructive')}>{row.getValue('name')}</div>
+    <Link
+      to='/channels/$channelId'
+      params={{ channelId: channel.id }}
+      className={cn('min-w-0 truncate font-medium hover:underline', hasError && 'text-destructive')}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {row.getValue('name')}
+    </Link>
   );
 
   const content = (

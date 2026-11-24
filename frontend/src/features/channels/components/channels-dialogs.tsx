@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useChannels } from '../context/channels-context';
 import { ChannelOperationsWorkspace } from './channel-operations-workspace';
+import { ChannelQuickCreateDialog } from './channel-quick-create-dialog';
 import { ChannelsActionDialog } from './channels-action-dialog';
 import { ChannelsArchiveDialog } from './channels-archive-dialog';
 import { ChannelsAutomationDialog } from './channels-automation-dialog';
@@ -42,6 +43,11 @@ export function ChannelsDialogs() {
   return (
     <>
       <ChannelsSystemSettingsDialog />
+      <ChannelQuickCreateDialog
+        open={open === 'quickAdd'}
+        onOpenChange={(isOpen) => setOpen(isOpen ? 'quickAdd' : null)}
+        onUseFullForm={() => setOpen('add')}
+      />
 
       <ChannelsActionDialog key='channel-add' open={open === 'add'} onOpenChange={(isOpen) => setOpen(isOpen ? 'add' : null)} />
 

@@ -28,6 +28,7 @@ import { Route as AuthenticatedChangeSetsIndexRouteImport } from './routes/_auth
 import { Route as AuthenticatedChangeSetsChangeSetIdRouteImport } from './routes/_authenticated/change-sets/$changeSetId'
 import { Route as AuthenticatedChangelogIndexRouteImport } from './routes/_authenticated/changelog/index'
 import { Route as AuthenticatedChannelsIndexRouteImport } from './routes/_authenticated/channels/index'
+import { Route as AuthenticatedChannelsChannelIdRouteImport } from './routes/_authenticated/channels/$channelId'
 import { Route as AuthenticatedChatsIndexRouteImport } from './routes/_authenticated/chats/index'
 import { Route as AuthenticatedDashboardChannelSuccessRatesRouteImport } from './routes/_authenticated/dashboard/channel-success-rates'
 import { Route as AuthenticatedDataStoragesIndexRouteImport } from './routes/_authenticated/data-storages/index'
@@ -162,6 +163,12 @@ const AuthenticatedChannelsIndexRoute =
   AuthenticatedChannelsIndexRouteImport.update({
     id: '/channels/',
     path: '/channels/',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
+const AuthenticatedChannelsChannelIdRoute =
+  AuthenticatedChannelsChannelIdRouteImport.update({
+    id: '/channels/$channelId',
+    path: '/channels/$channelId',
     getParentRoute: () => AuthenticatedRouteRoute,
   } as any)
 const AuthenticatedChatsIndexRoute = AuthenticatedChatsIndexRouteImport.update({
@@ -379,6 +386,7 @@ export interface FileRoutesByFullPath {
   '/503': typeof errors503Route
   '/permission': typeof AuthenticatedPermissionRoute
   '/change-sets/$changeSetId': typeof AuthenticatedChangeSetsChangeSetIdRoute
+  '/channels/$channelId': typeof AuthenticatedChannelsChannelIdRoute
   '/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
   '/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
@@ -432,6 +440,7 @@ export interface FileRoutesByTo {
   '/permission': typeof AuthenticatedPermissionRoute
   '/': typeof AuthenticatedIndexRoute
   '/change-sets/$changeSetId': typeof AuthenticatedChangeSetsChangeSetIdRoute
+  '/channels/$channelId': typeof AuthenticatedChannelsChannelIdRoute
   '/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
   '/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
@@ -488,6 +497,7 @@ export interface FileRoutesById {
   '/_authenticated/permission': typeof AuthenticatedPermissionRoute
   '/_authenticated/': typeof AuthenticatedIndexRoute
   '/_authenticated/change-sets/$changeSetId': typeof AuthenticatedChangeSetsChangeSetIdRoute
+  '/_authenticated/channels/$channelId': typeof AuthenticatedChannelsChannelIdRoute
   '/_authenticated/dashboard/channel-success-rates': typeof AuthenticatedDashboardChannelSuccessRatesRoute
   '/_authenticated/requests/$requestId': typeof AuthenticatedRequestsRequestIdRoute
   '/_authenticated/settings/appearance': typeof AuthenticatedSettingsAppearanceRoute
@@ -544,6 +554,7 @@ export interface FileRouteTypes {
     | '/503'
     | '/permission'
     | '/change-sets/$changeSetId'
+    | '/channels/$channelId'
     | '/dashboard/channel-success-rates'
     | '/requests/$requestId'
     | '/settings/appearance'
@@ -597,6 +608,7 @@ export interface FileRouteTypes {
     | '/permission'
     | '/'
     | '/change-sets/$changeSetId'
+    | '/channels/$channelId'
     | '/dashboard/channel-success-rates'
     | '/requests/$requestId'
     | '/settings/appearance'
@@ -652,6 +664,7 @@ export interface FileRouteTypes {
     | '/_authenticated/permission'
     | '/_authenticated/'
     | '/_authenticated/change-sets/$changeSetId'
+    | '/_authenticated/channels/$channelId'
     | '/_authenticated/dashboard/channel-success-rates'
     | '/_authenticated/requests/$requestId'
     | '/_authenticated/settings/appearance'
@@ -840,6 +853,13 @@ declare module '@tanstack/react-router' {
       path: '/channels'
       fullPath: '/channels/'
       preLoaderRoute: typeof AuthenticatedChannelsIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/channels/$channelId': {
+      id: '/_authenticated/channels/$channelId'
+      path: '/channels/$channelId'
+      fullPath: '/channels/$channelId'
+      preLoaderRoute: typeof AuthenticatedChannelsChannelIdRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/chats/': {
@@ -1111,6 +1131,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedPermissionRoute: typeof AuthenticatedPermissionRoute
   AuthenticatedIndexRoute: typeof AuthenticatedIndexRoute
   AuthenticatedChangeSetsChangeSetIdRoute: typeof AuthenticatedChangeSetsChangeSetIdRoute
+  AuthenticatedChannelsChannelIdRoute: typeof AuthenticatedChannelsChannelIdRoute
   AuthenticatedDashboardChannelSuccessRatesRoute: typeof AuthenticatedDashboardChannelSuccessRatesRoute
   AuthenticatedRequestsRequestIdRoute: typeof AuthenticatedRequestsRequestIdRoute
   AuthenticatedApiKeysIndexRoute: typeof AuthenticatedApiKeysIndexRoute
@@ -1152,6 +1173,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedIndexRoute: AuthenticatedIndexRoute,
   AuthenticatedChangeSetsChangeSetIdRoute:
     AuthenticatedChangeSetsChangeSetIdRoute,
+  AuthenticatedChannelsChannelIdRoute: AuthenticatedChannelsChannelIdRoute,
   AuthenticatedDashboardChannelSuccessRatesRoute:
     AuthenticatedDashboardChannelSuccessRatesRoute,
   AuthenticatedRequestsRequestIdRoute: AuthenticatedRequestsRequestIdRoute,
