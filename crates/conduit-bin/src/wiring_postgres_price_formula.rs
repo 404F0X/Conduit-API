@@ -146,6 +146,12 @@ async fn evaluate(
             return Err(format!("SOURCE_UNAVAILABLE: {field} is not enabled"));
         }
     }
+    let source_price: Value = row
+        .get::<Option<Value>, _>("price")
+        .ok_or("SOURCE_UNAVAILABLE: formal procurement price is missing")?;
+    if source_price.get("kind").is_some() {
+        return Err("UNSUPPORTED_EXPRESSION_FORMULA: usage-time procurement cannot derive a static retail price".into());
+    }
     let currency: String = row.get("currency");
     let source_currency: Option<String> = row.get("currency_code");
     if !currency.eq_ignore_ascii_case(&settings.accounting_currency)
@@ -155,9 +161,6 @@ async fn evaluate(
     {
         return Err("SOURCE_UNAVAILABLE: formal procurement price and book must use the accounting currency".into());
     }
-    let source_price: Value = row
-        .get::<Option<Value>, _>("price")
-        .ok_or("SOURCE_UNAVAILABLE: formal procurement price is missing")?;
     let approved_source = sqlx::query_scalar::<_, Value>(
         "SELECT item.source_snapshot FROM pricing_change_audits audit \
          JOIN change_set_items item ON item.change_set_id=audit.source_change_set_id \
@@ -202,6 +205,15 @@ async fn evaluate(
         .bind(book).fetch_optional(&mut **tx).await.map_err(storage)?.unwrap_or_default();
     let before = sqlx::query_scalar::<_, Value>("SELECT i.price FROM price_book_items i JOIN price_book_versions v ON v.id=i.price_book_version_id WHERE v.price_book_id=$1 AND v.reference_id=$2 AND i.public_model_id=$3")
         .bind(book).bind(&base_reference).bind(model).fetch_optional(&mut **tx).await.map_err(storage)?;
+    if let Some(before) = &before {
+        use conduit_core::objects::retail_price_plan::{RetailPriceDocument, RetailPriceLeaf};
+        if matches!(
+            RetailPriceDocument::parse(before)?.global,
+            Some(RetailPriceLeaf::Expression(_))
+        ) {
+            return Err("UNSUPPORTED_EXPRESSION_FORMULA: published expression retail price requires explicit editing".into());
+        }
+    }
     let price = conduit_core::objects::retail_price_plan::RetailPriceDocument::replace_global(
         before.as_ref(),
         result,
@@ -530,7 +542,8 @@ mod tests {
         SaveChannelModelPriceInput {
             model_id: "model-a".into(),
             currency_code: "CNY".into(),
-            price: ModelPriceInput {
+            billing_expression: None,
+            price: Some(ModelPriceInput {
                 items: [
                     PriceItemCode::PromptTokens,
                     PriceItemCode::CompletionTokens,
@@ -549,7 +562,7 @@ mod tests {
                     prompt_write_cache_variants: None,
                 })
                 .collect(),
-            },
+            }),
         }
     }
     struct Fixture {

@@ -82,13 +82,10 @@ test('duplicating a channel refreshes its staged procurement price change set', 
 });
 
 test('procurement drafts refresh the review queue and approved pricing refreshes the accounting lock', () => {
-  const channelData = readSource('features', 'channels', 'data', 'channels.ts');
+  const dialog = readSource('features', 'channels', 'components', 'channels-model-price-dialog.tsx');
   const commercialization = readSource('features', 'models', 'data', 'commercialization.ts');
   const changeSets = readSource('features', 'change-sets', 'data', 'change-sets.ts');
-  const createProviderPriceDraft = channelData.slice(
-    channelData.indexOf('export function useCreateProviderPriceChangeSet()'),
-    channelData.indexOf('// Use this hook to query channels with pagination')
-  );
+  const createProviderPriceDraft = dialog.slice(dialog.indexOf('const onSubmit'), dialog.indexOf('const submitDraft'));
 
   assert.match(createProviderPriceDraft, /invalidateQueries\(\{ queryKey: \['changeSets'\] \}\)/);
   assert.doesNotMatch(createProviderPriceDraft, /queryKey: \['generalSettings'\]/);

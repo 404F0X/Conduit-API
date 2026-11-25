@@ -21,6 +21,173 @@ test.describe('Admin Channels Management', () => {
     await channelsTable.waitFor({ state: 'visible', timeout: 15000 });
   });
 
+  test('keeps channel configuration when switching the management adapter', async ({ page }) => {
+    await page.getByTestId('add-channel-button').click();
+    const dialog = page.getByRole('dialog');
+    await enterChannelConfiguration(dialog);
+    await dialog.getByTestId('channel-name-input').fill('Adapter draft');
+    await dialog.getByTestId('channel-base-url-input').fill(mockUpstreamURL);
+    await dialog.getByTestId('channel-api-key-input').fill('sk-adapter-draft');
+    await setChannelBilling(dialog);
+    await addChannelTag(dialog, 'adapter-draft');
+
+    const adapter = dialog.getByTestId('management-adapter-select');
+    await adapter.click();
+    await page.getByRole('option', { name: /NEW\s*API/i }).click();
+
+    await expect(dialog.getByTestId('channel-name-input')).toHaveValue('Adapter draft');
+    await expect(dialog.getByTestId('channel-base-url-input')).toHaveValue(mockUpstreamURL);
+    await expect(dialog.getByTestId('channel-api-key-input')).toHaveValue('sk-adapter-draft');
+    await dialog.getByRole('tab', { name: /^(Quota & billing|额度与计费)$/ }).click();
+    await expect(dialog.locator('#channel-billing-currency')).toHaveValue('CNY');
+    await expect(dialog.locator('#channel-recharge-multiplier')).toHaveValue('1');
+    await dialog.getByRole('tab', { name: /^(Other settings|其他设置)$/ }).click();
+    await expect(dialog.getByRole('button', { name: 'Remove adapter-draft tag', exact: true })).toBeVisible();
+    await dialog.getByRole('tab', { name: /^(Connection & models|连接与模型)$/ }).click();
+    await adapter.click();
+    await page.getByRole('option', { name: /^(None \(standard channel\)|无)/ }).click();
+    await expect(dialog.getByTestId('channel-name-input')).toHaveValue('Adapter draft');
+    await expect(dialog.getByTestId('channel-api-key-input')).toHaveValue('sk-adapter-draft');
+
+    await dialog.getByRole('button', { name: /^(Cancel|取消)$/ }).click();
+    await page.getByTestId('add-channel-button').click();
+    await enterChannelConfiguration(dialog);
+    await expect(dialog.getByTestId('channel-name-input')).toHaveValue('');
+    await expect(dialog.getByTestId('channel-api-key-input')).toHaveValue('');
+  });
+
+  test('reuses the NEWAPI draft operation after a failed response and preserves its separate website', async ({ page }) => {
+    const name = `pw-newapi-draft-${Date.now()}`;
+    const website = `${new URL(mockUpstreamURL).origin}/console`;
+    const operationIDs: string[] = [];
+    await page.route('**/admin/graphql', async (route) => {
+      const request = route.request().postDataJSON();
+      if (!request?.query?.includes('mutation CreateChannel')) return route.fallback();
+      operationIDs.push(request.variables.input.operationID);
+      if (operationIDs.length === 1) {
+        return route.fulfill({ json: { errors: [{ message: 'An interrupted create response' }] } });
+      }
+      return route.fallback();
+    });
+
+    await page.getByTestId('add-channel-button').click();
+    const dialog = page.getByRole('dialog');
+    await enterChannelConfiguration(dialog);
+    await dialog.getByTestId('channel-name-input').fill(name);
+    await dialog.getByTestId('channel-base-url-input').fill(mockUpstreamURL);
+    await dialog.getByTestId('channel-api-key-input').fill('sk-newapi-draft-fixture');
+    await dialog.getByTestId('management-adapter-select').click();
+    await page.getByRole('option', { name: /NEW\s*API/i }).click();
+    await dialog.getByTestId('quick-model-gpt-4o').click();
+    await dialog.getByTestId('add-selected-models-button').click();
+    await dialog.getByTestId('default-test-model-select').click();
+    await page.getByRole('option', { name: 'gpt-4o', exact: true }).click();
+    await setChannelBilling(dialog);
+    await dialog.getByRole('tab', { name: /^(Quota & billing|额度与计费)$/ }).click();
+    const quotaDetails = /^(Provider details & actual quota|渠道资料与实际额度)$/;
+    const websiteLabel = /^(Provider website \/ console|渠道官网 \/ 控制台)$/;
+    await dialog.getByText(quotaDetails).click();
+    await dialog.getByLabel(websiteLabel).fill(website);
+
+    const submit = dialog.getByTestId('channel-submit-button');
+    await Promise.all([waitForGraphQLOperation(page, 'CreateChannel'), submit.click()]);
+    await expect(dialog.getByLabel(websiteLabel)).toHaveValue(website);
+
+    await Promise.all([waitForGraphQLOperation(page, 'CreateChannel'), submit.click()]);
+    await expect(dialog).not.toBeVisible();
+    expect(operationIDs[0]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(operationIDs).toEqual([operationIDs[0], operationIDs[0]]);
+
+    const row = page.getByTestId('channels-table').getByRole('row').filter({ hasText: name });
+    await row.getByRole('button', { name: /^(Edit|编辑)$/ }).click();
+    await dialog.getByRole('tab', { name: /^(Quota & billing|额度与计费)$/ }).click();
+    await dialog.getByText(quotaDetails).click();
+    await expect(dialog.getByLabel(websiteLabel)).toHaveValue(website);
+  });
+
+  test('keeps Anthropic outbound configuration and uses manual inventory with NEWAPI management', async ({ page }) => {
+    const name = `pw-newapi-anthropic-${Date.now()}`;
+    const outboundURL = `${new URL(mockUpstreamURL).origin}/relay/v1`;
+    await page.getByTestId('add-channel-button').click();
+    const dialog = page.getByRole('dialog');
+    await enterChannelConfiguration(dialog, 'anthropic');
+    await dialog.getByTestId('channel-name-input').fill(name);
+    await dialog.getByTestId('channel-base-url-input').fill(outboundURL);
+    await dialog.getByTestId('channel-api-key-input').fill('sk-anthropic-manual-inventory-test');
+    await dialog.getByTestId('management-adapter-select').click();
+    await page.getByRole('option', { name: /NEW\s*API/i }).click();
+    await expect(dialog.getByRole('button', { name: /^(Fetch|获取)$/ })).toBeDisabled();
+    await expect(dialog.getByTestId('auto-sync-supported-models-checkbox')).toHaveCount(0);
+    const model = 'claude-manual-inventory-fixture';
+    await dialog.getByPlaceholder(/^(Model ID|模型 ID)$/).fill(model);
+    await dialog.getByPlaceholder(/^(Model ID|模型 ID)$/).press('Enter');
+    await dialog.getByTestId('default-test-model-select').click();
+    await page.getByRole('option', { name: model, exact: true }).click();
+    await setChannelBilling(dialog);
+
+    const creation = page.waitForResponse(
+      (response) => response.url().includes('/admin/graphql') && response.request().postData()?.includes('mutation CreateChannel')
+    );
+    await dialog.getByTestId('channel-submit-button').click();
+    const response = await creation;
+    const result = await response.json();
+    expect(result.errors).toBeUndefined();
+    const input = response.request().postDataJSON().variables.input;
+    expect(input.type).toBe('anthropic');
+    expect(input.baseURL).toBe(outboundURL);
+    expect(input.operationID).toBeUndefined();
+    expect(input.autoSyncSupportedModels).toBe(false);
+    expect(input.supportedModels).toEqual([model]);
+    await expect(dialog).not.toBeVisible();
+    const row = page.getByTestId('channels-table').getByRole('row').filter({ hasText: name });
+    await expect(row.getByRole('button', { name: /^(Discover now|立即发现)$/ })).toBeDisabled();
+    await expect(row.getByText(/^(Model discovery is unavailable|此渠道不支持模型探测)/)).toBeVisible();
+
+    await row.getByRole('button', { name: /^(Edit|编辑)$/ }).click();
+    await expect(dialog.getByTestId('channel-base-url-input')).toHaveValue(outboundURL);
+  });
+
+  test('creates a disabled public model binding with the channel', async ({ page }) => {
+    const modelKey = `pw-public-binding-${Date.now()}`;
+    await page.getByTestId('add-channel-button').click();
+    const dialog = page.getByRole('dialog');
+    await enterChannelConfiguration(dialog);
+    await dialog.getByTestId('channel-name-input').fill(modelKey);
+    await dialog.getByTestId('channel-base-url-input').fill(mockUpstreamURL);
+    await dialog.getByTestId('channel-api-key-input').fill('sk-public-binding-fixture');
+    await dialog.getByTestId('quick-model-gpt-4o').click();
+    await dialog.getByTestId('add-selected-models-button').click();
+    await dialog.getByTestId('default-test-model-select').click();
+    await page.getByRole('option', { name: 'gpt-4o', exact: true }).click();
+    await setChannelBilling(dialog);
+
+    await dialog.getByText(/^(Public model bindings|公共模型绑定)$/).click();
+    await dialog.getByLabel(/^(Upstream model|上游模型)$/).click();
+    await page.getByRole('option', { name: 'gpt-4o', exact: true }).click();
+    await dialog.getByLabel(/^(Public model key|公共模型标识)$/).fill(modelKey);
+    await dialog.getByLabel(/^(New public model type|新公共模型类型)$/).click();
+    await page.getByRole('option', { name: /^(Chat|对话)$/ }).click();
+    await dialog.getByRole('button', { name: /^(Queue binding|加入待保存列表)$/ }).click();
+    await expect(dialog.getByText(`gpt-4o → ${modelKey}`, { exact: true })).toBeVisible();
+
+    const creation = page.waitForResponse((response) => response.url().includes('/admin/graphql') && response.request().postData()?.includes('mutation CreateChannel'));
+    await dialog.getByTestId('channel-submit-button').click();
+    const response = await creation;
+    const result = await response.json();
+    expect(response.ok()).toBe(true);
+    expect(result.errors).toBeUndefined();
+    expect(result.data.createChannel.name).toBe(modelKey);
+    expect(response.request().postDataJSON().variables.input.publicModelBindings.upserts).toEqual([
+      { upstreamModelID: 'gpt-4o', publicModelKey: modelKey, modelType: 'chat' },
+    ]);
+    await expect(dialog).not.toBeVisible();
+    await expect(page.getByRole('button', { name: /^(Open Models|打开模型页面)$/ })).toBeVisible();
+    const channelRow = page.getByTestId('channels-table').getByRole('row').filter({ hasText: modelKey });
+    await channelRow.locator('td:last-child button').first().click();
+    await dialog.getByText(/^(Public model bindings|公共模型绑定)$/).click();
+    await expect(dialog.getByText(new RegExp(`gpt-4o → ${modelKey} · (Disabled|已禁用)`))).toBeVisible();
+  });
+
   test('can create, edit, and archive a channel', async ({ page }) => {
     const uniqueSuffix = Date.now().toString().slice(-6);
     const name = `pw-test-Channel ${uniqueSuffix}`;
@@ -225,41 +392,20 @@ test.describe('Admin Channels Management', () => {
     await page.waitForTimeout(2000);
   });
 
-  test('can create a channel through the quick form', async ({ page }) => {
+  test('loads channel details for the requested channel ID', async ({ page }) => {
     const suffix = Date.now();
-    const createQuick = async (name: string) => {
-      await page.getByTestId('add-channel-button').click();
-      const dialog = page.getByRole('dialog');
-      await expect(dialog.locator('#quick-channel-name')).toBeVisible();
-      await expect(dialog.getByRole('combobox')).toContainText('OpenAI');
-      await dialog.locator('#quick-channel-name').fill(name);
-      await dialog.locator('#quick-channel-url').fill(mockUpstreamURL);
-      await dialog.locator('#quick-channel-keys').fill('sk-isolated-quick-channel-fixture');
-      const creation = page.waitForResponse(
-        (response) => response.url().includes('/admin/graphql') && (response.request().postData()?.includes('createChannel(') ?? false)
-      );
-      await dialog.getByRole('button', { name: /^(Create|创建)$/ }).click();
-      const response = await creation;
-      expect(response.ok()).toBe(true);
-      const result = await response.json();
-      expect(result.errors).toBeUndefined();
-      expect(result.data.createChannel.name).toBe(name);
-      expect(result.data.createChannel.type).toBe('openai');
-      await expect(page).toHaveURL(/\/channels\/[^/?]+$/);
-      const id = result.data.createChannel.id as string;
-      expect(decodeURIComponent(new URL(page.url()).pathname.split('/').at(-1)!)).toBe(id);
-      await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
-      return {id, name};
-    };
-    const unrelated = await createQuick(`pw-test-UnrelatedChannel${suffix}`);
-    await gotoAndEnsureAuth(page, '/channels');
-    const target = await createQuick(`pw-test-QuickChannel${suffix}`);
-    expect(target.id).not.toBe(unrelated.id);
-    await page.goto(`/channels/${encodeURIComponent(unrelated.id)}`);
-    await expect(page.getByRole('heading', {name: unrelated.name, exact: true})).toBeVisible();
-    await page.goto(`/channels/${encodeURIComponent(target.id)}`);
-    await expect(page.getByRole('heading', {name: target.name, exact: true})).toBeVisible();
+    const unrelatedName = `pw-test-UnrelatedChannel${suffix}`;
+    const targetName = `pw-test-TargetChannel${suffix}`;
+    const unrelatedID = await createDisabledChannelFixture(page, unrelatedName, mockUpstreamURL);
+    const targetID = await createDisabledChannelFixture(page, targetName, mockUpstreamURL);
+
+    expect(targetID).not.toBe(unrelatedID);
+    await page.goto(`/channels/${encodeURIComponent(unrelatedID)}`);
+    await expect(page.getByRole('heading', { name: unrelatedName, exact: true })).toBeVisible();
+    await page.goto(`/channels/${encodeURIComponent(targetID)}`);
+    await expect(page.getByRole('heading', { name: targetName, exact: true })).toBeVisible();
   });
+
   test('can search channels by name', async ({ page }) => {
     const uniqueSuffix = Date.now().toString().slice(-6);
     const searchTerm = `pw-test-SearchChannel${uniqueSuffix}`;

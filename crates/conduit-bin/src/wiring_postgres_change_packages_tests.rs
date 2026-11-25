@@ -10,7 +10,8 @@ fn input(key: &str, value: Decimal) -> SaveChannelModelPriceInput {
     SaveChannelModelPriceInput {
         model_id: key.into(),
         currency_code: "CNY".into(),
-        price: ModelPriceInput {
+        billing_expression: None,
+        price: Some(ModelPriceInput {
             items: [
                 PriceItemCode::PromptTokens,
                 PriceItemCode::CompletionTokens,
@@ -29,7 +30,7 @@ fn input(key: &str, value: Decimal) -> SaveChannelModelPriceInput {
                 prompt_write_cache_variants: None,
             })
             .collect(),
-        },
+        }),
     }
 }
 async fn db()
@@ -77,6 +78,68 @@ async fn fresh(adapter: &PgChangeSetAdapter, id: &ID) -> package::ChangeSetDetai
         .await
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn provider_create_and_replay_report_committed_detail_failure_as_storage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(db) = db().await? else { return Ok(()) };
+    let channel = channel(&db.pool).await?;
+    let adapter = PgChangeSetAdapter::new(db.pool.clone());
+    let op = Uuid::new_v4();
+    sqlx::query("INSERT INTO systems(key,value,created_at,updated_at) VALUES($1,$2,now(),now())")
+        .bind(crate::wiring_governance::KEY)
+        .bind(r#"{"revision":"invalid","enabled":false}"#)
+        .execute(&db.pool)
+        .await?;
+
+    for _ in 0..2 {
+        let error = create(&adapter, &channel, op, vec![input("m", Decimal::ONE)])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, gql::ChangeSetError::Storage(message) if message == "invalid governance settings")
+        );
+        let graphql_error = package::graphql_error(error);
+        assert_eq!(
+            graphql_error
+                .extensions
+                .as_ref()
+                .and_then(|ext| ext.get("code")),
+            Some(&async_graphql::Value::String("STORAGE_FAILED".into()))
+        );
+    }
+    let committed_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT c.id FROM change_sets c JOIN channel_operation_receipts r \
+         ON r.operation_id = c.operation_id \
+         AND (r.stage_results #>> '{providerPriceEdit,changeSetID}')::bigint = c.id \
+         WHERE c.operation_id = $1",
+    )
+    .bind(op)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(committed_ids.len(), 1);
+    sqlx::query("DELETE FROM systems WHERE key=$1")
+        .bind(crate::wiring_governance::KEY)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("ALTER TABLE change_set_items RENAME TO unavailable_change_set_items")
+        .execute(&db.pool)
+        .await?;
+    let error = create(&adapter, &channel, op, vec![input("m", Decimal::ONE)])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, gql::ChangeSetError::Storage(_)));
+    sqlx::query("ALTER TABLE unavailable_change_set_items RENAME TO change_set_items")
+        .execute(&db.pool)
+        .await?;
+    let recovered = create(&adapter, &channel, op, vec![input("m", Decimal::ONE)])
+        .await?
+        .change_set_detail
+        .unwrap();
+    assert_eq!(recovered.summary.id.as_str(), committed_ids[0].to_string());
+    db.cleanup().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -474,7 +537,7 @@ async fn r3_missing_cache_price_blocks_the_entire_manual_package()
     let channel = channel(&db.pool).await?;
     let adapter = PgChangeSetAdapter::new(db.pool.clone());
     let mut incomplete = input("incomplete", Decimal::ONE);
-    incomplete.price.items.pop();
+    incomplete.price.as_mut().unwrap().items.pop();
     let detail = create(
         &adapter,
         &channel,
@@ -638,7 +701,7 @@ async fn r3_retail_publication_keeps_untouched_prices_and_removes_unchanged_delt
     let book=sqlx::query_scalar::<_,i64>("INSERT INTO price_books(name,currency,is_default,created_at,updated_at) VALUES('r3-retail','CNY',true,now(),now()) RETURNING id").fetch_one(&db.pool).await?;
     let version=sqlx::query_scalar::<_,i64>("INSERT INTO price_book_versions(price_book_id,version,status,reference_id,effective_start_at,created_at,updated_at) VALUES($1,1,'published','r3-base',now(),now(),now()) RETURNING id").bind(book).fetch_one(&db.pool).await?;
     let original = serde_json::to_value(crate::conv::model_price_input_to_core(
-        input("unused", Decimal::ONE).price,
+        input("unused", Decimal::ONE).price.unwrap(),
     ))?;
     for model in &models {
         sqlx::query("INSERT INTO price_book_items(price_book_version_id,public_model_id,price,created_at,updated_at) VALUES($1,$2,$3,now(),now())").bind(version).bind(model).bind(SqlJson(original.clone())).execute(&db.pool).await?;
@@ -676,7 +739,7 @@ async fn r3_retail_publication_keeps_untouched_prices_and_removes_unchanged_delt
         .await?;
     assert_eq!(fresh(&adapter, &d.summary.id).await.summary.item_count, 0);
     let changed = serde_json::to_value(crate::conv::model_price_input_to_core(
-        input("unused", Decimal::TWO).price,
+        input("unused", Decimal::TWO).price.unwrap(),
     ))?;
     adapter
         .save_retail_item(
@@ -714,14 +777,24 @@ async fn r3_retail_publication_keeps_untouched_prices_and_removes_unchanged_delt
 async fn r3_new_api_create_atomically_binds_channel_receipt_and_normalized_intent()
 -> Result<(), Box<dyn std::error::Error>> {
     use conduit_admin_graphql::channel::{
-        ChannelCredentialsInput, ChannelMutationServices, ChannelSettingsInput, ChannelType,
-        CreateChannelInput, UpdateChannelInput,
+        ChannelCredentialsInput, ChannelMutationServices, ChannelPublicModelBindingInput,
+        ChannelPublicModelBindingsInput, ChannelSettingsInput, ChannelType, CreateChannelInput,
+        UpdateChannelInput,
     };
     let Some(db) = db().await? else { return Ok(()) };
     let repo = std::sync::Arc::new(conduit_db::PgChannelRepo::new(db.pool.clone()));
     let adapter =
         crate::wiring_channel_crud::ChannelCrudAdapter::new(repo).with_pool(db.pool.clone());
     let make = |op: Uuid, name: &str| CreateChannelInput {
+        public_model_bindings: Some(ChannelPublicModelBindingsInput {
+            upserts: Some(vec![ChannelPublicModelBindingInput {
+                upstream_model_id: "provider-model".into(),
+                public_model_key: "public-model".into(),
+                model_type: Some(conduit_admin_graphql::model::ModelType::Embedding),
+                confirm_compatibility: None,
+            }]),
+            remove_route_ids: None,
+        }),
         operation_id: Some(ID(op.to_string())),
         channel_type: ChannelType::Openai,
         base_url: Some("http://127.0.0.1:32123/prefix/v1/?ignored=yes#fragment".into()),
@@ -736,7 +809,7 @@ async fn r3_new_api_create_atomically_binds_channel_receipt_and_normalized_inten
             new_api_user_id: Some("12".into()),
             ..Default::default()
         },
-        supported_models: vec![],
+        supported_models: vec!["provider-model".into()],
         manual_models: None,
         auto_sync_supported_models: Some(false),
         auto_sync_model_pattern: None,
@@ -753,6 +826,32 @@ async fn r3_new_api_create_atomically_binds_channel_receipt_and_normalized_inten
     };
     let op = Uuid::new_v4();
     let input = make(op, "new-api-atomic");
+    let blocked = adapter
+        .create_channel(Some(7), input.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        blocked
+            .to_string()
+            .contains("APPROVAL_REQUIRED: model_mapping")
+    );
+    let unwritten = sqlx::query_scalar::<_, i64>(
+        "SELECT (SELECT COUNT(*) FROM channels)+(SELECT COUNT(*) FROM models)+(SELECT COUNT(*) FROM channel_operation_receipts)"
+    ).fetch_one(&db.pool).await?;
+    assert_eq!(unwritten, 0);
+    use conduit_admin_graphql::governance::{GovernanceServices, UpdateGovernanceSettingsInput};
+    crate::wiring_governance::PgGovernanceAdapter::new(db.pool.clone())
+        .update_settings(
+            7,
+            UpdateGovernanceSettingsInput {
+                enabled: true,
+                review_kinds: vec![],
+                allow_self_review: Some(true),
+            },
+            "0".into(),
+        )
+        .await?;
+
     let first = adapter.create_channel(Some(7), input.clone()).await?;
     let again = adapter.create_channel(Some(7), input.clone()).await?;
     assert_eq!(first.id, again.id);
@@ -783,8 +882,45 @@ async fn r3_new_api_create_atomically_binds_channel_receipt_and_normalized_inten
     let (state,actor)=sqlx::query_as::<_,(String,i64)>("SELECT state,created_by FROM channel_operation_receipts WHERE operation_id=$1 AND channel_id=$2").bind(op).bind(id).fetch_one(&db.pool).await?;
     assert_eq!(state, "NOT_STARTED");
     assert_eq!(actor, 7);
+    let (route_id, model_type, model_status, route_status) = sqlx::query_as::<_, (i64, String, String, String)>(
+        r#"SELECT r.id,m."type",m.status,r.status FROM model_routes r
+           JOIN models m ON m.id=r.public_model_id
+           JOIN upstream_model_deployments d ON d.id=r.deployment_id
+           WHERE m.model_id='public-model' AND d.channel_id=$1 AND d.upstream_model_id='provider-model'"#
+    ).bind(id).fetch_one(&db.pool).await?;
+    assert_eq!(model_type, "embedding");
+    assert_eq!(model_status, "disabled");
+    assert_eq!(route_status, "disabled");
+    let err = adapter
+        .update_channel(
+            Some(7),
+            first.id.as_str(),
+            UpdateChannelInput {
+                name: Some("must-not-rename".into()),
+                public_model_bindings: Some(ChannelPublicModelBindingsInput {
+                    upserts: Some(vec![ChannelPublicModelBindingInput {
+                        upstream_model_id: "provider-model".into(),
+                        public_model_key: "public-model".into(),
+                        model_type: None,
+                        confirm_compatibility: None,
+                    }]),
+                    remove_route_ids: Some(vec![ID(route_id.to_string())]),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("both upserted and removed"));
+    let stored_name = sqlx::query_scalar::<_, String>("SELECT name FROM channels WHERE id=$1")
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(stored_name, "new-api-atomic");
+
     let updated = adapter
         .update_channel(
+            None,
             first.id.as_str(),
             UpdateChannelInput {
                 base_url: Some("http://127.0.0.1:32123/changed/v1?x=1".into()),
@@ -797,13 +933,62 @@ async fn r3_new_api_create_atomically_binds_channel_receipt_and_normalized_inten
         Some("http://127.0.0.1:32123/changed")
     );
     assert_eq!(updated.website_url, updated.base_url);
+    let distinct = adapter
+        .update_channel(
+            Some(7),
+            first.id.as_str(),
+            UpdateChannelInput {
+                website_url: Some("http://127.0.0.1:32124/console".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(distinct.base_url, updated.base_url);
+    let preserved = adapter
+        .update_channel(
+            Some(7),
+            first.id.as_str(),
+            UpdateChannelInput {
+                base_url: Some("http://127.0.0.1:32123/new-base/v1".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(preserved.website_url, distinct.website_url);
+    let cleared = adapter
+        .update_channel(
+            Some(7),
+            first.id.as_str(),
+            UpdateChannelInput {
+                clear_website_url: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(cleared.website_url.is_none());
+    let unchanged = adapter
+        .update_channel(
+            Some(7),
+            first.id.as_str(),
+            UpdateChannelInput {
+                remark: Some("updated remark".into()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(unchanged.website_url.is_none());
+
     sqlx::query("ALTER TABLE channel_operation_receipts ADD CONSTRAINT r3_injected_receipt_failure CHECK (state <> 'NOT_STARTED') NOT VALID").execute(&db.pool).await?;
-    assert!(
-        adapter
-            .create_channel(Some(7), make(Uuid::new_v4(), "must-rollback"))
-            .await
-            .is_err()
-    );
+    let mut failure = make(Uuid::new_v4(), "must-rollback");
+    failure
+        .public_model_bindings
+        .as_mut()
+        .unwrap()
+        .upserts
+        .as_mut()
+        .unwrap()[0]
+        .public_model_key = "rollback-model".into();
+    assert!(adapter.create_channel(Some(7), failure).await.is_err());
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM channels WHERE name='must-rollback'")
             .fetch_one(&db.pool)
@@ -822,6 +1007,10 @@ async fn r3_new_api_create_atomically_binds_channel_receipt_and_normalized_inten
             .await?,
         1
     );
+    let models = sqlx::query_scalar::<_, String>("SELECT model_id FROM models ORDER BY id")
+        .fetch_all(&db.pool)
+        .await?;
+    assert_eq!(models, ["public-model"]);
     db.cleanup().await?;
     Ok(())
 }

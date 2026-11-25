@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { useQuery } from '@tanstack/react-query';
 import { graphqlRequest } from '@/gql/graphql';
 import { useSelectedProjectId } from '@/stores/projectStore';
+import { isNewApiExpressionPrice, type NewApiExpressionPrice } from '@/features/models/components/simple-retail-price';
 
 const healthSchema = z.object({
   status: z.string(),
@@ -29,6 +30,13 @@ const priceItemSchema = z.object({
   pricing: pricingSchema,
   promptWriteCacheVariants: z.array(z.object({ variantCode: z.string(), pricing: pricingSchema })),
 });
+const expressionSchema = z.custom<NewApiExpressionPrice>(isNewApiExpressionPrice).nullish();
+const priceLeafSchema = z
+  .object({
+    items: z.array(priceItemSchema).nullable(),
+    billingExpression: expressionSchema,
+  })
+  .refine((leaf) => !leaf.billingExpression || leaf.items === null, 'Expression price has incompatible static items');
 const modelSchema = z.object({
   id: z.string(),
   modelId: z.string(),
@@ -39,23 +47,23 @@ const modelSchema = z.object({
   capabilities: z.array(z.string()),
   contextLimit: z.number().nullable(),
   outputLimit: z.number().nullable(),
-  price: z.object({
-    status: z.enum(['PRICED', 'UNPRICED', 'UNAVAILABLE']),
-    items: z.array(priceItemSchema),
-    branches: z.array(
-      z.object({ source: z.string(), label: z.string(), condition: z.string().nullable(), items: z.array(priceItemSchema) })
-    ),
-    source: z.string(),
-    priceBookVersion: z.string().nullable(),
-    currency: z.string(),
-    displayName: z.string(),
-    inputPerMillion: z.string().nullable(),
-    outputPerMillion: z.string().nullable(),
-    cacheReadPerMillion: z.string().nullable(),
-    cacheWritePerMillion: z.string().nullable(),
-    effectiveMultiplier: z.string(),
-    billable: z.boolean(),
-  }),
+  price: z
+    .object({
+      ...priceLeafSchema.shape,
+      status: z.enum(['PRICED', 'UNPRICED', 'UNAVAILABLE']),
+      branches: z.array(priceLeafSchema.safeExtend({ source: z.string(), label: z.string(), condition: z.string().nullable() })),
+      source: z.string(),
+      priceBookVersion: z.string().nullable(),
+      currency: z.string(),
+      displayName: z.string(),
+      inputPerMillion: z.string().nullable(),
+      outputPerMillion: z.string().nullable(),
+      cacheReadPerMillion: z.string().nullable(),
+      cacheWritePerMillion: z.string().nullable(),
+      effectiveMultiplier: z.string(),
+      billable: z.boolean(),
+    })
+    .refine((leaf) => !leaf.billingExpression || leaf.items === null, 'Expression price has incompatible static items'),
   routes: z.array(routeSchema),
   health: healthSchema.nullable(),
 });
@@ -87,8 +95,8 @@ const QUERY = `
       models {
         id modelId name group developer modelType capabilities contextLimit outputLimit
         price {
-          status source priceBookVersion
-          branches { source label condition items { itemCode pricing { mode amount tiers { above upTo pricePerMillion } } promptWriteCacheVariants { variantCode pricing { mode amount tiers { above upTo pricePerMillion } } } } }
+          status source priceBookVersion billingExpression
+          branches { source label condition billingExpression items { itemCode pricing { mode amount tiers { above upTo pricePerMillion } } promptWriteCacheVariants { variantCode pricing { mode amount tiers { above upTo pricePerMillion } } } } }
           items {
             itemCode
             pricing { mode amount tiers { above upTo pricePerMillion } }

@@ -973,7 +973,10 @@ pub fn transform_responses_response(status: u16, body: &[u8]) -> TransformerResu
 
     // Extract usage.
     if let Some(usage_obj) = obj.get("usage") {
-        if let Ok(usage) = extract_usage_from_responses(usage_obj) {
+        if let Ok(usage) = extract_usage_from_responses(
+            usage_obj,
+            obj.get("status").and_then(Value::as_str) == Some("completed"),
+        ) {
             response.usage = Some(usage);
         }
     }
@@ -1081,7 +1084,10 @@ pub fn transform_responses_compact_response(
 
     // Extract usage.
     if let Some(usage_obj) = obj.get("usage") {
-        if let Ok(usage) = extract_usage_from_responses(usage_obj) {
+        if let Ok(usage) = extract_usage_from_responses(
+            usage_obj,
+            obj.get("status").and_then(Value::as_str) == Some("completed"),
+        ) {
             response.usage = Some(usage);
         }
     }
@@ -1405,7 +1411,7 @@ fn convert_annotation(ann_obj: &Map<String, Value>, text_offset: usize) -> Optio
 /// Extract usage from a Responses API response.
 ///
 /// Mirrors Go `Usage.ToUsage()` (responses/usage.go).
-fn extract_usage_from_responses(usage_obj: &Value) -> TransformerResult<Usage> {
+fn extract_usage_from_responses(usage_obj: &Value, complete: bool) -> TransformerResult<Usage> {
     let prompt_tokens = usage_obj
         .get("input_tokens")
         .or_else(|| usage_obj.get("prompt_tokens"))
@@ -1458,6 +1464,12 @@ fn extract_usage_from_responses(usage_obj: &Value) -> TransformerResult<Usage> {
         }
     }
 
+    crate::openai_outbound::attach_openai_billing_token_facts(
+        &mut usage,
+        usage_obj,
+        conduit_llm::usage::BillingTokenProtocol::OpenAiResponses,
+        complete,
+    );
     Ok(usage)
 }
 
@@ -1887,7 +1899,7 @@ impl ResponsesStreamIter {
                     .get("response")
                     .and_then(|response| response.get("usage"))
                 {
-                    chunk.usage = Some(extract_usage_from_responses(usage)?);
+                    chunk.usage = Some(extract_usage_from_responses(usage, false)?);
                 }
                 Ok(vec![chunk])
             }
@@ -2141,7 +2153,10 @@ impl ResponsesStreamIter {
                     .or_else(|| value.get("usage"))
                 {
                     let mut usage_chunk = self.base_chunk();
-                    usage_chunk.usage = Some(extract_usage_from_responses(usage)?);
+                    usage_chunk.usage = Some(extract_usage_from_responses(
+                        usage,
+                        event_type == "response.completed",
+                    )?);
                     output.push(usage_chunk);
                 }
                 Ok(output)

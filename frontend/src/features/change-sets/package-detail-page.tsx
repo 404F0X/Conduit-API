@@ -16,6 +16,9 @@ import { Header } from '@/components/layout/header';
 import { Main } from '@/components/layout/main';
 import { DiscoveryPanel } from '@/features/channels/components/new-api-discovery';
 import { getDiscovery, initializeDiscovery, rememberDiscovery } from '@/features/channels/data/discovery';
+import { ExpressionPriceSummary } from '@/features/models/components/expression-price-summary';
+import { LazyNewApiExpressionEditor } from '@/features/models/components/lazy-new-api-expression-editor';
+import { isNewApiExpressionPrice, validNewApiExpressionDraft } from '@/features/models/components/simple-retail-price';
 import {
   getEventPage,
   getItem,
@@ -48,6 +51,8 @@ function SnapshotView({ value, title, fields }: { value: unknown; title: string;
   const record = objectValue(value);
   const prices = priceRows(value).filter((row) => !fields || fields.includes(row.code));
   const model = objectValue(record.publicModel ?? record);
+  const priceDocument = record.billingExpression ?? record.price ?? value;
+  const grouped = objectValue(priceDocument).schema === 'group-conditional-price-v1';
   return (
     <section className='bg-background min-w-0 rounded-lg border p-4'>
       <h3 className='text-muted-foreground mb-3 text-xs font-medium'>{title}</h3>
@@ -55,6 +60,10 @@ function SnapshotView({ value, title, fields }: { value: unknown; title: string;
         <p className='text-muted-foreground text-sm'>{t('eventPackages.noDifference')}</p>
       ) : value == null ? (
         <p className='text-sm'>{t('eventPackages.noValue')}</p>
+      ) : isNewApiExpressionPrice(priceDocument) && (!fields || fields.includes('billingExpression')) ? (
+        <ExpressionPriceSummary price={priceDocument} />
+      ) : grouped && (!fields || fields.includes('conditionalPrice')) ? (
+        <pre className='max-h-64 overflow-auto text-xs break-all whitespace-pre-wrap'>{JSON.stringify(priceDocument, null, 2)}</pre>
       ) : prices.length ? (
         <dl className='space-y-2'>
           {Boolean(record.currencyCode) && <div className='mb-3 text-xs font-medium'>{String(record.currencyCode)}</div>}
@@ -157,6 +166,28 @@ function ItemInspection({ detail }: { detail: ItemDetail }) {
               </div>
             ))}
         </dl>
+        {Array.isArray(source.warnings) &&
+          source.warnings.map((raw, index) => {
+            const warning = objectValue(raw);
+            const excludedChannelIDs = Array.isArray(warning.excludedChannelIDs)
+              ? warning.excludedChannelIDs.filter((id) => typeof id === 'string')
+              : [];
+            if (typeof warning.message !== 'string') return null;
+            return (
+              <div key={index} className='mt-3 rounded border border-amber-500/30 p-3 text-sm'>
+                <p>{warning.message}</p>
+                {typeof warning.code === 'string' && <p className='text-muted-foreground mt-1 text-xs'>{warning.code}</p>}
+                {excludedChannelIDs.length > 0 && (
+                  <p className='mt-1 font-mono text-xs break-all'>
+                    {t('models.expressionPrice.excludedChannels', { channels: excludedChannelIDs.join(', ') })}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        {typeof provenance.selectedGroup === 'string' && (
+          <p className='mt-3 text-xs'>{t('models.expressionPrice.sourceGroup', { group: provenance.selectedGroup })}</p>
+        )}
         {Object.keys(objectValue(provenance.fieldOrigins)).length > 0 && (
           <dl className='mt-4 grid gap-3 text-xs sm:grid-cols-2'>
             {Object.entries(objectValue(provenance.fieldOrigins)).map(([key, value]) => (
@@ -217,7 +248,20 @@ function ProviderDraftEditor({ detail, onSaved, onClose }: { detail: PackageDeta
     setError(undefined);
     try {
       const current = await getProviderBase(detail.summary.scopeID);
-      const target = new Map(current.prices.map((p) => [p.modelID, { modelId: p.modelID, currencyCode: p.currencyCode, price: p.price }]));
+      const target = new Map<string, ProviderPriceInput>(
+        current.prices.map((p) => [
+          p.modelID,
+          p.billingExpression
+            ? { modelId: p.modelID, currencyCode: p.currencyCode, billingExpression: p.billingExpression }
+            : { modelId: p.modelID, currencyCode: p.currencyCode, price: p.price },
+        ])
+      );
+      const rowFromSnapshot = (modelId: string, snapshot: unknown): ProviderPriceInput => {
+        const expression = objectValue(snapshot).billingExpression ?? snapshot;
+        return isNewApiExpressionPrice(expression)
+          ? { modelId, currencyCode: 'USD', billingExpression: expression }
+          : { modelId, currencyCode: current.accountingCurrency, price: snapshot };
+      };
       let after: string | undefined;
       const omitted: string[] = [];
       do {
@@ -227,21 +271,11 @@ function ProviderDraftEditor({ detail, onSaved, onClose }: { detail: PackageDeta
           if (!item) throw new Error(t('eventPackages.error'));
           if (detail.summary.status === 'DRAFT') {
             if (item.item.action === 'DELETE') target.delete(item.item.itemKey);
-            else
-              target.set(item.item.itemKey, {
-                modelId: item.item.itemKey,
-                currencyCode: current.accountingCurrency,
-                price: item.item.afterSnapshot,
-              });
+            else target.set(item.item.itemKey, rowFromSnapshot(item.item.itemKey, item.item.afterSnapshot));
           } else if (item.issues.length || item.item.validationError) {
             omitted.push(item.item.itemKey);
           } else if (item.item.action === 'DELETE') target.delete(item.item.itemKey);
-          else
-            target.set(item.item.itemKey, {
-              modelId: item.item.itemKey,
-              currencyCode: current.accountingCurrency,
-              price: item.item.afterSnapshot,
-            });
+          else target.set(item.item.itemKey, rowFromSnapshot(item.item.itemKey, item.item.afterSnapshot));
         }
         after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor! : undefined;
       } while (after);
@@ -254,8 +288,9 @@ function ProviderDraftEditor({ detail, onSaved, onClose }: { detail: PackageDeta
       setBusy(false);
     }
   };
+  const invalidExpression = rows?.some((row) => row.billingExpression && !validNewApiExpressionDraft(row.billingExpression));
   const save = async () => {
-    if (!rows) return;
+    if (!rows || invalidExpression) return;
     setBusy(true);
     setError(undefined);
     try {
@@ -329,31 +364,42 @@ function ProviderDraftEditor({ detail, onSaved, onClose }: { detail: PackageDeta
                     <tr key={row.modelId} className='border-t'>
                       <td className='max-w-56 p-2 break-all'>{row.modelId}</td>
                       <td className='p-2'>{row.currencyCode}</td>
-                      {['prompt_tokens', 'completion_tokens', 'prompt_cached_tokens', 'prompt_write_cached_tokens'].map((code) => {
-                        const field = priceRows(row.price).find((p) => p.code === code);
-                        return (
-                          <td key={code} className='p-2'>
-                            <Input
-                              aria-label={`${row.modelId} ${code}`}
-                              inputMode='decimal'
-                              value={displayAmount(field?.amount) ?? ''}
-                              placeholder={t('eventPackages.unknown')}
-                              disabled={field != null && field.mode !== 'usage_per_unit'}
-                              onChange={(e) => {
-                                try {
-                                  setRows(
-                                    rows.map((r, i) =>
-                                      i === index ? { ...r, price: updatePriceAmount(r.price, code, e.target.value) } : r
-                                    )
-                                  );
-                                } catch (e) {
-                                  setError(String(e));
-                                }
-                              }}
-                            />
-                          </td>
-                        );
-                      })}
+                      {row.billingExpression ? (
+                        <td colSpan={4} className='p-2'>
+                          <LazyNewApiExpressionEditor
+                            value={row.billingExpression}
+                            onChange={(billingExpression) =>
+                              setRows(rows.map((item, i) => (i === index ? { ...item, billingExpression } : item)))
+                            }
+                          />
+                        </td>
+                      ) : (
+                        ['prompt_tokens', 'completion_tokens', 'prompt_cached_tokens', 'prompt_write_cached_tokens'].map((code) => {
+                          const field = priceRows(row.price).find((p) => p.code === code);
+                          return (
+                            <td key={code} className='p-2'>
+                              <Input
+                                aria-label={`${row.modelId} ${code}`}
+                                inputMode='decimal'
+                                value={displayAmount(field?.amount) ?? ''}
+                                placeholder={t('eventPackages.unknown')}
+                                disabled={field != null && field.mode !== 'usage_per_unit'}
+                                onChange={(e) => {
+                                  try {
+                                    setRows(
+                                      rows.map((r, i) =>
+                                        i === index ? { ...r, price: updatePriceAmount(r.price, code, e.target.value) } : r
+                                      )
+                                    );
+                                  } catch (e) {
+                                    setError(String(e));
+                                  }
+                                }}
+                              />
+                            </td>
+                          );
+                        })
+                      )}
                     </tr>
                   ))}
                 </tbody>
@@ -388,7 +434,7 @@ function ProviderDraftEditor({ detail, onSaved, onClose }: { detail: PackageDeta
           <Button variant='outline' onClick={onClose} disabled={busy}>
             {t('eventPackages.cancel')}
           </Button>
-          <Button onClick={() => void save()} disabled={busy || !rows}>
+          <Button onClick={() => void save()} disabled={busy || !rows || invalidExpression}>
             {t('eventPackages.save')}
           </Button>
         </DialogFooter>

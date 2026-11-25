@@ -1293,7 +1293,8 @@ async fn authorize_command(
     }
 
     let projects = command_projects(tx, command, targets).await?;
-    if matches!(command,Command::Channel(v) if v.settings.is_some())
+    if channel_form_has_bindings(command)
+        || matches!(command,Command::Channel(v) if v.settings.is_some())
         || matches!(command,Command::ChannelCreateForm(v) if v.0.settings.is_some())
         || matches!(command,Command::ChannelUpdateForm(v) if v.0.settings.is_some())
         || matches!(command,Command::ChannelBatch(v) if v.channels.iter().any(|v|v.settings.is_some()))
@@ -1742,9 +1743,28 @@ pub(crate) async fn propose(
         ));
     }
     let id:i64=sqlx::query_scalar("INSERT INTO change_sets(operation_id,kind,scope_type,scope_id,title,status,base_revision,source_revision,created_by,created_at,updated_at) VALUES($1,$2,'governed','0',$3,'draft',$4,$5,$6,now(),now()) RETURNING id").bind(operation).bind(kind).bind(input.reason.trim()).bind(&current).bind(policy.revision.to_string()).bind(actor).fetch_one(&mut *tx).await.map_err(|_|"package creation failed")?;
+    let mut summary = json!({"action":input.action,"targetIDs":targets});
+    if channel_form_has_bindings(&command) {
+        let bindings = &payload["publicModelBindings"];
+        let upserts: Vec<_> = bindings["upserts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|v| {
+                json!({
+                    "upstreamModelID":v["upstreamModelID"],
+                    "publicModelKey":v["publicModelKey"],
+                    "modelType":v["modelType"],
+                    "confirmCompatibility":v["confirmCompatibility"]
+                })
+            })
+            .collect();
+        summary["publicModelBindings"] =
+            json!({"upserts": upserts, "removeRouteIDs":bindings["removeRouteIDs"]});
+    }
     let private = json!({"payload":payload,"targets":targets});
     sqlx::query("INSERT INTO governed_change_commands(change_set_id,item_key,action,private_payload,target_revision,domain_scope,project_ids) VALUES($1,'command',$2,$3,$4,$5,$6)").bind(id).bind(&input.action).bind(sqlx::types::Json(private)).bind(&current).bind(registration(&input.action)?.1).bind(command_projects(&mut tx,&command,&targets).await?).execute(&mut *tx).await.map_err(|_|"command storage failed")?;
-    sqlx::query("INSERT INTO change_set_items(change_set_id,item_key,action,after_snapshot,created_at,updated_at) VALUES($1,'command','update',$2,now(),now())").bind(id).bind(sqlx::types::Json(json!({"action":input.action,"targetIDs":targets}))).execute(&mut *tx).await.map_err(|_|"command summary failed")?;
+    sqlx::query("INSERT INTO change_set_items(change_set_id,item_key,action,after_snapshot,created_at,updated_at) VALUES($1,'command','update',$2,now(),now())").bind(id).bind(sqlx::types::Json(summary)).execute(&mut *tx).await.map_err(|_|"command summary failed")?;
     sqlx::query("INSERT INTO governed_change_operations(operation_id,actor_id,action,fingerprint,change_set_id) VALUES($1,$2,$3,$4,$5)").bind(operation).bind(actor).bind(&input.action).bind(fingerprint).bind(id).execute(&mut *tx).await.map_err(|_|"operation storage failed")?;
     crate::wiring_postgres_change_sets::insert_event(
         &mut tx,
@@ -1838,6 +1858,9 @@ pub(crate) async fn check(
                 .await
                 .map_err(|_| "maker lookup failed")?;
         if let Some(maker) = maker {
+            if actor.is_some() && channel_form_has_bindings(&command) {
+                authorize_command(tx, maker, &action, &command, &targets).await?;
+            }
             validate_ownership(tx, maker, &command, &targets).await?;
         }
         validate_command(&command, &targets)?;
@@ -1946,7 +1969,8 @@ pub(crate) async fn requires_review(
         if p.requires(registration(&action)?.0) {
             return Ok(true);
         }
-        let mapping = matches!(&c,Command::ChannelCreateForm(v) if v.0.settings.is_some())
+        let mapping = channel_form_has_bindings(&c)
+            || matches!(&c,Command::ChannelCreateForm(v) if v.0.settings.is_some())
             || matches!(&c,Command::ChannelUpdateForm(v) if v.0.settings.is_some())
             || matches!(&c,Command::Channel(v) if v.settings.is_some())
             || matches!(
@@ -1956,26 +1980,27 @@ pub(crate) async fn requires_review(
                     | Command::ChannelDuplicate(_)
                     | Command::ChannelDuplicateForm(_)
             );
-        let supply = match &c {
-            Command::ChannelCreateForm(v) => {
-                !v.0.supported_models.is_empty()
-                    || v.0.manual_models.as_ref().is_some_and(|v| !v.is_empty())
-            }
-            Command::ChannelUpdateForm(v) => {
-                v.0.supported_models.is_some() || v.0.manual_models.is_some()
-            }
-            Command::Channel(v) => v.supported_models.is_some() || v.manual_models.is_some(),
-            Command::ChannelBatch(v) => v
-                .channels
-                .iter()
-                .any(|c| c.supported_models.is_some() || c.manual_models.is_some()),
-            Command::ChannelBulkCreateForm(v) => !v.0.supported_models.is_empty(),
-            Command::ChannelImportForm(v) => {
-                v.0.channels.iter().any(|v| !v.supported_models.is_empty())
-            }
-            Command::ChannelDuplicate(_) | Command::ChannelDuplicateForm(_) => true,
-            _ => false,
-        };
+        let supply = channel_form_has_bindings(&c)
+            || match &c {
+                Command::ChannelCreateForm(v) => {
+                    !v.0.supported_models.is_empty()
+                        || v.0.manual_models.as_ref().is_some_and(|v| !v.is_empty())
+                }
+                Command::ChannelUpdateForm(v) => {
+                    v.0.supported_models.is_some() || v.0.manual_models.is_some()
+                }
+                Command::Channel(v) => v.supported_models.is_some() || v.manual_models.is_some(),
+                Command::ChannelBatch(v) => v
+                    .channels
+                    .iter()
+                    .any(|c| c.supported_models.is_some() || c.manual_models.is_some()),
+                Command::ChannelBulkCreateForm(v) => !v.0.supported_models.is_empty(),
+                Command::ChannelImportForm(v) => {
+                    v.0.channels.iter().any(|v| !v.supported_models.is_empty())
+                }
+                Command::ChannelDuplicate(_) | Command::ChannelDuplicateForm(_) => true,
+                _ => false,
+            };
         let price = group_writes_price(&c);
         let access = matches!(
             &c,
@@ -2002,7 +2027,41 @@ pub(crate) async fn requires_review(
     }
     Ok(false)
 }
+fn channel_form_has_bindings(command: &Command) -> bool {
+    match command {
+        Command::ChannelCreateForm(v) => v.0.public_model_bindings.as_ref(),
+        Command::ChannelUpdateForm(v) => v.0.public_model_bindings.as_ref(),
+        _ => None,
+    }
+    .is_some_and(|bindings| bindings.has_changes())
+}
+
 fn validate_command(command: &Command, targets: &[String]) -> Result<(), String> {
+    match command {
+        Command::ChannelCreateForm(v)
+            if v.0
+                .public_model_bindings
+                .as_ref()
+                .and_then(|v| v.remove_route_ids.as_ref())
+                .is_some_and(|v| !v.is_empty()) =>
+        {
+            return Err("route removals are invalid when creating a channel".into());
+        }
+        Command::ChannelUpdateForm(_)
+            if channel_form_has_bindings(command) && targets.len() != 1 =>
+        {
+            return Err("public model bindings require exactly one channel".into());
+        }
+        Command::ChannelDuplicateForm(v)
+            if v.0
+                .public_model_bindings
+                .as_ref()
+                .is_some_and(|v| v.has_changes()) =>
+        {
+            return Err("public model bindings are only supported by the channel form".into());
+        }
+        _ => {}
+    }
     let status = |value: &Option<String>, allowed: &[&str]| -> Result<(), String> {
         if value
             .as_ref()
@@ -2511,8 +2570,8 @@ pub(crate) async fn apply(
             Command::RoleUpdateForm(v)=>{for target in &targets {let project:bool=sqlx::query_scalar("SELECT level='project' FROM roles WHERE id::text=$1 AND deleted_at=0").bind(target).fetch_one(&mut **tx).await.map_err(|_|"role is missing")?;if let Some(scopes)=&v.0.scopes{validate_scopes(scopes,project)?;}}write_row(tx,"roles",&RoleWrite{name:v.0.name,level:None,project_id:None,scopes:v.0.scopes},&targets).await?},
             Command::ChannelBulkCreateForm(v)=>{let v=v.0;let mut names:std::collections::HashSet<String>=sqlx::query_scalar("SELECT name FROM channels WHERE deleted_at=0").fetch_all(&mut **tx).await.map_err(|_|"channel names unavailable")?.into_iter().collect();let mut index=1;let mut ids=Vec::new();for key in &v.api_keys{let mut name=format!("{} - ({index})",v.name);while names.contains(&name){index+=1;name=format!("{} - ({index})",v.name);}index+=1;names.insert(name.clone());let input=channel_bulk_input(crate::wiring_channel_crud::channel_type_to_wire(v.channel_type).into(),name,v.base_url.clone(),key.clone(),v.supported_models.clone(),v.default_test_model.clone(),v.settings.clone(),v.policies.clone(),v.tags.clone().filter(|v|!v.is_empty()).unwrap_or_else(||vec![v.name.clone()]),v.auto_sync_supported_models,v.ordering_weight,v.remark.clone());ids.push(conduit_db::PgChannelRepo::create_channel_in_tx(tx,input).await.map_err(|_|"atomic bulk channel creation failed")?.id);}ids},
             Command::ChannelImportForm(v)=>{let mut ids=Vec::new();for v in v.0.channels{let input=channel_bulk_input(v.channel_type,v.name,v.base_url,v.api_key.ok_or("import key is required")?,v.supported_models,v.default_test_model,None,None,vec![],None,None,None);ids.push(conduit_db::PgChannelRepo::create_channel_in_tx(tx,input).await.map_err(|_|"atomic channel import failed")?.id);}ids},
-            Command::ChannelCreateForm(v)=>{let (input,new_api,operation)=crate::wiring_channel_crud::prepare_channel_create(maker,v.0).map_err(|_|"invalid channel form")?;let mut intent=input.clone();intent.created_at.clear();let fingerprint=format!("{:x}",Sha256::digest(format!("{:?}:{:?}",maker,intent).as_bytes()));let row=conduit_db::PgChannelRepo::create_channel_in_tx(tx,input).await.map_err(|_|"channel creation failed")?;if new_api{let stages=crate::wiring_postgres_channel_discovery::initial_results(&[conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Models,conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Prices],None);sqlx::query("INSERT INTO channel_operation_receipts(operation_id,channel_id,operation_type,origin,created_by,request_fingerprint,state,stage_results,created_at,updated_at) VALUES($1,$2,'NEW_API_DISCOVERY','CHANNEL_CREATE',$3,$4,'NOT_STARTED',$5,now(),now())").bind(operation.ok_or("NEWAPI operation required")?).bind(row.id.parse::<i64>().map_err(|_|"invalid channel ID")?).bind(maker).bind(fingerprint).bind(sqlx::types::Json(stages)).execute(&mut **tx).await.map_err(|_|"channel receipt creation failed")?;}vec![row.id]},
-            Command::ChannelUpdateForm(v)=>{let mut ids=Vec::new();for target in &targets{let existing=conduit_db::PgChannelRepo::find_channel_in_tx(tx,target).await.map_err(|_|"channel lookup failed")?.ok_or("channel is missing")?;let input=crate::wiring_channel_crud::prepare_channel_update(v.0.clone(),&existing).map_err(|_|"invalid channel form")?;ids.push(conduit_db::PgChannelRepo::update_channel_in_tx(tx,target,input).await.map_err(|_|"channel update failed")?.id);}ids},
+            Command::ChannelCreateForm(v)=>{let bindings=v.0.public_model_bindings.clone().filter(|v|v.has_changes());let (input,new_api,operation)=crate::wiring_channel_crud::prepare_channel_create(maker,v.0).map_err(|_|"invalid channel form")?;let fingerprint=crate::wiring_channel_crud::channel_create_fingerprint(maker,&input,bindings.as_ref());let row=conduit_db::PgChannelRepo::create_channel_in_tx(tx,input).await.map_err(|_|"channel creation failed")?;if let Some(bindings)=bindings{crate::wiring_postgres_commercialization::apply_channel_public_model_bindings(tx,&row,bindings,true).await?;}if new_api{let stages=crate::wiring_postgres_channel_discovery::initial_results(&[conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Models,conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Prices],None);sqlx::query("INSERT INTO channel_operation_receipts(operation_id,channel_id,operation_type,origin,created_by,request_fingerprint,state,stage_results,created_at,updated_at) VALUES($1,$2,'NEW_API_DISCOVERY','CHANNEL_CREATE',$3,$4,'NOT_STARTED',$5,now(),now())").bind(operation.ok_or("NEWAPI operation required")?).bind(row.id.parse::<i64>().map_err(|_|"invalid channel ID")?).bind(maker).bind(fingerprint).bind(sqlx::types::Json(stages)).execute(&mut **tx).await.map_err(|_|"channel receipt creation failed")?;}vec![row.id]},
+            Command::ChannelUpdateForm(v)=>{let bindings=v.0.public_model_bindings.clone().filter(|v|v.has_changes());if bindings.is_some()&&targets.len()!=1{return Err("public model bindings require exactly one channel".into());}let mut ids=Vec::new();for target in &targets{let existing=conduit_db::PgChannelRepo::find_channel_for_update(tx,target).await.map_err(|_|"channel lookup failed")?.ok_or("channel is missing")?;let input=crate::wiring_channel_crud::prepare_channel_update(v.0.clone(),&existing).map_err(|_|"invalid channel form")?;let row=conduit_db::PgChannelRepo::update_channel_in_tx(tx,target,input).await.map_err(|_|"channel update failed")?;if let Some(bindings)=bindings.clone(){crate::wiring_postgres_commercialization::apply_channel_public_model_bindings(tx,&row,bindings,false).await?;}ids.push(row.id);}ids},
             Command::ChannelBatch(v)=>{let mut ids=Vec::new();for channel in v.channels{ids.extend(write_row(tx,"channels",&channel,&[]).await?);}ids},
             Command::ModelBatch(v)=>{let mut ids=Vec::new();for mut model in v.models{model.icon.get_or_insert_with(String::new);model.r#group.get_or_insert_with(||model.developer.clone().unwrap_or_default());model.model_card.get_or_insert_with(Default::default);model.settings.get_or_insert_with(Default::default);ids.extend(write_row(tx,"models",&model,&[]).await?);}ids},
             Command::ChannelDuplicate(v)=>{let source=&targets[0];let new_id:i64=sqlx::query_scalar("INSERT INTO channels(type,name,base_url,default_test_model,status,credentials,settings,supported_models,manual_models,policies,endpoints,ordering_weight,tags,auto_sync_supported_models,auto_sync_model_pattern) SELECT type,$2,base_url,default_test_model,'disabled',credentials,settings,supported_models,manual_models,policies,endpoints,ordering_weight,tags,auto_sync_supported_models,auto_sync_model_pattern FROM channels WHERE id::text=$1 AND deleted_at=0 RETURNING id").bind(source).bind(v.name).fetch_one(&mut **tx).await.map_err(|_|"channel duplication failed")?;if v.include_prices{let name:String=sqlx::query_scalar("SELECT name FROM channels WHERE id=$1").bind(new_id).fetch_one(&mut **tx).await.map_err(|_|"duplicate name unavailable")?;crate::wiring_postgres_change_sets::publish_copied_provider_prices(tx,actor,Some(id),source.parse().map_err(|_|"invalid source channel")?,new_id,&name).await?;}vec![new_id.to_string()]},

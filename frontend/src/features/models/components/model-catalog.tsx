@@ -51,6 +51,7 @@ import type { ProvidersData } from '../data/providers.schema';
 import type { Model } from '../data/schema';
 import { type ModelsCatalogSearch, validateModelsSearch } from '../model-search';
 import { CommercializationPanel, type CommercializationAction } from './commercialization-panel';
+import { ExpressionPriceSummary } from './expression-price-summary';
 import { aggregatePublicModelHealth, aggregateUpstreamModelHealth, getHealth } from './model-catalog-health';
 import { priceColumns, retailPriceValues } from './model-catalog-pricing';
 import { createColumns } from './models-columns';
@@ -236,6 +237,7 @@ function RetailPriceSummary({ item, currency }: { item?: PriceBookItem; currency
       </div>
     );
   }
+  if (price.mode === 'expression') return <ExpressionPriceSummary price={price.price} />;
   if (price.mode === 'request') {
     const value = scaleDisplayAmount(price.flatFee, display.factor);
     return (
@@ -292,6 +294,13 @@ function RetailPriceSummary({ item, currency }: { item?: PriceBookItem; currency
 
 function ChannelPriceCells({ values }: { values: ReturnType<typeof priceColumns> }) {
   const display = useAdminPriceDisplay(values.currency);
+  if (values.billingExpression) {
+    return (
+      <TableCell colSpan={5}>
+        <ExpressionPriceSummary price={values.billingExpression} />
+      </TableCell>
+    );
+  }
   return (
     <>
       {[values.request, values.input, values.output, values.cacheRead, values.cacheWrite].map((value, index) => {
@@ -584,8 +593,8 @@ function UpstreamModelDetailDialog({
       : healthQuery.isError
         ? 'border-l-red-500'
         : healthEdgeClass(health.state);
-  const priceItems = new Map(price?.price.items.map((item) => [item.itemCode, item]));
-  const flatFeePrice = price?.price.items.find((item) => item.pricing.mode === 'flat_fee')?.pricing;
+  const priceItems = new Map(price?.price?.items.map((item) => [item.itemCode, item]));
+  const flatFeePrice = price?.price?.items.find((item) => item.pricing.mode === 'flat_fee')?.pricing;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -694,7 +703,7 @@ function UpstreamModelDetailDialog({
                   </h3>
                   <p className='text-muted-foreground mt-0.5 text-xs'>
                     {t('models.catalog.purchasePriceDescription', {
-                      currency: price?.currencyCode || accountingCurrencyCode,
+                      currency: price?.billingExpression ? 'USD' : price?.currencyCode || accountingCurrencyCode,
                     })}
                   </p>
                 </div>
@@ -708,6 +717,10 @@ function UpstreamModelDetailDialog({
                   <p className='px-4 py-6 text-sm text-amber-600 dark:text-amber-400'>{t('models.catalog.priceUnavailable')}</p>
                 ) : !price ? (
                   <p className='text-muted-foreground px-4 py-6 text-sm'>{t('models.catalog.purchasePriceNotConfigured')}</p>
+                ) : price.billingExpression ? (
+                  <div className='bg-background p-3'>
+                    <ExpressionPriceSummary price={price.billingExpression} />
+                  </div>
                 ) : flatFeePrice ? (
                   <div className='bg-background p-3'>
                     <div className='text-muted-foreground mb-2 text-[11px]'>{t('models.catalog.requestPrice')}</div>
@@ -715,12 +728,14 @@ function UpstreamModelDetailDialog({
                   </div>
                 ) : (
                   <div className='bg-border grid grid-cols-2 gap-px sm:grid-cols-4'>
-                    {[
-                      ['models.catalog.inputPrice', 'prompt_tokens'],
-                      ['models.catalog.outputPrice', 'completion_tokens'],
-                      ['models.catalog.cacheReadPrice', 'prompt_cached_tokens'],
-                      ['models.catalog.cacheWritePrice', 'prompt_write_cached_tokens'],
-                    ].map(([label, code]) => (
+                    {(
+                      [
+                        ['models.catalog.inputPrice', 'prompt_tokens'],
+                        ['models.catalog.outputPrice', 'completion_tokens'],
+                        ['models.catalog.cacheReadPrice', 'prompt_cached_tokens'],
+                        ['models.catalog.cacheWritePrice', 'prompt_write_cached_tokens'],
+                      ] as const
+                    ).map(([label, code]) => (
                       <div key={code} className='bg-background p-3'>
                         <div className='text-muted-foreground mb-2 text-[11px]'>{t(label)}</div>
                         <PricingValue pricing={priceItems.get(code)?.pricing} currency={price.currencyCode} />

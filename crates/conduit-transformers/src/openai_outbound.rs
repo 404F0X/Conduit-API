@@ -770,6 +770,84 @@ pub fn extract_usage(response_json: &Value) -> Option<Usage> {
     Some(openai_usage.to_unified())
 }
 
+/// Capture billing facts only at a caller's authoritative outbound usage boundary.
+pub fn attach_openai_billing_token_facts(
+    usage: &mut Usage,
+    raw: &Value,
+    protocol: conduit_llm::usage::BillingTokenProtocol,
+    complete: bool,
+) {
+    use conduit_llm::usage::{BillingTokenCount as Count, BillingTokenFacts, BillingTokenProtocol};
+
+    let (input, output, details) = match protocol {
+        BillingTokenProtocol::OpenAiChat => (
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+        ),
+        BillingTokenProtocol::OpenAiResponses => {
+            ("input_tokens", "output_tokens", "input_tokens_details")
+        }
+        BillingTokenProtocol::Anthropic => return,
+    };
+    let details = raw.get(details);
+    let detail = |name| match details {
+        Some(value) if !value.is_object() => Count::Invalid,
+        _ => Count::from_raw(details.and_then(|value| value.get(name))),
+    };
+    let cache_write_total = [
+        "cache_write_tokens",
+        "cached_creation_tokens",
+        "cache_creation_input_tokens",
+        "write_cached_tokens",
+    ]
+    .into_iter()
+    .map(detail)
+    .fold(Count::Missing, |total, count| match (total, count) {
+        (Count::Invalid, _) | (_, Count::Invalid) => Count::Invalid,
+        (Count::Present(a), Count::Present(b)) => Count::Present(a.max(b)),
+        (Count::Missing, count) => count,
+        (total, _) => total,
+    });
+    let split = details.and_then(|value| value.get("cache_write_tokens_details"));
+    let ttl = |name| match split {
+        Some(value) if !value.is_object() => Count::Invalid,
+        _ => Count::from_raw(split.and_then(|value| value.get(name))),
+    };
+    let short = ttl("ttl_30m_tokens");
+    let long = ttl("ttl_12h_tokens");
+    // Compatibility alone does not establish a missing 12h count. A zero
+    // aggregate or known 30m counts exhausting the aggregate prove absence.
+    let long = match (long, short, cache_write_total) {
+        (Count::Invalid, _, _) | (_, Count::Invalid, _) => Count::Invalid,
+        (Count::Present(long), Count::Present(short), Count::Present(total))
+            if short.checked_add(long).is_none_or(|split| split > total) =>
+        {
+            Count::Invalid
+        }
+        (_, Count::Present(short), Count::Present(total)) if short > total => Count::Invalid,
+        (Count::Missing, _, Count::Present(0)) => Count::SemanticZero,
+        (Count::Missing, Count::Present(short), Count::Present(total)) if short == total => {
+            Count::SemanticZero
+        }
+        (count, _, _) => count,
+    };
+    usage.set_billing_token_facts(BillingTokenFacts {
+        version: 1,
+        protocol,
+        complete,
+        input: Count::from_raw(raw.get(input)),
+        output: Count::from_raw(raw.get(output)),
+        cache_read: detail("cached_tokens"),
+        cache_write_total,
+        cache_write_1h: match detail("write_cached_1hour_tokens") {
+            Count::Missing => Count::SemanticZero,
+            count => count,
+        },
+        cache_write_12h: long,
+    });
+}
+
 /// OpenAI-compatible usage JSON shape mirroring Go's `Usage` /
 /// `PromptTokensDetails` / `CompletionTokensDetails` (usage.go:6-32). Used
 /// internally by [`extract_usage`].
@@ -1577,6 +1655,53 @@ mod tests {
             "choices": [],
             "usage": usage,
         })
+    }
+
+    #[test]
+    fn expression_facts_openai_requires_explicit_cache_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_llm::usage::{BillingTokenCount, BillingTokenProtocol};
+
+        let mut raw = json!({"prompt_tokens": 100, "completion_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 0, "write_cached_tokens": 0}});
+        let mut usage = extract_usage(&json!({"usage": raw})).expect("static usage");
+        let protocol = BillingTokenProtocol::OpenAiChat;
+        attach_openai_billing_token_facts(&mut usage, &raw, protocol, false);
+        assert!(usage.new_api_token_facts().is_err());
+        attach_openai_billing_token_facts(&mut usage, &raw, protocol, true);
+        let restored: Usage = serde_json::from_value(serde_json::to_value(&usage)?)?;
+        let facts = restored.new_api_token_facts()?;
+        assert_eq!((facts.input, facts.output, facts.cache_read), (100, 8, 0));
+        assert!(facts.input_includes_cache);
+        assert_eq!(
+            restored.billing_token_facts()?.cache_write_12h,
+            BillingTokenCount::SemanticZero
+        );
+
+        raw["prompt_tokens_details"]
+            .as_object_mut()
+            .expect("details")
+            .remove("write_cached_tokens");
+        attach_openai_billing_token_facts(&mut usage, &raw, protocol, true);
+        assert_eq!(
+            usage.billing_token_facts()?.cache_write_12h,
+            BillingTokenCount::Missing
+        );
+        assert!(usage.new_api_token_facts().is_err());
+        raw["prompt_tokens_details"]["cache_write_tokens"] = json!(25);
+        raw["prompt_tokens_details"]["cache_write_tokens_details"] =
+            json!({"ttl_30m_tokens": 15, "ttl_12h_tokens": 10});
+        attach_openai_billing_token_facts(&mut usage, &raw, protocol, true);
+        let facts = usage.new_api_token_facts()?;
+        assert_eq!((facts.cache_write, facts.cache_write_12h), (15, 10));
+        raw["prompt_tokens_details"]["cached_tokens"] = json!("0");
+        attach_openai_billing_token_facts(&mut usage, &raw, protocol, true);
+        assert_eq!(
+            usage.billing_token_facts()?.cache_read,
+            BillingTokenCount::Invalid
+        );
+        assert!(usage.new_api_token_facts().is_err());
+        Ok(())
     }
 
     #[test]

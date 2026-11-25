@@ -30,6 +30,7 @@ impl PgGroupAdapter {
                 .map_err(storage)?;
         let models:Vec<String>=sqlx::query_scalar("SELECT public_model_key FROM model_group_models WHERE model_group_id=$1 ORDER BY public_model_key").bind(id).fetch_all(&self.pool).await.map_err(storage)?;
         Ok(ModelGroup {
+            is_default: id == DEFAULT_MODEL_GROUP_ID,
             id: ID(r.get("id")),
             name: r.get("name"),
             description: r.get("description"),
@@ -169,6 +170,22 @@ impl GroupServices for PgGroupAdapter {
         };
         self.member_catalog(None, Some(user), Some(group.to_owned()), project)
             .await
+    }
+
+    async fn default_model_group_diagnostic(
+        &self,
+    ) -> Result<Option<DefaultModelGroupDiagnostic>, String> {
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM systems WHERE key=$1 AND deleted_at=0)",
+        )
+        .bind(DEFAULT_CONFLICT_KEY)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(active.then(|| DefaultModelGroupDiagnostic {
+            code: "DEFAULT_MODEL_GROUP_CONFLICT".into(),
+            message: "Another model group is named Default. Rename it, then restart to initialize the reserved group.".into(),
+        }))
     }
 
     async fn model_groups(&self) -> Result<Vec<ModelGroup>, String> {
@@ -424,6 +441,61 @@ mod tests {
     use conduit_db::repo::{ApiKeyRepo, RequestContext};
     use conduit_db::{PgApiKeyRepo, PolicyContext, Principal};
     #[tokio::test]
+    async fn default_model_group_collision_recovers_without_adopting_existing_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let groups = PgGroupAdapter::new(db.pool.clone());
+        sqlx::query("INSERT INTO model_groups(id,name) VALUES('existing','Default')")
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("INSERT INTO model_group_models VALUES('existing','original-model')")
+            .execute(&db.pool)
+            .await?;
+        initialize_default_model_group(&db.pool).await?;
+        initialize_default_model_group(&db.pool).await?;
+        assert_eq!(
+            groups.default_model_group_diagnostic().await?.unwrap().code,
+            "DEFAULT_MODEL_GROUP_CONFLICT"
+        );
+        let existing = groups.model_groups().await?;
+        assert_eq!(existing.len(), 1);
+        assert!(!existing[0].is_default);
+        assert_eq!(existing[0].model_ids, vec![ID("original-model".into())]);
+
+        sqlx::query("UPDATE model_groups SET name='Previously Default' WHERE id='existing'")
+            .execute(&db.pool)
+            .await?;
+        initialize_default_model_group(&db.pool).await?;
+        assert!(groups.default_model_group_diagnostic().await?.is_none());
+        let group = groups.model(DEFAULT_MODEL_GROUP_ID).await?;
+        assert_eq!(group.name, "Default");
+        assert!(group.is_default);
+        assert_eq!(group.status, GroupStatus::Enabled);
+        assert!(group.model_ids.is_empty());
+        sqlx::query("UPDATE model_groups SET name='Custom Default' WHERE id=$1")
+            .bind(DEFAULT_MODEL_GROUP_ID)
+            .execute(&db.pool)
+            .await?;
+        sqlx::query("INSERT INTO model_group_models VALUES($1,'chosen-model')")
+            .bind(DEFAULT_MODEL_GROUP_ID)
+            .execute(&db.pool)
+            .await?;
+        initialize_default_model_group(&db.pool).await?;
+        let group = groups.model(DEFAULT_MODEL_GROUP_ID).await?;
+        assert_eq!(group.name, "Custom Default");
+        assert_eq!(group.model_ids, vec![ID("chosen-model".into())]);
+        assert_eq!(
+            groups.model("existing").await?.model_ids,
+            vec![ID("original-model".into())]
+        );
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn independent_groups_permissions_revocation_and_atomic_keys_when_dsn_provided()
     -> Result<(), Box<dyn std::error::Error>> {
         let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
@@ -610,4 +682,38 @@ mod tests {
         isolated.cleanup().await?;
         result
     }
+}
+
+const DEFAULT_CONFLICT_KEY: &str = "system_default_model_group_conflict";
+
+pub(crate) async fn initialize_default_model_group(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(0x434f_4e44_4d47_0001_i64)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO model_groups(id,name,status) SELECT $1,'Default','enabled' WHERE NOT EXISTS (SELECT 1 FROM model_groups WHERE id=$1) ON CONFLICT DO NOTHING")
+        .bind(DEFAULT_MODEL_GROUP_ID).execute(&mut *tx).await?;
+    let initialized =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM model_groups WHERE id=$1)")
+            .bind(DEFAULT_MODEL_GROUP_ID)
+            .fetch_one(&mut *tx)
+            .await?;
+    if initialized {
+        sqlx::query("DELETE FROM systems WHERE key=$1 AND deleted_at=0")
+            .bind(DEFAULT_CONFLICT_KEY)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        sqlx::query("INSERT INTO systems(key,value) VALUES($1,'DEFAULT_MODEL_GROUP_CONFLICT') ON CONFLICT(key) DO UPDATE SET deleted_at=0 WHERE systems.deleted_at<>0")
+            .bind(DEFAULT_CONFLICT_KEY).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    if !initialized {
+        tracing::warn!(
+            code = "DEFAULT_MODEL_GROUP_CONFLICT",
+            "reserved Default model group could not be initialized because its name is occupied"
+        );
+    }
+    Ok(())
 }

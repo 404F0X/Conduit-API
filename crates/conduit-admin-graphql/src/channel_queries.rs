@@ -247,6 +247,13 @@ pub struct ChannelSensitiveFields {
 /// use the in-memory double below.
 #[async_trait::async_trait]
 pub trait ChannelExtraQueryServices: Send + Sync {
+    async fn public_model_bindings(
+        &self,
+        _channel_id: &str,
+    ) -> Result<Vec<crate::channel::ChannelPublicModelBinding>, String> {
+        Err("channel public model bindings unavailable".into())
+    }
+
     /// `Query.allChannelSummarys` — status filter `[enabled, disabled]`
     /// (plus `archived` when `include_archived`), ordered `Desc` by
     /// `orderingWeight`, then project-profile visibility filtered when a

@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { pageInfoSchema } from '@/gql/pagination';
+import { isNewApiExpressionPrice, type NewApiExpressionPrice } from '@/features/models/components/simple-retail-price';
+import { modelTypeSchema } from '@/features/models/data/schema';
 
 export const apiFormatSchema = z.enum([
   'openai/chat_completions',
@@ -358,13 +360,22 @@ export const channelQuotaProbeResultSchema = z.object({
 });
 export type ChannelQuotaProbeResult = z.infer<typeof channelQuotaProbeResultSchema>;
 
+export const newApiExpressionPriceSchema = z.custom<NewApiExpressionPrice>(isNewApiExpressionPrice);
+
+const newApiPricingDiagnosticSchema = z.object({ code: z.string(), message: z.string(), severity: z.string().nullish() });
+
 export const newApiModelPricingProbeSchema = z.object({
   provenance: z
     .object({
-      issues: z.array(z.object({ severity: z.string(), code: z.string(), message: z.string() })).optional(),
+      issues: z.array(newApiPricingDiagnosticSchema).optional(),
+      selectedGroup: z.string().nullish(),
+      rawBillingExpression: z.unknown().optional(),
+      adoptionBlocked: z.boolean().optional(),
     })
     .passthrough(),
   modelId: z.string(),
+  billingExpression: newApiExpressionPriceSchema.nullish(),
+  diagnostics: z.array(newApiPricingDiagnosticSchema).optional(),
   billingKind: z.enum(['token', 'per_request', 'tiered_expr', 'unknown', 'unsupported']),
   quality: z.enum(['exact', 'estimated', 'unavailable', 'unsupported']),
   groupRatio: z.string().optional().nullable(),
@@ -405,6 +416,29 @@ const graphqlBaseURLSchema = z
   .string()
   .nullable()
   .transform((baseURL) => baseURL ?? '');
+
+export const channelPublicModelBindingSchema = z.object({
+  routeID: z.string(),
+  upstreamModelID: z.string(),
+  publicModelKey: z.string(),
+  status: z.enum(['ENABLED', 'DISABLED', 'ARCHIVED']),
+});
+export type ChannelPublicModelBinding = z.infer<typeof channelPublicModelBindingSchema>;
+
+const channelPublicModelBindingsInputSchema = z.object({
+  upserts: z
+    .array(
+      z.object({
+        upstreamModelID: z.string().trim().min(1),
+        publicModelKey: z.string().trim().min(1),
+        modelType: modelTypeSchema.optional(),
+        confirmCompatibility: z.boolean().optional(),
+      })
+    )
+    .optional(),
+  removeRouteIDs: z.array(z.string()).optional(),
+});
+export type ChannelPublicModelBindingsInput = z.infer<typeof channelPublicModelBindingsInputSchema>;
 
 export const channelSchema = z.object({
   id: z.string(),
@@ -515,19 +549,25 @@ export const modelPriceSchema = z.object({
 });
 export type ModelPrice = z.infer<typeof modelPriceSchema>;
 
-export const channelModelPriceSchema = z.object({
-  id: z.string(),
-  modelID: z.string(),
-  currencyCode: z.string().regex(/^[A-Z]{3}$/),
-  price: modelPriceSchema,
-});
+export const channelModelPriceSchema = z
+  .object({
+    id: z.string(),
+    modelID: z.string(),
+    currencyCode: z.string().regex(/^[A-Z]{3}$/),
+    price: modelPriceSchema.nullish(),
+    billingExpression: newApiExpressionPriceSchema.nullish(),
+  })
+  .refine((row) => (row.price != null) !== (row.billingExpression != null), 'Expected exactly one static or expression price');
 export type ChannelModelPrice = z.infer<typeof channelModelPriceSchema>;
 
-export const saveChannelModelPriceInputSchema = z.object({
-  modelId: z.string(),
-  currencyCode: z.string().regex(/^[A-Z]{3}$/),
-  price: modelPriceSchema,
-});
+export const saveChannelModelPriceInputSchema = z
+  .object({
+    modelId: z.string(),
+    currencyCode: z.string().regex(/^[A-Z]{3}$/),
+    price: modelPriceSchema.nullish(),
+    billingExpression: newApiExpressionPriceSchema.nullish(),
+  })
+  .refine((row) => (row.price != null) !== (row.billingExpression != null), 'Expected exactly one static or expression price');
 export type SaveChannelModelPriceInput = z.infer<typeof saveChannelModelPriceInputSchema>;
 
 // Helper function to validate OAuth credentials
@@ -579,6 +619,7 @@ function validateOAuthCredentials(type: string, apiKey: string | undefined, ctx:
 
 export const createChannelInputSchema = z
   .object({
+    publicModelBindings: channelPublicModelBindingsInputSchema.nullish(),
     type: channelTypeSchema,
     operationID: z.string().uuid().optional(),
     baseURL: z.url('Please enter a valid URL'),
@@ -693,6 +734,7 @@ export type CreateChannelInput = z.infer<typeof createChannelInputSchema>;
 // Update Channel Input
 export const updateChannelInputSchema = z
   .object({
+    publicModelBindings: channelPublicModelBindingsInputSchema.nullish(),
     type: channelTypeSchema.optional(),
     baseURL: z.string().url('Please enter a valid URL').optional(),
     websiteURL: z

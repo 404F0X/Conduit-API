@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react';
 import { z } from 'zod';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
+import { useNavigate } from '@tanstack/react-router';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { X, RefreshCw, Search, ChevronLeft, ChevronRight, PanelLeft, Plus, Trash2, Eye, EyeOff, Copy, Play, Info } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { DEFAULT_ACCOUNTING_CURRENCY_CODE, normalizeCurrencyCode } from '@/lib/accounting';
+import { usePermissions } from '@/hooks/usePermissions';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -52,8 +54,9 @@ import {
   getApiFormatsForProvider,
   getChannelTypeForApiFormat,
 } from '../data/config_providers';
-import { canonicalNewApiURL } from '../data/discovery';
+import { canonicalNewApiURL, isNewApiAnthropicControlOnly } from '../data/discovery';
 import { Channel, ChannelType, ApiFormat, RetryableErrorPattern, createChannelInputSchema, updateChannelInputSchema } from '../data/schema';
+import type { ChannelPublicModelBindingsInput } from '../data/schema';
 import { ProxyConfig, useOAuthFlow } from '../hooks/use-oauth-flow';
 import {
   ConfigurationCategory,
@@ -62,10 +65,10 @@ import {
 } from '../utils/configuration-navigation';
 import { mergeChannelSettingsForUpdate } from '../utils/merge';
 import { isValidModelPattern, matchesModelPattern } from '../utils/pattern';
+import { ChannelPublicModelBindings } from './channel-public-model-bindings';
 import { ProxyType } from './channels-proxy-dialog';
 import { CopilotDeviceFlow } from './copilot-device-flow';
 import { ManualModelBadge } from './manual-model-badge';
-import { NewApiCreateDialog } from './new-api-discovery';
 
 interface Props {
   currentRow?: Channel;
@@ -320,12 +323,17 @@ function extractCodexAuthJSONText(apiKey: string | undefined): string | undefine
 
 export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpenChange, showModelsPanel = false }: Props) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
+  const { hasSystemScope } = usePermissions();
+  const [bindingChanges, setBindingChanges] = useState<ChannelPublicModelBindingsInput>({});
   const isEdit = !!currentRow;
   const isDuplicate = !!duplicateFromRow && !isEdit;
+  const canBindPublicModels = !isDuplicate && hasSystemScope('write_commercialization');
   const initialRow: Channel | undefined = currentRow || duplicateFromRow;
   const [dialogStep, setDialogStep] = useState<'provider' | 'configuration'>(() => (initialRow ? 'configuration' : 'provider'));
   const [configurationCategory, setConfigurationCategory] = useState<ConfigurationCategory>('connection');
   const configurationHeadingRef = useRef<HTMLDivElement>(null);
+  const newApiOperationIDRef = useRef<string>(undefined);
   const channelFormRef = useRef<HTMLFormElement>(null);
   const channelDialogRef = useRef<HTMLDivElement>(null);
   const { data: generalSettings } = useGeneralSettings();
@@ -656,6 +664,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     return getChannelTypeForApiFormat(selectedProvider, selectedApiFormat) || 'openai';
   }, [selectedProvider, selectedApiFormat, useGeminiVertex, useAnthropicAws, useKimiCoding]);
 
+  const newApiControlOnly = isNewApiAnthropicControlOnly(derivedChannelType, managementAdapter);
   const formSchema = isEdit ? updateChannelInputSchema : createChannelInputSchema;
 
   const form = useForm<z.infer<typeof formSchema>>({
@@ -747,7 +756,8 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
   const apiKeysCount = useMemo(() => (apiKeys || []).filter((k) => k.trim().length > 0).length, [apiKeys]);
   const isSubmitting = createChannel.isPending || duplicateChannel.isPending || updateChannel.isPending;
   const isSidePanelOpen =
-    configurationCategory === 'connection' && (showFetchedModelsPanel || showSupportedModelsPanel || showApiKeysPanel);
+    configurationCategory === 'connection' &&
+    ((!newApiControlOnly && showFetchedModelsPanel) || showSupportedModelsPanel || showApiKeysPanel);
   const selectedProviderOption = availableProviders.find((provider) => provider.key === selectedProvider);
   const SelectedProviderIcon = selectedProviderOption?.icon;
 
@@ -1199,9 +1209,20 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
 
   const onSubmit = async (values: z.infer<typeof formSchema>) => {
     // Check if there are selected fetched models that haven't been confirmed
-    if (selectedFetchedModels.length > 0) {
+    if (!newApiControlOnly && selectedFetchedModels.length > 0) {
       revealConfigurationError('selectedFetchedModels');
       toast.error(t('channels.messages.modelsNotConfirmed'));
+      return;
+    }
+
+    const hasBindingChanges = !!(bindingChanges.upserts?.length || bindingChanges.removeRouteIDs?.length);
+    if (hasBindingChanges && !canBindPublicModels) {
+      toast.error(t('channels.publicBindings.permissionChanged'));
+      return;
+    }
+    if (bindingChanges.upserts?.some((binding) => !supportedModels.includes(binding.upstreamModelID))) {
+      setConfigurationCategory('connection');
+      toast.error(t('channels.publicBindings.upstreamRemoved'));
       return;
     }
 
@@ -1272,6 +1293,8 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         supportedModels,
         manualModels,
         credentials: valuesForSubmit.credentials,
+        ...(newApiControlOnly ? { autoSyncSupportedModels: false, autoSyncModelPattern: '' } : {}),
+        ...(hasBindingChanges ? { publicModelBindings: bindingChanges } : {}),
       };
 
       const shouldUseProtocolDefaultBaseURL =
@@ -1286,10 +1309,9 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         }
       }
 
-      if (managementAdapter === 'new_api') {
+      if (managementAdapter === 'new_api' && !newApiControlOnly) {
         const root = canonicalNewApiURL(dataWithModels.baseURL ?? currentRow?.baseURL ?? '');
         dataWithModels.baseURL = root;
-        dataWithModels.websiteURL = root;
       }
 
       if (selectedApiFormat === OPENAI_RESPONSES && !baseURLMatchesResponsesTransport(dataWithModels.baseURL, responsesTransport)) {
@@ -1319,7 +1341,9 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         } as z.infer<typeof updateChannelInputSchema>;
 
         updateInput.quotaCurrency = updateInput.quotaCurrency?.trim().toUpperCase();
-        if (!updateInput.websiteURL?.trim()) {
+        if ((updateInput.websiteURL?.trim() || '') === (currentRow.websiteURL?.trim() || '')) {
+          delete updateInput.websiteURL;
+        } else if (!updateInput.websiteURL?.trim()) {
           delete updateInput.websiteURL;
           updateInput.clearWebsiteUrl = true;
         }
@@ -1377,6 +1401,10 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
           ...(dataWithModels as z.infer<typeof createChannelInputSchema>),
           settings: nextSettings,
         } as z.infer<typeof createChannelInputSchema>;
+        if (managementAdapter === 'new_api' && !newApiControlOnly) {
+          newApiOperationIDRef.current ??= crypto.randomUUID();
+          createInput.operationID = newApiOperationIDRef.current;
+        }
         createInput.quotaCurrency = createInput.quotaCurrency.trim().toUpperCase();
         if (!createInput.websiteURL?.trim()) delete createInput.websiteURL;
         if (!createInput.actualQuotaUsed?.trim()) delete createInput.actualQuotaUsed;
@@ -1403,10 +1431,12 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
         }
       }
 
-      form.reset();
-      setSupportedModels([]);
-      setManualModels([]);
-      onOpenChange(false);
+      if (bindingChanges.upserts?.some((binding) => binding.modelType)) {
+        toast.success(t('channels.publicBindings.configureCreatedModel'), {
+          action: { label: t('channels.publicBindings.openCatalog'), onClick: () => void navigate({ to: '/models' }) },
+        });
+      }
+      handleDialogOpenChange(false);
     } catch (_error) {
       void _error;
     }
@@ -1764,85 +1794,73 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
     overscan: 5,
   });
 
-  if (!isEdit && !isDuplicate && managementAdapter === 'new_api') {
-    return (
-      <NewApiCreateDialog
-        open={open}
-        onOpenChange={(value) => {
-          if (!value) {
-            setManagementAdapter('none');
-            onOpenChange(false);
-          }
-        }}
-      />
-    );
+  function handleDialogOpenChange(state: boolean) {
+    if (!state) {
+      form.reset();
+      newApiOperationIDRef.current = undefined;
+      setBindingChanges({});
+      setSupportedModels(initialRow?.supportedModels || []);
+      setManualModels(initialRow?.manualModels || []);
+      setSelectedDefaultModels([]);
+      setFetchedModels([]);
+      setUseFetchedModels(false);
+      // Reset expandable panel states
+      setShowFetchedModelsPanel(false);
+      setShowSupportedModelsPanel(false);
+      setShowApiKeysPanel(false);
+      setFetchedModelsSearch('');
+      setSupportedModelsSearch('');
+      setSelectedFetchedModels([]);
+      setShowNotAddedModelsOnly(false);
+      setApplyPatternFilter(false);
+      setSupportedModelsExpanded(false);
+      setApiKeysSearch('');
+      setSelectedKeysToRemove(new Set());
+      setConfirmRemoveSelectedOpen(false);
+      setConfirmRemoveKey(null);
+      setShowApiKey(false);
+      // Reset proxy state
+      if (initialRow?.settings?.proxy?.type) {
+        setProxyType(initialRow.settings.proxy.type as ProxyType);
+      } else {
+        setProxyType(ProxyType.ENVIRONMENT);
+      }
+      setProxyUrl(initialRow?.settings?.proxy?.url || '');
+      setProxyUsername(initialRow?.settings?.proxy?.username || '');
+      setProxyPassword(initialRow?.settings?.proxy?.password || '');
+      setPassThroughUserAgent(initialRow?.settings?.passThroughUserAgent ?? null);
+      setPassThroughBody(initialRow?.settings?.passThroughBody ?? null);
+      setRetryableStatusCodesText(formatRetryableStatusCodes(initialRow?.settings?.retryableStatusCodes));
+      setRetryableErrorPatternsText(formatRetryableErrorPatterns(initialRow?.settings?.retryableErrorPatterns));
+      setManagementAdapter(initialRow?.settings?.managementAdapter === 'new_api' ? 'new_api' : 'none');
+      billingCurrencyEditedRef.current = false;
+      setBillingCurrency(initialRow?.settings?.billingCurrency || defaultBillingCurrency);
+      setRechargeMultiplier(initialRow?.settings?.rechargeMultiplier || '');
+      setBillingCurrencyError('');
+      setRechargeMultiplierError('');
+      // Reset provider and API format state
+      if (initialRow) {
+        setSelectedProvider(getProviderFromChannelType(initialRow.type) || 'openai');
+        setSelectedApiFormat(CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || OPENAI_CHAT_COMPLETIONS);
+        setResponsesTransport(getResponsesTransportFromChannel(initialRow));
+        setUseGeminiVertex(initialRow.type === 'gemini_vertex');
+        setUseAnthropicAws(initialRow.type === 'anthropic_aws');
+        setUseKimiCoding(initialRow.type === 'moonshot_coding');
+      } else {
+        setSelectedProvider('openai');
+        setSelectedApiFormat(OPENAI_CHAT_COMPLETIONS);
+        setResponsesTransport('http');
+        setUseGeminiVertex(false);
+        setUseAnthropicAws(false);
+        setUseKimiCoding(false);
+      }
+    }
+    onOpenChange(state);
   }
+
   return (
     <>
-      <Dialog
-        open={open}
-        onOpenChange={(state) => {
-          if (!state) {
-            form.reset();
-            setSupportedModels(initialRow?.supportedModels || []);
-            setManualModels(initialRow?.manualModels || []);
-            setSelectedDefaultModels([]);
-            setFetchedModels([]);
-            setUseFetchedModels(false);
-            // Reset expandable panel states
-            setShowFetchedModelsPanel(false);
-            setShowSupportedModelsPanel(false);
-            setShowApiKeysPanel(false);
-            setFetchedModelsSearch('');
-            setSupportedModelsSearch('');
-            setSelectedFetchedModels([]);
-            setShowNotAddedModelsOnly(false);
-            setApplyPatternFilter(false);
-            setSupportedModelsExpanded(false);
-            setApiKeysSearch('');
-            setSelectedKeysToRemove(new Set());
-            setConfirmRemoveSelectedOpen(false);
-            setConfirmRemoveKey(null);
-            setShowApiKey(false);
-            // Reset proxy state
-            if (initialRow?.settings?.proxy?.type) {
-              setProxyType(initialRow.settings.proxy.type as ProxyType);
-            } else {
-              setProxyType(ProxyType.ENVIRONMENT);
-            }
-            setProxyUrl(initialRow?.settings?.proxy?.url || '');
-            setProxyUsername(initialRow?.settings?.proxy?.username || '');
-            setProxyPassword(initialRow?.settings?.proxy?.password || '');
-            setPassThroughUserAgent(initialRow?.settings?.passThroughUserAgent ?? null);
-            setPassThroughBody(initialRow?.settings?.passThroughBody ?? null);
-            setRetryableStatusCodesText(formatRetryableStatusCodes(initialRow?.settings?.retryableStatusCodes));
-            setRetryableErrorPatternsText(formatRetryableErrorPatterns(initialRow?.settings?.retryableErrorPatterns));
-            setManagementAdapter(initialRow?.settings?.managementAdapter === 'new_api' ? 'new_api' : 'none');
-            billingCurrencyEditedRef.current = false;
-            setBillingCurrency(initialRow?.settings?.billingCurrency || defaultBillingCurrency);
-            setRechargeMultiplier(initialRow?.settings?.rechargeMultiplier || '');
-            setBillingCurrencyError('');
-            setRechargeMultiplierError('');
-            // Reset provider and API format state
-            if (initialRow) {
-              setSelectedProvider(getProviderFromChannelType(initialRow.type) || 'openai');
-              setSelectedApiFormat(CHANNEL_CONFIGS[initialRow.type as ChannelType]?.apiFormat || OPENAI_CHAT_COMPLETIONS);
-              setResponsesTransport(getResponsesTransportFromChannel(initialRow));
-              setUseGeminiVertex(initialRow.type === 'gemini_vertex');
-              setUseAnthropicAws(initialRow.type === 'anthropic_aws');
-              setUseKimiCoding(initialRow.type === 'moonshot_coding');
-            } else {
-              setSelectedProvider('openai');
-              setSelectedApiFormat(OPENAI_CHAT_COMPLETIONS);
-              setResponsesTransport('http');
-              setUseGeminiVertex(false);
-              setUseAnthropicAws(false);
-              setUseKimiCoding(false);
-            }
-          }
-          onOpenChange(state);
-        }}
-      >
+      <Dialog open={open} onOpenChange={handleDialogOpenChange}>
         <DialogContent
           ref={channelDialogRef}
           className='flex h-[min(860px,calc(100dvh-2rem))] w-[calc(100%-2rem)] min-w-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-[1200px]'
@@ -2129,7 +2147,11 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                 render={({ field, fieldState }) => (
                                   <FormItem className='min-w-0 space-y-2'>
                                     <FormLabel className='font-medium'>
-                                      {t(managementAdapter === 'new_api' ? 'eventPackages.url' : 'channels.dialogs.fields.baseURL.label')}
+                                      {t(
+                                        managementAdapter === 'new_api' && !newApiControlOnly
+                                          ? 'eventPackages.url'
+                                          : 'channels.dialogs.fields.baseURL.label'
+                                      )}
                                     </FormLabel>
                                     <div className='space-y-1'>
                                       <Input
@@ -2159,13 +2181,6 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                           })}
                                         </p>
                                       )}
-                                      {managementAdapter === 'new_api' &&
-                                        initialRow?.websiteURL &&
-                                        initialRow.websiteURL !== initialRow.baseURL && (
-                                          <p className='text-xs break-all text-amber-700 dark:text-amber-400'>
-                                            {t('eventPackages.addressDrift', { url: initialRow.websiteURL })}
-                                          </p>
-                                        )}
                                     </div>
                                   </FormItem>
                                 )}
@@ -2187,7 +2202,13 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                       <SelectItem value='new_api'>{t('channels.managementAdapter.newApi')}</SelectItem>
                                     </SelectContent>
                                   </Select>
-                                  <p className='text-muted-foreground text-xs'>{t('channels.managementAdapter.description')}</p>
+                                  <p className='text-muted-foreground text-xs'>
+                                    {t(
+                                      newApiControlOnly
+                                        ? 'channels.managementAdapter.controlOnly'
+                                        : 'channels.managementAdapter.description'
+                                    )}
+                                  </p>
                                 </div>
                               </FormItem>
                               {!isEdit && (
@@ -2634,7 +2655,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                   </div>
 
                                   {supportedModels.length === 0 && (
-                                    <p className='text-destructive text-sm'>{t('channels.dialogs.fields.supportedModels.required')}</p>
+                                    <p className='text-muted-foreground text-sm'>{t('channels.dialogs.fields.supportedModels.required')}</p>
                                   )}
 
                                   {/* Supported models display - limited to 3 with expand button */}
@@ -2669,108 +2690,109 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                   </div>
 
                                   {/* Auto sync checkbox */}
-                                  <div className='pt-3'>
-                                    <FormField
-                                      control={form.control}
-                                      name='autoSyncSupportedModels'
-                                      render={({ field }) => (
-                                        <FormItem
-                                          className={`flex items-center gap-2 ${isCodexType || isClaudeCodeType || isCopilotType ? 'opacity-60' : ''}`}
-                                        >
-                                          {wrapUnsupported(
-                                            isCodexType || isClaudeCodeType || isCopilotType,
-                                            <Checkbox
-                                              checked={field.value}
-                                              onCheckedChange={field.onChange}
-                                              data-testid='auto-sync-supported-models-checkbox'
-                                              disabled={isCodexType || isClaudeCodeType || isCopilotType}
-                                              className={
-                                                isCodexType || isClaudeCodeType || isCopilotType ? 'pointer-events-none' : undefined
-                                              }
-                                            />,
-                                            'inline-flex items-center'
-                                          )}
-                                          <div className='flex flex-1 items-center justify-between'>
-                                            <div className='space-y-0.5'>
-                                              <div className='flex items-center gap-1.5'>
-                                                <FormLabel className='cursor-pointer text-sm font-normal'>
-                                                  {t('channels.dialogs.fields.autoSyncSupportedModels.label')}
-                                                </FormLabel>
-                                                <Tooltip>
-                                                  <TooltipTrigger asChild>
-                                                    <button
-                                                      type='button'
-                                                      className='text-muted-foreground hover:text-foreground inline-flex items-center'
-                                                      aria-label={t('channels.dialogs.fields.autoSyncSupportedModels.description')}
-                                                      data-testid='auto-sync-supported-models-tip'
-                                                    >
-                                                      <Info className='h-3.5 w-3.5' />
-                                                    </button>
-                                                  </TooltipTrigger>
-                                                  <TooltipContent>
-                                                    <p>{t('channels.dialogs.fields.autoSyncSupportedModels.description')}</p>
-                                                  </TooltipContent>
-                                                </Tooltip>
-                                              </div>
-                                            </div>
-                                            {isEdit && field.value && (
-                                              <Button
-                                                type='button'
-                                                size='sm'
-                                                variant='outline'
-                                                onClick={handleSyncNow}
-                                                disabled={syncChannelModels.isPending || updateChannel.isPending}
-                                              >
-                                                <Play className={`mr-1 h-3 w-3 ${syncChannelModels.isPending ? 'animate-spin' : ''}`} />
-                                                {syncChannelModels.isPending
-                                                  ? t('channels.dialogs.buttons.syncingNow')
-                                                  : t('channels.dialogs.buttons.syncNow')}
-                                              </Button>
-                                            )}
-                                          </div>
-                                        </FormItem>
-                                      )}
-                                    />
-
-                                    {/* Auto sync model pattern */}
-                                    {form.watch('autoSyncSupportedModels') && (
+                                  {!newApiControlOnly && (
+                                    <div className='pt-3'>
                                       <FormField
                                         control={form.control}
-                                        name='autoSyncModelPattern'
+                                        name='autoSyncSupportedModels'
                                         render={({ field }) => (
-                                          <FormItem className='mt-2 pl-6'>
-                                            <FormLabel className='text-sm font-normal'>
-                                              {t('channels.dialogs.fields.autoSyncModelPattern.label')}
-                                            </FormLabel>
-                                            <FormControl>
-                                              <Input
-                                                placeholder={t('channels.dialogs.fields.autoSyncModelPattern.placeholder')}
-                                                {...field}
-                                                value={field.value || ''}
-                                                onChange={(e) => {
-                                                  const val = e.target.value;
-                                                  field.onChange(val);
-                                                  if (val === '') {
-                                                    setPatternError(null);
-                                                  } else if (isValidModelPattern(val)) {
-                                                    setPatternError(null);
-                                                  } else {
-                                                    setPatternError(t('channels.dialogs.fields.autoSyncModelPattern.invalid'));
-                                                  }
-                                                }}
-                                                className='font-mono text-sm'
-                                              />
-                                            </FormControl>
-                                            <p className='text-muted-foreground text-xs'>
-                                              {t('channels.dialogs.fields.autoSyncModelPattern.description')}
-                                            </p>
-                                            {patternError && <p className='text-destructive text-xs'>{patternError}</p>}
+                                          <FormItem
+                                            className={`flex items-center gap-2 ${isCodexType || isClaudeCodeType || isCopilotType ? 'opacity-60' : ''}`}
+                                          >
+                                            {wrapUnsupported(
+                                              isCodexType || isClaudeCodeType || isCopilotType,
+                                              <Checkbox
+                                                checked={field.value}
+                                                onCheckedChange={field.onChange}
+                                                data-testid='auto-sync-supported-models-checkbox'
+                                                disabled={isCodexType || isClaudeCodeType || isCopilotType}
+                                                className={
+                                                  isCodexType || isClaudeCodeType || isCopilotType ? 'pointer-events-none' : undefined
+                                                }
+                                              />,
+                                              'inline-flex items-center'
+                                            )}
+                                            <div className='flex flex-1 items-center justify-between'>
+                                              <div className='space-y-0.5'>
+                                                <div className='flex items-center gap-1.5'>
+                                                  <FormLabel className='cursor-pointer text-sm font-normal'>
+                                                    {t('channels.dialogs.fields.autoSyncSupportedModels.label')}
+                                                  </FormLabel>
+                                                  <Tooltip>
+                                                    <TooltipTrigger asChild>
+                                                      <button
+                                                        type='button'
+                                                        className='text-muted-foreground hover:text-foreground inline-flex items-center'
+                                                        aria-label={t('channels.dialogs.fields.autoSyncSupportedModels.description')}
+                                                        data-testid='auto-sync-supported-models-tip'
+                                                      >
+                                                        <Info className='h-3.5 w-3.5' />
+                                                      </button>
+                                                    </TooltipTrigger>
+                                                    <TooltipContent>
+                                                      <p>{t('channels.dialogs.fields.autoSyncSupportedModels.description')}</p>
+                                                    </TooltipContent>
+                                                  </Tooltip>
+                                                </div>
+                                              </div>
+                                              {isEdit && field.value && (
+                                                <Button
+                                                  type='button'
+                                                  size='sm'
+                                                  variant='outline'
+                                                  onClick={handleSyncNow}
+                                                  disabled={syncChannelModels.isPending || updateChannel.isPending}
+                                                >
+                                                  <Play className={`mr-1 h-3 w-3 ${syncChannelModels.isPending ? 'animate-spin' : ''}`} />
+                                                  {syncChannelModels.isPending
+                                                    ? t('channels.dialogs.buttons.syncingNow')
+                                                    : t('channels.dialogs.buttons.syncNow')}
+                                                </Button>
+                                              )}
+                                            </div>
                                           </FormItem>
                                         )}
                                       />
-                                    )}
-                                  </div>
 
+                                      {/* Auto sync model pattern */}
+                                      {form.watch('autoSyncSupportedModels') && (
+                                        <FormField
+                                          control={form.control}
+                                          name='autoSyncModelPattern'
+                                          render={({ field }) => (
+                                            <FormItem className='mt-2 pl-6'>
+                                              <FormLabel className='text-sm font-normal'>
+                                                {t('channels.dialogs.fields.autoSyncModelPattern.label')}
+                                              </FormLabel>
+                                              <FormControl>
+                                                <Input
+                                                  placeholder={t('channels.dialogs.fields.autoSyncModelPattern.placeholder')}
+                                                  {...field}
+                                                  value={field.value || ''}
+                                                  onChange={(e) => {
+                                                    const val = e.target.value;
+                                                    field.onChange(val);
+                                                    if (val === '') {
+                                                      setPatternError(null);
+                                                    } else if (isValidModelPattern(val)) {
+                                                      setPatternError(null);
+                                                    } else {
+                                                      setPatternError(t('channels.dialogs.fields.autoSyncModelPattern.invalid'));
+                                                    }
+                                                  }}
+                                                  className='font-mono text-sm'
+                                                />
+                                              </FormControl>
+                                              <p className='text-muted-foreground text-xs'>
+                                                {t('channels.dialogs.fields.autoSyncModelPattern.description')}
+                                              </p>
+                                              {patternError && <p className='text-destructive text-xs'>{patternError}</p>}
+                                            </FormItem>
+                                          )}
+                                        />
+                                      )}
+                                    </div>
+                                  )}
                                   {/* Quick add models section */}
                                   <div className='pt-3'>
                                     <div className='mb-2 flex items-center justify-between'>
@@ -2783,7 +2805,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                           onClick={handleFetchModels}
                                           size='sm'
                                           variant='outline'
-                                          disabled={!canFetchModels() || fetchModels.isPending}
+                                          disabled={newApiControlOnly || !canFetchModels() || fetchModels.isPending}
                                         >
                                           <RefreshCw className={`mr-1 h-4 w-4 ${fetchModels.isPending ? 'animate-spin' : ''}`} />
                                           {t('channels.dialogs.buttons.fetchModels')}
@@ -2842,6 +2864,17 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                               />
                             </section>
                           </div>
+                          {isDuplicate && hasSystemScope('write_commercialization') && (
+                            <p className='text-muted-foreground text-sm'>{t('channels.publicBindings.duplicateHint')}</p>
+                          )}
+                          {open && canBindPublicModels && (
+                            <ChannelPublicModelBindings
+                              channelID={currentRow?.id}
+                              upstreamModels={supportedModels}
+                              changes={bindingChanges}
+                              onChange={setBindingChanges}
+                            />
+                          )}
                         </div>
                       </TabsContent>
                       <TabsContent
@@ -2918,24 +2951,23 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                                 {t('channels.dialogs.quotaSnapshot.title')}
                               </summary>
                               <div className='bg-muted/20 space-y-4 rounded-md border p-4'>
-                                {managementAdapter !== 'new_api' && (
-                                  <FormField
-                                    control={form.control}
-                                    name='websiteURL'
-                                    render={({ field, fieldState }) => (
-                                      <FormItem>
-                                        <FormLabel>{t('channels.dialogs.fields.websiteURL.label')}</FormLabel>
+                                <FormField
+                                  control={form.control}
+                                  name='websiteURL'
+                                  render={({ field }) => (
+                                    <FormItem>
+                                      <FormLabel>{t('channels.dialogs.fields.websiteURL.label')}</FormLabel>
+                                      <FormControl>
                                         <Input
                                           placeholder={t('channels.dialogs.fields.websiteURL.placeholder')}
                                           inputMode='url'
-                                          aria-invalid={!!fieldState.error}
                                           {...field}
                                         />
-                                        <FormMessage />
-                                      </FormItem>
-                                    )}
-                                  />
-                                )}
+                                      </FormControl>
+                                      <FormMessage />
+                                    </FormItem>
+                                  )}
+                                />
                                 <div className='grid grid-cols-1 gap-3 sm:grid-cols-[0.65fr_1fr_1fr]'>
                                   <FormField
                                     control={form.control}
@@ -3237,7 +3269,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
               }
             >
               {/* Fetched Models Panel Content */}
-              <div className={showFetchedModelsPanel ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
+              <div className={!newApiControlOnly && showFetchedModelsPanel ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
                 <div className='mb-3 flex items-center justify-between'>
                   <h3 className='text-sm font-semibold'>{t('channels.dialogs.fields.supportedModels.fetchedModelsLabel')}</h3>
                   <Button type='button' variant='ghost' size='sm' className='h-6 w-6 p-0' onClick={closeFetchedModelsPanel}>
@@ -3350,7 +3382,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
                 </div>
               </div>
 
-              {showFetchedModelsPanel && showSupportedModelsPanel && <div className='border-border my-2 border-t' />}
+              {!newApiControlOnly && showFetchedModelsPanel && showSupportedModelsPanel && <div className='border-border my-2 border-t' />}
 
               {/* API Keys Panel Content */}
               <div className={showApiKeysPanel ? 'flex h-full min-h-0 flex-col' : 'hidden'}>
@@ -3624,7 +3656,7 @@ export function ChannelsActionDialog({ currentRow, duplicateFromRow, open, onOpe
               )}
             </div>
             <div className='flex items-center gap-2'>
-              <Button type='button' variant='ghost' onClick={() => onOpenChange(false)}>
+              <Button type='button' variant='ghost' onClick={() => handleDialogOpenChange(false)} disabled={isSubmitting}>
                 {t('common.buttons.cancel')}
               </Button>
               {dialogStep === 'provider' ? (

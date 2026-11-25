@@ -296,7 +296,8 @@ fn retail_price(
     use gql::MyCatalogPriceStatus;
     let mut result = gql::MyCatalogPrice {
         status: MyCatalogPriceStatus::Unpriced,
-        items: Vec::new(),
+        items: Some(Vec::new()),
+        billing_expression: None,
         branches: Vec::new(),
         source: "global".into(),
         price_book_version: None,
@@ -313,6 +314,20 @@ fn retail_price(
         return result;
     };
     result.status = MyCatalogPriceStatus::Unavailable;
+    if raw.get("kind").is_some() {
+        use conduit_core::objects::newapi_price::NewApiPrice;
+        if serde_json::from_value::<NewApiPrice>(raw.clone())
+            .is_ok_and(|price| price.compile().is_ok())
+            && accounting.real_to_accounting(Decimal::ONE, "USD").is_ok()
+            && multiplier >= Decimal::ZERO
+        {
+            result.items = None;
+            result.billing_expression = Some(async_graphql::Json(raw));
+            result.status = MyCatalogPriceStatus::Priced;
+            result.billable = true;
+        }
+        return result;
+    }
     if !catalog_price_shape(&raw)
         || multiplier.is_sign_negative()
         || accounting.credits_per_accounting_unit <= Decimal::ZERO
@@ -382,7 +397,7 @@ fn retail_price(
             }
         }
     }
-    result.items = items;
+    result.items = Some(items);
     result.status = MyCatalogPriceStatus::Priced;
     result.billable = true;
     result
@@ -456,6 +471,7 @@ fn scoped_retail_price(
             label,
             condition,
             items: projection.items,
+            billing_expression: projection.billing_expression,
         });
     }
     result.status = gql::MyCatalogPriceStatus::Priced;
@@ -823,7 +839,7 @@ mod tests {
             let price = project_price(Some(value.clone()));
             assert_eq!(price.status, Unavailable, "{value}");
             assert!(!price.billable);
-            assert!(price.items.is_empty());
+            assert!(price.items.as_ref().unwrap().is_empty());
         }
     }
 
@@ -846,37 +862,58 @@ mod tests {
         let price = retail_price(Some(raw), Decimal::new(15, 1), &accounting);
         assert_eq!(price.status, gql::MyCatalogPriceStatus::Priced);
         assert!(price.billable);
-        assert_eq!(price.items.len(), 5);
-        assert_eq!(price.items[0].pricing.amount.as_deref(), Some("0"));
+        assert_eq!(price.items.as_ref().unwrap().len(), 5);
         assert_eq!(
-            price.items[1].pricing.tiers[0].up_to.as_deref(),
+            price.items.as_ref().unwrap()[0].pricing.amount.as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            price.items.as_ref().unwrap()[1].pricing.tiers[0]
+                .up_to
+                .as_deref(),
             Some("9007199254740993")
         );
-        assert_eq!(price.items[1].pricing.tiers[1].above, "9007199254740993");
-        assert!(price.items[1].pricing.tiers[1].up_to.is_none());
-        assert_eq!(price.items[1].pricing.tiers[0].price_per_million, "30");
-        assert_eq!(price.items[2].pricing.mode, "usage_volume");
-        assert_eq!(price.items[2].pricing.tiers[1].price_per_million, "75");
         assert_eq!(
-            price.items[3].prompt_write_cache_variants[0].variant_code,
+            price.items.as_ref().unwrap()[1].pricing.tiers[1].above,
+            "9007199254740993"
+        );
+        assert!(
+            price.items.as_ref().unwrap()[1].pricing.tiers[1]
+                .up_to
+                .is_none()
+        );
+        assert_eq!(
+            price.items.as_ref().unwrap()[1].pricing.tiers[0].price_per_million,
+            "30"
+        );
+        assert_eq!(
+            price.items.as_ref().unwrap()[2].pricing.mode,
+            "usage_volume"
+        );
+        assert_eq!(
+            price.items.as_ref().unwrap()[2].pricing.tiers[1].price_per_million,
+            "75"
+        );
+        assert_eq!(
+            price.items.as_ref().unwrap()[3].prompt_write_cache_variants[0].variant_code,
             "one_hour"
         );
         assert_eq!(
-            price.items[3].prompt_write_cache_variants[0]
+            price.items.as_ref().unwrap()[3].prompt_write_cache_variants[0]
                 .pricing
                 .amount
                 .as_deref(),
             Some("105")
         );
         assert_eq!(
-            price.items[3].prompt_write_cache_variants[1]
+            price.items.as_ref().unwrap()[3].prompt_write_cache_variants[1]
                 .pricing
                 .amount
                 .as_deref(),
             Some("0")
         );
         assert_eq!(
-            price.items[4].pricing.amount.as_deref(),
+            price.items.as_ref().unwrap()[4].pricing.amount.as_deref(),
             Some("1.85185183518")
         );
         assert!(price.input_per_million.is_none());
@@ -915,12 +952,15 @@ mod tests {
             Some(123),
         );
         assert_eq!(price.status, gql::MyCatalogPriceStatus::Priced);
-        assert!(price.items.is_empty());
+        assert!(price.items.as_ref().unwrap().is_empty());
         assert!(price.input_per_million.is_none());
         assert_eq!(price.branches.len(), 3);
         assert_eq!(price.branches[0].label, "Zero minute");
         assert_eq!(
-            price.branches[0].items[0].pricing.amount.as_deref(),
+            price.branches[0].items.as_ref().unwrap()[0]
+                .pricing
+                .amount
+                .as_deref(),
             Some("0")
         );
         assert!(

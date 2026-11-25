@@ -307,3 +307,24 @@ HTTP统一为部署base path下POST /admin/graphql，JWT必需（health/version�
 createUser/updateUser的isOwner=true必须由当前平台Owner调用，先于项目Owner scope豁免检查。拥有平台write_users且当前项目membership Owner的普通平台用户仍不能授予users.is_owner；项目角色与成员Owner操作不受此平台授予规则替代。此检查在resolver策略层执行，隐藏/禁用UI复选框只是反馈。字段数量/参数及JWT项目授权规则保持前文契约。
 
 SIMPLE mode checks scopes first, then blocks non-owner/system/test access to roles, prompts, protection, threads/traces and storage writes. Settings read errors propagate. Payment and group governance retain existing guards. Key node/nodes require read_api_keys in the requested project; list search supports case-insensitive name/key and creation date bounds. Rename/status updates preserve profiles and expiry; updateAPIKeyProfiles replaces the full profile value, so clients must preserve advanced settings.
+
+
+### 渠道表单的公开模型绑定
+
+单渠道 `createChannel`、`updateChannel` 及治理命令 `channel.create_form`、`channel.update_form` 支持可选的 `publicModelBindings`。每项 `upserts` 提供 `upstreamModelID` 和 `publicModelKey`，上游模型须在保存后的渠道供应清单内并能唯一定位部署。向已有其他路由的 SKU 添加部署须确认兼容性。已存在的绑定保持状态，新增 SKU 需要 `modelType`，以禁用状态创建 SKU 和路由。通过 `removeRouteIDs` 显式禁用当前渠道的路由。省略、null 或空变更保留绑定。
+
+同时有 `write_channels` 和 `write_commercialization` 的编辑者可查询 `Channel.publicModelBindings` 和提交绑定变更。渠道、部署、SKU、路由和适用的 NEW API 创建收据原子保存，并受渠道配置、模型供应和模型映射审批策略约束。绑定不添加价格、分组成员或访问授权。
+
+
+NEW API 发现与管理使用规范化的 `baseURL`。`websiteURL` 是独立的控制台链接，创建未填写时使用 `baseURL`。编辑显式提交的链接或清除操作优先；省略链接时保留已有独立链接和空值，已有镜像链接随 `baseURL` 更新。
+
+### Default 模型组与 NEW API 表达式价格
+
+`system-default` 是保留模型组 ID。首次启动在名称可用时创建启用且成员为空的 Default，不迁移已有 Key、授权、成员或价格。已有保留 ID 的名称和成员维持原样。名称冲突记录为 `defaultModelGroupDiagnostic`，需要 `read_users`。管理员使用现有模型组编辑器解决冲突后，下一次启动重试。
+
+零售价可在全局、组基础价或有序规则使用 `NEW_API_EXPRESSION` JSON 价格，采购价在 `SaveChannelModelPriceInput` 的 `price` 和 `billingExpression` 中选择一项。表达式使用 `conduit-newapi-token-v1`、版本 1 以及十进制字符串倍率。管理预览 `previewNewApiBillingExpression` 使用相同解释器，返回应用表达式倍率后的 USD，需要 `read_commercialization`。输入的缓存写入为不重叠的短缓存与 1 小时计数。市场显示零售表达式及其投影，保留现有采购读权限边界。
+
+首个表达式配置支持已验证的原生 Anthropic Messages HTTP 使用量契约。无法证明计数语义的 OpenAI 兼容路线在零售表达式准入前排除。未知计数保留未知状态，采购成本不可用时存为 NULL，零售结算留在待处理收件箱。请求保留准入时的价格、项目倍率和折算设置，结算按实际可信用量计算，估算不足沿用现有差额处理。静态成本推导不接受采购表达式。
+
+
+可在 Anthropic Messages HTTP 渠道独立配置 NEW API 管理适配器，保留实际请求协议、API Key 与基础 URL。此组合只支持手动管理价表观测，模型清单由管理员维护，不创建或安排自动发现。已知 NEW API Messages 转译可能掩盖底层缓存明细，观测返回 `NEWAPI_CLAUDE_RELAY_FACTS_UNPROVEN`，这类观测不可采用为正式采购价。原生直连渠道依旧由实际响应证明计数，OpenAI 兼容渠道原有静态价格流程保持适用。

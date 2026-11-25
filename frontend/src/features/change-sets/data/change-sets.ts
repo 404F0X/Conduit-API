@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { graphqlRequest } from '@/gql/graphql';
+import { GraphQLRequestError, graphqlRequest } from '@/gql/graphql';
+import type { NewApiExpressionPrice } from '@/features/models/components/simple-retail-price';
 
 export const CHANGE_SET_KINDS = [
   'PROVIDER_PRICE',
@@ -114,13 +115,18 @@ export type PackageFilter = {
   scopeID?: string;
   search?: string;
 };
-export type ProviderPriceInput = { modelId: string; currencyCode: string; price: unknown };
+export type ProviderPriceInput = {
+  modelId: string;
+  currencyCode: string;
+  price?: unknown;
+  billingExpression?: NewApiExpressionPrice | null;
+};
 export type ProviderEditBase = {
   channelID: string;
   revision: string;
   accountingCurrency: string;
   accountingSettingsVersion: string;
-  prices: Array<{ id: string; modelID: string; currencyCode: string; price: unknown }>;
+  prices: Array<{ id: string; modelID: string; currencyCode: string; price: unknown; billingExpression?: NewApiExpressionPrice | null }>;
 };
 export type RetailEditBase = {
   priceBookID: string;
@@ -176,7 +182,7 @@ export async function getEventPage(id: string, after?: string) {
 }
 export async function getProviderBase(channelID: string) {
   return graphqlRequest<{ providerPriceEditBase: ProviderEditBase }>(
-    `query ProviderEditBase($channelID: ID!) { providerPriceEditBase(channelID: $channelID) { channelID revision accountingCurrency accountingSettingsVersion prices { id modelID currencyCode price { items { itemCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } promptWriteCacheVariants { variantCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } } } } } } }`,
+    `query ProviderEditBase($channelID: ID!) { providerPriceEditBase(channelID: $channelID) { channelID revision accountingCurrency accountingSettingsVersion prices { id modelID currencyCode price { items { itemCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } promptWriteCacheVariants { variantCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } } } } billingExpression } } }`,
     { channelID }
   ).then((d) => d.providerPriceEditBase);
 }
@@ -206,6 +212,36 @@ export async function createProviderPackage(input: {
     input
   ).then((d) => d.createProviderPriceChangeSet);
 }
+function requireProviderDraftReceipt(receipt: CreateProviderResult | undefined, operationID: string): CreateProviderResult {
+  if (receipt?.operationID === operationID) {
+    if (receipt.outcome === 'NO_CHANGE' && receipt.changeSetDetail === null) return receipt;
+    const id = receipt.changeSetDetail?.summary?.id;
+    if (receipt.outcome === 'CREATED' && typeof id === 'string' && /^[1-9][0-9]{0,18}$/.test(id) && BigInt(id) <= 9223372036854775807n)
+      return receipt;
+  }
+  throw new Error('Provider price draft receipt is incomplete');
+}
+
+export async function lookupProviderDraftReceipt(operationID: string) {
+  const receipt = await findProviderOperation(operationID);
+  return receipt === null ? null : requireProviderDraftReceipt(receipt, operationID);
+}
+
+export async function createProviderDraftFromDialog(
+  intent: Parameters<typeof createProviderPackage>[0],
+  create: typeof createProviderPackage,
+  lookup = lookupProviderDraftReceipt
+): Promise<{ result: CreateProviderResult; recovered?: true } | { validationError: GraphQLRequestError }> {
+  try {
+    return { result: requireProviderDraftReceipt(await create(intent), intent.operationID) };
+  } catch (error) {
+    if (!(error instanceof GraphQLRequestError) || !error.providerCreateValidationRejected) throw error;
+    const receipt = await lookup(intent.operationID);
+    if (receipt === null) return { validationError: error };
+    return { result: receipt, recovered: true };
+  }
+}
+
 export async function saveProviderPackage(input: { id: string; expectedRevision: string; input: ProviderPriceInput[] }) {
   return graphqlRequest<{ saveProviderPriceChangeSet: PackageDetail }>(
     `mutation SaveProviderPackage($id: ID!, $expectedRevision: String!, $input: [SaveChannelModelPriceInput!]!) { saveProviderPriceChangeSet(id: $id, expectedRevision: $expectedRevision, input: $input) { ${DETAIL_FIELDS} } }`,

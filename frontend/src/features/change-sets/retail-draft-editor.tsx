@@ -2,13 +2,16 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { GroupRetailPriceEditor } from '@/features/models/components/group-retail-price-editor';
+import { validateEditorDocument } from '@/features/models/components/simple-retail-price';
+import { usePricingModelGroups } from '@/features/models/data/commercialization';
 import { getItem, getItemPage, getRetailBase, saveRetailItem, type PackageDetail } from './data/change-sets';
-import { displayAmount, priceRows, updatePriceAmount } from './price-view';
 
 export function RetailDraftEditor({ detail, onSaved, onClose }: { detail: PackageDetail; onSaved: () => void; onClose: () => void }) {
   const { t } = useTranslation();
+  const groups = usePricingModelGroups(true);
+  const [currency, setCurrency] = useState('');
   const [model, setModel] = useState('');
   const [price, setPrice] = useState<unknown>({ items: [] });
   const [choices, setChoices] = useState<string[]>([]);
@@ -19,6 +22,7 @@ export function RetailDraftEditor({ detail, onSaved, onClose }: { detail: Packag
     setBusy(true);
     try {
       const base = await getRetailBase(detail.summary.scopeID);
+      setCurrency(base.accountingCurrency);
       const keys = new Set(base.prices.map((p) => p.publicModelID));
       let after: string | undefined;
       do {
@@ -62,7 +66,13 @@ export function RetailDraftEditor({ detail, onSaved, onClose }: { detail: Packag
     setBusy(true);
     setError(undefined);
     try {
-      await saveRetailItem({ changeSetID: detail.summary.id, expectedRevision: detail.summary.revision, publicModelID: model, price });
+      const result = await saveRetailItem({
+        changeSetID: detail.summary.id,
+        expectedRevision: detail.summary.revision,
+        publicModelID: model,
+        price,
+      });
+      if (result.item.validationError) throw new Error(result.item.validationError);
       onSaved();
       onClose();
     } catch (e) {
@@ -73,7 +83,7 @@ export function RetailDraftEditor({ detail, onSaved, onClose }: { detail: Packag
   };
   return (
     <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
-      <DialogContent>
+      <DialogContent className='max-h-[85svh] max-w-3xl overflow-y-auto'>
         <DialogHeader>
           <DialogTitle>{t('eventPackages.edit')}</DialogTitle>
           <DialogDescription>{t('eventPackages.priceUnit')}</DialogDescription>
@@ -98,21 +108,9 @@ export function RetailDraftEditor({ detail, onSaved, onClose }: { detail: Packag
                 </option>
               ))}
             </select>
-            {['prompt_tokens', 'completion_tokens', 'prompt_cached_tokens', 'prompt_write_cached_tokens', 'request'].map((code) => {
-              const field = priceRows(price).find((p) => p.code === code);
-              return (
-                <div key={code}>
-                  <Label htmlFor={code}>{t(`eventPackages.fields.${code}`)}</Label>
-                  <Input
-                    id={code}
-                    inputMode='decimal'
-                    value={displayAmount(field?.amount) ?? ''}
-                    disabled={busy || (field != null && !['usage_per_unit', 'flat_fee'].includes(field.mode))}
-                    onChange={(e) => setPrice(updatePriceAmount(price, code, e.target.value))}
-                  />
-                </div>
-              );
-            })}
+            {model && !busy && (
+              <GroupRetailPriceEditor key={model} value={price} onChange={setPrice} currency={currency} groups={groups.data ?? []} />
+            )}
           </>
         )}
         {error && (
@@ -124,7 +122,7 @@ export function RetailDraftEditor({ detail, onSaved, onClose }: { detail: Packag
           <Button variant='outline' disabled={busy} onClick={onClose}>
             {t('eventPackages.cancel')}
           </Button>
-          <Button disabled={busy || !loaded || !model} onClick={() => void save()}>
+          <Button disabled={busy || !loaded || !model || !!validateEditorDocument(price)} onClick={() => void save()}>
             {t('eventPackages.save')}
           </Button>
         </DialogFooter>

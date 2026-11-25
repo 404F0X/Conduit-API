@@ -427,6 +427,16 @@ impl QueryRoot {
             .profile_catalog(groups::numeric_id(key_id.as_str())?, project)
             .await
     }
+    async fn default_model_group_diagnostic(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<groups::DefaultModelGroupDiagnostic>, String> {
+        policy::authorize_current(ctx, "read_users").map_err(|e| e.to_string())?;
+        groups::services(ctx)?
+            .default_model_group_diagnostic()
+            .await
+    }
+
     async fn model_groups(&self, ctx: &Context<'_>) -> Result<Vec<groups::ModelGroup>, String> {
         groups::global(ctx, false)?;
         groups::services(ctx)?.model_groups().await
@@ -546,6 +556,16 @@ impl QueryRoot {
         price_formula::services(ctx)?
             .list(price_formula::actor(ctx)?, price_book_id.as_str())
             .await
+    }
+
+    async fn preview_new_api_billing_expression(
+        &self,
+        ctx: &Context<'_>,
+        input: price_formula::NewApiBillingExpressionPreviewInput,
+    ) -> Result<price_formula::NewApiBillingExpressionPreview, String> {
+        policy::authorize_current(ctx, "read_commercialization")
+            .map_err(|error| error.to_string())?;
+        input.evaluate()
     }
 
     async fn preview_retail_price_formula(

@@ -270,7 +270,7 @@ impl TransformerStreamAggregator {
 impl StreamChunkAggregator for TransformerStreamAggregator {
     async fn aggregate(
         &self,
-        _ctx: &OrchestratorContext,
+        ctx: &OrchestratorContext,
         chunks: &[StreamEvent],
     ) -> Result<HttpResponse, StreamAggregationError> {
         let mut response = self
@@ -292,6 +292,21 @@ impl StreamChunkAggregator for TransformerStreamAggregator {
                     .entry("llm_response_id".to_string())
                     .or_insert_with(|| serde_json::Value::String(llm.id.clone()));
             }
+        }
+        if let Some(usage) = response.usage.as_mut() {
+            usage
+                .metadata
+                .remove(conduit_llm::usage::BILLING_TOKEN_FACTS_KEY);
+        }
+        if let Some(facts) = ctx
+            .stream_billing_facts
+            .as_ref()
+            .and_then(|value| value.get())
+        {
+            response
+                .usage
+                .get_or_insert_with(Default::default)
+                .set_billing_token_facts(facts);
         }
         Ok(response)
     }

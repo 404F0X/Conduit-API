@@ -527,6 +527,15 @@ impl ChannelExtMutationAdapter {
     pub(crate) fn prepare_create_from_gql_input(
         input: CreateChannelInput,
     ) -> Result<(String, RepoCreateChannelInput), ChannelServiceError> {
+        if input
+            .public_model_bindings
+            .as_ref()
+            .is_some_and(|v| v.has_changes())
+        {
+            return Err(ChannelServiceError::Create(
+                "public model bindings are only supported by the channel form".into(),
+            ));
+        }
         // Retained for the duplicate-name error (repo `NameConflict` maps to Go
         // `xerrors.DuplicateNameError("channel", …)`).
         let name = input.name.clone();
@@ -2097,6 +2106,7 @@ mod tests {
                 Some(77),
                 &source_id.to_string(),
                 CreateChannelInput {
+                    public_model_bindings: None,
                     operation_id: None,
                     channel_type: ChannelType::Openai,
                     base_url: None,

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { IconArrowsSort, IconDots, IconForms, IconPlus, IconScale, IconSettings, IconUpload } from '@tabler/icons-react';
+import { IconArrowsSort, IconDots, IconPlus, IconScale, IconSettings, IconUpload } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import {
@@ -14,10 +14,6 @@ import { PermissionGuard } from '@/components/permission-guard';
 import { useChannels } from '../context/channels-context';
 import { NewApiCreateDialog } from './new-api-discovery';
 
-/**
- * 页头只留一个主按钮“新建渠道”（四个字段的快速新建），
- * 完整表单、批量导入、排序、渠道设置、负载均衡策略都收进“更多”。
- */
 export function ChannelsPrimaryButtons() {
   const { t } = useTranslation();
   const [newApiOpen, setNewApiOpen] = useState(false);
@@ -33,7 +29,7 @@ export function ChannelsPrimaryButtons() {
         </Button>
       </PermissionGuard>
       <PermissionGuard requiredScope='write_channels'>
-        <Button className='min-w-0 flex-1 lg:flex-none' onClick={() => setOpen('quickAdd')} data-testid='add-channel-button'>
+        <Button className='min-w-0 flex-1 lg:flex-none' onClick={() => setOpen('add')} data-testid='add-channel-button'>
           <IconPlus size={18} />
           <span className='truncate'>{t('channels.addChannel')}</span>
         </Button>
@@ -47,10 +43,6 @@ export function ChannelsPrimaryButtons() {
         <DropdownMenuContent align='end' className='w-56'>
           <PermissionGuard requiredScope='write_channels'>
             <>
-              <DropdownMenuItem onClick={() => setOpen('add')}>
-                <IconForms />
-                {t('channels.quickCreate.useFullForm')}
-              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setOpen('bulkImport')}>
                 <IconUpload />
                 {t('channels.importChannels')}

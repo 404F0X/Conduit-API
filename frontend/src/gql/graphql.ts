@@ -9,13 +9,18 @@ export class GraphQLRequestError extends Error {
   status?: number;
   isAuthError: boolean;
   extensions?: Record<string, any>;
+  readonly providerCreateValidationRejected: boolean;
 
-  constructor(message: string, options?: { status?: number; isAuthError?: boolean; extensions?: Record<string, any> }) {
+  constructor(
+    message: string,
+    options?: { status?: number; isAuthError?: boolean; extensions?: Record<string, any>; providerCreateValidationRejected?: boolean }
+  ) {
     super(message);
     this.name = 'GraphQLRequestError';
     this.status = options?.status;
     this.isAuthError = Boolean(options?.isAuthError);
     this.extensions = options?.extensions;
+    this.providerCreateValidationRejected = options?.providerCreateValidationRejected === true;
   }
 }
 
@@ -159,9 +164,25 @@ export async function graphqlRequest<T>(
       )
     )
       requestGovernedMutation(query, variables);
+    // Keep only the outcome witness, never the response data or all error objects.
+    const providerCreateValidationRejected =
+      /^\s*mutation\s+CreateProviderPriceChangeSet\b/.test(query) &&
+      response.status === 200 &&
+      !Object.hasOwn(result, 'hasNext') &&
+      !Object.hasOwn(result, 'incremental') &&
+      !Object.hasOwn(result, 'pending') &&
+      (result.data === null ||
+        (result.data != null &&
+          Object.keys(result.data).length === 1 &&
+          Object.hasOwn(result.data, 'createProviderPriceChangeSet') &&
+          result.data.createProviderPriceChangeSet === null)) &&
+      Array.isArray(result.errors) &&
+      result.errors.length > 0 &&
+      result.errors.every((error: { extensions?: { code?: string } } | null) => error?.extensions?.code === 'VALIDATION_FAILED');
     throw new GraphQLRequestError(firstError?.message || 'GraphQL Error', {
       status: isForbiddenGraphQLError(firstError) ? 403 : undefined,
       extensions: firstError?.extensions,
+      providerCreateValidationRejected,
     });
   }
 

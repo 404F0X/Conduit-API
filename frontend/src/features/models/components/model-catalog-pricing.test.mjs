@@ -107,3 +107,15 @@ test('admin summary reports malformed documents and leaves unavailable without t
     assert.deepEqual(retailPriceValues({ price }), { mode: 'unavailable' });
   }
 });
+
+test('a published expression is displayed symbolically with its exact multiplier', () => {
+  const expression = {
+    kind: 'NEW_API_EXPRESSION',
+    profile: 'conduit-newapi-token-v1',
+    version: 1,
+    expression: 'fixed(0.002)',
+    multiplier: '1.000000000000000001',
+  };
+  assert.deepEqual(retailPriceValues({ price: expression }), { mode: 'expression', price: expression });
+  assert.deepEqual(retailPriceValues({ price: { ...expression, items: [] } }), { mode: 'unavailable' });
+});

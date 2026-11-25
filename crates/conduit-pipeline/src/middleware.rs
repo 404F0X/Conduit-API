@@ -362,6 +362,8 @@ pub struct PipelineContext {
     pub request_id: Option<String>,
     pub route: Option<String>,
     pub metadata: BTreeMap<String, String>,
+    pub completed_stream_billing_facts: Option<conduit_llm::usage::BillingTokenFacts>,
+    pub provider_price_snapshot: Option<crate::pipeline::ProviderPriceSnapshot>,
     pub order: Vec<String>,
     /// RUST-P8-002 S17 — shared cancellation token standing in for the Go
     /// request `context.Context`. The HTTP layer cancels it on client

@@ -109,6 +109,7 @@ struct ProviderChannelRow {
     base_url: Option<String>,
     credentials: Json<Value>,
     settings: Option<Json<Value>>,
+    endpoints: Json<Value>,
     probe_adapter: Option<String>,
     probe_verified_at: Option<DateTime<Utc>>,
 }
@@ -163,11 +164,12 @@ impl PgProviderQuotaAdapter {
             return Ok(());
         }
         let rows = sqlx::query_as::<_, ProviderChannelRow>(
-            "SELECT c.id,c.name,c.\"type\" AS channel_type,c.base_url,c.credentials,c.settings, \
+            "SELECT c.id,c.name,c.\"type\" AS channel_type,c.base_url,c.credentials,c.settings,COALESCE(c.endpoints,'[]'::jsonb) AS endpoints, \
                     q.probe_adapter,q.probe_verified_at \
              FROM channels c LEFT JOIN provider_quota_status q \
                ON q.channel_id=c.id AND q.deleted_at=0 \
              WHERE c.status='enabled' AND c.deleted_at=0 \
+               AND NOT (c.\"type\"='anthropic' AND COALESCE(c.settings->>'managementAdapter','')='new_api') \
                AND (c.\"type\" IN ('claudecode','codex','github_copilot','nanogpt', \
                     'nanogpt_responses') \
                     OR (q.probe_adapter='new_api' AND q.probe_verified_at IS NOT NULL)) \
@@ -422,8 +424,17 @@ impl PgProviderQuotaAdapter {
         supplied_pat: Option<&str>,
         supplied_user_id: Option<&str>,
     ) -> Result<NewApiPricingSnapshot, String> {
-        if !matches!(row.channel_type.as_str(), "openai" | "openai_responses") {
-            return Err("NEW API 价格探测仅支持已确认的 OpenAI 兼容 NEW API 渠道".to_string());
+        let direct_openai = matches!(row.channel_type.as_str(), "openai" | "openai_responses");
+        let native_control = row
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.0["managementAdapter"] == "new_api")
+            && crate::wiring_postgres_pricing_admission::native_anthropic_http_config(
+                &row.channel_type,
+                &row.endpoints.0,
+            );
+        if !direct_openai && !native_control {
+            return Err("NEW API pricing requires an OpenAI-compatible channel or an explicit NEW API adapter on native Anthropic Messages HTTP".into());
         }
         let base_url = row
             .base_url
@@ -632,7 +643,7 @@ impl PgProviderQuotaAdapter {
         let mut seen = BTreeSet::new();
         let mut models = Vec::new();
         for item in items {
-            let model = normalize_new_api_pricing_item_with_contract(
+            let mut model = normalize_new_api_pricing_item_with_contract(
                 item,
                 &effective_groups,
                 &group_ratios,
@@ -643,6 +654,30 @@ impl PgProviderQuotaAdapter {
                 keys.len(),
             )
             .ok_or("NEWAPI pricing contains a row without a model identity")?;
+            if model.billing_kind == "tiered_expr"
+                && !model.provenance["billingExpression"].is_null()
+            {
+                model.provenance["billingExpression"] = Value::Null;
+                if let Some(issues) = model.provenance["issues"].as_array_mut() {
+                    issues.push(json!({"code":"EXPR_REQUIRES_UNPROVEN_USAGE_FACTS","message":"The probed OpenAI-compatible channel does not establish all outbound usage and cache facts"}));
+                }
+                model.quality = "unsupported".into();
+                model.reason = Some(
+                    "This outbound protocol does not establish all expression token facts".into(),
+                );
+            }
+            if native_control {
+                let issue = json!({"code":"NEWAPI_CLAUDE_RELAY_FACTS_UNPROVEN","severity":"BLOCKING","message":"NEW API can translate other upstream protocols to Messages. Observed prices are available for inspection and cannot be adopted."});
+                if let Some(issues) = model.provenance["issues"].as_array_mut() {
+                    issues.push(issue);
+                } else {
+                    model.provenance["issues"] = json!([issue]);
+                }
+                model.provenance["billingExpression"] = Value::Null;
+                model.provenance["adoptionBlocked"] = Value::Bool(true);
+                model.quality = "unsupported".into();
+                model.reason = Some("NEWAPI_CLAUDE_RELAY_FACTS_UNPROVEN".into());
+            }
             if !seen.insert(model.model_id.clone()) {
                 return Err(
                     "NEWAPI pricing contains duplicate model rows; observation was not committed"
@@ -668,7 +703,7 @@ impl PgProviderQuotaAdapter {
 
     async fn load_channel(&self, channel_id: i64) -> Result<ProviderChannelRow, String> {
         sqlx::query_as::<_, ProviderChannelRow>(
-            "SELECT c.id,c.name,c.\"type\" AS channel_type,c.base_url,c.credentials,c.settings, \
+            "SELECT c.id,c.name,c.\"type\" AS channel_type,c.base_url,c.credentials,c.settings,COALESCE(c.endpoints,'[]'::jsonb) AS endpoints, \
                     q.probe_adapter,q.probe_verified_at \
              FROM channels c LEFT JOIN provider_quota_status q \
                ON q.channel_id=c.id AND q.deleted_at=0 \
@@ -1438,18 +1473,44 @@ impl QuotaMutationServices for PgProviderQuotaAdapter {
             models: snapshot
                 .models
                 .into_iter()
-                .map(|model| NewApiModelPricingProbe {
-                    provenance: async_graphql::Json(model.provenance),
-                    model_id: model.model_id,
-                    billing_kind: model.billing_kind,
-                    quality: model.quality,
-                    group_ratio: decimal(model.group_ratio),
-                    input_per_million: decimal(model.input_per_million),
-                    output_per_million: decimal(model.output_per_million),
-                    cache_read_per_million: decimal(model.cache_read_per_million),
-                    cache_write_per_million: decimal(model.cache_write_per_million),
-                    flat_per_request: decimal(model.flat_per_request),
-                    reason: model.reason,
+                .map(|mut model| {
+                    // The apply editor needs a positive block flag. Keep the
+                    // underlying observation available to the discovery audit.
+                    if model.provenance["issues"].as_array().is_some_and(|issues| {
+                        issues.iter().any(|issue| issue["severity"] == "BLOCKING")
+                    }) {
+                        model.provenance["adoptionBlocked"] = Value::Bool(true);
+                    }
+                    NewApiModelPricingProbe {
+                        billing_expression: model
+                            .provenance
+                            .get("billingExpression")
+                            .filter(|value| !value.is_null())
+                            .cloned()
+                            .map(async_graphql::Json),
+                        diagnostics: model.provenance["issues"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|issue| {
+                                Some(conduit_admin_graphql::mutation::NewApiPricingDiagnostic {
+                                    code: issue["code"].as_str()?.into(),
+                                    message: issue["message"].as_str()?.into(),
+                                })
+                            })
+                            .collect(),
+                        provenance: async_graphql::Json(model.provenance),
+                        model_id: model.model_id,
+                        billing_kind: model.billing_kind,
+                        quality: model.quality,
+                        group_ratio: decimal(model.group_ratio),
+                        input_per_million: decimal(model.input_per_million),
+                        output_per_million: decimal(model.output_per_million),
+                        cache_read_per_million: decimal(model.cache_read_per_million),
+                        cache_write_per_million: decimal(model.cache_write_per_million),
+                        flat_per_request: decimal(model.flat_per_request),
+                        reason: model.reason,
+                    }
                 })
                 .collect(),
         })
@@ -1820,6 +1881,62 @@ fn normalize_new_api_pricing_item_with_contract(
 ) -> Option<NewApiModelPricingSnapshot> {
     let mut model = normalize_new_api_pricing_item(item, groups, ratios, estimated)?;
     let version = metadata["version"].as_str().unwrap_or_default();
+    if item["billing_mode"].as_str() == Some("tiered_expr") {
+        let source = item["billing_expr"].as_str();
+        let group = groups.iter().next().filter(|_| groups.len() == 1);
+        let mut issues = Vec::new();
+        if version.trim_start_matches('v') != "1.0.0-rc.51" && !version.starts_with("c9c6da2") {
+            issues.push(json!({"code":"UPSTREAM_CONTRACT_UNKNOWN","message":"NEW API expression adapter requires the pinned upstream version"}));
+        }
+        if group.is_none() || estimated || !group_verified || model.group_ratio.is_none() {
+            issues.push(json!({"code":"GROUP_UNVERIFIED","message":"Expression pricing requires one verified applicable KEY group"}));
+        }
+        let billing_expression = match (source, model.group_ratio) {
+            (Some(expression), Some(ratio)) => {
+                let price = conduit_core::objects::newapi_price::NewApiPrice {
+                    kind: "NEW_API_EXPRESSION".into(),
+                    profile: conduit_core::newapi_billing_expression::PROFILE.into(),
+                    version: 1,
+                    expression: expression.into(),
+                    multiplier: ratio.normalize().to_string(),
+                };
+                match price.compile() {
+                    Ok(_) if issues.is_empty() => Some(price),
+                    Ok(_) => None,
+                    Err(error) => {
+                        let code = if error.starts_with("UNSUPPORTED_CC12H_UNTRUSTED_USAGE") {
+                            "UNSUPPORTED_CC12H_UNTRUSTED_USAGE"
+                        } else {
+                            "EXPRESSION_INVALID"
+                        };
+                        issues.push(json!({"code":code,"message":error}));
+                        None
+                    }
+                }
+            }
+            _ => {
+                issues.push(json!({"code":"EXPRESSION_SOURCE_UNAVAILABLE","message":"Upstream expression or group multiplier is missing"}));
+                None
+            }
+        };
+        model.billing_kind = "tiered_expr".into();
+        model.quality = if billing_expression.is_some() {
+            "exact"
+        } else {
+            "unsupported"
+        }
+        .into();
+        model.reason = issues
+            .first()
+            .and_then(|v| v["message"].as_str())
+            .map(str::to_owned);
+        model.provenance = json!({
+            "upstreamVersion":version, "adapterVersion":"conduit-newapi-token-v1",
+            "rawBillingExpression":item.get("billing_expr"), "selectedGroup":group,
+            "billingExpression":billing_expression,"issues":issues,
+        });
+        return Some(model);
+    }
     let quota = json_decimal(&metadata["quota_per_unit"]);
     let unit = metadata["quota_display_type"].as_str().unwrap_or_default();
     let supported =
@@ -1908,7 +2025,9 @@ fn new_api_pricing_shape(payload: &Value) -> bool {
         && payload["data"].as_array().is_some_and(|rows| {
             rows.iter().any(|row| {
                 row["model_name"].as_str().is_some()
-                    && (row.get("model_ratio").is_some() || row.get("model_price").is_some())
+                    && (row.get("model_ratio").is_some()
+                        || row.get("model_price").is_some()
+                        || row.get("billing_expr").is_some())
             })
         })
 }
@@ -2505,6 +2624,34 @@ mod tests {
     }
 
     #[test]
+    fn pinned_expression_observation_preserves_exact_source_and_rejects_unknowns() {
+        let groups = BTreeSet::from(["verified".into()]);
+        let ratios = BTreeMap::from([("verified".into(), Decimal::new(15, 1))]);
+        let metadata = json!({"version":"v1.0.0-rc.51"});
+        let mut item = json!({"model_name":"test","billing_mode":"tiered_expr","billing_expr":"p + c","enable_groups":["verified"]});
+        let good = normalize_new_api_pricing_item_with_contract(
+            &item, &groups, &ratios, false, &metadata, true, 1, 1,
+        )
+        .unwrap();
+        assert_eq!(good.quality, "exact");
+        assert_eq!(good.provenance["billingExpression"]["multiplier"], "1.5");
+        assert_eq!(good.provenance["selectedGroup"], "verified");
+        assert!(good.input_per_million.is_none());
+        item["billing_expr"] = json!("p + cc12h");
+        let bad = normalize_new_api_pricing_item_with_contract(
+            &item, &groups, &ratios, false, &metadata, true, 1, 1,
+        )
+        .unwrap();
+        assert_eq!(bad.quality, "unsupported");
+        assert_eq!(bad.provenance["rawBillingExpression"], "p + cc12h");
+        assert!(bad.provenance["billingExpression"].is_null());
+        assert_eq!(
+            bad.provenance["issues"][0]["code"],
+            "UNSUPPORTED_CC12H_UNTRUSTED_USAGE"
+        );
+    }
+
+    #[test]
     fn r3_fixed_new_api_contract_preserves_zero_and_blocks_unknown_modes() {
         let groups = BTreeSet::from(["default".into()]);
         let ratios = BTreeMap::from([("default".into(), Decimal::ONE)]);
@@ -2576,6 +2723,84 @@ mod tests {
                     |v| v["code"] == "MODEL_RATIO_PROVENANCE_UNKNOWN" && v["severity"] == "WARNING"
                 )
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_native_managed_price_probe_reads_only_verified_control_plane()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let server = MockServer::start().await;
+        for (endpoint, data) in [
+            ("/api/status", json!({"version":"v1.0.0-rc.51"})),
+            ("/api/user/self", json!({"group":"verified"})),
+            (
+                "/api/token/",
+                json!({"total":1,"items":[{"key":"abcd**********5678","group":"verified"}]}),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"success":true,"data":data})),
+                )
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET")).and(path("/api/pricing"))
+            .and(header("authorization","Bearer control-test-pat")).and(header("new-api-user","7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success":true,"group_ratio":{"verified":2},
+                "data":[{"model_name":"wire","billing_mode":"tiered_expr","billing_expr":"p * 2","enable_groups":["verified"]}]
+            }))).mount(&server).await;
+        let repo = PgProviderQuotaAdapter::new(db.pool.clone(), test_system(&db.pool));
+        for (index, (adapter, key, transport)) in [
+            ("new_api", "sk-abcdefgh12345678", "http"),
+            ("new_api", "sk-unknown-00000000", "http"),
+            ("default", "sk-abcdefgh12345678", "http"),
+            ("new_api", "sk-abcdefgh12345678", "websocket"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let channel: i64 = sqlx::query_scalar(
+                r#"INSERT INTO channels("type",name,status,base_url,credentials,supported_models,default_test_model,settings,endpoints)
+                VALUES('anthropic',$1,'disabled',$2,$3,'["wire"]','wire',$4,$5) RETURNING id"#
+            ).bind(format!("native-control-{index}")).bind(format!("{}/v1",server.uri()))
+                .bind(Json(json!({"apiKeys":[key],"newApiPat":"control-test-pat","newApiUserID":"7"})))
+                .bind(Json(json!({"managementAdapter":adapter})))
+                .bind(Json(json!([{"api_format":"anthropic/messages","transport":transport}])))
+                .fetch_one(&db.pool).await?;
+            let before = server.received_requests().await.unwrap().len();
+            let result = repo.fetch_pricing(channel).await;
+            if index < 2 {
+                let snapshot = result?;
+                let model = &snapshot.models[0];
+                assert_eq!(model.provenance["rawBillingExpression"], "p * 2");
+                assert!(model.provenance["billingExpression"].is_null());
+                assert_eq!(model.quality, "unsupported");
+                assert_eq!(snapshot.matched_key_count, usize::from(index == 0));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(server.received_requests().await.unwrap().len(), before);
+            }
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == "GET" && request.url.path().starts_with("/api/"))
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM channel_model_prices")
+                .fetch_one(&db.pool)
+                .await?,
+            0
+        );
+        db.cleanup().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2721,6 +2946,33 @@ mod tests {
         );
         assert!(unsupported_result.total.is_none());
 
+        Mock::given(method("GET"))
+            .and(path("/api/pricing"))
+            .and(|request: &wiremock::Request| !request.headers.contains_key("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "group_ratio": {"default": 1},
+                "data": [{"model_name":"same-model","quota_type":0,"model_ratio":1,"completion_ratio":2}]
+            })))
+            .mount(&first)
+            .await;
+        let public_preview = QuotaMutationServices::probe_new_api_pricing(
+            &adapter,
+            &priced_channel.to_string(),
+            None,
+            None,
+        )
+        .await?;
+        let blocked = &public_preview.models[0];
+        assert_eq!(blocked.input_per_million.as_deref(), Some("50000"));
+        assert_eq!(blocked.provenance.0["adoptionBlocked"], true);
+        assert!(
+            blocked
+                .diagnostics
+                .iter()
+                .any(|issue| issue.code == "GROUP_UNVERIFIED")
+        );
+
         let first_price = QuotaMutationServices::probe_new_api_pricing(
             &adapter,
             &priced_channel.to_string(),
@@ -2730,6 +2982,13 @@ mod tests {
         .await?;
         assert_eq!(first_price.models.len(), 1);
         assert_eq!(first_price.models[0].quality, "exact");
+        assert!(
+            first_price.models[0]
+                .provenance
+                .0
+                .get("adoptionBlocked")
+                .is_none()
+        );
         assert_eq!(
             first_price.models[0].input_per_million.as_deref(),
             Some("50000")
@@ -2765,7 +3024,6 @@ mod tests {
             second_price.models[0].input_per_million.as_deref(),
             Some("100000")
         );
-
         adapter
             .probe_new_api_pricing(priced_channel, None, None)
             .await?;

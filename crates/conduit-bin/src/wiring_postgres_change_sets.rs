@@ -573,8 +573,8 @@ async fn apply_provider_price(
     let settings = crate::wiring_postgres_commercialization::PgCommercializationAdapter::pricing_audit_settings(tx)
         .await
         .map_err(|error| ApplyFailure::Invalid(error.to_string()))?;
-    let channel_settings = sqlx::query_scalar::<_, SqlJson<Value>>(
-        "SELECT settings FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE",
+    let (channel_type, channel_endpoints, channel_settings) = sqlx::query_as::<_, (String, SqlJson<Value>, SqlJson<Value>)>(
+        "SELECT type,COALESCE(endpoints,'[]'::jsonb),settings FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE",
     )
     .bind(channel_id)
     .fetch_optional(&mut **tx)
@@ -583,7 +583,7 @@ async fn apply_provider_price(
     .ok_or_else(|| ApplyFailure::Invalid("channel not found".into()))?;
     let channel_settings = serde_json::from_value::<
         conduit_core::objects::channel_settings::ChannelSettings,
-    >(channel_settings.0)
+    >(channel_settings.0.clone())
     .map_err(|error| ApplyFailure::Invalid(format!("invalid channel settings: {error}")))?;
     let items = load_items_in_tx(tx, change_set.id).await?;
     if items.is_empty() {
@@ -657,7 +657,18 @@ async fn apply_provider_price(
                 settings.version
             )));
         }
-        if !is_manual {
+        if !is_manual
+            && (source["provenance"]["adoptionBlocked"] == true
+                || (channel_type == "anthropic"
+                    && channel_settings.management_adapter.as_deref() == Some("new_api")))
+        {
+            return Err(ApplyFailure::Invalid("NEWAPI_CLAUDE_RELAY_FACTS_UNPROVEN: observed native gateway prices cannot be adopted".into()));
+        }
+        let is_expression = item
+            .after_snapshot
+            .as_ref()
+            .is_some_and(|value| value.0.get("kind").is_some());
+        if !is_manual && !is_expression {
             crate::wiring_postgres_pricing_admission::validate_channel_billing_snapshot(
                 source,
                 &channel_settings.billing_currency,
@@ -736,13 +747,53 @@ async fn apply_provider_price(
             .as_ref()
             .map(|value| &value.0)
             .ok_or_else(|| ApplyFailure::Invalid("provider price is missing".into()))?;
-        let parsed: ModelPrice = serde_json::from_value(proposed.clone())
-            .map_err(|error| ApplyFailure::Invalid(format!("invalid provider price: {error}")))?;
-        crate::wiring::validate_model_price(&parsed)
-            .map_err(|error| ApplyFailure::Invalid(format!("invalid provider price: {error}")))?;
-        if parsed.items.is_empty() {
-            return Err(ApplyFailure::Invalid("provider price is empty".into()));
+        let document =
+            conduit_core::objects::retail_price_plan::RetailPriceDocument::parse(proposed)
+                .map_err(ApplyFailure::Invalid)?;
+        if proposed.get("schema").is_some() {
+            return Err(ApplyFailure::Invalid(
+                "provider price must be a single price leaf".into(),
+            ));
         }
+        if let Some(parsed) = document
+            .global
+            .as_ref()
+            .and_then(|leaf| leaf.static_price())
+        {
+            crate::wiring::validate_model_price(parsed).map_err(ApplyFailure::Invalid)?;
+        }
+        let price_currency = if is_expression {
+            if !crate::wiring_postgres_pricing_admission::expression_channel_supported(
+                &channel_type,
+                &channel_endpoints.0,
+                &serde_json::to_value(&channel_settings).map_err(|_| {
+                    ApplyFailure::Invalid("invalid channel billing settings".into())
+                })?,
+            ) {
+                return Err(ApplyFailure::Invalid("EXPR_REQUIRES_UNPROVEN_USAGE_FACTS: procurement expressions require a native Anthropic channel".into()));
+            }
+            let accounting =
+                crate::usage_charge_settler_postgres::load_accounting_settings_from(&mut **tx)
+                    .await
+                    .map_err(ApplyFailure::Invalid)?;
+            accounting
+                .real_to_accounting(rust_decimal::Decimal::ONE, "USD")
+                .map_err(ApplyFailure::Invalid)?;
+            if let Some(snapshot) = source_snapshot_id {
+                let observed: Option<Value> = sqlx::query_scalar(
+                    "SELECT provenance->'billingExpression' FROM provider_price_rows WHERE id=$1 AND snapshot_id=$2 AND channel_id=$3 AND upstream_model_id=$4 AND quality='exact'"
+                ).bind(provider_row_id).bind(snapshot).bind(channel_id).bind(&item.item_key)
+                 .fetch_optional(&mut **tx).await.map_err(db_failure)?;
+                if observed.as_ref() != Some(proposed) {
+                    return Err(ApplyFailure::Superseded(
+                        "observed expression no longer matches the proposed leaf".into(),
+                    ));
+                }
+            }
+            "USD"
+        } else {
+            &settings.currency
+        };
         let reference_id = crate::wiring::generate_reference_id();
         let applied = if let Some(existing) = current {
             let head_id = parse_i64(&existing.id, "price head")?;
@@ -754,7 +805,7 @@ async fn apply_provider_price(
             conduit_db::PgChannelModelPriceRepo::update_price_in_tx(
                 tx,
                 head_id,
-                &settings.currency,
+                price_currency,
                 proposed,
                 &reference_id,
                 &now_text,
@@ -766,7 +817,7 @@ async fn apply_provider_price(
                 tx,
                 channel_id,
                 &item.item_key,
-                &settings.currency,
+                price_currency,
                 proposed,
                 &reference_id,
                 &now_text,
@@ -780,7 +831,7 @@ async fn apply_provider_price(
             channel_id,
             &item.item_key,
             applied_id,
-            &settings.currency,
+            price_currency,
             proposed,
             VERSION_STATUS_ACTIVE,
             &now_text,
@@ -1026,7 +1077,30 @@ async fn apply_retail_price(
             .ok_or_else(|| ApplyFailure::Invalid("retail price is missing".into()))?;
         let document = conduit_core::objects::retail_price_plan::RetailPriceDocument::parse(&price)
             .map_err(ApplyFailure::Invalid)?;
-        for leaf in document.leaves() {
+        if document
+            .leaves()
+            .iter()
+            .any(|leaf| leaf.static_price().is_none())
+        {
+            crate::wiring_postgres_pricing_admission::expression_retail_route_warnings(
+                tx,
+                public_model_id,
+            )
+            .await
+            .map_err(ApplyFailure::Invalid)?;
+            let accounting =
+                crate::usage_charge_settler_postgres::load_accounting_settings_from(&mut **tx)
+                    .await
+                    .map_err(ApplyFailure::Invalid)?;
+            accounting
+                .real_to_accounting(rust_decimal::Decimal::ONE, "USD")
+                .map_err(ApplyFailure::Invalid)?;
+        }
+        for leaf in document
+            .leaves()
+            .into_iter()
+            .filter_map(|leaf| leaf.static_price())
+        {
             crate::wiring::validate_model_price(leaf).map_err(ApplyFailure::Invalid)?;
         }
         let exists = sqlx::query_scalar::<_, bool>(
@@ -1437,7 +1511,8 @@ mod tests {
         conduit_admin_graphql::model_ext::SaveChannelModelPriceInput {
             model_id: model_id.into(),
             currency_code: "CNY".into(),
-            price: conduit_admin_graphql::model_ext::ModelPriceInput {
+            billing_expression: None,
+            price: Some(conduit_admin_graphql::model_ext::ModelPriceInput {
                 items: [
                     conduit_admin_graphql::request_usage::PriceItemCode::PromptTokens,
                     conduit_admin_graphql::request_usage::PriceItemCode::CompletionTokens,
@@ -1460,7 +1535,7 @@ mod tests {
                     },
                 )
                 .collect(),
-            },
+            }),
         }
     }
 

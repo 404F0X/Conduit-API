@@ -330,6 +330,7 @@ fn config(path: &std::path::Path) -> UsageRecoveryConfig {
 }
 fn event(key: &str) -> MeteredEvent {
     MeteredEvent {
+        billing_token_facts: None,
         version: 1,
         event_key: event_key(key),
         reservation_key: None,

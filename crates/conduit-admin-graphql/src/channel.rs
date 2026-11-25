@@ -833,6 +833,22 @@ impl Channel {
         Ok(Some(prices))
     }
 
+    async fn public_model_bindings(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<Vec<ChannelPublicModelBinding>>, String> {
+        if crate::policy::authorize_current(ctx, "write_channels").is_err()
+            || crate::policy::authorize_current(ctx, "write_commercialization").is_err()
+        {
+            return Ok(None);
+        }
+        let services = crate::channel_queries::channel_extra_query_services(ctx)?;
+        services
+            .public_model_bindings(self.id.as_str())
+            .await
+            .map(Some)
+    }
+
     /// Sensitive channel fields are loaded only for callers holding the same
     /// `write_channels` capability required by the editor.
     async fn credentials(&self, ctx: &Context<'_>) -> Result<Option<ChannelCredentials>, String> {
@@ -1491,9 +1507,46 @@ pub struct ChannelCredentialsInput {
     pub oauth: Option<OAuthCredentialsInput>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, InputObject)]
+pub struct ChannelPublicModelBindingInput {
+    #[graphql(name = "upstreamModelID")]
+    pub upstream_model_id: String,
+    pub public_model_key: String,
+    pub model_type: Option<crate::model::ModelType>,
+    pub confirm_compatibility: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, InputObject)]
+pub struct ChannelPublicModelBindingsInput {
+    pub upserts: Option<Vec<ChannelPublicModelBindingInput>>,
+    #[graphql(name = "removeRouteIDs")]
+    pub remove_route_ids: Option<Vec<ID>>,
+}
+
+impl ChannelPublicModelBindingsInput {
+    pub fn has_changes(&self) -> bool {
+        self.upserts.as_ref().is_some_and(|items| !items.is_empty())
+            || self
+                .remove_route_ids
+                .as_ref()
+                .is_some_and(|items| !items.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct ChannelPublicModelBinding {
+    #[graphql(name = "routeID")]
+    pub route_id: ID,
+    #[graphql(name = "upstreamModelID")]
+    pub upstream_model_id: String,
+    pub public_model_key: String,
+    pub status: crate::commercialization::CommercialStatus,
+}
+
 /// `input CreateChannelInput` — snapshot lines 2896-2924 (ent-generated).
 #[derive(Debug, Clone, PartialEq, Eq, InputObject)]
 pub struct CreateChannelInput {
+    pub public_model_bindings: Option<ChannelPublicModelBindingsInput>,
     #[graphql(name = "operationID")]
     pub operation_id: Option<async_graphql::ID>,
     #[graphql(name = "type")]
@@ -1527,6 +1580,7 @@ pub struct CreateChannelInput {
 /// in-memory double in the tests for the authoritative application list.
 #[derive(Debug, Clone, Default, PartialEq, Eq, InputObject)]
 pub struct UpdateChannelInput {
+    pub public_model_bindings: Option<ChannelPublicModelBindingsInput>,
     #[graphql(name = "type")]
     pub channel_type: Option<ChannelType>,
     #[graphql(name = "baseURL")]
@@ -2113,6 +2167,7 @@ pub trait ChannelMutationServices: Send + Sync {
     /// fields.
     async fn update_channel(
         &self,
+        actor_user_id: Option<i64>,
         id: &str,
         input: UpdateChannelInput,
     ) -> Result<Channel, ChannelServiceError>;
@@ -2324,6 +2379,7 @@ mod tests {
 
         async fn update_channel(
             &self,
+            _actor_user_id: Option<i64>,
             id: &str,
             input: UpdateChannelInput,
         ) -> Result<Channel, ChannelServiceError> {

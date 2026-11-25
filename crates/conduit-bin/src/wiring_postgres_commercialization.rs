@@ -1184,6 +1184,132 @@ mod tests {
     }
 }
 
+pub(crate) async fn apply_channel_public_model_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    channel: &conduit_db::row::ChannelRow,
+    bindings: conduit_admin_graphql::channel::ChannelPublicModelBindingsInput,
+    creating: bool,
+) -> Result<(), String> {
+    let channel_id = channel
+        .id
+        .parse::<i64>()
+        .map_err(|_| "invalid channel ID")?;
+    let removes = bindings
+        .remove_route_ids
+        .unwrap_or_default()
+        .iter()
+        .map(|id| parse_id(id.as_str()).map_err(|error| error.to_string()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if creating && !removes.is_empty() {
+        return Err("route removals are invalid when creating a channel".into());
+    }
+    let failed = |_| "STORAGE_FAILED: channel bindings could not be saved";
+    let mut upserts = bindings.upserts.unwrap_or_default();
+    upserts.sort_by(|a, b| a.public_model_key.trim().cmp(b.public_model_key.trim()));
+    for binding in upserts {
+        let upstream = binding.upstream_model_id.trim();
+        let key = binding.public_model_key.trim();
+        if upstream.is_empty() || key.is_empty() {
+            return Err("upstreamModelID and publicModelKey are required".into());
+        }
+        let (supported, manual): (bool, bool) = sqlx::query_as(
+            "SELECT supported_models ? $2, COALESCE(manual_models ? $2,false) FROM channels WHERE id=$1"
+        ).bind(channel_id).bind(upstream).fetch_one(&mut **tx).await.map_err(failed)?;
+        if !supported && !manual {
+            return Err(format!(
+                "upstream model {upstream} is outside the channel inventory"
+            ));
+        }
+        let mut deployments = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM upstream_model_deployments WHERE channel_id=$1 AND upstream_model_id=$2 ORDER BY id"
+        ).bind(channel_id).bind(upstream).fetch_all(&mut **tx).await.map_err(failed)?;
+        let deployment = match deployments.pop() {
+            Some(id) if deployments.is_empty() => id,
+            Some(_) => return Err(format!("upstream model {upstream} has multiple deployment variants")),
+            None => sqlx::query_scalar(
+                "INSERT INTO upstream_model_deployments(channel_id,upstream_model_id,internal_name,variant,status,source) VALUES($1,$2,$2,'','enabled',$3) RETURNING id"
+            ).bind(channel_id).bind(upstream).bind(if supported { "discovered" } else { "manual" })
+                .fetch_one(&mut **tx).await.map_err(failed)?,
+        };
+        let find_model = |key: String| {
+            sqlx::query_as::<_, (i64, String)>(
+                "SELECT id,status FROM models WHERE model_id=$1 AND deleted_at=0 FOR UPDATE",
+            )
+            .bind(key)
+        };
+        let model = if let Some(model) = find_model(key.into())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(failed)?
+        {
+            model
+        } else {
+            let model_type = binding
+                .model_type
+                .ok_or_else(|| format!("modelType is required to create public model {key}"))?;
+            let display_name_in_use = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE name=$1 AND model_id<>$1 AND deleted_at=0)"
+            ).bind(key).fetch_one(&mut **tx).await.map_err(failed)?;
+            if display_name_in_use {
+                return Err(format!(
+                    "the display name {key} already belongs to another public model; create the SKU with a distinct display name first"
+                ));
+            }
+            sqlx::query(
+                r#"INSERT INTO models(developer,model_id,"type",name,icon,"group",model_card,settings,status) VALUES('',$1,$2,$1,'','','{}','{}','disabled') ON CONFLICT(model_id,deleted_at) DO NOTHING"#
+            ).bind(key).bind(crate::conv::model_type_to_wire(model_type))
+                .execute(&mut **tx).await.map_err(failed)?;
+            find_model(key.into())
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(failed)?
+        };
+        let current = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM model_routes WHERE public_model_id=$1 AND deployment_id=$2",
+        )
+        .bind(model.0)
+        .bind(deployment)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(failed)?;
+        if let Some(route) = current {
+            if removes.contains(&route) {
+                return Err("a route cannot be both upserted and removed".into());
+            }
+            continue;
+        }
+        upsert_model_route_in_tx(
+            tx,
+            gql::UpsertModelRouteInput {
+                id: None,
+                public_model_id: model.0.to_string().into(),
+                deployment_id: deployment.to_string().into(),
+                status: Some(if model.1 == "enabled" {
+                    gql::CommercialStatus::Enabled
+                } else {
+                    gql::CommercialStatus::Disabled
+                }),
+                confirm_compatibility: binding.confirm_compatibility,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    for id in removes {
+        if sqlx::query(
+            "UPDATE model_routes r SET status='disabled',updated_at=now() FROM upstream_model_deployments d WHERE r.id=$1 AND r.deployment_id=d.id AND d.channel_id=$2 AND r.status<>'disabled'"
+        ).bind(id).bind(channel_id).execute(&mut **tx).await.map_err(failed)?.rows_affected() == 0 {
+            let owned = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM model_routes r JOIN upstream_model_deployments d ON d.id=r.deployment_id WHERE r.id=$1 AND d.channel_id=$2)"
+            ).bind(id).bind(channel_id).fetch_one(&mut **tx).await.map_err(failed)?;
+            if !owned {
+                return Err("route removal must reference a route owned by this channel".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn upsert_model_route_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: gql::UpsertModelRouteInput,

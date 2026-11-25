@@ -257,23 +257,58 @@ impl ChannelMutationServices for ChannelCrudAdapter {
     ) -> Result<GqlChannel, ChannelServiceError> {
         let name = input.name.clone();
         let ctx = boot_request_context();
+        let bindings = input
+            .public_model_bindings
+            .clone()
+            .filter(|v| v.has_changes());
         let (repo_input, new_api, operation) = prepare_channel_create(actor_user_id, input)?;
+        if !new_api && let Some(bindings) = bindings.clone() {
+            let mut tx = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| {
+                    ChannelServiceError::Create("PostgreSQL bindings unavailable".into())
+                })?
+                .begin()
+                .await
+                .map_err(|_| {
+                    ChannelServiceError::Create("channel transaction unavailable".into())
+                })?;
+            authorize_channel_bindings(&mut tx, actor_user_id)
+                .await
+                .map_err(ChannelServiceError::Create)?;
+            let row = conduit_db::PgChannelRepo::create_channel_in_tx(&mut tx, repo_input)
+                .await
+                .map_err(|err| match err {
+                    RepoError::NameConflict => ChannelServiceError::DuplicateName(name),
+                    _ => ChannelServiceError::Create("channel creation failed".into()),
+                })?;
+            crate::wiring_postgres_commercialization::apply_channel_public_model_bindings(
+                &mut tx, &row, bindings, true,
+            )
+            .await
+            .map_err(ChannelServiceError::Create)?;
+            tx.commit()
+                .await
+                .map_err(|_| ChannelServiceError::Create("channel commit failed".into()))?;
+            return Ok(channel_row_to_gql(row));
+        }
         if new_api {
             let operation = operation
                 .ok_or_else(|| ChannelServiceError::Create("operationID required".into()))?;
             let pool = self.pool.as_ref().ok_or_else(|| {
                 ChannelServiceError::Create("PostgreSQL operation persistence unavailable".into())
             })?;
-            let mut intent = repo_input.clone();
-            intent.created_at.clear();
-            use sha2::Digest;
-            let fingerprint = format!(
-                "{:x}",
-                sha2::Sha256::digest(format!("{:?}:{:?}", actor_user_id, intent).as_bytes())
-            );
+            let fingerprint =
+                channel_create_fingerprint(actor_user_id, &repo_input, bindings.as_ref());
             let mut tx = pool.begin().await.map_err(|_| {
                 ChannelServiceError::Create("STORAGE_FAILED: creation transaction failed".into())
             })?;
+            if bindings.is_some() {
+                authorize_channel_bindings(&mut tx, actor_user_id)
+                    .await
+                    .map_err(ChannelServiceError::Create)?;
+            }
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
                 .bind(format!("channel-operation:{operation}"))
                 .execute(&mut *tx)
@@ -294,6 +329,13 @@ impl ChannelMutationServices for ChannelCrudAdapter {
                         "STORAGE_FAILED: channel could not be saved".into(),
                     ),
                 })?;
+            if let Some(bindings) = bindings {
+                crate::wiring_postgres_commercialization::apply_channel_public_model_bindings(
+                    &mut tx, &row, bindings, true,
+                )
+                .await
+                .map_err(ChannelServiceError::Create)?;
+            }
             let stages = crate::wiring_postgres_channel_discovery::initial_results(
                 &[
                     conduit_admin_graphql::channel_discovery::ChannelDiscoveryStage::Models,
@@ -318,6 +360,7 @@ impl ChannelMutationServices for ChannelCrudAdapter {
 
     async fn update_channel(
         &self,
+        actor_user_id: Option<i64>,
         id: &str,
         input: UpdateChannelInput,
     ) -> Result<GqlChannel, ChannelServiceError> {
@@ -326,6 +369,43 @@ impl ChannelMutationServices for ChannelCrudAdapter {
         let db_id = channel_db_id(id).ok_or_else(|| {
             ChannelServiceError::Update(ChannelServiceError::NotFound.to_string())
         })?;
+        if let Some(bindings) = input
+            .public_model_bindings
+            .clone()
+            .filter(|v| v.has_changes())
+        {
+            let mut tx = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| {
+                    ChannelServiceError::Update("PostgreSQL bindings unavailable".into())
+                })?
+                .begin()
+                .await
+                .map_err(|_| {
+                    ChannelServiceError::Update("channel transaction unavailable".into())
+                })?;
+            authorize_channel_bindings(&mut tx, actor_user_id)
+                .await
+                .map_err(ChannelServiceError::Update)?;
+            let existing = conduit_db::PgChannelRepo::find_channel_for_update(&mut tx, &db_id)
+                .await
+                .map_err(|_| ChannelServiceError::Update("channel lookup failed".into()))?
+                .ok_or(ChannelServiceError::NotFound)?;
+            let input = prepare_channel_update(input, &existing)?;
+            let row = conduit_db::PgChannelRepo::update_channel_in_tx(&mut tx, &db_id, input)
+                .await
+                .map_err(|_| ChannelServiceError::Update("channel update failed".into()))?;
+            crate::wiring_postgres_commercialization::apply_channel_public_model_bindings(
+                &mut tx, &row, bindings, false,
+            )
+            .await
+            .map_err(ChannelServiceError::Update)?;
+            tx.commit()
+                .await
+                .map_err(|_| ChannelServiceError::Update("channel commit failed".into()))?;
+            return Ok(channel_row_to_gql(row));
+        }
         // The GraphQL projection deliberately redacts write-only secrets. Load
         // the stored row before lowering a full settings update so an unchanged
         // blank proxy password can be interpreted as "preserve", never
@@ -376,6 +456,41 @@ impl ChannelMutationServices for ChannelCrudAdapter {
     }
 }
 
+pub(crate) fn channel_create_fingerprint(
+    actor: Option<i64>,
+    input: &RepoCreateChannelInput,
+    bindings: Option<&conduit_admin_graphql::channel::ChannelPublicModelBindingsInput>,
+) -> String {
+    use sha2::Digest;
+    let mut intent = input.clone();
+    intent.created_at.clear();
+    let intent = match bindings {
+        Some(bindings) => format!("{actor:?}:{intent:?}:{bindings:?}"),
+        None => format!("{actor:?}:{intent:?}"),
+    };
+    format!("{:x}", sha2::Sha256::digest(intent.as_bytes()))
+}
+
+async fn authorize_channel_bindings(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    actor: Option<i64>,
+) -> Result<(), String> {
+    let actor =
+        actor.ok_or("FORBIDDEN: channel bindings require an authenticated administrator")?;
+    let policy = crate::wiring_governance::lock_policy(tx).await?;
+    for scope in ["write_channels", "write_commercialization"] {
+        crate::wiring_governance::authorize(tx, actor, scope).await?;
+    }
+    for kind in ["channel_configuration", "model_supply", "model_mapping"] {
+        if policy.requires(kind) {
+            return Err(format!(
+                "APPROVAL_REQUIRED: {kind} requires proposeGovernedChange"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_channel_create(
     actor_user_id: Option<i64>,
     input: CreateChannelInput,
@@ -394,15 +509,27 @@ pub(crate) fn prepare_channel_create(
         .map_err(|_| {
             ChannelServiceError::Create("OPERATION_CONFLICT: operationID must be a UUID".into())
         })?;
-    if new_api {
-        if !matches!(
-            channel_type_to_wire(input.channel_type),
-            "openai" | "openai_responses"
-        ) {
-            return Err(ChannelServiceError::Create(
-                "NEWAPI management requires OpenAI or OpenAI Responses".into(),
-            ));
+    let kind = channel_type_to_wire(input.channel_type);
+    let new_api_discovery = new_api && matches!(kind, "openai" | "openai_responses");
+    if new_api && !new_api_discovery {
+        let endpoints = Value::Array(
+            input
+                .endpoints
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(endpoint_input_to_json)
+                .collect(),
+        );
+        if !crate::wiring_postgres_pricing_admission::native_anthropic_http_config(kind, &endpoints)
+        {
+            return Err(ChannelServiceError::Create("NEWAPI management supports OpenAI, OpenAI Responses or native Anthropic Messages HTTP control-plane probes".into()));
         }
+        canonical_new_api_url(input.base_url.as_deref().unwrap_or_default())
+            .map_err(ChannelServiceError::Create)?;
+        input.auto_sync_supported_models = Some(false);
+    }
+    if new_api_discovery {
         let root = canonical_new_api_url(
             input
                 .base_url
@@ -412,7 +539,13 @@ pub(crate) fn prepare_channel_create(
         )
         .map_err(ChannelServiceError::Create)?;
         input.base_url = Some(root.clone());
-        input.website_url = Some(root);
+        if input
+            .website_url
+            .as_ref()
+            .is_none_or(|url| url.trim().is_empty())
+        {
+            input.website_url = Some(root);
+        }
         if operation.is_none() || actor_user_id.is_none() {
             return Err(ChannelServiceError::Create(
                 "NEWAPI creation requires operationID and authenticated actor".into(),
@@ -467,7 +600,7 @@ pub(crate) fn prepare_channel_create(
         created_at: now,
     };
 
-    Ok((repo_input, new_api, operation))
+    Ok((repo_input, new_api_discovery, operation))
 }
 pub(crate) fn prepare_channel_update(
     input: UpdateChannelInput,
@@ -491,23 +624,45 @@ pub(crate) fn prepare_channel_update(
             .map(channel_type_to_wire)
             .unwrap_or(existing.channel_type.as_str());
         if !matches!(kind, "openai" | "openai_responses") {
-            return Err(ChannelServiceError::Update(
-                "NEWAPI management requires OpenAI or OpenAI Responses".into(),
-            ));
+            let endpoints = Value::Array(
+                input
+                    .endpoints
+                    .clone()
+                    .map(|items| items.into_iter().map(endpoint_input_to_json).collect())
+                    .unwrap_or_else(|| existing.endpoints.clone()),
+            );
+            if !crate::wiring_postgres_pricing_admission::native_anthropic_http_config(
+                kind, &endpoints,
+            ) {
+                return Err(ChannelServiceError::Update("NEWAPI management supports OpenAI, OpenAI Responses or native Anthropic Messages HTTP control-plane probes".into()));
+            }
+            let base = if input.clear_base_url == Some(true) {
+                None
+            } else {
+                input.base_url.as_deref().or(existing.base_url.as_deref())
+            };
+            canonical_new_api_url(base.unwrap_or_default()).map_err(ChannelServiceError::Update)?;
+            input.auto_sync_supported_models = Some(false);
+        } else {
+            let root = canonical_new_api_url(
+                input
+                    .base_url
+                    .as_deref()
+                    .or(existing.base_url.as_deref())
+                    .or(input.website_url.as_deref())
+                    .or(existing.website_url.as_deref())
+                    .unwrap_or_default(),
+            )
+            .map_err(ChannelServiceError::Update)?;
+            input.base_url = Some(root.clone());
+            if input.website_url.is_none()
+                && input.clear_website_url != Some(true)
+                && existing.website_url.is_some()
+                && existing.website_url == existing.base_url
+            {
+                input.website_url = Some(root);
+            }
         }
-        let root = canonical_new_api_url(
-            input
-                .base_url
-                .as_deref()
-                .or(input.website_url.as_deref())
-                .or(existing.base_url.as_deref())
-                .or(existing.website_url.as_deref())
-                .unwrap_or_default(),
-        )
-        .map_err(ChannelServiceError::Update)?;
-        input.base_url = Some(root.clone());
-        input.website_url = Some(root);
-        input.clear_website_url = Some(false);
     }
     if let Some(credentials) = &input.credentials {
         validate_new_api_account(credentials).map_err(ChannelServiceError::Update)?;

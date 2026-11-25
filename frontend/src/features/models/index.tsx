@@ -6,7 +6,7 @@ import { Header } from '@/components/layout/header';
 import { Main } from '@/components/layout/main';
 import { PermissionGuard } from '@/components/permission-guard';
 import { PricingDisplayToggle } from '@/components/pricing-display-toggle';
-import { ChannelsModelPriceDialog } from '@/features/channels/components/channels-model-price-dialog';
+import { LazyChannelsModelPriceDialog } from '@/features/channels/components/lazy-channels-model-price-dialog';
 import ChannelsProvider from '@/features/channels/context/channels-context';
 import { useOnboardingInfo } from '@/features/system/data/system';
 import { ModelCatalog } from './components/model-catalog';
@@ -128,7 +128,7 @@ export default function ModelsManagement() {
           <ModelsContent />
         </Main>
         <ModelsDialogs />
-        <ChannelsModelPriceDialog />
+        <LazyChannelsModelPriceDialog />
         {showOnboarding && <ModelsOnboardingFlow onComplete={handleOnboardingComplete} />}
       </ModelsProvider>
     </ChannelsProvider>

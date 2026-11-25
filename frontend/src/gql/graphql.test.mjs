@@ -144,3 +144,48 @@ test('turns a successful HTTP response with GraphQL errors into a catchable non-
     globalThis.fetch = originalFetch;
   }
 });
+
+test('provider create rejection witness requires a complete single-operation response and all validation codes', async () => {
+  const validation = {
+    message: 'invalid change set operation: VALIDATION_FAILED: unsupported cc12h',
+    extensions: { code: 'VALIDATION_FAILED' },
+  };
+  const cases = [
+    [{ data: null, errors: [validation, validation] }, true],
+    [{ data: { createProviderPriceChangeSet: null }, errors: [validation] }, true],
+    [{ errors: [validation] }, false],
+    [{ data: { createProviderPriceChangeSet: { changeSetDetail: { summary: { id: 'exists' } } } }, errors: [validation] }, false],
+    [{ data: { createProviderPriceChangeSet: null, other: null }, errors: [validation] }, false],
+    [{ data: null, errors: [validation], hasNext: true }, false],
+    [{ data: null, errors: [validation, { message: 'uncoded' }] }, false],
+    [{ data: null, errors: [validation, { message: 'mixed', extensions: { code: 'STORAGE_FAILED' } }] }, false],
+  ];
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [reply, expected] of cases) {
+      globalThis.fetch = async () => Response.json(reply);
+      await assert.rejects(
+        graphqlRequest('mutation CreateProviderPriceChangeSet { createProviderPriceChangeSet { operationID } }'),
+        (error) => error instanceof GraphQLRequestError && error.providerCreateValidationRejected === expected
+      );
+      await assert.rejects(
+        graphqlRequest('query ProviderOperation { providerPriceChangeSetOperation { operationID } }'),
+        (error) => error instanceof GraphQLRequestError && !error.providerCreateValidationRejected
+      );
+    }
+    globalThis.fetch = async () => Response.json(cases[0][0], { status: 502 });
+    await assert.rejects(
+      graphqlRequest('mutation CreateProviderPriceChangeSet { createProviderPriceChangeSet { operationID } }'),
+      (error) => error instanceof GraphQLRequestError && !error.providerCreateValidationRejected
+    );
+    globalThis.fetch = async () => {
+      throw new Error('offline');
+    };
+    await assert.rejects(
+      graphqlRequest('mutation CreateProviderPriceChangeSet { createProviderPriceChangeSet { operationID } }'),
+      (error) => error instanceof GraphQLRequestError && !error.providerCreateValidationRejected
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

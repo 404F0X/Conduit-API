@@ -269,6 +269,7 @@ async fn repair_r1_human_observations_and_native_price_copy_recheck_current_side
         pool.clone(),
     );
     let input = |name: &str| conduit_admin_graphql::channel::CreateChannelInput {
+        public_model_bindings: None,
         operation_id: None,
         channel_type: conduit_admin_graphql::channel::ChannelType::Openai,
         base_url: None,
@@ -1372,6 +1373,95 @@ async fn governance_native_forms_off_publish_signup_and_mixed_key_batch_are_atom
     Ok(())
 }
 
+#[tokio::test]
+async fn governed_channel_public_model_bindings_are_reviewed_and_published_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(db) = database().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let actor = owner(pool, "channel-binding@contract.test").await?;
+    let payload = json!({
+        "type": "openai",
+        "name": "governed-binding",
+        "credentials": {"apiKeys": ["binding-test-key"]},
+        "supportedModels": ["wire-model"],
+        "defaultTestModel": "wire-model",
+        "publicModelBindings": {"upserts": [{
+            "upstreamModelID": "wire-model",
+            "publicModelKey": "governed-sku",
+            "modelType": "chat"
+        }]}
+    });
+    let mut draft = propose_native(pool, actor, "channel.create_form", vec![], payload).await?;
+    assert!(!draft.available_actions.contains(&Action::Publish));
+    let before =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM models WHERE model_id='governed-sku'")
+            .fetch_one(pool)
+            .await?;
+    assert_eq!(before, 0);
+    let packages = crate::wiring_postgres_change_sets::PgChangeSetAdapter::new(pool.clone());
+    for action in [Action::Submit, Action::Approve, Action::Publish] {
+        draft = packages
+            .transition(
+                actor,
+                draft.summary.id,
+                draft.summary.revision,
+                action,
+                None,
+            )
+            .await?;
+    }
+    let (route, channel, public, model_state, route_state) = sqlx::query_as::<_, (i64, i64, String, String, String)>(
+        "SELECT r.id,c.id,m.model_id,m.status,r.status FROM channels c JOIN upstream_model_deployments d ON c.id=d.channel_id JOIN model_routes r ON r.deployment_id=d.id JOIN models m ON m.id=r.public_model_id WHERE c.name='governed-binding' AND d.upstream_model_id='wire-model'"
+    ).fetch_one(pool).await?;
+    assert_eq!(
+        (public.as_str(), model_state.as_str(), route_state.as_str()),
+        ("governed-sku", "disabled", "disabled")
+    );
+    let mut invalid = propose_native(
+        pool,
+        actor,
+        "channel.update_form",
+        vec![ID(channel.to_string())],
+        json!({
+            "name":"must-not-change",
+            "publicModelBindings":{"removeRouteIDs":[(route + 1).to_string()]}
+        }),
+    )
+    .await?;
+    for action in [Action::Submit, Action::Approve] {
+        invalid = packages
+            .transition(
+                actor,
+                invalid.summary.id,
+                invalid.summary.revision,
+                action,
+                None,
+            )
+            .await?;
+    }
+    assert!(
+        packages
+            .transition(
+                actor,
+                invalid.summary.id,
+                invalid.summary.revision,
+                Action::Publish,
+                None
+            )
+            .await
+            .is_err()
+    );
+    let name = sqlx::query_scalar::<_, String>("SELECT name FROM channels WHERE id=$1")
+        .bind(channel)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(name, "governed-binding");
+    db.cleanup().await?;
+    Ok(())
+}
+
 async fn propose_native(
     pool: &PgPool,
     actor: i64,
@@ -1444,7 +1534,8 @@ fn provider_input() -> Vec<conduit_admin_graphql::model_ext::SaveChannelModelPri
     vec![m::SaveChannelModelPriceInput {
         model_id: "gpt-priced".into(),
         currency_code: "CNY".into(),
-        price: m::ModelPriceInput {
+        billing_expression: None,
+        price: Some(m::ModelPriceInput {
             items: [
                 C::PromptTokens,
                 C::CompletionTokens,
@@ -1463,7 +1554,7 @@ fn provider_input() -> Vec<conduit_admin_graphql::model_ext::SaveChannelModelPri
                 prompt_write_cache_variants: None,
             })
             .collect(),
-        },
+        }),
     }]
 }
 #[tokio::test]

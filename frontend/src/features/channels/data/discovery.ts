@@ -79,3 +79,7 @@ export function canonicalNewApiURL(raw: string) {
   url.pathname = url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '');
   return url.toString().replace(/\/+$/, '');
 }
+
+export function isNewApiAnthropicControlOnly(channelType: string, managementAdapter: string | null | undefined) {
+  return channelType === 'anthropic' && managementAdapter === 'new_api';
+}

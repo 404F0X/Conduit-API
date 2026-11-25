@@ -191,6 +191,14 @@ fn candidate_cost(
     let stored = prices
         .get(&key)
         .ok_or_else(|| format!("missing procurement price for model {}", model.actual_model))?;
+    if stored.price.get("kind").is_some() {
+        let expression: conduit_core::objects::newapi_price::NewApiPrice =
+            serde_json::from_value(stored.price.clone()).map_err(|error| error.to_string())?;
+        return accounting.real_to_accounting(
+            expression.estimate_upper(usage.prompt_tokens, usage.completion_tokens)?,
+            "USD",
+        );
+    }
     if let Some(source) = stored.approved_source.as_ref() {
         validate_channel_billing_snapshot(
             source,
@@ -615,4 +623,193 @@ mod tests {
             validate_channel_billing_snapshot(&source, "USD", Some(Decimal::from(3))).unwrap_err();
         assert!(multiplier_error.contains("channel billing conversion change"));
     }
+}
+
+pub(crate) fn native_anthropic_http_config(channel_type: &str, endpoints: &Value) -> bool {
+    use conduit_core::objects::channel_settings::ChannelEndpoint;
+    if !conduit_orchestrator::orchestrator::supports_expression_usage_facts(
+        channel_type,
+        "anthropic/messages",
+    ) {
+        return false;
+    }
+    // A direct Anthropic channel with no endpoint configuration uses the built-in Messages HTTP endpoint.
+    serde_json::from_value::<Vec<ChannelEndpoint>>(endpoints.clone()).is_ok_and(|endpoints| {
+        endpoints.iter().all(|endpoint| {
+            endpoint.api_format == "anthropic/messages"
+                && (endpoint.transport.is_empty() || endpoint.transport == "http")
+        })
+    })
+}
+
+pub(crate) fn expression_channel_supported(
+    channel_type: &str,
+    endpoints: &Value,
+    settings: &Value,
+) -> bool {
+    native_anthropic_http_config(channel_type, endpoints)
+        && settings["managementAdapter"] != "new_api"
+}
+
+pub(crate) async fn expression_admission_channel_ids(
+    pool: &sqlx::PgPool,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let channels = sqlx::query_as::<_, (i64, String, Json<Value>, Json<Value>)>(
+        "SELECT id,type,COALESCE(endpoints,'[]'::jsonb),COALESCE(settings,'{}'::jsonb)
+         FROM channels WHERE type='anthropic' AND deleted_at=0 AND status='enabled'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| "expression admission channel configuration lookup failed")?;
+    Ok(channels
+        .into_iter()
+        .filter(|(_, kind, endpoints, settings)| {
+            expression_channel_supported(kind, &endpoints.0, &settings.0)
+        })
+        .map(|(id, _, _, _)| id.to_string())
+        .collect())
+}
+
+pub(crate) async fn expression_retail_route_warnings(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    model_id: i64,
+) -> Result<Vec<i64>, String> {
+    let configured = sqlx::query_as::<_, (i64, String, Json<Value>, Json<Value>)>(
+        "SELECT DISTINCT c.id,c.type,COALESCE(c.endpoints,'[]'::jsonb),COALESCE(c.settings,'{}'::jsonb) FROM model_routes r
+         JOIN upstream_model_deployments d ON d.id=r.deployment_id
+         JOIN channels c ON c.id=d.channel_id
+         WHERE r.public_model_id=$1 AND r.status<>'archived'
+           AND d.status<>'archived' AND c.status<>'archived' AND c.deleted_at=0 ORDER BY c.id",
+    )
+    .bind(model_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|_| "retail expression route validation failed")?;
+    let unsupported = configured
+        .iter()
+        .filter(|(_, kind, endpoints, settings)| {
+            !expression_channel_supported(kind, &endpoints.0, &settings.0)
+        })
+        .map(|(id, _, _, _)| *id)
+        .collect::<Vec<_>>();
+    if configured.len() == unsupported.len() {
+        return Err("EXPR_REQUIRES_UNPROVEN_USAGE_FACTS: configure a native Anthropic route before publishing an expression".into());
+    }
+    Ok(unsupported)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn expression_route_coverage_accepts_disabled_native_scaffold_and_warns_for_generic_routes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+        return Ok(());
+    };
+    let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+    let mut tx = db.pool.begin().await?;
+    let model: i64 = sqlx::query_scalar(
+        r#"INSERT INTO models(developer,model_id,"type",name,icon,"group",model_card,settings,status)
+        VALUES('','expression-sku','chat','Expression','','','{}','{}','disabled') RETURNING id"#
+    ).fetch_one(&mut *tx).await?;
+    let mut generic = 0_i64;
+    let mut native = 0_i64;
+    for kind in ["openai", "anthropic"] {
+        let channel: i64 = sqlx::query_scalar(
+            r#"INSERT INTO channels("type",name,status,credentials,supported_models,default_test_model)
+            VALUES($1,$1,'disabled','{}','["wire"]','wire') RETURNING id"#
+        ).bind(kind).fetch_one(&mut *tx).await?;
+        let deployment: i64 = sqlx::query_scalar(
+            "INSERT INTO upstream_model_deployments(channel_id,upstream_model_id,internal_name,status) VALUES($1,'wire','wire','enabled') RETURNING id"
+        ).bind(channel).fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO model_routes(public_model_id,deployment_id,status) VALUES($1,$2,'disabled')")
+            .bind(model).bind(deployment).execute(&mut *tx).await?;
+        if kind == "anthropic" {
+            native = channel;
+        }
+        if kind == "openai" {
+            generic = channel;
+            assert!(
+                expression_retail_route_warnings(&mut tx, model)
+                    .await
+                    .unwrap_err()
+                    .contains("EXPR_REQUIRES_UNPROVEN_USAGE_FACTS")
+            );
+        }
+    }
+    assert_eq!(
+        expression_retail_route_warnings(&mut tx, model).await?,
+        vec![generic]
+    );
+    sqlx::query("UPDATE channels SET status='enabled' WHERE id=$1")
+        .bind(native)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    assert_eq!(
+        expression_admission_channel_ids(&db.pool).await?,
+        std::collections::BTreeSet::from([native.to_string()])
+    );
+    sqlx::query("UPDATE channels SET endpoints=$1 WHERE id=$2")
+        .bind(sqlx::types::Json(serde_json::json!([
+            {"api_format":"anthropic/messages","transport":"http"},
+            {"api_format":"openai/chat_completions","transport":"http"}
+        ])))
+        .bind(native)
+        .execute(&db.pool)
+        .await?;
+    assert!(expression_admission_channel_ids(&db.pool).await?.is_empty());
+    let mut after = db.pool.begin().await?;
+    assert!(
+        expression_retail_route_warnings(&mut after, model)
+            .await
+            .is_err()
+    );
+    after.rollback().await?;
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn expression_endpoint_eligibility_distinguishes_explicit_and_default_endpoints() {
+    let direct = serde_json::json!({});
+    let foreign = serde_json::json!([{"api_format":"openai/chat_completions","transport":"http"}]);
+    let mixed = serde_json::json!([
+        {"api_format":"openai/chat_completions","transport":"http"},
+        {"api_format":"anthropic/messages","transport":"http"}
+    ]);
+    let websocket =
+        serde_json::json!([{"api_format":"anthropic/messages","transport":"websocket"}]);
+    let mixed_transport = serde_json::json!([
+        {"api_format":"anthropic/messages","transport":"http"},
+        {"api_format":"anthropic/messages","transport":"websocket"}
+    ]);
+    let native = serde_json::json!([{"api_format":"anthropic/messages","transport":"http"}]);
+    assert!(expression_channel_supported("anthropic", &native, &direct));
+    assert!(!expression_channel_supported(
+        "anthropic",
+        &mixed_transport,
+        &direct
+    ));
+    assert!(expression_channel_supported(
+        "anthropic",
+        &serde_json::json!([]),
+        &direct
+    ));
+    assert!(!expression_channel_supported(
+        "anthropic",
+        &foreign,
+        &direct
+    ));
+    assert!(!expression_channel_supported(
+        "anthropic",
+        &websocket,
+        &direct
+    ));
+    assert!(!expression_channel_supported("anthropic", &mixed, &direct));
+    assert!(!expression_channel_supported(
+        "anthropic",
+        &native,
+        &serde_json::json!({"managementAdapter":"new_api"})
+    ));
 }

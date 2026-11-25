@@ -1,14 +1,16 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { z } from 'zod';
-import { useFieldArray, useForm, useWatch, type Control } from 'react-hook-form';
+import { useFieldArray, useForm, useFormContext, useWatch, type Control } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { IconAlertTriangle, IconCloudDownload, IconCoin, IconCopy, IconPlus, IconTrash } from '@tabler/icons-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
+import { useStore } from 'zustand';
+import { useAuthStore } from '@/stores/authStore';
 import { DEFAULT_ACCOUNTING_CURRENCY_CODE, currencyConversionFactor, normalizeCurrencyCode } from '@/lib/accounting';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
@@ -21,14 +23,25 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { AutoCompleteSelect } from '@/components/auto-complete-select';
 import { ModelPriceEditor } from '@/components/model-price-editor';
-import { getProviderBase, findProviderOperation } from '@/features/change-sets/data/change-sets';
-import { isDefinitePackageRejection } from '@/features/change-sets/price-view';
+import { getProviderBase, type CreateProviderResult } from '@/features/change-sets/data/change-sets';
+import { ExpressionPriceSummary } from '@/features/models/components/expression-price-summary';
+import { LazyNewApiExpressionEditor } from '@/features/models/components/lazy-new-api-expression-editor';
+import { newApiExpressionPrice, validNewApiExpressionDraft } from '@/features/models/components/simple-retail-price';
 import { useProvidersData } from '@/features/models/data/providers';
 import { type ProviderModel, type ProvidersData } from '@/features/models/data/providers.schema';
 import { useGeneralSettings } from '@/features/system/data/system';
 import { useChannels } from '../context/channels-context';
-import { useChannelModelPrices, useCreateProviderPriceChangeSet, useProbeNewApiPricing } from '../data/channels';
-import { PricingMode, PriceItemCode, type NewApiModelPricingProbe, type NewApiPricingProbeResult } from '../data/schema';
+import { useChannelModelPrices, useProbeNewApiPricing } from '../data/channels';
+import { isNewApiAnthropicControlOnly } from '../data/discovery';
+import {
+  PricingMode,
+  PriceItemCode,
+  newApiExpressionPriceSchema,
+  type NewApiModelPricingProbe,
+  type NewApiPricingProbeResult,
+} from '../data/schema';
+import { currentProviderDraftSlot, providerDraftSessions, providerDraftSlotKey } from './provider-draft-sessions';
+import { createProviderDraftSubmission } from './provider-draft-submission';
 
 const priceItemCodes = ['prompt_tokens', 'completion_tokens', 'prompt_cached_tokens', 'prompt_write_cached_tokens'] as const;
 const pricingModes = ['flat_fee', 'usage_per_unit', 'usage_tiered', 'usage_volume'] as const;
@@ -41,6 +54,8 @@ const createPriceFormSchema = (t: (key: string) => string) =>
         z.object({
           modelId: z.string().min(1, { message: t('price.validation.modelRequired') }),
           currencyCode: z.string().regex(/^[A-Z]{3}$/),
+          billingExpression: newApiExpressionPriceSchema.nullish(),
+          inactiveBillingExpression: newApiExpressionPriceSchema.nullish(),
           price: z.object({
             items: z.array(
               z.object({
@@ -165,6 +180,16 @@ const createPriceFormSchema = (t: (key: string) => string) =>
       };
 
       data.prices.forEach((price, priceIndex) => {
+        if (price.billingExpression) {
+          if (!validNewApiExpressionDraft(price.billingExpression)) {
+            ctx.addIssue({
+              code: 'custom',
+              message: t('models.expressionPrice.invalid'),
+              path: ['prices', priceIndex, 'billingExpression'],
+            });
+          }
+          return;
+        }
         // Check for duplicate item codes
         const itemCodes = new Map<string, number[]>();
         price.price.items.forEach((item, itemIndex) => {
@@ -251,8 +276,9 @@ function mapServerPricesToFormData(currentPrices: ChannelModelPrices): PriceForm
     prices: currentPrices.map((p) => ({
       modelId: p.modelID,
       currencyCode: p.currencyCode,
+      billingExpression: p.billingExpression,
       price: {
-        items: p.price.items.map((item) => ({
+        items: (p.price?.items ?? []).map((item) => ({
           itemCode: item.itemCode,
           pricing: {
             mode: item.pricing.mode,
@@ -478,6 +504,9 @@ const PriceCard = memo(function PriceCard({
   onAddVariant: (priceIndex: number, itemIndex: number) => void;
   onRemoveVariant: (priceIndex: number, itemIndex: number, variantIndex: number) => void;
 }) {
+  const { getValues, setValue } = useFormContext<PriceFormData>();
+  const inactiveExpressionPath = `prices.${priceIndex}.inactiveBillingExpression` as const;
+  const billingExpression = useWatch({ control, name: `prices.${priceIndex}.billingExpression` });
   return (
     <Card data-testid='channel-price-card' data-price-index={priceIndex} className='overflow-hidden'>
       <CardContent className='grid grid-cols-1 gap-3 pt-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,3fr)] lg:gap-x-4'>
@@ -486,7 +515,7 @@ const PriceCard = memo(function PriceCard({
             <div className='flex min-w-0 items-center gap-2'>
               <FormLabel className='truncate'>{t('price.model')}</FormLabel>
               <Badge variant='outline' className='shrink-0 font-mono text-[10px] tabular-nums'>
-                {currencyCode}
+                {billingExpression ? 'USD' : currencyCode}
               </Badge>
             </div>
             <div className='flex shrink-0 gap-1'>
@@ -535,19 +564,46 @@ const PriceCard = memo(function PriceCard({
           />
         </div>
         <div className='min-w-0'>
-          <div className='mb-3 flex h-8 items-center'>
-            <FormLabel className='truncate'>{t('price.items')}</FormLabel>
-          </div>
-          <ModelPriceEditor
+          <FormField
             control={control}
-            priceIndex={priceIndex}
-            currencyCode={currencyCode}
-            hideHeader
-            onAddItem={onAddItem}
-            onRemoveItem={onRemoveItem}
-            onAddVariant={onAddVariant}
-            onRemoveVariant={onRemoveVariant}
+            name={`prices.${priceIndex}.billingExpression`}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('models.expressionPrice.kind')}</FormLabel>
+                <FormControl>
+                  <select
+                    className='bg-background h-9 rounded-md border px-2 text-sm'
+                    value={field.value ? 'expression' : 'static'}
+                    onChange={(event) => {
+                      if (event.target.value === 'expression') {
+                        field.onChange(getValues(inactiveExpressionPath) ?? newApiExpressionPrice());
+                      } else {
+                        setValue(inactiveExpressionPath, field.value);
+                        field.onChange(null);
+                      }
+                    }}
+                  >
+                    <option value='static'>{t('models.expressionPrice.static')}</option>
+                    <option value='expression'>{t('models.expressionPrice.expression')}</option>
+                  </select>
+                </FormControl>
+                {field.value && <LazyNewApiExpressionEditor value={field.value} onChange={field.onChange} />}
+                <FormMessage />
+              </FormItem>
+            )}
           />
+          {!billingExpression && (
+            <ModelPriceEditor
+              control={control}
+              priceIndex={priceIndex}
+              currencyCode={currencyCode}
+              hideHeader
+              onAddItem={onAddItem}
+              onRemoveItem={onRemoveItem}
+              onAddVariant={onAddVariant}
+              onRemoveVariant={onRemoveVariant}
+            />
+          )}
         </div>
       </CardContent>
     </Card>
@@ -561,9 +617,17 @@ export function ChannelsModelPriceDialog() {
   const { data: settings } = useGeneralSettings();
   const defaultRowCurrency = normalizeCurrencyCode(settings?.accountingCurrencyCode || DEFAULT_ACCOUNTING_CURRENCY_CODE);
   const isOpen = open === 'price';
-  const createPriceDraft = useCreateProviderPriceChangeSet();
-  const [operationID, setOperationID] = useState(() => crypto.randomUUID());
-  const pendingIntent = useRef<Parameters<typeof createPriceDraft.mutateAsync>[0] | null>(null);
+  const actorID = useAuthStore((state) => state.auth.user?.id);
+  const queryClient = useQueryClient();
+  const [submission] = useState(createProviderDraftSubmission);
+  const [submitting, setSubmitting] = useState(false);
+  const slot = useMemo(
+    () => (actorID && currentRow?.id ? currentProviderDraftSlot(actorID, currentRow.id) : undefined),
+    [actorID, currentRow?.id]
+  );
+  const slotKey = slot ? providerDraftSlotKey(slot) : '';
+  const pending = useStore(providerDraftSessions.store, (state) => state.entries[slotKey]);
+  useLayoutEffect(() => () => submission.invalidate(), [submission, isOpen, slotKey]);
   const editBase = useQuery({
     queryKey: ['providerPriceEditBase', currentRow?.id],
     queryFn: () => getProviderBase(currentRow!.id),
@@ -702,6 +766,7 @@ export function ChannelsModelPriceDialog() {
   }, [currentPrices, defaultRowCurrency, isOpen, reset, selectedPriceModelID]);
 
   const handleClose = useCallback(() => {
+    submission.invalidate();
     setOpen(null);
     setSelectedPriceModelID(null);
     reset();
@@ -709,19 +774,22 @@ export function ChannelsModelPriceDialog() {
     setNewApiUserID('');
     setNewApiPreview(null);
     setAcceptEstimated(false);
-  }, [reset, setOpen, setSelectedPriceModelID]);
+  }, [reset, setOpen, setSelectedPriceModelID, submission]);
 
+  const controlOnly = currentRow ? isNewApiAnthropicControlOnly(currentRow.type, currentRow.settings?.managementAdapter) : false;
   const supportedNewApiPrices = useMemo(() => {
-    if (!newApiPreview) return [];
+    if (!newApiPreview || controlOnly) return [];
     const supported = new Set(supportedModels);
     return newApiPreview.models.filter(
       (model) =>
         supported.has(model.modelId) &&
         !['unsupported', 'unavailable'].includes(model.quality) &&
-        !model.provenance?.issues?.some((issue) => issue.severity === 'BLOCKING') &&
-        buildItemsFromNewApiPrice(model).length > 0
+        !model.provenance.adoptionBlocked &&
+        (model.billingExpression
+          ? validNewApiExpressionDraft(model.billingExpression)
+          : model.billingKind !== 'tiered_expr' && buildItemsFromNewApiPrice(model).length > 0)
     );
-  }, [newApiPreview, supportedModels]);
+  }, [controlOnly, newApiPreview, supportedModels]);
 
   const hasEstimatedNewApiPrice = useMemo(
     () => supportedNewApiPrices.some((model) => model.quality === 'estimated'),
@@ -770,6 +838,17 @@ export function ChannelsModelPriceDialog() {
     for (const model of supportedNewApiPrices) {
       const existing = next.findIndex((row) => row.modelId === model.modelId);
       const currencyCode = existing >= 0 ? next[existing].currencyCode : defaultRowCurrency;
+      if (model.billingExpression) {
+        const row = {
+          modelId: model.modelId,
+          currencyCode,
+          price: existing >= 0 ? next[existing].price : { items: [] },
+          billingExpression: model.billingExpression,
+        };
+        if (existing >= 0) next[existing] = row;
+        else next.push(row);
+        continue;
+      }
       const factor = channelUnitToCurrencyFactor(currencyCode);
       if (factor == null) {
         toast.error(t('price.accounting.missingRate', { currency: currencyCode }));
@@ -783,82 +862,105 @@ export function ChannelsModelPriceDialog() {
     toast.success(t('price.newApi.applied', { count: supportedNewApiPrices.length }));
   }, [channelUnitToCurrencyFactor, defaultRowCurrency, getValues, replace, supportedNewApiPrices, t]);
 
-  const onSubmit = useCallback(
-    async (data: PriceFormData) => {
-      if (!currentRow || !editBaseData || editBaseFetching || editBaseError) return;
+  const finishDraft = (result: Pick<CreateProviderResult, 'outcome'>, packageID?: string) => {
+    if (!slot) return;
+    toast[result.outcome === 'NO_CHANGE' ? 'info' : 'success'](
+      t(result.outcome === 'NO_CHANGE' ? 'eventPackages.noChange' : 'channels.messages.priceDraftCreated')
+    );
+    if (packageID) void navigate({ to: '/change-sets/$changeSetId', params: { changeSetId: packageID } });
+    providerDraftSessions.dismiss(slot);
+    handleClose();
+  };
 
-      try {
-        const input = data.prices.map((p) => ({
-          modelId: p.modelId,
-          currencyCode: p.currencyCode,
-          price: {
-            items: p.price.items.map((item) => ({
-              itemCode: item.itemCode as PriceItemCode,
-              pricing: {
-                mode: item.pricing.mode as PricingMode,
-                flatFee: item.pricing.flatFee || null,
-                usagePerUnit: item.pricing.usagePerUnit || null,
-                usageTiered: item.pricing.usageTiered
-                  ? {
-                      tiers: item.pricing.usageTiered.tiers.map((t) => ({
-                        upTo: t.upTo,
-                        pricePerUnit: t.pricePerUnit,
-                      })),
-                    }
-                  : null,
-              },
-              promptWriteCacheVariants:
-                item.promptWriteCacheVariants?.map((v) => ({
-                  variantCode: v.variantCode,
+  const onSubmit = async (data: PriceFormData, isCurrent: () => boolean) => {
+    if (!isCurrent() || !slot || !editBaseData || editBaseFetching || editBaseError) return;
+
+    try {
+      const input = data.prices.map((p) =>
+        p.billingExpression
+          ? { modelId: p.modelId, currencyCode: 'USD', billingExpression: p.billingExpression }
+          : {
+              modelId: p.modelId,
+              currencyCode: p.currencyCode,
+              price: {
+                items: p.price.items.map((item) => ({
+                  itemCode: item.itemCode as PriceItemCode,
                   pricing: {
-                    mode: v.pricing.mode as PricingMode,
-                    flatFee: v.pricing.flatFee || null,
-                    usagePerUnit: v.pricing.usagePerUnit || null,
-                    usageTiered: v.pricing.usageTiered
+                    mode: item.pricing.mode as PricingMode,
+                    flatFee: item.pricing.flatFee || null,
+                    usagePerUnit: item.pricing.usagePerUnit || null,
+                    usageTiered: item.pricing.usageTiered
                       ? {
-                          tiers: v.pricing.usageTiered.tiers.map((t) => ({
+                          tiers: item.pricing.usageTiered.tiers.map((t) => ({
                             upTo: t.upTo,
                             pricePerUnit: t.pricePerUnit,
                           })),
                         }
                       : null,
                   },
-                })) || [],
-            })),
-          },
-        }));
+                  promptWriteCacheVariants:
+                    item.promptWriteCacheVariants?.map((v) => ({
+                      variantCode: v.variantCode,
+                      pricing: {
+                        mode: v.pricing.mode as PricingMode,
+                        flatFee: v.pricing.flatFee || null,
+                        usagePerUnit: v.pricing.usagePerUnit || null,
+                        usageTiered: v.pricing.usageTiered
+                          ? {
+                              tiers: v.pricing.usageTiered.tiers.map((t) => ({
+                                upTo: t.upTo,
+                                pricePerUnit: t.pricePerUnit,
+                              })),
+                            }
+                          : null,
+                      },
+                    })) || [],
+                })),
+              },
+            }
+      );
 
-        const intent = pendingIntent.current ?? {
-          channelID: currentRow.id,
-          operationID,
-          expectedBaseRevision: editBaseData.revision,
-          input,
-        };
-        const wasPending = pendingIntent.current !== null;
-        pendingIntent.current = intent;
-        let result = wasPending ? await findProviderOperation(intent.operationID) : null;
-        if (!result) {
-          if (JSON.stringify(input) !== JSON.stringify(intent.input)) throw new Error(t('eventPackages.pendingIntent'));
-          result = await createPriceDraft.mutateAsync(intent);
-        } else toast.info(t('eventPackages.recovered'));
-        pendingIntent.current = null;
-        toast[result.outcome === 'NO_CHANGE' ? 'info' : 'success'](
-          t(result.outcome === 'NO_CHANGE' ? 'eventPackages.noChange' : 'channels.messages.priceDraftCreated')
-        );
-        setOperationID(crypto.randomUUID());
-        if (result.changeSetDetail)
-          void navigate({ to: '/change-sets/$changeSetId', params: { changeSetId: result.changeSetDetail.summary.id } });
-        handleClose();
-      } catch (error) {
-        if (isDefinitePackageRejection(error)) {
-          pendingIntent.current = null;
-          setOperationID(crypto.randomUUID());
-        }
-        toast.error(error instanceof Error ? error.message : t('eventPackages.error'));
+      const result = await providerDraftSessions.start(slot, { input, expectedBaseRevision: editBaseData.revision });
+      if (result) {
+        void queryClient.invalidateQueries({ queryKey: ['changeSets'] });
+        if (isCurrent()) finishDraft(result, result.changeSetDetail?.summary.id);
       }
-    },
-    [createPriceDraft, currentRow, handleClose, editBaseData, editBaseFetching, editBaseError, operationID, t, navigate]
-  );
+    } catch (error) {
+      if (isCurrent()) toast.error(error instanceof Error ? error.message : t('eventPackages.error'));
+    }
+  };
+
+  const recoverDraft = async (action: 'check' | 'retry' | 'abandon') => {
+    if (!slot || !isOpen) return;
+    const ticket = submission.start();
+    if (!ticket) return;
+    setSubmitting(true);
+    try {
+      const result = await providerDraftSessions.recover(slot, action);
+      if (result) void queryClient.invalidateQueries({ queryKey: ['changeSets'] });
+      if (ticket.isCurrent() && result === null && action === 'check') toast.info(t('price.pendingDraft.noReceipt'));
+    } catch (error) {
+      if (ticket.isCurrent()) toast.error(error instanceof Error ? error.message : t('eventPackages.error'));
+    } finally {
+      if (ticket.finish()) setSubmitting(false);
+    }
+  };
+
+  const submitDraft = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!isOpen || !slot || pending || !editBaseData || editBaseFetching || editBaseError) return;
+    const ticket = submission.start();
+    if (!ticket) return;
+    setSubmitting(true);
+    void form
+      .handleSubmit((data) => onSubmit(data, ticket.isCurrent))(event)
+      .catch((error: unknown) => {
+        if (ticket.isCurrent()) toast.error(error instanceof Error ? error.message : t('eventPackages.error'));
+      })
+      .finally(() => {
+        if (ticket.finish()) setSubmitting(false);
+      });
+  };
 
   const addPrice = useCallback(() => {
     append({
@@ -879,6 +981,10 @@ export function ChannelsModelPriceDialog() {
 
   const applyProviderModelToIndex = useCallback(
     (priceIndex: number, providerModel: ProviderModel) => {
+      if (getValues(`prices.${priceIndex}.billingExpression`)) {
+        toast.error(t('models.expressionPrice.switchToStatic'));
+        return false;
+      }
       const currencyCode = getValues(`prices.${priceIndex}.currencyCode`);
       const factor = usdToCurrencyFactor(currencyCode);
       if (factor == null) {
@@ -1016,6 +1122,7 @@ export function ChannelsModelPriceDialog() {
         modelId: '',
         currencyCode: getValues(`prices.${index}.currencyCode`),
         price: structuredClone(priceData),
+        billingExpression: structuredClone(getValues(`prices.${index}.billingExpression`)),
       });
       toast.success(t('common.success.duplicated'));
     },
@@ -1038,6 +1145,33 @@ export function ChannelsModelPriceDialog() {
           </DialogDescription>
         </DialogHeader>
 
+        {pending && (
+          <section className='space-y-2 rounded-md border p-3 text-sm' aria-label={t('price.pendingDraft.title')}>
+            <p role='status'>{t(`price.pendingDraft.${pending.status}`)}</p>
+            <p className='text-muted-foreground text-xs'>{t('price.pendingDraft.sessionLimit')}</p>
+            {pending.status === 'unknown' && (
+              <div className='flex flex-wrap gap-2'>
+                {(['check', 'retry', 'abandon'] as const).map((action) => (
+                  <Button
+                    key={action}
+                    type='button'
+                    variant='outline'
+                    size='sm'
+                    disabled={submitting}
+                    onClick={() => void recoverDraft(action)}
+                  >
+                    {t(`price.pendingDraft.${action}`)}
+                  </Button>
+                ))}
+              </div>
+            )}
+            {pending.status === 'complete' && pending.result && (
+              <Button type='button' size='sm' onClick={() => pending.result && finishDraft(pending.result, pending.result.packageID)}>
+                {t(pending.result.packageID ? 'price.pendingDraft.openPackage' : 'price.pendingDraft.done')}
+              </Button>
+            )}
+          </section>
+        )}
         {editBase.isError && (
           <p role='alert' className='text-destructive text-sm'>
             {editBase.error.message}
@@ -1054,7 +1188,7 @@ export function ChannelsModelPriceDialog() {
         )}
 
         <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className='flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'>
+          <form onSubmit={submitDraft} className='flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden'>
             <div
               ref={setPriceScrollElement}
               data-testid='model-price-dialog-body'
@@ -1070,6 +1204,8 @@ export function ChannelsModelPriceDialog() {
                         <Badge variant='outline'>{t('price.newApi.actualSource')}</Badge>
                       </div>
                       <p className='text-muted-foreground mt-1 text-xs'>{t('price.newApi.description')}</p>
+                      <p className='text-muted-foreground mt-1 text-xs'>{t('models.expressionPrice.probeScope')}</p>
+                      {controlOnly && <p className='mt-1 text-xs'>{t('channels.managementAdapter.observationOnly')}</p>}
                     </div>
                     <Button type='button' size='sm' onClick={runNewApiPricingProbe} disabled={probeNewApiPricing.isPending}>
                       {probeNewApiPricing.isPending ? t('price.newApi.probing') : t('price.newApi.probe')}
@@ -1115,6 +1251,39 @@ export function ChannelsModelPriceDialog() {
                           <span>{warning}</span>
                         </div>
                       ))}
+                      {newApiPreview.models
+                        .filter((model) => model.billingExpression || model.diagnostics?.length || model.provenance.issues?.length)
+                        .map((model) => (
+                          <div key={model.modelId} className='mt-3 space-y-2 rounded border p-2'>
+                            <p className='font-medium'>{model.modelId}</p>
+                            {model.provenance.selectedGroup && (
+                              <p className='text-muted-foreground'>
+                                {t('models.expressionPrice.sourceGroup', { group: model.provenance.selectedGroup })}
+                              </p>
+                            )}
+                            {model.billingExpression ? (
+                              <ExpressionPriceSummary price={model.billingExpression} />
+                            ) : typeof model.provenance.rawBillingExpression === 'string' ? (
+                              <pre className='max-h-32 overflow-auto break-all whitespace-pre-wrap'>
+                                {model.provenance.rawBillingExpression}
+                              </pre>
+                            ) : null}
+                            {Array.from(
+                              new Map(
+                                [...(model.diagnostics ?? []), ...(model.provenance.issues ?? [])].map((issue) => [issue.code, issue])
+                              ).values()
+                            ).map((diagnostic) => (
+                              <p
+                                key={diagnostic.code}
+                                className={
+                                  diagnostic.severity === 'BLOCKING' ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'
+                                }
+                              >
+                                {diagnostic.code} · {diagnostic.message}
+                              </p>
+                            ))}
+                          </div>
+                        ))}
                       {hasEstimatedNewApiPrice && (
                         <label className='mt-3 flex cursor-pointer items-start gap-2'>
                           <Checkbox checked={acceptEstimated} onCheckedChange={(checked) => setAcceptEstimated(checked === true)} />
@@ -1194,7 +1363,10 @@ export function ChannelsModelPriceDialog() {
                           const providerId = selectedProviderId || defaultProviderId;
                           const prices = getValues('prices') || [];
                           const existingModelIds = new Set(prices.map((p) => p?.modelId).filter(Boolean));
-                          const targetCurrencies = new Set([defaultRowCurrency, ...prices.map((price) => price.currencyCode)]);
+                          const targetCurrencies = new Set([
+                            defaultRowCurrency,
+                            ...prices.filter((price) => !price.billingExpression).map((price) => price.currencyCode),
+                          ]);
                           const missingTargetCurrency = [...targetCurrencies].find((currency) => usdToCurrencyFactor(currency) == null);
                           if (missingTargetCurrency) {
                             toast.error(t('price.accounting.missingUsdRate', { currency: missingTargetCurrency }));
@@ -1214,6 +1386,7 @@ export function ChannelsModelPriceDialog() {
                             }
                             const existingIndex = prices.findIndex((p) => p?.modelId === modelId);
                             if (existingIndex >= 0) {
+                              if (prices[existingIndex].billingExpression) return;
                               if (applyProviderModelToIndex(existingIndex, found.model)) applied += 1;
                               return;
                             }
@@ -1295,7 +1468,10 @@ export function ChannelsModelPriceDialog() {
                 <Button type='button' variant='ghost' onClick={handleClose}>
                   {t('common.buttons.cancel')}
                 </Button>
-                <Button type='submit' disabled={createPriceDraft.isPending || !editBase.data || editBase.isFetching || editBase.isError}>
+                <Button
+                  type='submit'
+                  disabled={!slot || !!pending || submitting || !editBase.data || editBase.isFetching || editBase.isError}
+                >
                   {t('price.createDraft')}
                 </Button>
               </div>
