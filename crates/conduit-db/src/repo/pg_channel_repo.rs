@@ -46,6 +46,19 @@ impl PgChannelRepo {
         .map_err(|e| error("find in transaction", e))
     }
 
+    pub async fn find_channel_for_update(
+        tx: &mut Transaction<'_, Postgres>,
+        value: &str,
+    ) -> RepoResult<Option<ChannelRow>> {
+        sqlx::query_as::<_, ChannelRow>(sqlx::AssertSqlSafe::<&str>(&format!(
+            "SELECT {COLUMNS} FROM channels WHERE id=$1 AND deleted_at=0 FOR UPDATE"
+        )))
+        .bind(id(value)?)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| error("find in transaction", e))
+    }
+
     pub async fn update_channel_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         v: &str,

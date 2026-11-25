@@ -13,6 +13,7 @@ const CHANNEL_CATALOG_PRICES_QUERY = `
             id
             modelID
             currencyCode
+            billingExpression
             price {
               items {
                 itemCode

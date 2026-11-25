@@ -11,7 +11,15 @@ import ProjectRulesPanel from './project-rules-panel';
 import { rechargeMultiplierToPPM, rechargePPMToMultiplier } from './recharge-multiplier';
 
 type Status = 'ENABLED' | 'DISABLED' | 'ARCHIVED';
-type ModelGroup = { id: string; name: string; description: string | null; status: Status; revision: number; modelIDs: string[] };
+type ModelGroup = {
+  id: string;
+  name: string;
+  description: string | null;
+  status: Status;
+  revision: number;
+  modelIDs: string[];
+  isDefault: boolean;
+};
 type UserGroup = {
   id: string;
   name: string;
@@ -22,7 +30,7 @@ type UserGroup = {
   rechargeMultiplierPPM: string;
   rechargeRevision: string;
 };
-const query = `query IndependentGroups { modelGroups { id name description status revision modelIDs } userGroups { id name description status memberUserIDs modelGroupIDs rechargeMultiplierPPM rechargeRevision } }`;
+const query = `query IndependentGroups { modelGroups { id name description status revision modelIDs isDefault } defaultModelGroupDiagnostic { code message } userGroups { id name description status memberUserIDs modelGroupIDs rechargeMultiplierPPM rechargeRevision } }`;
 export default function GroupsPage() {
   const { t } = useTranslation();
   const [tab, setTab] = useState<'users' | 'models' | 'projects'>('users');
@@ -31,7 +39,12 @@ export default function GroupsPage() {
   const client = useQueryClient();
   const catalog = useQuery({
     queryKey: ['independent-groups'],
-    queryFn: () => graphqlRequest<{ modelGroups: ModelGroup[]; userGroups: UserGroup[] }>(query),
+    queryFn: () =>
+      graphqlRequest<{
+        modelGroups: ModelGroup[];
+        userGroups: UserGroup[];
+        defaultModelGroupDiagnostic: { code: string; message: string } | null;
+      }>(query),
   });
   const models = useSimpleGroupModelsCatalog(canWrite);
   const users = useSimpleGroupUsersCatalog(canWrite);
@@ -124,6 +137,14 @@ export default function GroupsPage() {
                 ? t('users.groups.recharge.description')
                 : '模型组整理公开模型，Key 固定属于一个模型组；可用范围仍受 Project 和 Key 规则限制。'}
             </p>
+            {tab === 'models' && catalog.data?.defaultModelGroupDiagnostic && (
+              <div role='alert' className='rounded border p-3 text-sm'>
+                <p>{catalog.data.defaultModelGroupDiagnostic.message}</p>
+                {catalog.data.defaultModelGroupDiagnostic.code === 'DEFAULT_MODEL_GROUP_CONFLICT' && (
+                  <p className='text-muted-foreground'>{t('models.defaultGroup.conflictResolution')}</p>
+                )}
+              </div>
+            )}
             {catalog.isError && <p role='alert'>分组加载失败，请重试。</p>}
             {catalog.isPending && <p>加载中…</p>}
             {canWrite && (
@@ -142,6 +163,9 @@ export default function GroupsPage() {
                   <div className='flex items-center justify-between gap-3'>
                     <div>
                       <h2 className='font-semibold'>{group.name}</h2>
+                      {'isDefault' in group && group.isDefault && (
+                        <p className='text-muted-foreground text-xs'>{t('models.defaultGroup.reserved')}</p>
+                      )}
                       <p className='text-muted-foreground text-sm'>
                         {group.description} · {group.status}
                       </p>

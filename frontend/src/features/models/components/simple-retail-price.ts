@@ -51,7 +51,43 @@ export function readSimpleRetailPrice(value: unknown): SimpleRetailPrice | null 
   return result;
 }
 
-export type RetailPriceLeaf = { items: unknown[] };
+export const NEW_API_EXPRESSION_PROFILE = 'conduit-newapi-token-v1';
+export type NewApiExpressionPrice = {
+  kind: 'NEW_API_EXPRESSION';
+  profile: typeof NEW_API_EXPRESSION_PROFILE;
+  version: 1;
+  expression: string;
+  multiplier: string;
+};
+
+export function newApiExpressionPrice(): NewApiExpressionPrice {
+  return { kind: 'NEW_API_EXPRESSION', profile: NEW_API_EXPRESSION_PROFILE, version: 1, expression: '', multiplier: '1' };
+}
+
+export function isNewApiExpressionPrice(value: unknown): value is NewApiExpressionPrice {
+  return (
+    record(value) &&
+    onlyKeys(value, ['kind', 'profile', 'version', 'expression', 'multiplier']) &&
+    value.kind === 'NEW_API_EXPRESSION' &&
+    value.profile === NEW_API_EXPRESSION_PROFILE &&
+    value.version === 1 &&
+    typeof value.expression === 'string' &&
+    typeof value.multiplier === 'string'
+  );
+}
+
+export function validNewApiExpressionDraft(value: NewApiExpressionPrice): boolean {
+  return (
+    value.expression.trim().length > 0 &&
+    new TextEncoder().encode(value.expression).length <= 4096 &&
+    value.multiplier.length <= 32 &&
+    /^\d+(?:\.\d+)?$/.test(value.multiplier) &&
+    /[1-9]/.test(value.multiplier)
+  );
+}
+
+export type StaticRetailPriceLeaf = { items: unknown[] };
+export type RetailPriceLeaf = StaticRetailPriceLeaf | NewApiExpressionPrice;
 export type RetailPriceRule = { id: string; label: string; condition: string | Record<string, unknown>; price: RetailPriceLeaf };
 export type RetailPriceGroup = { modelGroupID: string; rules: RetailPriceRule[]; base: RetailPriceLeaf | null };
 export type RetailPriceDocument = { schema: 'group-conditional-price-v1'; global: RetailPriceLeaf | null; groups: RetailPriceGroup[] };
@@ -59,7 +95,8 @@ export type RetailPriceDocument = { schema: 'group-conditional-price-v1'; global
 // Keep leaf JSON intact: tiers, cache variants and dimensions belong to the
 // canonical backend parser and must survive editing another branch.
 export function readRetailPriceDocument(value: unknown): RetailPriceDocument | null {
-  const leaf = (v: unknown): v is RetailPriceLeaf => record(v) && Array.isArray(v.items);
+  const leaf = (v: unknown): v is RetailPriceLeaf =>
+    isNewApiExpressionPrice(v) || (record(v) && !Object.hasOwn(v, 'kind') && Array.isArray(v.items));
   if (leaf(value)) return { schema: 'group-conditional-price-v1', global: value, groups: [] };
   if (
     !record(value) ||
@@ -100,7 +137,7 @@ export function readRetailPriceDocument(value: unknown): RetailPriceDocument | n
   return value as RetailPriceDocument;
 }
 
-export function writeSimpleRetailPrice(price: SimpleRetailPrice): RetailPriceLeaf {
+export function writeSimpleRetailPrice(price: SimpleRetailPrice): StaticRetailPriceLeaf {
   if (price.mode === 'request') {
     if (!DECIMAL_PATTERN.test(price.flatFee)) throw new Error('Invalid request price');
     return { items: [{ itemCode: 'request', pricing: { mode: 'flat_fee', flatFee: price.flatFee } }] };
@@ -135,6 +172,10 @@ export function validateEditorDocument(value: unknown): string | null {
   );
   if (!leaves.length || doc.groups.some((group) => !group.base && !group.rules.length)) return 'models.groupPrice.invalidDocument';
   for (const leaf of leaves) {
+    if (isNewApiExpressionPrice(leaf)) {
+      if (!validNewApiExpressionDraft(leaf)) return 'models.expressionPrice.invalid';
+      continue;
+    }
     if (!leaf.items.length) return 'models.groupPrice.invalidLeaf';
     const simple = readSimpleRetailPrice(leaf);
     if (simple) {

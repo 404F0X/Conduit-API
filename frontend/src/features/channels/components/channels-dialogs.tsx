@@ -1,7 +1,6 @@
 import { useEffect } from 'react';
 import { useChannels } from '../context/channels-context';
 import { ChannelOperationsWorkspace } from './channel-operations-workspace';
-import { ChannelQuickCreateDialog } from './channel-quick-create-dialog';
 import { ChannelsActionDialog } from './channels-action-dialog';
 import { ChannelsArchiveDialog } from './channels-archive-dialog';
 import { ChannelsAutomationDialog } from './channels-automation-dialog';
@@ -19,7 +18,6 @@ import { ChannelsDisabledAPIKeysDialog } from './channels-disabled-api-keys-dial
 import { ChannelsEndpointsDialog } from './channels-endpoints-dialog';
 import { ChannelsErrorResolvedDialog } from './channels-error-resolved-dialog';
 import { ChannelsModelMappingDialog } from './channels-model-mapping-dialog';
-import { ChannelsModelPriceDialog } from './channels-model-price-dialog';
 import { ChannelsOverrideDialog } from './channels-override-dialog';
 import { ChannelsProxyDialog } from './channels-proxy-dialog';
 import { ChannelsQuotaProbeDialog } from './channels-quota-probe-dialog';
@@ -30,6 +28,7 @@ import { ChannelsTestAPIKeysDialog } from './channels-test-api-keys-dialog';
 import { ChannelsTestDialog } from './channels-test-dialog';
 import { ChannelsTestHistoryDrawer } from './channels-test-history-drawer';
 import { ChannelsTransformOptionsDialog } from './channels-transform-options-dialog';
+import { LazyChannelsModelPriceDialog } from './lazy-channels-model-price-dialog';
 
 export function ChannelsDialogs() {
   const { open, setOpen, currentRow, setCurrentRow, selectedChannels } = useChannels();
@@ -43,12 +42,6 @@ export function ChannelsDialogs() {
   return (
     <>
       <ChannelsSystemSettingsDialog />
-      <ChannelQuickCreateDialog
-        open={open === 'quickAdd'}
-        onOpenChange={(isOpen) => setOpen(isOpen ? 'quickAdd' : null)}
-        onUseFullForm={() => setOpen('add')}
-      />
-
       <ChannelsActionDialog key='channel-add' open={open === 'add'} onOpenChange={(isOpen) => setOpen(isOpen ? 'add' : null)} />
 
       <ChannelsBulkArchiveDialog />
@@ -163,7 +156,7 @@ export function ChannelsDialogs() {
             currentRow={currentRow}
           />
 
-          <ChannelsModelPriceDialog />
+          <LazyChannelsModelPriceDialog />
 
           <ChannelsOverrideDialog
             key={`channel-overrides-${currentRow.id}`}

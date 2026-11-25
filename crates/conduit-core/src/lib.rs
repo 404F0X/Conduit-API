@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod newapi_billing_expression;
 pub mod objects;
 
 pub use error::{

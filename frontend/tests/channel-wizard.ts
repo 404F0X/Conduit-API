@@ -1,7 +1,6 @@
 import { expect, type Locator, type Page } from '@playwright/test';
 
 export async function enterChannelConfiguration(dialog: Locator, provider = 'openai') {
-  await dialog.getByRole('button', { name: /^(Use full form|使用完整表单)$/ }).click();
   await dialog.getByTestId(`provider-${provider}`).click();
   await dialog.getByRole('button', { name: /^(Next|下一步)$/ }).click();
   await expect(dialog.getByRole('tab', { name: /^(Connection & models|连接与模型)$/ })).toBeVisible();
@@ -45,6 +44,8 @@ export async function createDisabledChannelFixture(page: Page, name: string, bas
   await dialog.getByTestId('channel-submit-button').click();
   const response = await creation;
   expect(response.ok()).toBe(true);
-  expect((await response.json()).errors).toBeUndefined();
+  const result = await response.json();
+  expect(result.errors).toBeUndefined();
   await expect(dialog).not.toBeVisible();
+  return result.data.createChannel.id as string;
 }

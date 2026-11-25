@@ -155,7 +155,8 @@ pub const MODEL_PRICE_FORMULAS_SCHEMA_VERSION: &str = "000039";
 pub const USER_MODEL_GROUPS_SCHEMA_VERSION: &str = "000040";
 pub const PAYMENT_TOPUPS_SCHEMA_VERSION: &str = "000041";
 pub const GOVERNANCE_ACCOUNTING_LOCK_ORDER_SCHEMA_VERSION: &str = "000042";
-pub const LATEST_SCHEMA_VERSION: &str = GOVERNANCE_ACCOUNTING_LOCK_ORDER_SCHEMA_VERSION;
+pub const EXPRESSION_USAGE_FACTS_SCHEMA_VERSION: &str = "000043";
+pub const LATEST_SCHEMA_VERSION: &str = EXPRESSION_USAGE_FACTS_SCHEMA_VERSION;
 pub const SCHEMA_MIGRATIONS_TABLE: &str = "schema_migrations";
 
 // Keep this stable across releases: an instance running an older binary must
@@ -368,6 +369,10 @@ const EMBEDDED_MIGRATIONS: &[EmbeddedMigration] = &[
         sql: include_str!(
             "../../../migrations/postgres/000042_governance_accounting_lock_order.sql"
         ),
+    },
+    EmbeddedMigration {
+        version: EXPRESSION_USAGE_FACTS_SCHEMA_VERSION,
+        sql: include_str!("../../../migrations/postgres/000043_expression_usage_facts.sql"),
     },
 ];
 
@@ -725,15 +730,15 @@ mod tests {
             migrations.last().map(|migration| migration.version),
             Some(LATEST_SCHEMA_VERSION)
         );
-        assert_eq!(migrations.len(), 39);
+        assert_eq!(migrations.len(), 40);
         assert_eq!(
             migrations[36..]
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec!["000040", "000041", "000042"]
+            vec!["000040", "000041", "000042", "000043"]
         );
-        for version in ["000040", "000041", "000042"] {
+        for version in ["000040", "000041", "000042", "000043"] {
             assert_eq!(
                 migrations
                     .iter()

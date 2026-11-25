@@ -118,6 +118,83 @@ struct ResolvedChannelPrice {
     currency_code: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CapturedProviderPrice {
+    reference: String,
+    currency: String,
+    pricing: Value,
+    accounting: Option<AccountingSettings>,
+    qualified_usage_contract: bool,
+}
+
+pub(crate) struct PgProviderPriceSource(pub sqlx::PgPool);
+
+#[async_trait]
+impl conduit_pipeline::pipeline::ProviderPriceSource for PgProviderPriceSource {
+    async fn capture(
+        &self,
+        channel: &str,
+        model: &str,
+        selected_format: &str,
+    ) -> Result<Option<Value>, String> {
+        let channel = channel
+            .parse::<i64>()
+            .map_err(|_| "invalid procurement channel identity")?;
+        let mut tx = self
+            .0
+            .begin()
+            .await
+            .map_err(|_| "procurement snapshot transaction unavailable")?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| "procurement snapshot unavailable")?;
+        let captured = sqlx::query_as::<_, (String, String, sqlx::types::Json<Value>, String, sqlx::types::Json<Value>, sqlx::types::Json<Value>)>(
+            "SELECT p.reference_id,p.currency_code,p.price,c.type,COALESCE(c.settings,'{}'::jsonb),COALESCE(c.endpoints,'[]'::jsonb) FROM channel_model_prices p
+             JOIN channels c ON c.id=p.channel_id WHERE p.channel_id=$1 AND p.model_id=$2 AND p.deleted_at=0 AND c.deleted_at=0"
+        ).bind(channel).bind(model).fetch_optional(&mut *tx).await.map_err(|_| "procurement price lookup failed")?;
+        let Some((
+            reference,
+            currency,
+            sqlx::types::Json(pricing),
+            channel_type,
+            sqlx::types::Json(channel_settings),
+            sqlx::types::Json(channel_endpoints),
+        )) = captured
+        else {
+            return Ok(None);
+        };
+        let accounting = if pricing.get("kind").is_some() {
+            Some(
+                crate::usage_charge_settler_postgres::load_accounting_settings_from(&mut *tx)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let value = serde_json::to_value(CapturedProviderPrice {
+            reference,
+            currency,
+            pricing,
+            accounting,
+            qualified_usage_contract:
+                crate::wiring_postgres_pricing_admission::expression_channel_supported(
+                    &channel_type,
+                    &channel_endpoints,
+                    &channel_settings,
+                ) && conduit_orchestrator::orchestrator::supports_expression_usage_facts(
+                    &channel_type,
+                    selected_format,
+                ),
+        })
+        .map_err(|_| "procurement price snapshot invalid")?;
+        tx.commit()
+            .await
+            .map_err(|_| "procurement price snapshot transaction failed")?;
+        Ok(Some(value))
+    }
+}
+
 struct AccountingConversionAudit {
     source_currency: String,
     source_total: Decimal,
@@ -943,7 +1020,17 @@ impl RequestRecorder for UsageLogRecorder {
         match settler.reserve_request(input).await {
             Ok(Some(key)) => {
                 ctx.metadata
-                    .insert("billing_reservation_key".to_string(), key);
+                    .insert("billing_reservation_key".into(), key.clone());
+                if let Some(pool) = self.postgres_pool() {
+                    ctx.requires_expression_usage_facts =
+                        crate::usage_charge_settler_postgres::reservation_requires_expression_usage(pool, &key)
+                            .await.map_err(|_| ConduitError::internal("expression admission snapshot lookup failed"))?;
+                    if ctx.requires_expression_usage_facts {
+                        ctx.expression_admission_channel_ids =
+                            crate::wiring_postgres_pricing_admission::expression_admission_channel_ids(pool)
+                                .await.map_err(ConduitError::internal)?;
+                    }
+                }
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -998,13 +1085,20 @@ impl RequestRecorder for UsageLogRecorder {
         // field — the provider's model is in the JSON body's top-level "model"
         // key — because the pipeline does not currently stamp `actual_model`
         // onto the orchestrator context.
-        let model = response
-            .json_body
+        let model = ctx
+            .provider_price_snapshot
             .as_ref()
-            .and_then(|body| body.get("model"))
-            .and_then(Value::as_str)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
+            .filter(|snapshot| snapshot.channel_id == attempt.channel_id)
+            .map(|snapshot| snapshot.upstream_model.clone())
+            .or_else(|| {
+                response
+                    .json_body
+                    .as_ref()
+                    .and_then(|body| body.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| Self::resolve_model(ctx));
         self.persist_route_explanation(
             ctx,
@@ -1025,8 +1119,35 @@ impl RequestRecorder for UsageLogRecorder {
         // computes `total_cost`; a miss (no repo, disabled channel, unpriced
         // model, or parse error) leaves the S11 no-cost fallback so token
         // accounting still records.
-        let resolved_price = match channel_id {
-            Some(cid) if !model.is_empty() => self.resolve_price(&svc_ctx, cid, &model).await,
+        let captured = ctx
+            .provider_price_snapshot
+            .as_ref()
+            .map(|snapshot| match &snapshot.price {
+                Ok(Some(value)) => serde_json::from_value::<CapturedProviderPrice>(value.clone())
+                    .map(Some)
+                    .map_err(|_| "procurement price snapshot invalid".to_string()),
+                Ok(None) => Ok(None),
+                Err(error) => Err(error.clone()),
+            });
+        let expression = captured
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|value| value.as_ref())
+            .filter(|value| value.pricing.get("kind").is_some());
+        let capture_error = captured.as_ref().and_then(|result| result.as_ref().err());
+        let resolved_price = match (captured.as_ref(), channel_id) {
+            (Some(Ok(Some(value))), _) if expression.is_none() => {
+                serde_json::from_value::<ModelPrice>(value.pricing.clone())
+                    .ok()
+                    .map(|price| ResolvedChannelPrice {
+                        price,
+                        reference_id: value.reference.clone(),
+                        currency_code: value.currency.clone(),
+                    })
+            }
+            (None, Some(cid)) if !model.is_empty() => {
+                self.resolve_price(&svc_ctx, cid, &model).await
+            }
             _ => None,
         };
 
@@ -1061,6 +1182,8 @@ impl RequestRecorder for UsageLogRecorder {
         let usage = match response.usage.as_ref() {
             Some(usage) if !usage.is_zero() => usage,
             _ if retail_flat_fee
+                || expression.is_some()
+                || capture_error.is_some()
                 || resolved_price
                     .as_ref()
                     .is_some_and(|resolved| Self::has_request_flat_fee(&resolved.price)) =>
@@ -1152,12 +1275,43 @@ impl RequestRecorder for UsageLogRecorder {
         if let Some(audit) = conversion_audit {
             audit.attach_to_cost_items(&mut input.cost_items);
         }
+        if let Some(captured) = expression {
+            use rust_decimal::prelude::ToPrimitive;
+            let result = (|| -> Result<(Decimal, Decimal), String> {
+                if !captured.qualified_usage_contract {
+                    return Err("EXPR_REQUIRES_UNPROVEN_USAGE_FACTS: the actual outbound protocol cannot establish complete expression facts".into());
+                }
+                let price: conduit_core::objects::newapi_price::NewApiPrice =
+                    serde_json::from_value(captured.pricing.clone())
+                        .map_err(|_| "invalid approved procurement expression")?;
+                let usd = price.evaluate(usage.new_api_token_facts()?)?;
+                let accounting = captured
+                    .accounting
+                    .as_ref()
+                    .ok_or("procurement accounting snapshot unavailable")?;
+                Ok((usd, accounting.real_to_accounting(usd, "USD")?))
+            })();
+            input.cost_price_reference_id = Some(captured.reference.clone());
+            input.total_cost = result.as_ref().ok().and_then(|(_, amount)| amount.to_f64());
+            let audit = match result {
+                Ok((usd, amount)) => {
+                    json!({"status":"priced","amountUSD":usd.to_string(),"accountingAmount":amount.to_string()})
+                }
+                Err(error) => json!({"status":"unavailable","diagnostic":error}),
+            };
+            input.cost_items =
+                json!([{"itemCode":"new_api_expression","billingExpressionAudit":audit}]);
+        } else if let Some(error) = capture_error {
+            input.total_cost = None;
+            input.cost_items = json!([{"itemCode":"procurement_snapshot","billingExpressionAudit":{"status":"unavailable","diagnostic":error}}]);
+        }
         let created = if let Some(journal) = &self.journal {
             let request_key = ctx
                 .metadata
                 .get(BILLING_ADMISSION_REQUEST_KEY_METADATA)
                 .ok_or_else(|| ConduitError::internal("missing metering admission key"))?;
             let event = crate::usage_recovery::MeteredEvent {
+                billing_token_facts: usage.billing_token_facts().ok(),
                 version: 1,
                 event_key: crate::usage_recovery::event_key(request_key),
                 reservation_key: ctx.metadata.get("billing_reservation_key").cloned(),
@@ -1935,6 +2089,92 @@ mod tests {
         let stored = stream_chunks_value(&chunks);
         assert!(stored.is_array());
         assert_eq!(stored[0]["json_data"]["delta"], "hello");
+    }
+
+    #[tokio::test]
+    async fn expression_procurement_preserves_reference_and_records_unavailable_cost()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_db::repo::usage_repo::{UsageListQuery, UsageRepo};
+        use conduit_llm::usage::{
+            BillingTokenCount as Count, BillingTokenFacts, BillingTokenProtocol,
+        };
+        let repo = Arc::new(InMemoryUsageRepo::new());
+        let recorder = UsageLogRecorder::new(repo.clone());
+        let accounting = AccountingSettings {
+            exchange_rates: vec![conduit_core::objects::money::CurrencyExchangeRate {
+                currency: "USD".into(),
+                quote_per_accounting_unit: Decimal::new(5, 1),
+            }],
+            ..Default::default()
+        };
+        let captured = CapturedProviderPrice {
+            reference: "approved-version-A".into(),
+            currency: "USD".into(),
+            accounting: Some(accounting),
+            qualified_usage_contract: true,
+            pricing: json!({"kind":"NEW_API_EXPRESSION","profile":"conduit-newapi-token-v1","version":1,"expression":"p * 1000","multiplier":"1.5"}),
+        };
+        let mut ctx = OrchestratorContext::new();
+        ctx.provider_price_snapshot = Some(conduit_pipeline::pipeline::ProviderPriceSnapshot {
+            channel_id: "7".into(),
+            upstream_model: "native-model".into(),
+            price: Ok(Some(serde_json::to_value(captured)?)),
+        });
+        let attempt = succeeded_attempt(1, "7");
+        let mut complete = response_with_usage(1000, 0);
+        complete
+            .usage
+            .as_mut()
+            .unwrap()
+            .set_billing_token_facts(BillingTokenFacts {
+                version: 1,
+                protocol: BillingTokenProtocol::Anthropic,
+                complete: true,
+                input: Count::Present(1000),
+                output: Count::Present(0),
+                cache_read: Count::Present(0),
+                cache_write_total: Count::Present(0),
+                cache_write_1h: Count::SemanticZero,
+                cache_write_12h: Count::SemanticZero,
+            });
+        recorder
+            .record_success(&ctx, "1", "1", &attempt, &complete)
+            .await?;
+        let missing_repo = Arc::new(InMemoryUsageRepo::new());
+        let missing_recorder = UsageLogRecorder::new(missing_repo.clone());
+        missing_recorder
+            .record_success(&ctx, "2", "1", &attempt, &response_with_usage(1000, 0))
+            .await?;
+        let admin = RequestContext::new(PolicyContext::new(conduit_db::Principal::system()));
+        let query = UsageListQuery {
+            project_id: "1".into(),
+            limit: 10,
+            ..Default::default()
+        };
+        let rows = repo.list_usage(&admin, &query).await?.rows;
+        let good = rows.iter().find(|row| row.request_id == "1").unwrap();
+        assert_eq!(good.model_id, "native-model");
+        assert_eq!(good.total_cost, Some(3.0));
+        assert_eq!(
+            good.cost_price_reference_id.as_deref(),
+            Some("approved-version-A")
+        );
+        let missing_rows = missing_repo.list_usage(&admin, &query).await?.rows;
+        let missing = missing_rows
+            .iter()
+            .find(|row| row.request_id == "2")
+            .unwrap();
+        assert_eq!(missing.total_cost, None);
+        assert_eq!(missing.prompt_tokens, 1000);
+        assert_eq!(
+            missing.cost_price_reference_id.as_deref(),
+            Some("approved-version-A")
+        );
+        assert_eq!(
+            missing.cost_items[0]["billingExpressionAudit"]["status"],
+            "unavailable"
+        );
+        Ok(())
     }
 
     #[tokio::test]

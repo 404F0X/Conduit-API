@@ -3045,6 +3045,7 @@ pub struct AnthropicStreamReducer {
     stream_id: String,
     stream_model: String,
     stream_usage: Option<Value>,
+    billing_usage: Option<conduit_llm::usage::BillingTokenFacts>,
     tool_index: i64,
     /// `tool_index` → stored tool-call (id + transformer metadata). Mirrors Go's
     /// `state.toolCalls map[int]*llm.ToolCall`.
@@ -3079,6 +3080,7 @@ impl AnthropicStreamReducer {
             }
             AnthropicStreamEvent::Unknown => Ok(None),
             AnthropicStreamEvent::Error { detail } => {
+                self.billing_usage = None;
                 // Go returns the error directly rather than wrapping in a response;
                 // surface as an ConduitError so the caller can decide.
                 Err(ConduitError::upstream(detail.message.clone())
@@ -3099,7 +3101,13 @@ impl AnthropicStreamReducer {
                 let mut resp = self.base_chunk();
                 if let Some(usage) = &usage {
                     self.stream_usage = Some(usage.clone());
+                    let mut facts = anthropic_billing_token_facts(usage, false);
+                    facts.output = conduit_llm::usage::BillingTokenCount::Missing;
+                    self.billing_usage = Some(facts);
                     resp.usage = convert_anthropic_usage(usage);
+                    if let (Some(usage), Some(facts)) = (&mut resp.usage, self.billing_usage) {
+                        usage.set_billing_token_facts(facts);
+                    }
                     if let Some(tier) = service_tier {
                         resp.service_tier = Some(tier);
                     }
@@ -3269,6 +3277,26 @@ impl AnthropicStreamReducer {
             } => {
                 // Merge usage (final usage information).
                 if let Some(new_usage) = &usage {
+                    use conduit_llm::usage::BillingTokenCount::Missing;
+                    let delta = anthropic_billing_token_facts(new_usage, false);
+                    if let Some(facts) = &mut self.billing_usage {
+                        if delta.input != Missing {
+                            facts.input = delta.input;
+                        }
+                        if delta.cache_read != Missing {
+                            facts.cache_read = delta.cache_read;
+                        }
+                        if delta.cache_write_total != Missing {
+                            facts.cache_write_total = delta.cache_write_total;
+                            // A refreshed aggregate without a split cannot attest to the old split.
+                            facts.cache_write_1h = delta.cache_write_1h;
+                        } else if delta.cache_write_1h != Missing {
+                            facts.cache_write_1h = delta.cache_write_1h;
+                        }
+                        facts.output = delta.output;
+                    }
+                }
+                if let Some(new_usage) = &usage {
                     let mut merged = new_usage.clone();
                     if let Some(prev) = &self.stream_usage {
                         // Preserve prompt_tokens / details from message_start if new omits them.
@@ -3299,6 +3327,9 @@ impl AnthropicStreamReducer {
                 }
                 if let Some(usage) = &self.stream_usage {
                     resp.usage = convert_anthropic_usage(usage);
+                    if let (Some(usage), Some(facts)) = (&mut resp.usage, self.billing_usage) {
+                        usage.set_billing_token_facts(facts);
+                    }
                 }
                 Ok(Some(resp))
             }
@@ -3308,6 +3339,10 @@ impl AnthropicStreamReducer {
                 resp.choices = Vec::new();
                 if let Some(usage) = &self.stream_usage {
                     resp.usage = convert_anthropic_usage(usage);
+                    if let (Some(usage), Some(mut facts)) = (&mut resp.usage, self.billing_usage) {
+                        facts.complete = true;
+                        usage.set_billing_token_facts(facts);
+                    }
                 }
                 Ok(Some(resp))
             }
@@ -3453,6 +3488,52 @@ fn map_anthropic_stop_reason(reason: &str) -> String {
 /// `input_tokens` → `prompt_tokens`, `output_tokens` → `completion_tokens`,
 /// `cache_*_input_tokens` → prompt token details, and service_tier carried via
 /// `extra`. Provider-specific fields ride in `extra`/`metadata` losslessly.
+fn anthropic_billing_token_facts(
+    raw: &Value,
+    complete: bool,
+) -> conduit_llm::usage::BillingTokenFacts {
+    use conduit_llm::usage::{BillingTokenCount as Count, BillingTokenFacts, BillingTokenProtocol};
+
+    let count = |name| Count::from_raw(raw.get(name));
+    let nullable_count = |name| Count::from_raw(raw.get(name).filter(|value| !value.is_null()));
+    let total = nullable_count("cache_creation_input_tokens");
+    let split = raw.get("cache_creation").filter(|value| !value.is_null());
+    let detail = |name| match split {
+        Some(value) if !value.is_object() => Count::Invalid,
+        _ => Count::from_raw(split.and_then(|value| value.get(name))),
+    };
+    let short = detail("ephemeral_5m_input_tokens");
+    let long = detail("ephemeral_1h_input_tokens");
+    let long = match (long, short, total) {
+        (Count::Invalid, _, _) | (_, Count::Invalid, _) => Count::Invalid,
+        (Count::Present(one_hour), Count::Present(short), Count::Present(total))
+            if short
+                .checked_add(one_hour)
+                .is_none_or(|split| split > total) =>
+        {
+            Count::Invalid
+        }
+        (_, Count::Present(short), Count::Present(total)) if short > total => Count::Invalid,
+        (Count::Missing, _, Count::Present(0)) => Count::SemanticZero,
+        (Count::Missing, Count::Present(short), Count::Present(total)) if short == total => {
+            Count::SemanticZero
+        }
+        (count, _, _) => count,
+    };
+    BillingTokenFacts {
+        version: 1,
+        protocol: BillingTokenProtocol::Anthropic,
+        complete,
+        input: count("input_tokens"),
+        output: count("output_tokens"),
+        cache_read: nullable_count("cache_read_input_tokens"),
+        cache_write_total: total,
+        cache_write_1h: long,
+        // The Anthropic cache-write protocol supports 5m and 1h only.
+        cache_write_12h: Count::SemanticZero,
+    }
+}
+
 fn convert_anthropic_usage(usage: &Value) -> Option<conduit_llm::Usage> {
     use conduit_llm::{TokenDetails, Usage};
     if usage.is_null() {
@@ -3479,7 +3560,9 @@ fn convert_anthropic_usage(usage: &Value) -> Option<conduit_llm::Usage> {
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let prompt_tokens = input_tokens + cache_read + cache_creation;
+    let prompt_tokens = input_tokens
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation);
     let mut prompt_details = TokenDetails {
         cached_tokens: cache_read,
         write_cached_tokens: cache_creation,
@@ -3510,7 +3593,7 @@ fn convert_anthropic_usage(usage: &Value) -> Option<conduit_llm::Usage> {
     Some(Usage {
         prompt_tokens,
         completion_tokens,
-        total_tokens: prompt_tokens + completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
         prompt_details,
         ..Default::default()
     })
@@ -5738,7 +5821,11 @@ fn convert_anthropic_message_to_llm_response(msg: &Value) -> TransformerResult<L
         .map(map_anthropic_stop_reason);
 
     // Usage mapping.
-    let usage = msg.get("usage").and_then(convert_anthropic_usage);
+    let usage = msg.get("usage").and_then(|raw| {
+        let mut usage = convert_anthropic_usage(raw)?;
+        usage.set_billing_token_facts(anthropic_billing_token_facts(raw, true));
+        Some(usage)
+    });
 
     // Build the unified LlmMessage.
     let message = LlmMessage {
@@ -11852,6 +11939,61 @@ mod tests {
     /// tokens, so `billable_prompt_tokens` (prompt - read - write) leaves
     /// exactly Anthropic's `input_tokens`, and the round trip back to the
     /// Anthropic shape is lossless.
+    #[test]
+    fn expression_facts_anthropic_requires_terminal_usage() -> TransformerResult<()> {
+        let mut reducer = AnthropicStreamReducer::new();
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":20,"cache_creation_input_tokens":14,"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":10}}}}"#;
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}"#;
+        let stop = r#"{"type":"message_stop"}"#;
+        for data in [start, delta] {
+            let usage = reducer
+                .next_event(parse_anthropic_sse_event(None, data))?
+                .and_then(|reply| reply.usage)
+                .expect("stream usage");
+            assert!(usage.new_api_token_facts().is_err());
+        }
+        let usage = reducer
+            .next_event(parse_anthropic_sse_event(None, stop))?
+            .and_then(|reply| reply.usage)
+            .expect("terminal stream usage");
+        let facts = usage.new_api_token_facts().expect("complete native usage");
+        assert_eq!((facts.input, facts.output, facts.cache_read), (100, 8, 20));
+        assert_eq!(
+            (
+                facts.cache_write,
+                facts.cache_write_1h,
+                facts.cache_write_12h
+            ),
+            (4, 10, 0)
+        );
+        assert!(!facts.input_includes_cache);
+        Ok(())
+    }
+
+    #[test]
+    fn expression_facts_anthropic_distinguishes_unknown_and_proven_zero() -> TransformerResult<()> {
+        let mut raw = json!({
+            "id": "msg_x", "model": "claude", "role": "assistant", "content": [],
+            "usage": {"input_tokens": 100, "output_tokens": 8, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 14}
+        });
+        let to_usage = |raw: &Value| {
+            convert_anthropic_message_to_llm_response(raw).map(|reply| reply.usage.expect("usage"))
+        };
+        assert!(to_usage(&raw)?.new_api_token_facts().is_err());
+        raw["usage"]["cache_creation_input_tokens"] = json!(0);
+        raw["usage"]["cache_creation"] = Value::Null;
+        assert_eq!(
+            to_usage(&raw)?
+                .new_api_token_facts()
+                .expect("zero writes")
+                .cache_write_1h,
+            0
+        );
+        raw["usage"]["cache_creation"] = json!({"ephemeral_1h_input_tokens": -1});
+        assert!(to_usage(&raw)?.new_api_token_facts().is_err());
+        Ok(())
+    }
+
     #[test]
     fn anthropic_usage_counts_cache_tokens_in_prompt() {
         let usage = convert_anthropic_usage(&json!({

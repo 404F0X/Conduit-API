@@ -257,6 +257,25 @@ async fn summaries(
         })
         .collect()
 }
+async fn committed_provider_detail(
+    pool: &PgPool,
+    viewer: package::PackageViewer,
+    id: i64,
+) -> Result<package::ChangeSetDetail, gql::ChangeSetError> {
+    detail(pool, viewer, id)
+        .await
+        .map_err(|error| match error {
+            // A package and its receipt already exist when loading this response.
+            gql::ChangeSetError::Invalid(message) | gql::ChangeSetError::Query(message) => {
+                gql::ChangeSetError::Storage(message)
+            }
+            other => other,
+        })?
+        .ok_or_else(|| {
+            gql::ChangeSetError::Storage("committed provider price package is missing".into())
+        })
+}
+
 async fn detail(
     pool: &PgPool,
     viewer: package::PackageViewer,
@@ -783,11 +802,21 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
         viewer: package::PackageViewer,
         op: ID,
     ) -> Result<Option<package::CreateChangeSetResult>, gql::ChangeSetError> {
-        let row=sqlx::query_scalar::<_,SqlJson<Value>>("SELECT stage_results->'providerPriceEdit' FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='PROVIDER_PRICE_EDIT'").bind(operation(&op)?).fetch_optional(&self.pool).await.map_err(query_error)?;
+        let row=sqlx::query_scalar::<_,SqlJson<Value>>("SELECT stage_results->'providerPriceEdit' FROM channel_operation_receipts WHERE operation_id=$1 AND operation_type='PROVIDER_PRICE_EDIT'").bind(operation(&op)?).fetch_optional(&self.pool).await.map_err(storage_error)?;
         let Some(r) = row else { return Ok(None) };
-        let id = r.0.get("changeSetID").and_then(Value::as_i64);
+        let id = match (r.0["outcome"].as_str(), r.0.get("changeSetID")) {
+            (Some("CREATED"), Some(value)) => Some(value.as_i64().ok_or_else(|| {
+                gql::ChangeSetError::Storage("invalid provider price receipt package ID".into())
+            })?),
+            (Some("NO_CHANGE"), Some(Value::Null)) => None,
+            _ => {
+                return Err(gql::ChangeSetError::Storage(
+                    "invalid provider price receipt".into(),
+                ));
+            }
+        };
         let d = match id {
-            Some(n) => detail(&self.pool, viewer, n).await?,
+            Some(n) => Some(committed_provider_detail(&self.pool, viewer, n).await?),
             None => None,
         };
         Ok(Some(package::CreateChangeSetResult {
@@ -915,8 +944,8 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
                 package::CreateChangeSetOutcome::NoChange
             },
             change_set_detail: match change_set_id {
-                Some(id) => {
-                    detail(
+                Some(id) => Some(
+                    committed_provider_detail(
                         &self.pool,
                         package::PackageViewer {
                             actor_user_id: actor,
@@ -924,8 +953,8 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
                         },
                         id,
                     )
-                    .await?
-                }
+                    .await?,
+                ),
                 None => None,
             },
         })
@@ -1082,8 +1111,26 @@ impl package::ChangePackageServices for PgChangeSetAdapter {
         .map_err(storage_error)?;
         let before=sqlx::query_scalar::<_,SqlJson<Value>>("SELECT i.price FROM price_book_items i JOIN price_book_versions v ON v.id=i.price_book_version_id WHERE v.reference_id=$1 AND v.price_book_id=$2 AND i.public_model_id=$3").bind(&cs.base_revision).bind(parse_numeric_id(&cs.scope_id,"price book")?).bind(model).fetch_optional(&mut *tx).await.map_err(storage_error)?;
         let after = input.price.0;
-        let error = validate_price_for_type(&after, price_request_type(&model_type)).err();
-        let item_id=sqlx::query_scalar::<_,i64>("INSERT INTO change_set_items(change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,validation_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,now(),now()) ON CONFLICT(change_set_id,item_key) DO UPDATE SET action=EXCLUDED.action,before_snapshot=EXCLUDED.before_snapshot,after_snapshot=EXCLUDED.after_snapshot,source_snapshot=EXCLUDED.source_snapshot,validation_error=EXCLUDED.validation_error,updated_at=now() RETURNING id").bind(id).bind(model.to_string()).bind(if before.is_some(){"update"}else{"create"}).bind(before.clone()).bind(SqlJson(after.clone())).bind(SqlJson(json!({"publicModelID":model,"publicModelKey":key}))).bind(error).fetch_one(&mut *tx).await.map_err(storage_error)?;
+        let mut error = validate_price_for_type(&after, price_request_type(&model_type)).err();
+        let mut source = json!({"publicModelID":model,"publicModelKey":key});
+        if error.is_none() && contains_expression_price(&after) {
+            match crate::wiring_postgres_pricing_admission::expression_retail_route_warnings(
+                &mut tx, model,
+            )
+            .await
+            {
+                Ok(excluded) if !excluded.is_empty() => {
+                    source["warnings"] = json!([{
+                        "code":"EXPR_REQUIRES_UNPROVEN_USAGE_FACTS",
+                        "message":"These channels will be excluded at expression-pricing admission.",
+                        "excludedChannelIDs":excluded,
+                    }]);
+                }
+                Ok(_) => {}
+                Err(message) => error = Some(message),
+            }
+        }
+        let item_id=sqlx::query_scalar::<_,i64>("INSERT INTO change_set_items(change_set_id,item_key,action,before_snapshot,after_snapshot,source_snapshot,validation_error,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,now(),now()) ON CONFLICT(change_set_id,item_key) DO UPDATE SET action=EXCLUDED.action,before_snapshot=EXCLUDED.before_snapshot,after_snapshot=EXCLUDED.after_snapshot,source_snapshot=EXCLUDED.source_snapshot,validation_error=EXCLUDED.validation_error,updated_at=now() RETURNING id").bind(id).bind(model.to_string()).bind(if before.is_some(){"update"}else{"create"}).bind(before.clone()).bind(SqlJson(after.clone())).bind(SqlJson(source)).bind(error).fetch_one(&mut *tx).await.map_err(storage_error)?;
         let item = load_item_in_tx(&mut tx, item_id).await?.into_graphql()?;
         let unchanged = before.as_ref().is_some_and(|v| v.0 == after);
         if unchanged {
@@ -1708,8 +1755,31 @@ fn prepare_provider(
                 "model keys must be nonempty and unique",
             ));
         }
-        let price = crate::conv::model_price_input_to_core(v.price);
-        let after = serde_json::to_value(price).map_err(storage_error)?;
+        let after = match (v.price, v.billing_expression) {
+            (Some(price), None) => {
+                serde_json::to_value(crate::conv::model_price_input_to_core(price))
+                    .map_err(storage_error)?
+            }
+            (None, Some(expression)) => {
+                let price: conduit_core::objects::newapi_price::NewApiPrice =
+                    serde_json::from_value(expression.0.clone()).map_err(|error| {
+                        conflict(
+                            "VALIDATION_FAILED",
+                            format!("invalid billingExpression: {error}"),
+                        )
+                    })?;
+                price
+                    .compile()
+                    .map_err(|error| conflict("VALIDATION_FAILED", error))?;
+                expression.0
+            }
+            _ => {
+                return Err(conflict(
+                    "VALIDATION_FAILED",
+                    "exactly one of price and billingExpression is required",
+                ));
+            }
+        };
         let error = validate_price_for_type(&after, conduit_llm::RequestType::Chat).err();
         values.insert(
             key.clone(),
@@ -1843,8 +1913,13 @@ fn provider_changes(
             continue;
         }
         let error = v.error.clone().or_else(|| {
-            if v.currency != currency {
-                Some(format!("currencyCode must be {currency}"))
+            let expected = if v.after.get("kind").is_some() {
+                "USD"
+            } else {
+                currency
+            };
+            if v.currency != expected {
+                Some(format!("currencyCode must be {expected}"))
             } else {
                 None
             }
@@ -1874,9 +1949,21 @@ fn provider_changes(
     proposals.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(proposals)
 }
+fn contains_expression_price(value: &Value) -> bool {
+    conduit_core::objects::retail_price_plan::RetailPriceDocument::parse(value).is_ok_and(|doc| {
+        doc.leaves()
+            .iter()
+            .any(|leaf| leaf.static_price().is_none())
+    })
+}
+
 fn validate_price(value: &Value) -> Result<(), String> {
     let document = conduit_core::objects::retail_price_plan::RetailPriceDocument::parse(value)?;
-    for price in document.leaves() {
+    for price in document
+        .leaves()
+        .into_iter()
+        .filter_map(|leaf| leaf.static_price())
+    {
         crate::wiring::validate_model_price(price)?;
     }
     Ok(())
@@ -1894,7 +1981,11 @@ fn price_request_type(kind: &str) -> conduit_llm::RequestType {
 fn validate_price_for_type(value: &Value, kind: conduit_llm::RequestType) -> Result<(), String> {
     validate_price(value)?;
     let document = conduit_core::objects::retail_price_plan::RetailPriceDocument::parse(value)?;
-    for price in document.leaves() {
+    for price in document
+        .leaves()
+        .into_iter()
+        .filter_map(|leaf| leaf.static_price())
+    {
         crate::wiring_postgres_pricing_admission::validate_price_coverage(price, kind)?;
     }
     Ok(())
@@ -2122,6 +2213,18 @@ async fn validate_items(
                 .fetch_optional(&mut **tx)
                 .await
                 .map_err(storage_error)?;
+                if item
+                    .after_snapshot
+                    .as_ref()
+                    .is_some_and(|after| contains_expression_price(&after.0))
+                    && let Err(message) =
+                        crate::wiring_postgres_pricing_admission::expression_retail_route_warnings(
+                            tx, model,
+                        )
+                        .await
+                {
+                    error = Some(message);
+                }
                 if let Some(kind) = model_type {
                     if let Some(after) = item.after_snapshot.as_ref() {
                         if let Err(message) =

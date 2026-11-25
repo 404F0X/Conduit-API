@@ -316,7 +316,8 @@ test('editor raw/visual switch retains complex leaves; invalid raw blocks parent
   let tree = root.render(props());
   const leaf = nodes(tree).find((node) => typeof node.type === 'function' && node.type.name === 'LeafEditor');
   const child = mount(leaf.type, leaf.props);
-  let childNodes = nodes(child.render());
+  const staticEditor = nodes(child.render()).find((node) => typeof node.type === 'function' && node.type.name === 'StaticLeafEditor');
+  const childNodes = nodes(mount(staticEditor.type, staticEditor.props).render());
   assert.equal(childNodes.find((node) => node.props?.children === 'models.groupPrice.visual').props.disabled, true);
   const raw = childNodes.find((node) => node.type === 'Textarea');
   raw.props.onChange({ target: { value: '{invalid' } });
@@ -485,4 +486,88 @@ test('GID draft restoration matches numeric itemKey and retains complete saved p
   assert.deepEqual(nodes.find((node) => node.type === 'GroupRetailPriceEditor').props.value, draftPrice);
   await nodes.find((node) => node.props?.children === '保存变更').props.onClick();
   assert.deepEqual(saves[0].price, draftPrice);
+});
+
+const expressionLeaf = {
+  kind: 'NEW_API_EXPRESSION',
+  profile: 'conduit-newapi-token-v1',
+  version: 1,
+  expression: 'p * 2 + c * 7',
+  multiplier: '1.000000000000000000000000001',
+};
+
+test('retail proposal preserves expression leaf source and decimal multiplier in global, base and ordered rules', async () => {
+  const price = {
+    schema: 'group-conditional-price-v1',
+    global: expressionLeaf,
+    groups: [
+      {
+        modelGroupID: groupID,
+        base: { ...expressionLeaf, expression: 'fixed(2)', multiplier: '1' },
+        rules: [
+          { id: 'one', label: 'first', condition: 'prompt_tokens >= 1000', price: { ...expressionLeaf, expression: 'p * 6' } },
+          { id: 'two', label: 'second', condition: 'prompt_tokens >= 5', price: { items: [flat] } },
+        ],
+      },
+    ],
+  };
+  const { nodes, saves } = await panel(price);
+  const save = nodes.find((node) => node.props?.children === '保存变更');
+  assert.equal(Boolean(save.props.disabled), false);
+  await save.props.onClick();
+  assert.deepEqual(saves[0].price, price);
+});
+
+test('editor disallows mixed leaves, nonpositive multipliers and oversized expression source', () => {
+  assert.equal(helper.readRetailPriceDocument({ ...expressionLeaf, items: [flat] }), null);
+  assert.equal(helper.validateEditorDocument({ ...expressionLeaf, multiplier: '0.000' }), 'models.expressionPrice.invalid');
+  assert.equal(helper.validateEditorDocument({ ...expressionLeaf, expression: '表'.repeat(1366) }), 'models.expressionPrice.invalid');
+  assert.equal(helper.validateEditorDocument(expressionLeaf), null);
+});
+
+test('expression preview sends separate cache fields as integer strings and keeps the returned Decimal', async () => {
+  const actualTokens = {
+    promptTokens: '9007199254740993',
+    completionTokens: '12',
+    cacheReadTokens: '4',
+    cacheWriteTokens: '2',
+    cacheWrite1hTokens: '17',
+  };
+  const amountUSD = '0.000000000000000000000001';
+  let variables;
+  let response;
+  const jsx = (type, props) => ({ type, props });
+  const ui = new Proxy({}, { get: (_, name) => name });
+  const { NewApiExpressionEditor } = compile('./new-api-expression-editor.tsx', (id) => {
+    if (id === 'react') return { useState: (value) => [typeof value === 'object' ? actualTokens : false, () => {}] };
+    if (id === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+    if (id === './simple-retail-price') return helper;
+    if (id === 'react-i18next') return { useTranslation: () => ({ t: (key) => key }) };
+    if (id.includes('usePermissions')) return { usePermissions: () => ({ hasSystemScope: () => true }) };
+    if (id === '@tanstack/react-query')
+      return {
+        useMutation: ({ mutationFn }) => ({
+          mutate: async (input) => {
+            response = await mutationFn(input);
+          },
+        }),
+      };
+    if (id === '@/gql/graphql')
+      return {
+        graphqlRequest: async (query, input) => {
+          assert.match(query, /previewNewApiBillingExpression\(input: \$input\)/);
+          variables = input;
+          return { previewNewApiBillingExpression: { amountUSD } };
+        },
+      };
+    return ui;
+  });
+  const editor = NewApiExpressionEditor({ value: expressionLeaf, onChange() {} });
+  const preview = editor.props.children.find((child) => typeof child?.type === 'function');
+  const tree = preview.type(preview.props);
+  const button = tree.props.children.find((child) => child?.props?.children === 'models.expressionPrice.evaluate');
+  assert.equal(button.props.disabled, false);
+  await button.props.onClick();
+  assert.deepEqual(variables, { input: { pricing: expressionLeaf, ...actualTokens, inputIncludesCache: false } });
+  assert.equal(response, amountUSD);
 });

@@ -223,6 +223,10 @@ pub enum OrchestratorResponse {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrchestratorContext {
     pub stages: Vec<OrchestratorStage>,
+    pub stream_billing_facts: Option<conduit_pipeline::pipeline::StreamBillingFacts>,
+    pub requires_expression_usage_facts: bool,
+    pub expression_admission_channel_ids: std::collections::BTreeSet<String>,
+    pub provider_price_snapshot: Option<conduit_pipeline::pipeline::ProviderPriceSnapshot>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -234,6 +238,85 @@ impl OrchestratorContext {
     pub fn record_stage(&mut self, stage: OrchestratorStage) {
         self.stages.push(stage);
     }
+}
+
+pub const UNPROVEN_EXPRESSION_FACTS: &str = "EXPR_REQUIRES_UNPROVEN_USAGE_FACTS";
+
+pub fn supports_expression_usage_facts(channel_type: &str, api_format: &str) -> bool {
+    channel_type == "anthropic" && api_format == "anthropic/messages"
+}
+
+fn filter_expression_candidates(
+    ctx: &OrchestratorContext,
+    candidates: &mut Vec<PipelineCandidate>,
+) -> Result<(), OrchestratorError> {
+    if !ctx.requires_expression_usage_facts {
+        return Ok(());
+    }
+    candidates.retain(|candidate| {
+        supports_expression_usage_facts(&candidate.channel_type, &candidate.api_format)
+            && ctx.expression_admission_channel_ids.contains(&candidate.id)
+            && candidate
+                .endpoint_transport
+                .as_deref()
+                .is_none_or(|transport| transport.is_empty() || transport == "http")
+    });
+    if candidates.is_empty() {
+        return Err(OrchestratorError::new(
+            OrchestratorStage::Quota,
+            ConduitError::invalid_request(
+                "No eligible route provides authenticated expression-pricing token facts",
+            )
+            .with_code(UNPROVEN_EXPRESSION_FACTS),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn expression_admission_filters_unproven_and_non_http_candidates() {
+    let mut native = PipelineCandidate::from("native");
+    native.channel_type = "anthropic".into();
+    native.api_format = "anthropic/messages".into();
+    let mut websocket = native.clone();
+    websocket.endpoint_transport = Some("websocket".into());
+    let mut generic = PipelineCandidate::from("generic");
+    generic.channel_type = "openai".into();
+    generic.api_format = "openai/chat_completions".into();
+    let mut candidates = vec![generic.clone(), websocket.clone(), native];
+    let mut ctx = OrchestratorContext::new();
+    filter_expression_candidates(&ctx, &mut candidates).unwrap();
+    assert_eq!(candidates.len(), 3);
+    ctx.requires_expression_usage_facts = true;
+    ctx.expression_admission_channel_ids = ["native".to_string(), "generic".to_string()]
+        .into_iter()
+        .collect();
+    filter_expression_candidates(&ctx, &mut candidates).unwrap();
+    assert_eq!(candidates[0].id, "native");
+    assert_eq!(candidates.len(), 1);
+    for inbound in ["openai/chat_completions", "anthropic/messages"] {
+        let endpoints = [conduit_core::objects::channel_settings::ChannelEndpoint {
+            api_format: "anthropic/messages".into(),
+            transport: "http".into(),
+            ..Default::default()
+        }];
+        let request =
+            CandidateRequest::new("native-model", conduit_llm::RequestType::Chat, inbound);
+        let endpoint = crate::candidates::select_endpoint(&endpoints, &request).unwrap();
+        assert!(supports_expression_usage_facts(
+            "anthropic",
+            &endpoint.api_format
+        ));
+    }
+    ctx.expression_admission_channel_ids.clear();
+    let mut changed_after_publication = candidates.clone();
+    assert!(filter_expression_candidates(&ctx, &mut changed_after_publication).is_err());
+    assert!(changed_after_publication.is_empty());
+    let mut all_unqualified = vec![generic, websocket];
+    let result = filter_expression_candidates(&ctx, &mut all_unqualified);
+    assert!(format!("{result:?}").contains(UNPROVEN_EXPRESSION_FACTS));
+    assert!(all_unqualified.is_empty());
 }
 
 fn request_sticky_provider(ctx: &OrchestratorContext) -> Option<StaticStickyKeyProvider> {
@@ -1213,7 +1296,7 @@ impl CommandOrchestrator {
             LOAD_BALANCE_STRATEGY_METADATA.to_string(),
             load_balance_strategy.as_str().to_string(),
         );
-        let ordered_candidates = self
+        let mut ordered_candidates = self
             .resolve_ordered_candidates(
                 ctx,
                 request_id,
@@ -1275,6 +1358,7 @@ impl CommandOrchestrator {
             ctx,
             "buffered request future dropped before terminal recording",
         );
+        filter_expression_candidates(ctx, &mut ordered_candidates)?;
 
         // ---- S03 Pipeline: inbound → attempt loop → outbound → execute ----
         // The pipeline owns retry/failover (RUST-P8-002); orchestrator re-checks
@@ -1355,6 +1439,7 @@ impl CommandOrchestrator {
         // operability (debug builds / observability).
         ctx.metadata
             .insert("pipeline_steps".to_string(), pipeline_ctx.order.join(","));
+        ctx.provider_price_snapshot = pipeline_ctx.provider_price_snapshot.clone();
         for key in [
             "actual_model",
             "request_model",
@@ -1966,7 +2051,7 @@ impl CommandOrchestrator {
             LOAD_BALANCE_STRATEGY_METADATA.to_string(),
             load_balance_strategy.as_str().to_string(),
         );
-        let ordered_candidates = self
+        let mut ordered_candidates = self
             .resolve_ordered_candidates(
                 ctx,
                 request_id,
@@ -2025,6 +2110,7 @@ impl CommandOrchestrator {
             ctx,
             "stream request future dropped before finalizer handoff",
         );
+        filter_expression_candidates(ctx, &mut ordered_candidates)?;
 
         // ---- S03 Pipeline (live): retry/fail over before client commitment ----
         let pipeline_retry_policy = runtime_retry_policy
@@ -2157,10 +2243,12 @@ impl CommandOrchestrator {
             }
         };
         let response_content_type = live.content_type.clone();
+        ctx.stream_billing_facts = Some(live.billing_facts.clone());
 
         // The live pipeline owns the attempt-scoped channel/model metadata.
         // Copy the fields needed by the detached usage/cost recorder before
         // moving the pipeline cleanup into its background finalizer task.
+        ctx.provider_price_snapshot = pipeline_ctx.provider_price_snapshot.clone();
         for key in [
             "api_key_id",
             "trace_id",

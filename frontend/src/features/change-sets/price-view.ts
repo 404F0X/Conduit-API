@@ -46,6 +46,8 @@ export function displayAmount(value: unknown): string | null {
 }
 export function updatePriceAmount(price: unknown, code: string, amount: string) {
   const record = structuredClone(objectValue(price));
+  if (record.kind === 'NEW_API_EXPRESSION' || record.schema === 'group-conditional-price-v1')
+    throw new Error('Edit expression and conditional prices in their price editor');
   const items = Array.isArray(record.items) ? record.items.map(objectValue) : [];
   const index = items.findIndex((item) => (item.itemCode ?? item.item_code) === code);
   const old = index >= 0 ? items[index] : { itemCode: code, pricing: { mode: code === 'request' ? 'flat_fee' : 'usage_per_unit' } };
@@ -60,9 +62,11 @@ export function updatePriceAmount(price: unknown, code: string, amount: string) 
 
 export function snapshotFieldValues(snapshot: unknown): Record<string, unknown> {
   const record = objectValue(snapshot);
+  const price = objectValue(record.billingExpression ?? record.price ?? snapshot);
+  if (price.kind === 'NEW_API_EXPRESSION') return { billingExpression: price };
+  if (price.schema === 'group-conditional-price-v1') return { conditionalPrice: price };
   const rows = priceRows(snapshot);
   if (rows.length) {
-    const price = objectValue(record.price ?? snapshot);
     return Object.fromEntries(
       (price.items as unknown[]).map((raw) => {
         const item = objectValue(raw);

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import ts from 'typescript';
+import { createStore } from 'zustand/vanilla';
 
 async function loadSource(path, replacements = []) {
   let source = readFileSync(join(import.meta.dirname, path), 'utf8');
@@ -176,12 +177,17 @@ globalThis.__packageQueryClient = {
     invalidations.push(value.queryKey);
   },
 };
+class TestPackageRequestError extends Error {}
+globalThis.__packageRequestError = TestPackageRequestError;
 const packages = await loadSource('data/change-sets.ts', [
   [
     /import \{ useMutation, useQuery, useQueryClient \} from '@tanstack\/react-query';/,
     `const useMutation=options=>options; const useQuery=options=>options; const useQueryClient=()=>globalThis.__packageQueryClient;`,
   ],
-  [/import \{ graphqlRequest \} from '@\/gql\/graphql';/, `const graphqlRequest=(...args)=>globalThis.__packageTransport(...args);`],
+  [
+    /import \{ GraphQLRequestError, graphqlRequest \} from '@\/gql\/graphql';/,
+    `const GraphQLRequestError=globalThis.__packageRequestError; const graphqlRequest=(...args)=>globalThis.__packageTransport(...args);`,
+  ],
 ]);
 test('summary and lazy detail requests bind filters, cursors and server revisions', async () => {
   response = {
@@ -348,4 +354,310 @@ test('lost proposal response retries the same operation and original target revi
   assert.notEqual(edited.operationID, intent);
   assert.equal(edited.expectedTargetRevision, 'published');
   delete globalThis.__governanceTestRequest;
+});
+
+test('review detects an exact expression change and protects it from conversion by a static editor', () => {
+  const before = {
+    kind: 'NEW_API_EXPRESSION',
+    profile: 'conduit-newapi-token-v1',
+    version: 1,
+    expression: 'p * 2',
+    multiplier: '1.00000000001',
+  };
+  const next = { ...before, multiplier: '1.00000000002' };
+  assert.deepEqual(prices.changedSnapshotFields({ billingExpression: before, price: null }, next), ['billingExpression']);
+  assert.deepEqual(prices.snapshotFieldValues(next), { billingExpression: next });
+  assert.throws(() => prices.updatePriceAmount(next, 'prompt_tokens', '1'), /price editor/);
+});
+
+test('provider dialog checks the exact receipt after a definite create rejection and preserves uncertainty', async () => {
+  const error = new TestPackageRequestError('invalid change set operation: VALIDATION_FAILED: unsupported cc12h');
+  error.providerCreateValidationRejected = true;
+  const rejected = async () => {
+    throw error;
+  };
+  const intent = { channelID: 'channel', operationID: 'same-id', expectedBaseRevision: 'base', input: [] };
+  const existing = { operationID: intent.operationID, outcome: 'CREATED', changeSetDetail: { summary: { id: '1' } } };
+
+  response = { providerPriceChangeSetOperation: null };
+  assert.deepEqual(await packages.createProviderDraftFromDialog(intent, rejected), { validationError: error });
+  assert.deepEqual(calls.at(-1).variables, { operationID: intent.operationID });
+
+  const corrected = {
+    ...intent,
+    operationID: 'corrected-id',
+    input: [{ modelId: 'model', currencyCode: 'USD', billingExpression: { expression: 'fixed(0.1)' } }],
+  };
+  const submitted = [];
+  const created = await packages.createProviderDraftFromDialog(corrected, async (input) => {
+    submitted.push(input);
+    return { ...existing, operationID: input.operationID };
+  });
+  assert.deepEqual(submitted, [corrected]);
+  assert.equal(created.result.changeSetDetail.summary.id, '1');
+  assert.notEqual(created.result.operationID, intent.operationID);
+
+  response = { providerPriceChangeSetOperation: existing };
+  assert.deepEqual(await packages.createProviderDraftFromDialog(intent, rejected), { result: existing, recovered: true });
+  assert.deepEqual(calls.at(-1).variables, { operationID: intent.operationID });
+  assert.deepEqual(await packages.lookupProviderDraftReceipt(intent.operationID), existing);
+
+  const noChange = { operationID: intent.operationID, outcome: 'NO_CHANGE', changeSetDetail: null };
+  response = { providerPriceChangeSetOperation: noChange };
+  assert.deepEqual(await packages.lookupProviderDraftReceipt(intent.operationID), noChange);
+  assert.deepEqual(await packages.createProviderDraftFromDialog(intent, async () => noChange), { result: noChange });
+
+  const invalidReceipts = [
+    {},
+    { ...existing, operationID: 'other' },
+    { ...existing, outcome: 'unknown' },
+    { ...existing, changeSetDetail: null },
+    { operationID: intent.operationID, outcome: 'CREATED' },
+    { ...existing, changeSetDetail: {} },
+    ...['', 'abc', '0', '9223372036854775808'].map((id) => ({ ...existing, changeSetDetail: { summary: { id } } })),
+    { operationID: intent.operationID, outcome: 'NO_CHANGE' },
+    { ...noChange, changeSetDetail: existing.changeSetDetail },
+  ];
+  for (const malformed of [undefined, ...invalidReceipts]) {
+    response = { providerPriceChangeSetOperation: malformed };
+    await assert.rejects(packages.createProviderDraftFromDialog(intent, rejected), /receipt is incomplete/);
+    assert.deepEqual(calls.at(-1).variables, { operationID: intent.operationID });
+    await assert.rejects(
+      packages.createProviderDraftFromDialog(intent, async () => malformed),
+      /receipt is incomplete/
+    );
+  }
+  const oldTransport = globalThis.__packageTransport;
+  try {
+    for (const message of ['validation during lookup', 'Unauthorized', 'Network error']) {
+      const lookupError = new TestPackageRequestError(message);
+      globalThis.__packageTransport = async () => {
+        throw lookupError;
+      };
+      await assert.rejects(packages.createProviderDraftFromDialog(intent, rejected), (actual) => actual === lookupError);
+    }
+  } finally {
+    globalThis.__packageTransport = oldTransport;
+  }
+  const internal = new TestPackageRequestError('STORAGE_FAILED: response detail unavailable');
+  const before = calls.length;
+  await assert.rejects(
+    packages.createProviderDraftFromDialog(intent, async () => {
+      throw internal;
+    }),
+    (actual) => actual === internal
+  );
+  assert.equal(calls.length, before);
+  response = { providerPriceChangeSetOperation: existing };
+  assert.deepEqual(await packages.lookupProviderDraftReceipt(intent.operationID), existing);
+});
+
+const submissionGuard = await loadSource('../channels/components/provider-draft-submission.ts');
+test('provider draft owns the complete lookup and ignores completion from a cancelled session', async () => {
+  const submission = submissionGuard.createProviderDraftSubmission();
+  let resolveLookup;
+  const lookup = new Promise((resolve) => {
+    resolveLookup = resolve;
+  });
+  const current = submission.start();
+  let writes = 0;
+  let releases = 0;
+  const completion = (async () => {
+    await lookup;
+    if (current.isCurrent()) writes++;
+    if (current.finish()) releases++;
+  })();
+  assert.equal(current.isCurrent(), true);
+  assert.equal(submission.start(), null, 'double submit before any UI re-render cannot acquire');
+  submission.invalidate();
+  assert.equal(current.isCurrent(), false);
+  assert.equal(submission.start(), null, 'a reopened dialog waits for the one physical request to finish');
+  resolveLookup();
+  await completion;
+  assert.equal(writes, 0);
+  assert.equal(releases, 1);
+  const reopened = submission.start();
+  assert.equal(current.finish(), false, 'stale finally cannot release the new submission');
+  assert.equal(reopened.isCurrent(), true);
+  assert.equal(reopened.finish(), true);
+});
+
+const testAuth = createStore(() => ({ auth: { user: { id: 'actor-1' }, accessToken: 'test-token' } }));
+globalThis.__providerDraftSessionTest = { createStore, testAuth, packages };
+const sessions = await loadSource('../channels/components/provider-draft-sessions.ts', [
+  [/import \{ createStore \} from 'zustand\/vanilla';/, 'const {createStore}=globalThis.__providerDraftSessionTest;'],
+  [/import \{ GRAPHQL_ENDPOINT \} from '@\/gql\/graphql';/, `const GRAPHQL_ENDPOINT='/admin/graphql';`],
+  [/import \{ useAuthStore \} from '@\/stores\/authStore';/, 'const useAuthStore=globalThis.__providerDraftSessionTest.testAuth;'],
+  [
+    /import \{\s*createProviderDraftFromDialog,[\s\S]*?from '@\/features\/change-sets\/data\/change-sets';/,
+    'const { createProviderDraftFromDialog, createProviderPackage, lookupProviderDraftReceipt }=globalThis.__providerDraftSessionTest.packages;',
+  ],
+]);
+const channelSlot = { actorID: 'actor-1', endpoint: 'https://conduit.invalid/admin/graphql', channelID: 'channel-1' };
+const draftInput = { expectedBaseRevision: 'base', input: [{ modelId: 'example', currencyCode: 'USD', price: { items: [] } }] };
+const receipt = (operationID) => ({ operationID, outcome: 'CREATED', changeSetDetail: { summary: { id: '42' } } });
+const entryFor = (owner, slot = channelSlot) => owner.store.getState().entries[sessions.providerDraftSlotKey(slot)];
+
+test('pending provider price draft survives teardown, 500 ms row removal, and a soft navigation to Models', async () => {
+  let resolveCreate;
+  let calls = 0;
+  const owner = sessions.createProviderDraftSessions(
+    {
+      create: () => {
+        calls++;
+        return new Promise((resolve) => {
+          resolveCreate = resolve;
+        });
+      },
+      lookup: async () => {
+        throw new Error('busy must not look up a receipt');
+      },
+    },
+    () => true,
+    () => 'first-op'
+  );
+  const channelsView = submissionGuard.createProviderDraftSubmission();
+  const ticket = channelsView.start();
+  const operation = owner.start(channelSlot, draftInput);
+  channelsView.invalidate();
+  await new Promise((resolve) => setTimeout(resolve, 510));
+
+  const modelsView = submissionGuard.createProviderDraftSubmission();
+  const modelsTicket = modelsView.start();
+  assert.equal(modelsTicket.isCurrent(), true);
+  assert.equal(entryFor(owner).intent.operationID, 'first-op');
+  assert.equal(entryFor(owner).status, 'busy');
+  assert.equal(owner.start(channelSlot, draftInput), undefined);
+  assert.equal(owner.recover(channelSlot, 'retry'), undefined);
+  assert.equal(owner.recover(channelSlot, 'abandon'), undefined);
+  assert.equal(calls, 1);
+  modelsView.invalidate();
+
+  resolveCreate(receipt('first-op'));
+  await operation;
+  assert.equal(ticket.isCurrent(), false);
+  assert.equal(modelsTicket.isCurrent(), false);
+  assert.deepEqual(entryFor(owner).result, { outcome: 'CREATED', packageID: '42' });
+  assert.equal(owner.start(channelSlot, draftInput), undefined);
+  owner.dismiss(channelSlot);
+  assert.equal(entryFor(owner), undefined);
+});
+
+test('unknown draft uses same receipt and bytes and can be abandoned only after a successful null lookup', async () => {
+  const payloads = [];
+  const lookups = [];
+  let found = null;
+  let lookupError = new Error('offline');
+  let seq = 0;
+  const owner = sessions.createProviderDraftSessions(
+    {
+      create: async (intent) => {
+        payloads.push(JSON.stringify(intent));
+        if (payloads.length < 3) throw new Error('response lost');
+        return receipt(intent.operationID);
+      },
+      lookup: async (id) => {
+        lookups.push(id);
+        if (lookupError) throw lookupError;
+        return found;
+      },
+    },
+    () => true,
+    () => `op-${++seq}`
+  );
+
+  const input = structuredClone(draftInput);
+  await assert.rejects(owner.start(channelSlot, input), /response lost/);
+  input.input[0].modelId = 'unsent edit';
+  assert.equal(entryFor(owner).status, 'unknown');
+  await assert.rejects(owner.recover(channelSlot, 'abandon'), /offline/);
+  assert.equal(entryFor(owner).intent.operationID, 'op-1');
+  lookupError = null;
+  assert.equal(await owner.recover(channelSlot, 'check'), null);
+  assert.equal(entryFor(owner).intent.operationID, 'op-1');
+  await assert.rejects(owner.recover(channelSlot, 'retry'), /response lost/);
+  assert.deepEqual(payloads.slice(0, 2), [payloads[0], payloads[0]]);
+  assert.equal(
+    lookups.every((id) => id === 'op-1'),
+    true
+  );
+
+  found = receipt('op-1');
+  await owner.recover(channelSlot, 'abandon');
+  assert.deepEqual(entryFor(owner).result, { outcome: 'CREATED', packageID: '42' });
+  assert.equal(payloads.length, 2);
+
+  const other = { ...channelSlot, channelID: 'channel-2' };
+  const owner2 = sessions.createProviderDraftSessions(
+    {
+      create: async () => {
+        throw new Error('response lost');
+      },
+      lookup: async () => null,
+    },
+    () => true,
+    () => `op-${++seq}`
+  );
+  await assert.rejects(owner2.start(other, draftInput), /response lost/);
+  await owner2.recover(other, 'abandon');
+  assert.equal(entryFor(owner2, other), undefined);
+  await assert.rejects(owner2.start(other, draftInput), /response lost/);
+  assert.equal(entryFor(owner2, other).intent.operationID, 'op-3');
+});
+
+test('provider session slots isolate actors, API endpoints and channels and clear on sign-out', async () => {
+  let currentActor = 'actor-1';
+  let done;
+  const payloads = [];
+  const owner = sessions.createProviderDraftSessions(
+    {
+      create: (intent) => {
+        payloads.push(intent);
+        if (intent.channelID === 'channel-1')
+          return new Promise((resolve) => {
+            done = resolve;
+          });
+        return Promise.resolve(receipt(intent.operationID));
+      },
+      lookup: async () => null,
+    },
+    (actorID) => actorID === currentActor,
+    () => `op-${payloads.length + 1}`
+  );
+  const first = owner.start(channelSlot, draftInput);
+  const secondChannel = { ...channelSlot, channelID: 'channel-2' };
+  await owner.start(secondChannel, draftInput);
+  assert.equal(entryFor(owner).status, 'busy');
+  assert.equal(entryFor(owner, secondChannel).status, 'complete');
+  assert.notEqual(
+    sessions.providerDraftSlotKey({ ...channelSlot, endpoint: 'https://other.invalid/admin/graphql' }),
+    sessions.providerDraftSlotKey(channelSlot)
+  );
+  currentActor = 'actor-2';
+  owner.clear();
+  assert.equal(owner.start(channelSlot, draftInput), undefined);
+  assert.equal(owner.recover(channelSlot, 'retry'), undefined);
+  assert.equal(entryFor(owner, { ...channelSlot, actorID: currentActor }), undefined);
+  done(receipt('op-1'));
+  assert.equal(await first, undefined);
+  assert.deepEqual(owner.store.getState().entries, {});
+
+  response = { createProviderPriceChangeSet: receipt('observer-op') };
+  const authOwner = sessions.providerDraftSessions;
+  const original = globalThis.__packageTransport;
+  globalThis.__packageTransport = async (query, variables) =>
+    query.includes('CreateProviderPriceChangeSet')
+      ? { createProviderPriceChangeSet: receipt(variables.operationID) }
+      : original(query, variables);
+  try {
+    await authOwner.start(channelSlot, draftInput);
+    assert.equal(entryFor(authOwner).status, 'complete');
+    assert.doesNotMatch(JSON.stringify(authOwner.store.getState()), /test-token|accessToken|credential/);
+    testAuth.setState({ auth: { user: null, accessToken: '' } });
+    assert.deepEqual(authOwner.store.getState().entries, {});
+    testAuth.setState({ auth: { user: { id: channelSlot.actorID }, accessToken: 'new-login' } });
+    assert.equal(entryFor(authOwner), undefined);
+  } finally {
+    globalThis.__packageTransport = original;
+  }
 });

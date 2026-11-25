@@ -73,3 +73,54 @@ pub(crate) fn actor(ctx: &Context<'_>) -> Result<i64, String> {
         .map(|user| user.user_id)
         .map_err(|_| "authentication required".into())
 }
+
+#[derive(async_graphql::InputObject)]
+pub struct NewApiBillingExpressionPreviewInput {
+    pub pricing: async_graphql::Json<serde_json::Value>,
+    pub prompt_tokens: String,
+    pub completion_tokens: String,
+    pub cache_read_tokens: String,
+    pub cache_write_tokens: String,
+    #[graphql(name = "cacheWrite1hTokens")]
+    pub cache_write_1h_tokens: String,
+    pub input_includes_cache: bool,
+}
+
+#[derive(async_graphql::SimpleObject)]
+pub struct NewApiBillingExpressionPreview {
+    #[graphql(name = "amountUSD")]
+    pub amount_usd: String,
+}
+
+impl NewApiBillingExpressionPreviewInput {
+    pub(crate) fn evaluate(self) -> Result<NewApiBillingExpressionPreview, String> {
+        use conduit_core::{
+            newapi_billing_expression::TokenFacts, objects::newapi_price::NewApiPrice,
+        };
+        fn tokens(value: &str, field: &str) -> Result<u64, String> {
+            if value.is_empty()
+                || value.len() > 20
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(format!("{field} must be an unsigned integer string"));
+            }
+            value
+                .parse()
+                .map_err(|_| format!("{field} exceeds the supported range"))
+        }
+        let price: NewApiPrice =
+            serde_json::from_value(self.pricing.0).map_err(|error| error.to_string())?;
+        let amount = price.evaluate(TokenFacts {
+            input: tokens(&self.prompt_tokens, "promptTokens")?,
+            output: tokens(&self.completion_tokens, "completionTokens")?,
+            cache_read: tokens(&self.cache_read_tokens, "cacheReadTokens")?,
+            cache_write: tokens(&self.cache_write_tokens, "cacheWriteTokens")?,
+            cache_write_1h: tokens(&self.cache_write_1h_tokens, "cacheWrite1hTokens")?,
+            cache_write_12h: 0,
+            input_includes_cache: self.input_includes_cache,
+        })?;
+        Ok(NewApiBillingExpressionPreview {
+            amount_usd: amount.normalize().to_string(),
+        })
+    }
+}

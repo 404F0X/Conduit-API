@@ -22,6 +22,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Skeleton } from '@/components/ui/skeleton';
 import { Header } from '@/components/layout/header';
 import { Main } from '@/components/layout/main';
+import { ExpressionPriceSummary } from '@/features/models/components/expression-price-summary';
 import { type CatalogModel, useMyModelCatalog } from './data';
 
 function compact(value: number | null) {
@@ -55,7 +56,13 @@ function healthFreshness(value: string | null | undefined, locale: string) {
   return new Intl.DateTimeFormat(locale, { dateStyle: 'short', timeStyle: 'short' }).format(date);
 }
 
-function PricingDetail({ pricing, currency }: { pricing: CatalogModel['price']['items'][number]['pricing']; currency: string }) {
+function PricingDetail({
+  pricing,
+  currency,
+}: {
+  pricing: NonNullable<CatalogModel['price']['items']>[number]['pricing'];
+  currency: string;
+}) {
   const { t } = useTranslation();
   return (
     <div className='space-y-1 text-sm'>
@@ -104,14 +111,25 @@ export function Price({ model, large = false }: { model: CatalogModel; large?: b
   if (model.price.branches?.length) {
     return (
       <div className='space-y-3'>
-        <Badge variant='secondary'>{t('modelMarket.price.conditional')}</Badge>
+        <div className='flex flex-wrap gap-1'>
+          <Badge variant='secondary'>{t('modelMarket.price.conditional')}</Badge>
+          {model.price.branches.some((branch) => branch.billingExpression) && (
+            <Badge variant='outline'>{t('models.expressionPrice.expression')}</Badge>
+          )}
+        </div>
         <p className='text-muted-foreground text-xs'>{t('modelMarket.price.conditionHint')}</p>
         {large ? (
           model.price.branches.map((branch, index) => (
             <div key={index} className='space-y-2 rounded-md border p-3'>
               <div className='text-sm font-semibold'>{branch.label || t(`modelMarket.price.source.${branch.source}`)}</div>
               {branch.condition && <pre className='text-muted-foreground text-xs break-all whitespace-pre-wrap'>{branch.condition}</pre>}
-              <Price model={{ ...model, price: { ...model.price, items: branch.items, branches: [] } }} large />
+              <Price
+                model={{
+                  ...model,
+                  price: { ...model.price, items: branch.items, billingExpression: branch.billingExpression, branches: [] },
+                }}
+                large
+              />
             </div>
           ))
         ) : (
@@ -122,6 +140,11 @@ export function Price({ model, large = false }: { model: CatalogModel; large?: b
       </div>
     );
   }
+  if (model.price.billingExpression) {
+    return <ExpressionPriceSummary price={model.price.billingExpression} />;
+  }
+  const items = model.price.items;
+  if (items === null) return <span className='text-muted-foreground text-sm'>{t('modelMarket.price.unavailable')}</span>;
   const simple = [
     model.price.inputPerMillion,
     model.price.outputPerMillion,
@@ -139,7 +162,7 @@ export function Price({ model, large = false }: { model: CatalogModel; large?: b
     return (
       <div className='space-y-4'>
         <p className='text-muted-foreground text-xs'>{t('modelMarket.price.itemsHint')}</p>
-        {model.price.items.map((item, index) => (
+        {items.map((item, index) => (
           <div key={index} className='space-y-2 rounded-md border p-3'>
             <div className='text-sm font-semibold'>{labels[item.itemCode] ? t(labels[item.itemCode]).split(' / ')[0] : item.itemCode}</div>
             <PricingDetail pricing={item.pricing} currency={model.price.displayName} />
@@ -159,9 +182,7 @@ export function Price({ model, large = false }: { model: CatalogModel; large?: b
   }
   if (!simple) {
     const modes = [
-      ...new Set(
-        model.price.items.flatMap((item) => [item.pricing.mode, ...item.promptWriteCacheVariants.map((variant) => variant.pricing.mode)])
-      ),
+      ...new Set(items.flatMap((item) => [item.pricing.mode, ...item.promptWriteCacheVariants.map((variant) => variant.pricing.mode)])),
     ];
     return (
       <div className='space-y-2'>
@@ -172,13 +193,13 @@ export function Price({ model, large = false }: { model: CatalogModel; large?: b
             </Badge>
           ))}
         </div>
-        {model.price.items.slice(0, 2).map((item, index) => (
+        {items.slice(0, 2).map((item, index) => (
           <div key={index} className='space-y-1 text-xs'>
             <div className='text-muted-foreground font-mono break-all'>{item.itemCode}</div>
             <PricingDetail pricing={item.pricing} currency={model.price.displayName} />
           </div>
         ))}
-        <p className='text-muted-foreground text-xs'>{t('modelMarket.price.structured', { count: model.price.items.length })}</p>
+        <p className='text-muted-foreground text-xs'>{t('modelMarket.price.structured', { count: items.length })}</p>
       </div>
     );
   }

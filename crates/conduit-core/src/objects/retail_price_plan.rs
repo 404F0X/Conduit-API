@@ -1,9 +1,18 @@
 //! Versioned retail documents and bounded, deterministic condition evaluation.
-use super::pricing::ModelPrice;
+use super::{newapi_price::NewApiPrice, pricing::ModelPrice};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+
+pub const DEFAULT_MODEL_GROUP_ID: &str = "system-default";
+
+fn canonical_model_group_id(id: &str) -> Result<String, uuid::Error> {
+    if id == DEFAULT_MODEL_GROUP_ID {
+        return Ok(id.into());
+    }
+    uuid::Uuid::parse_str(id).map(|id| id.to_string())
+}
 
 pub const RETAIL_PRICE_SCHEMA: &str = "group-conditional-price-v1";
 pub const FACTS_VERSION: &str = "normalized-usage-v1";
@@ -23,10 +32,30 @@ const FACTS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RetailPriceLeaf {
+    Expression(NewApiPrice),
+    Static(ModelPrice),
+}
+impl RetailPriceLeaf {
+    pub fn static_price(&self) -> Option<&ModelPrice> {
+        match self {
+            Self::Static(price) => Some(price),
+            Self::Expression(_) => None,
+        }
+    }
+}
+impl PartialEq<ModelPrice> for RetailPriceLeaf {
+    fn eq(&self, other: &ModelPrice) -> bool {
+        self.static_price() == Some(other)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetailPriceDocument {
     pub schema: String,
-    pub global: Option<ModelPrice>,
+    pub global: Option<RetailPriceLeaf>,
     pub groups: Vec<GroupPriceBranch>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,7 +64,7 @@ pub struct GroupPriceBranch {
     #[serde(rename = "modelGroupID")]
     pub model_group_id: String,
     pub rules: Vec<GroupPriceRule>,
-    pub base: Option<ModelPrice>,
+    pub base: Option<RetailPriceLeaf>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,7 +72,7 @@ pub struct GroupPriceRule {
     pub id: String,
     pub label: String,
     pub condition: PriceCondition,
-    pub price: ModelPrice,
+    pub price: RetailPriceLeaf,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -306,7 +335,7 @@ impl Parser<'_> {
 impl RetailPriceDocument {
     pub fn parse(value: &Value) -> Result<Self, String> {
         let object = value.as_object().ok_or("price must be an object")?;
-        let mut document = if object.contains_key("items") {
+        let mut document = if object.contains_key("items") || object.contains_key("kind") {
             Self {
                 schema: RETAIL_PRICE_SCHEMA.into(),
                 global: Some(strict_price(value)?),
@@ -340,9 +369,8 @@ impl RetailPriceDocument {
         }
         let mut ids = BTreeSet::new();
         for group in &mut document.groups {
-            group.model_group_id = uuid::Uuid::parse_str(&group.model_group_id)
-                .map_err(|_| "invalid modelGroupID")?
-                .to_string();
+            group.model_group_id = canonical_model_group_id(&group.model_group_id)
+                .map_err(|_| "invalid modelGroupID")?;
             if !ids.insert(group.model_group_id.clone()) || group.rules.len() > 128 {
                 return Err("duplicate group or too many rules".into());
             }
@@ -366,6 +394,9 @@ impl RetailPriceDocument {
         }
         if object.contains_key("schema") {
             for price in document.leaves() {
+                let Some(price) = price.static_price() else {
+                    continue;
+                };
                 for item in &price.items {
                     if item.pricing.mode != "flat_fee"
                         && ![
@@ -386,7 +417,7 @@ impl RetailPriceDocument {
         }
         Ok(document)
     }
-    pub fn leaves(&self) -> Vec<&ModelPrice> {
+    pub fn leaves(&self) -> Vec<&RetailPriceLeaf> {
         self.global
             .iter()
             .chain(
@@ -400,7 +431,7 @@ impl RetailPriceDocument {
         &'a self,
         group: Option<&str>,
         facts: &BTreeMap<String, i64>,
-    ) -> Result<Option<&'a ModelPrice>, String> {
+    ) -> Result<Option<&'a RetailPriceLeaf>, String> {
         if let Some(branch) = self
             .groups
             .iter()
@@ -429,7 +460,7 @@ impl RetailPriceDocument {
         if let Some(value) = value {
             let mut document = Self::parse(value)?;
             if value.get("schema").is_some() {
-                document.global = Some(price);
+                document.global = Some(RetailPriceLeaf::Static(price));
                 return serde_json::to_value(document).map_err(|e| e.to_string());
             }
         }
@@ -493,7 +524,13 @@ fn strict_pricing(value: &Value) -> Result<(), String> {
     }
     Ok(())
 }
-fn strict_price(value: &Value) -> Result<ModelPrice, String> {
+fn strict_price(value: &Value) -> Result<RetailPriceLeaf, String> {
+    if value.get("kind").is_some() {
+        let price: NewApiPrice =
+            serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        price.compile()?;
+        return Ok(RetailPriceLeaf::Expression(price));
+    }
     fields(value, &["items"])?;
     for item in value["items"].as_array().ok_or("items must be an array")? {
         fields(item, &["itemCode", "pricing", "promptWriteCacheVariants"])?;
@@ -517,7 +554,7 @@ fn strict_price(value: &Value) -> Result<ModelPrice, String> {
     if price.items.is_empty() {
         return Err("price must contain at least one item".into());
     }
-    Ok(price)
+    Ok(RetailPriceLeaf::Static(price))
 }
 
 /// Stored once in the existing durable reservation JSON; recovery evaluates this tree.
@@ -549,9 +586,7 @@ impl FrozenRetailPlan {
             return Err("invalid frozen retail plan context".into());
         }
         if let Some(id) = &mut self.model_group_id {
-            *id = uuid::Uuid::parse_str(id)
-                .map_err(|_| "invalid trusted model group ID")?
-                .to_string();
+            *id = canonical_model_group_id(id).map_err(|_| "invalid trusted model group ID")?;
         }
         self.document
             .groups
@@ -566,7 +601,7 @@ impl FrozenRetailPlan {
     pub fn select_price(
         &self,
         actual: &BTreeMap<String, i64>,
-    ) -> Result<Option<&ModelPrice>, String> {
+    ) -> Result<Option<&RetailPriceLeaf>, String> {
         let mut facts = actual.clone();
         facts.extend(self.time_facts()?);
         self.document.select(self.model_group_id.as_deref(), &facts)
@@ -601,7 +636,7 @@ impl FrozenRetailPlan {
     /// This is a maximum estimated charge, not a bound on final usage or charge.
     pub fn maximum_estimated_charge<F>(&self, mut estimate: F) -> Result<Decimal, String>
     where
-        F: FnMut(&ModelPrice) -> Result<Decimal, String>,
+        F: FnMut(&RetailPriceLeaf) -> Result<Decimal, String>,
     {
         let mut maximum = Decimal::ZERO;
         for leaf in self.reachable_prices()? {
@@ -615,7 +650,7 @@ impl FrozenRetailPlan {
             .checked_mul(self.project_multiplier)
             .ok_or_else(|| "project estimate overflow".into())
     }
-    pub fn reachable_prices(&self) -> Result<Vec<&ModelPrice>, String> {
+    pub fn reachable_prices(&self) -> Result<Vec<&RetailPriceLeaf>, String> {
         let facts = self.time_facts()?;
         let mut prices = Vec::new();
         if let Some(group) = self
@@ -707,7 +742,11 @@ mod tests {
         let original = document();
         let replaced = RetailPriceDocument::replace_global(
             Some(&original),
-            strict_price(&price("3")).unwrap(),
+            strict_price(&price("3"))
+                .unwrap()
+                .static_price()
+                .unwrap()
+                .clone(),
         )
         .unwrap();
         assert_eq!(replaced["groups"], original["groups"]);
@@ -835,7 +874,7 @@ mod tests {
         };
         assert_eq!(
             frozen
-                .maximum_estimated_charge(|price| Ok(price.items[0]
+                .maximum_estimated_charge(|price| Ok(price.static_price().unwrap().items[0]
                     .pricing
                     .usage_per_unit
                     .unwrap()))
@@ -879,7 +918,7 @@ mod tests {
         );
         assert_eq!(
             frozen
-                .maximum_estimated_charge(|price| Ok(price.items[0]
+                .maximum_estimated_charge(|price| Ok(price.static_price().unwrap().items[0]
                     .pricing
                     .usage_per_unit
                     .unwrap()))

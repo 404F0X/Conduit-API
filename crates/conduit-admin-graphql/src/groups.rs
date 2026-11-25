@@ -16,8 +16,17 @@ impl GroupStatus {
         }
     }
 }
+pub use conduit_core::objects::retail_price_plan::DEFAULT_MODEL_GROUP_ID;
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct DefaultModelGroupDiagnostic {
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, SimpleObject)]
 pub struct ModelGroup {
+    pub is_default: bool,
     pub id: ID,
     pub name: String,
     pub description: Option<String>,
@@ -77,6 +86,9 @@ pub trait GroupServices: Send + Sync {
         key_id: i64,
         project_id: i64,
     ) -> Result<APIKeyProfileCatalog, String>;
+    async fn default_model_group_diagnostic(
+        &self,
+    ) -> Result<Option<DefaultModelGroupDiagnostic>, String>;
     async fn model_groups(&self) -> Result<Vec<ModelGroup>, String>;
     async fn user_groups(&self) -> Result<Vec<UserGroup>, String>;
     async fn save_model_group(&self, input: SaveModelGroupInput) -> Result<ModelGroup, String>;

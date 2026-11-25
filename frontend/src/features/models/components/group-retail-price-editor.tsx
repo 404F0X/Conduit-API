@@ -4,7 +4,10 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
+import { LazyNewApiExpressionEditor } from './lazy-new-api-expression-editor';
 import {
+  isNewApiExpressionPrice,
+  newApiExpressionPrice,
   readRetailPriceDocument,
   readSimpleRetailPrice,
   serializeRetailPriceDocument,
@@ -12,18 +15,19 @@ import {
   type RetailPriceDocument,
   type RetailPriceLeaf,
   type SimpleRetailPrice,
+  type StaticRetailPriceLeaf,
 } from './simple-retail-price';
 
 type GroupOption = { id: string; name: string; status: string };
 const blank = (): RetailPriceLeaf => ({ items: [] });
 
-function LeafEditor({
+function StaticLeafEditor({
   value,
   onChange,
   currency,
 }: {
-  value: RetailPriceLeaf;
-  onChange: (value: RetailPriceLeaf) => void;
+  value: StaticRetailPriceLeaf;
+  onChange: (value: StaticRetailPriceLeaf) => void;
   currency: string;
 }) {
   const { t } = useTranslation();
@@ -82,9 +86,9 @@ function LeafEditor({
               setText(event.target.value);
               try {
                 const parsed: unknown = JSON.parse(event.target.value);
-                if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as RetailPriceLeaf).items))
+                if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as StaticRetailPriceLeaf).items))
                   throw new Error(t('models.groupPrice.invalidLeaf'));
-                onChange(parsed as RetailPriceLeaf);
+                onChange(parsed as StaticRetailPriceLeaf);
                 setError('');
               } catch (err) {
                 setError(err instanceof Error ? err.message : String(err));
@@ -123,6 +127,49 @@ function LeafEditor({
             </div>
           </>
         )
+      )}
+    </div>
+  );
+}
+
+function LeafEditor({
+  value,
+  onChange,
+  currency,
+}: {
+  value: RetailPriceLeaf;
+  onChange: (value: RetailPriceLeaf) => void;
+  currency: string;
+}) {
+  const { t } = useTranslation();
+  const expression = isNewApiExpressionPrice(value);
+  const [previousStatic, setPreviousStatic] = useState<StaticRetailPriceLeaf>({ items: [] });
+  const [previousExpression, setPreviousExpression] = useState(newApiExpressionPrice);
+  return (
+    <div className='space-y-3'>
+      <label className='grid gap-1 text-xs'>
+        {t('models.expressionPrice.kind')}
+        <select
+          className='bg-background h-9 rounded-md border px-2 text-sm'
+          value={expression ? 'expression' : 'static'}
+          onChange={(event) => {
+            if (event.target.value === 'expression' && !expression) {
+              setPreviousStatic(value);
+              onChange(previousExpression);
+            } else if (expression) {
+              setPreviousExpression(value);
+              onChange(previousStatic);
+            }
+          }}
+        >
+          <option value='static'>{t('models.expressionPrice.static')}</option>
+          <option value='expression'>{t('models.expressionPrice.expression')}</option>
+        </select>
+      </label>
+      {expression ? (
+        <LazyNewApiExpressionEditor value={value} onChange={onChange} />
+      ) : (
+        <StaticLeafEditor value={value} onChange={onChange} currency={currency} />
       )}
     </div>
   );

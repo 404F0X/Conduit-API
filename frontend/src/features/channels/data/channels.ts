@@ -5,11 +5,12 @@ import { pageInfoSchema } from '@/gql/pagination';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
 import { useErrorHandler } from '@/hooks/use-error-handler';
-import { createProviderPackage } from '@/features/change-sets/data/change-sets';
 import {
   Channel,
   ChannelConnection,
   ChannelSummaryConnection,
+  ChannelPublicModelBinding,
+  channelPublicModelBindingSchema,
   CreateChannelInput,
   UpdateChannelInput,
   channelConnectionSchema,
@@ -723,6 +724,7 @@ const GET_CHANNEL_MODEL_PRICES_QUERY = `
         id
         modelID
         currencyCode
+        billingExpression
         price {
           items {
             itemCode
@@ -885,6 +887,30 @@ const ALL_CHANNEL_TAGS_QUERY = `
     allChannelTags
   }
 `;
+
+const CHANNEL_PUBLIC_MODEL_BINDINGS_QUERY = `
+  query ChannelPublicModelBindings($id: ID!) {
+    node(id: $id) {
+      ... on Channel {
+        publicModelBindings { routeID upstreamModelID publicModelKey status }
+      }
+    }
+  }
+`;
+
+export function useChannelPublicModelBindings(id: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ['channel', id, 'public-model-bindings'],
+    enabled: enabled && !!id,
+    queryFn: async () => {
+      const data = await graphqlRequest<{ node: { publicModelBindings: ChannelPublicModelBinding[] | null } }>(
+        CHANNEL_PUBLIC_MODEL_BINDINGS_QUERY,
+        { id }
+      );
+      return z.array(channelPublicModelBindingSchema).nullable().parse(data.node.publicModelBindings);
+    },
+  });
+}
 
 const QUERY_CHANNELS_QUERY = `
   query QueryChannels($input: QueryChannelInput!) {
@@ -1115,7 +1141,9 @@ const PROBE_NEW_API_PRICING_MUTATION = `
       warnings
       models {
         provenance
-      modelId
+        modelId
+        billingExpression
+        diagnostics { code message }
         billingKind
         quality
         groupRatio
@@ -1210,11 +1238,6 @@ export function useChannelModelPrices(channelId: string) {
     },
     enabled: !!channelId,
   });
-}
-
-export function useCreateProviderPriceChangeSet() {
-  const queryClient = useQueryClient();
-  return useMutation({ mutationFn: createProviderPackage, onSettled: () => queryClient.invalidateQueries({ queryKey: ['changeSets'] }) });
 }
 
 // Use this hook to query channels with pagination and filtering
@@ -1314,10 +1337,11 @@ export function useCreateChannel() {
       const data = await graphqlRequest<{ createChannel: Channel }>(CREATE_CHANNEL_MUTATION, { input });
       return channelSchema.parse(data.createChannel);
     },
-    onSuccess: async () => {
+    onSuccess: async (_data, input) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['channels'] }),
         queryClient.invalidateQueries({ queryKey: ['allChannelTags'] }),
+        ...(input.publicModelBindings ? [queryClient.invalidateQueries({ queryKey: ['models'] })] : []),
         queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
         queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
       ]);
@@ -1401,11 +1425,12 @@ export function useUpdateChannel() {
       const data = await graphqlRequest<{ updateChannel: Channel }>(UPDATE_CHANNEL_MUTATION, { id, input });
       return channelSchema.parse(data.updateChannel);
     },
-    onSuccess: async (data) => {
+    onSuccess: async (data, { input }) => {
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['channels'] }),
         queryClient.invalidateQueries({ queryKey: ['allChannelTags'] }),
         queryClient.invalidateQueries({ queryKey: ['channel', data.id] }),
+        ...(input.publicModelBindings ? [queryClient.invalidateQueries({ queryKey: ['models'] })] : []),
         queryClient.invalidateQueries({ queryKey: ['commercialization-catalog'] }),
         queryClient.invalidateQueries({ queryKey: ['upstream-supply-catalog'] }),
       ]);

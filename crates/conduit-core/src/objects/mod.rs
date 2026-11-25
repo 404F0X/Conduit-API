@@ -12,6 +12,7 @@ pub mod cost;
 pub mod model;
 pub mod model_association;
 pub mod money;
+pub mod newapi_price;
 pub mod overrides;
 pub mod price_formula;
 pub mod pricing;

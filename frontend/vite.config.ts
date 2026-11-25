@@ -60,6 +60,14 @@ export default defineConfig({
   // chunk URLs let the same build work at both / and server.base_path.
   base: './',
   build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          // Keep eagerly registered model/pricing translations out of the entry chunk.
+          if (id.replaceAll('\\', '/').match(/\/src\/locales\/(en|zh-CN)\/models\.json$/)) return 'model-locales';
+        },
+      },
+    },
     // Keep the license texts for dependencies that Rollup actually bundles.
     // This avoids both an incomplete hand-maintained list and notices for
     // development-only packages that never ship to users.

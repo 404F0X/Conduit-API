@@ -195,7 +195,8 @@ pub fn field_authz(field: &str) -> FieldAuthz {
         "users" => Scope(slug::READ_USERS),
 
         // ── groups ─────────────────────────────────────────────────────────
-        "modelGroups" | "userGroups" => Scope(slug::READ_USERS),
+        "previewNewApiBillingExpression" => Scope(slug::READ_COMMERCIALIZATION),
+        "modelGroups" | "userGroups" | "defaultModelGroupDiagnostic" => Scope(slug::READ_USERS),
         "saveModelGroup" | "saveUserGroup" | "moveUserToGroup" => Scope(slug::WRITE_USERS),
         "apiKeyAssignableModelGroups" | "apiKeyProfileCatalog" => Scope(slug::READ_API_KEYS),
         "apiKeyCreationCatalog" | "assignApiKeyModelGroup" => Scope(slug::WRITE_API_KEYS),

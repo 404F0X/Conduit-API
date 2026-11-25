@@ -25,6 +25,21 @@ new Function('require', 'module', 'exports', output)(
   module.exports
 );
 const { Price } = module.exports;
+const expressionHelpersModule = { exports: {} };
+const expressionHelpersOutput = ts.transpileModule(
+  readFileSync(new URL('../models/components/simple-retail-price.ts', import.meta.url), 'utf8'),
+  {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }
+).outputText;
+new Function('require', 'module', 'exports', expressionHelpersOutput)(
+  createRequire(import.meta.url),
+  expressionHelpersModule,
+  expressionHelpersModule.exports
+);
+const expressionHelpers = expressionHelpersModule.exports;
+const expression = { ...expressionHelpers.newApiExpressionPrice(), expression: 'fixed(0.000000001)', multiplier: '1.0000000000000001' };
+
 const pricing = (mode, amount = null, tiers = []) => ({ mode, amount, tiers });
 const item = (itemCode, value, variants = []) => ({ itemCode, pricing: value, promptWriteCacheVariants: variants });
 const price = (items, extra = {}) => ({
@@ -126,6 +141,7 @@ test('catalog query validates structured prices and uses the selected Project', 
     (name) => {
       if (name === 'zod') return require('zod');
       if (name === '@tanstack/react-query') return { useQuery: (options) => options };
+      if (name === '@/features/models/components/simple-retail-price') return expressionHelpers;
       if (name === '@/stores/projectStore') return { useSelectedProjectId: () => 'project-current' };
       if (name === '@/gql/graphql')
         return {
@@ -134,7 +150,26 @@ test('catalog query validates structured prices and uses the selected Project', 
             return {
               myModelCatalog: {
                 healthVisible: false,
-                models: [model],
+                models: [
+                  model,
+                  { ...model, id: 'expression', price: { ...model.price, items: null, billingExpression: expression } },
+                  {
+                    ...model,
+                    id: 'branch',
+                    price: {
+                      ...model.price,
+                      branches: [
+                        {
+                          source: 'rule',
+                          label: 'Expression rule',
+                          condition: 'prompt_tokens >= 100',
+                          items: null,
+                          billingExpression: expression,
+                        },
+                      ],
+                    },
+                  },
+                ],
                 priceScopes: [{ id: 'group:g1', label: 'Group', modelGroupID: 'g1', modelGroupRevision: 1, apiKeyID: null }],
                 selectedPriceScope: 'group:g1',
               },
@@ -154,6 +189,7 @@ test('catalog query validates structured prices and uses the selected Project', 
   for (const field of [
     'status',
     'items',
+    'billingExpression',
     'itemCode',
     'pricing',
     'mode',
@@ -169,6 +205,12 @@ test('catalog query validates structured prices and uses the selected Project', 
   }
   assert.equal(response.models[0].price.items[0].pricing.amount, '0');
   assert.equal(response.models[0].price.effectiveMultiplier, '1.5');
+  assert.equal(response.models[1].price.items, null);
+  assert.deepEqual(response.models[1].price.billingExpression, expression);
+  assert.deepEqual(response.models[2].price.branches[0].billingExpression, expression);
+  assert.match(render(response.models[1], true), /fixed\(0\.000000001\)/);
+  assert.match(render(response.models[2], true), /1\.0000000000000001/);
+  assert.doesNotMatch(render(response.models[1], true), /credits 0|\/ 1M tokens/);
 });
 
 test('open model details follow refreshed current-Project catalog prices', () => {

@@ -239,7 +239,7 @@ pub struct ModelPrice {
 }
 
 /// `type ChannelModelPrice implements Node` — snapshot lines 1900-1916.
-/// Scalar + self-domain fields only (`price: ModelPrice!` embedded object is
+/// Scalar + self-domain fields only (`price: ModelPrice` embedded object is
 /// self-domain). The two Node-edge fields `channel: Channel!` and
 /// `versions: [ChannelModelPriceVersion!]` are DEFERRED (module doc). The
 /// `implements Node` clause is contributed by the shared `crate::channel::Node`
@@ -259,7 +259,8 @@ pub struct ChannelModelPrice {
     pub model_id: String,
     /// Real-world accounting currency for this imported price.
     pub currency_code: String,
-    pub price: ModelPrice,
+    pub price: Option<ModelPrice>,
+    pub billing_expression: Option<async_graphql::Json<serde_json::Value>>,
     /// `referenceID: String!` — acronym tag (snapshot line 1913).
     #[graphql(name = "referenceID")]
     pub reference_id: String,
@@ -364,7 +365,8 @@ pub struct ModelPriceInput {
 pub struct SaveChannelModelPriceInput {
     pub model_id: String,
     pub currency_code: String,
-    pub price: ModelPriceInput,
+    pub price: Option<ModelPriceInput>,
+    pub billing_expression: Option<async_graphql::Json<serde_json::Value>>,
 }
 
 // ===========================================================================
@@ -675,7 +677,8 @@ mod tests {
             channel_id: ID::from("gid://conduit/Channel/7"),
             model_id: "gpt-4o".to_owned(),
             currency_code: "CNY".to_owned(),
-            price: ModelPrice {
+            billing_expression: None,
+            price: Some(ModelPrice {
                 items: vec![ModelPriceItem {
                     item_code: PriceItemCode::PromptTokens,
                     pricing: Pricing {
@@ -686,7 +689,7 @@ mod tests {
                     },
                     prompt_write_cache_variants: None,
                 }],
-            },
+            }),
             reference_id: "ref-1".to_owned(),
         }
     }

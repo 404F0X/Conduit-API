@@ -100,7 +100,9 @@ impl AccountingSettings {
     /// Convert an amount in a real currency into the accounting currency.
     pub fn real_to_accounting(&self, amount: Decimal, currency: &str) -> Result<Decimal, String> {
         self.validate()?;
-        Ok(amount / self.quote_per_accounting_unit(currency)?)
+        amount
+            .checked_div(self.quote_per_accounting_unit(currency)?)
+            .ok_or_else(|| "currency conversion amount overflow".into())
     }
 
     /// Convert an accounting-currency amount into another real currency.
@@ -111,7 +113,9 @@ impl AccountingSettings {
 
     pub fn accounting_to_credits(&self, amount: Decimal) -> Result<Decimal, String> {
         self.validate()?;
-        Ok(amount * self.credits_per_accounting_unit)
+        amount
+            .checked_mul(self.credits_per_accounting_unit)
+            .ok_or_else(|| "station credit amount overflow".into())
     }
 
     /// Channel prices are quoted in channel balance units. Divide by the

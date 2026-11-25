@@ -270,7 +270,15 @@ pub struct ChannelQuotaProbeResult {
 /// USD. `quality` is `exact`, `estimated`, or `unsupported`; callers must not
 /// silently persist unsupported rows.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct NewApiPricingDiagnostic {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
 pub struct NewApiModelPricingProbe {
+    pub billing_expression: Option<async_graphql::Json<serde_json::Value>>,
+    pub diagnostics: Vec<NewApiPricingDiagnostic>,
     pub provenance: async_graphql::Json<serde_json::Value>,
     pub model_id: String,
     pub billing_kind: String,
@@ -1548,7 +1556,11 @@ impl MutationRoot {
             .map_err(|err| err.to_string())?;
         let services = channel_mutation_services(ctx)?;
         services
-            .update_channel(id.as_str(), input)
+            .update_channel(
+                ctx.data_opt::<crate::me::CurrentUser>().map(|u| u.user_id),
+                id.as_str(),
+                input,
+            )
             .await
             .map_err(|err| err.to_string())
     }
@@ -3645,6 +3657,8 @@ mod tests {
                 matched_key_count: 1,
                 warnings: Vec::new(),
                 models: vec![NewApiModelPricingProbe {
+                    billing_expression: None,
+                    diagnostics: vec![],
                     provenance: async_graphql::Json(serde_json::json!({})),
                     model_id: "gpt-test".to_string(),
                     billing_kind: "token".to_string(),

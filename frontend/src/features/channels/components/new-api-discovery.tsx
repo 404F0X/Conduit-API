@@ -15,6 +15,7 @@ import {
   canonicalNewApiURL,
   getDiscovery,
   initializeDiscovery,
+  isNewApiAnthropicControlOnly,
   recalledDiscovery,
   rememberDiscovery,
   retryDiscovery,
@@ -439,6 +440,7 @@ export function NewApiCreateDialog({ open, onOpenChange }: { open: boolean; onOp
 
 export function NewApiChannelActions({ channel }: { channel: Channel }) {
   const { t } = useTranslation();
+  const controlOnly = isNewApiAnthropicControlOnly(channel.type, channel.settings?.managementAdapter);
   const { hasSystemScope } = usePermissions();
   const [open, setOpen] = useState(false);
   const [operationID, setOperationID] = useState(() => recalledDiscovery(channel.id));
@@ -482,12 +484,19 @@ export function NewApiChannelActions({ channel }: { channel: Channel }) {
           </Button>
         )}
         {hasSystemScope('write_channels') && (
-          <Button size='sm' variant='outline' disabled={busy} onClick={() => void sync()}>
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={busy || controlOnly}
+            title={controlOnly ? t('channels.managementAdapter.manualInventory') : undefined}
+            onClick={() => void sync()}
+          >
             <RefreshCw className='size-3' />
             {t(unknown ? 'eventPackages.checkResult' : 'eventPackages.sync')}
           </Button>
         )}
-        {operationID && hasSystemScope('read_channels') && (
+        {controlOnly && <span className='text-muted-foreground text-xs'>{t('channels.managementAdapter.manualInventory')}</span>}
+        {!controlOnly && operationID && hasSystemScope('read_channels') && (
           <Button size='sm' variant='outline' onClick={() => setOpen(true)}>
             {t('eventPackages.result')}
           </Button>

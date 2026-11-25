@@ -243,17 +243,18 @@ pub(crate) async fn record_new_api_pricing_snapshot_with_context(
         .fetch_one(&mut *tx)
         .await
         .map_err(|error| error.to_string())?;
-        if let Some(proposal) = provider_price_proposal(
-            &mut tx,
-            channel_id,
-            snapshot_id,
-            provider_price_row_id,
-            model,
-            &group,
-            &conversion,
-            &converted,
-        )
-        .await?
+        if model.provenance["adoptionBlocked"] != true
+            && let Some(proposal) = provider_price_proposal(
+                &mut tx,
+                channel_id,
+                snapshot_id,
+                provider_price_row_id,
+                model,
+                &group,
+                &conversion,
+                &converted,
+            )
+            .await?
         {
             proposals.push(proposal);
         }
@@ -424,13 +425,34 @@ async fn provider_price_proposal(
     conversion: &PriceConversionContext,
     converted: &ConvertedPrices,
 ) -> Result<Option<crate::wiring_postgres_change_sets::packages::Proposal>, String> {
-    let proposed = proposed_model_price(model, converted);
-    let proposed_json = proposed
-        .as_ref()
-        .ok()
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    let proposed = if model.billing_kind == "tiered_expr" {
+        model
+            .provenance
+            .get("billingExpression")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                model
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "Expression is unsupported".into())
+            })
+            .and_then(|value| {
+                let accounting = conversion
+                    .accounting_settings
+                    .as_ref()
+                    .ok_or("Accounting settings are unavailable")?;
+                accounting.real_to_accounting(Decimal::ONE, "USD")?;
+                let price: conduit_core::objects::newapi_price::NewApiPrice =
+                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                price.compile()?;
+                Ok(value)
+            })
+    } else {
+        proposed_model_price(model, converted)
+            .and_then(|price| serde_json::to_value(price).map_err(|error| error.to_string()))
+    };
+    let proposed_json = proposed.as_ref().ok().cloned();
     let current = sqlx::query_as::<_, (i64, String, Json<Value>, String)>(
         "SELECT id,currency_code,price,reference_id FROM channel_model_prices \
          WHERE channel_id=$1 AND model_id=$2 AND deleted_at=0 LIMIT 1",
@@ -465,10 +487,14 @@ async fn provider_price_proposal(
             .as_ref()
             .is_some_and(|(_, currency, Json(current), _)| {
                 current == price
-                    && conversion
-                        .accounting_settings
-                        .as_ref()
-                        .is_some_and(|s| currency == &s.accounting_currency)
+                    && (if model.billing_kind == "tiered_expr" {
+                        currency == "USD"
+                    } else {
+                        conversion
+                            .accounting_settings
+                            .as_ref()
+                            .is_some_and(|s| currency == &s.accounting_currency)
+                    })
             })
     }) {
         return Ok(None);

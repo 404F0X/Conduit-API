@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use conduit_core::objects::money::{AccountingSettings, CurrencyExchangeRate, STATION_CREDIT_CODE};
 use conduit_core::objects::pricing::ModelPrice;
 use conduit_core::objects::retail_price_plan::{
-    FACTS_VERSION, FrozenRetailPlan, RetailPriceDocument,
+    FACTS_VERSION, FrozenRetailPlan, RetailPriceDocument, RetailPriceLeaf,
 };
 use conduit_db::row::UsageLogRow;
 use conduit_llm::Usage;
@@ -64,18 +64,38 @@ struct RetailPricingSnapshot {
     frozen_plan: Option<FrozenRetailPlan>,
     #[serde(default)]
     frozen_plan_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expression_identities: Vec<String>,
     multiplier: Decimal,
     accounting_settings: AccountingSettings,
 }
 
 impl RetailPricingSnapshot {
+    fn requires_expression_usage(&self) -> Result<bool, String> {
+        match &self.frozen_plan {
+            Some(plan) => Ok(plan
+                .reachable_prices()?
+                .iter()
+                .any(|leaf| matches!(leaf, RetailPriceLeaf::Expression(_)))),
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
     fn selected_price(&self, usage: &Usage) -> Result<Option<ModelPrice>, String> {
+        Ok(self
+            .selected_leaf(usage)?
+            .and_then(|leaf| leaf.static_price().cloned()))
+    }
+
+    fn selected_leaf(&self, usage: &Usage) -> Result<Option<RetailPriceLeaf>, String> {
         if let Some(plan) = &self.frozen_plan {
             if self.frozen_plan_hash.as_deref() != Some(retail_plan_hash(plan)?.as_str())
                 || plan.price_version_id != self.version_id
                 || plan.price_reference != self.reference
                 || plan.project_multiplier != self.multiplier
                 || self.price.is_some()
+                || expression_identities(plan)? != self.expression_identities
             {
                 return Err("invalid or inconsistent frozen retail pricing snapshot".into());
             }
@@ -83,11 +103,12 @@ impl RetailPricingSnapshot {
                 .select_price(&retail_usage_facts(usage)?)
                 .map(|price| price.cloned());
         }
-        if self.frozen_plan_hash.is_some() {
+        if self.frozen_plan_hash.is_some() || !self.expression_identities.is_empty() {
             return Err("frozen retail plan is missing".into());
         }
         self.price
             .clone()
+            .map(RetailPriceLeaf::Static)
             .map(Some)
             .ok_or_else(|| "retail pricing snapshot payload is missing".into())
     }
@@ -98,13 +119,31 @@ fn retail_plan_hash(plan: &FrozenRetailPlan) -> Result<String, String> {
     let bytes = serde_json::to_vec(plan).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
+fn expression_identities(plan: &FrozenRetailPlan) -> Result<Vec<String>, String> {
+    use sha2::{Digest, Sha256};
+    plan.document
+        .leaves()
+        .into_iter()
+        .filter_map(|leaf| match leaf {
+            RetailPriceLeaf::Expression(price) => Some(price.compile().map(|(expression, _)| {
+                format!("{:x}", Sha256::digest(expression.identity_bytes()))
+            })),
+            RetailPriceLeaf::Static(_) => None,
+        })
+        .collect()
+}
+
 fn legacy_retail_price(value: &Value) -> Result<ModelPrice, String> {
     if value.get("schema").is_some() {
         return Err("versioned retail plan requires its durable admission snapshot".into());
     }
     RetailPriceDocument::parse(value)?
         .global
-        .ok_or_else(|| "legacy retail price is missing".into())
+        .and_then(|leaf| leaf.static_price().cloned())
+        .ok_or_else(|| {
+            "legacy retail price must be static; expressions require a durable admission snapshot"
+                .into()
+        })
 }
 async fn retail_timezone_offset(pool: &PgPool, at: DateTime<Utc>) -> Result<i32, String> {
     use chrono::Offset;
@@ -242,14 +281,36 @@ pub(crate) async fn reservation_has_request_flat_fee(
     if snapshot.frozen_plan.is_none() {
         return Ok(false);
     }
+    if snapshot.requires_expression_usage()? {
+        return Ok(true);
+    }
     Ok(snapshot
-        .selected_price(&Usage::default())?
+        .selected_leaf(&Usage::default())?
+        .and_then(|leaf| leaf.static_price().cloned())
         .is_some_and(|price| {
             price.items.iter().any(|item| {
                 item.pricing.mode == "flat_fee"
                     && item.pricing.flat_fee.is_some_and(|fee| fee > Decimal::ZERO)
             })
         }))
+}
+
+pub(crate) async fn reservation_requires_expression_usage(
+    pool: &PgPool,
+    reservation_key: &str,
+) -> Result<bool, String> {
+    let raw = sqlx::query_scalar::<_, Option<sqlx::types::Json<RetailPricingSnapshot>>>(
+        "SELECT pricing_snapshot FROM project_wallet_reservations WHERE request_id=$1",
+    )
+    .bind(reservation_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .flatten();
+    match raw {
+        Some(sqlx::types::Json(snapshot)) => snapshot.requires_expression_usage(),
+        None => Ok(false),
+    }
 }
 
 pub(crate) async fn load_accounting_settings(pool: &PgPool) -> Result<AccountingSettings, String> {
@@ -507,16 +568,27 @@ impl PgUsageChargeSettler {
         usage_log_id: i64,
         reservation_key: Option<&str>,
     ) -> Result<bool, String> {
+        self.persist_outbox_with_facts(usage_log_id, reservation_key, None)
+            .await
+    }
+
+    async fn persist_outbox_with_facts(
+        &self,
+        usage_log_id: i64,
+        reservation_key: Option<&str>,
+        facts: Option<crate::usage_recovery::BillingTokenFacts>,
+    ) -> Result<bool, String> {
         let status = sqlx::query_scalar::<_, String>(
             "INSERT INTO usage_charge_outbox \
-             (usage_log_id,reservation_key,status,available_at,created_at,updated_at) \
-             VALUES($1,$2,'pending',now(),now(),now()) \
+             (usage_log_id,reservation_key,billing_token_facts,status,available_at,created_at,updated_at) \
+             VALUES($1,$2,$3,'pending',now(),now(),now()) \
              ON CONFLICT(usage_log_id) DO UPDATE SET \
                reservation_key=COALESCE(usage_charge_outbox.reservation_key,EXCLUDED.reservation_key), \
                updated_at=now() RETURNING status",
         )
         .bind(usage_log_id)
         .bind(reservation_key)
+        .bind(facts.map(sqlx::types::Json))
         .fetch_one(&self.pool)
         .await
         .map_err(|error| error.to_string())?;
@@ -847,7 +919,11 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             ..Usage::default()
         };
         let legacy_price = if price_value.get("schema").is_none() {
-            document.global.clone()
+            document
+                .global
+                .as_ref()
+                .and_then(RetailPriceLeaf::static_price)
+                .cloned()
         } else {
             None
         };
@@ -872,7 +948,8 @@ impl UsageChargeSettler for PgUsageChargeSettler {
         } else {
             None
         };
-        let estimated_amount = if let Some(plan) = &frozen_plan {
+        let accounting_settings = load_accounting_settings(&self.pool).await?;
+        let accounting_amount = if let Some(plan) = &frozen_plan {
             if !plan.has_complete_coverage()?
                 && (enforcement_mode == BillingEnforcementMode::HardEnforce
                     || member_limit.is_some())
@@ -881,26 +958,40 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                     "billing admission rejected: conditional retail price requires a group base or global fallback for complete coverage".into(),
                 );
             }
-            plan.maximum_estimated_charge(|price| {
-                Ok(compute_usage_cost_full(Some(&estimate), price).total)
+            plan.maximum_estimated_charge(|leaf| match leaf {
+                RetailPriceLeaf::Static(price) => accounting_price_amount(
+                    compute_usage_cost_full(Some(&estimate), price).total,
+                    &price_currency,
+                    &accounting_settings,
+                ),
+                RetailPriceLeaf::Expression(price) => {
+                    let amount = price
+                        .estimate_upper(input.estimated_input_tokens, input.max_output_tokens)?;
+                    accounting_settings.real_to_accounting(amount, "USD")
+                }
             })?
         } else {
-            compute_usage_cost_full(
+            let estimated = compute_usage_cost_full(
                 Some(&estimate),
                 legacy_price.as_ref().ok_or("legacy price missing")?,
             )
             .total
-                * multiplier
+                * multiplier;
+            accounting_price_amount(estimated, &price_currency, &accounting_settings)?
         };
         let plan_hash = frozen_plan.as_ref().map(retail_plan_hash).transpose()?;
-        let accounting_settings = load_accounting_settings(&self.pool).await?;
-        let accounting_amount =
-            accounting_price_amount(estimated_amount, &price_currency, &accounting_settings)?;
+        let expression_identities = frozen_plan
+            .as_ref()
+            .map(expression_identities)
+            .transpose()?
+            .unwrap_or_default();
         let amount = accounting_settings
             .accounting_to_credits(accounting_amount)?
             .round_dp(6);
         let currency = STATION_CREDIT_CODE.to_string();
-        let amount_micros = (amount * Decimal::from(1_000_000_i64))
+        let amount_micros = amount
+            .checked_mul(Decimal::from(1_000_000_i64))
+            .ok_or("retail credit micros overflow")?
             .round_dp(0)
             .to_i64()
             .ok_or_else(|| "retail reservation does not fit in i64 micros".to_string())?
@@ -912,6 +1003,7 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             price: legacy_price,
             frozen_plan,
             frozen_plan_hash: plan_hash,
+            expression_identities,
             multiplier,
             accounting_settings: accounting_settings.clone(),
         })
@@ -1176,7 +1268,14 @@ impl UsageChargeSettler for PgUsageChargeSettler {
     ) -> Result<(), String> {
         let usage_log_id = log.id.parse::<i64>().map_err(|e| e.to_string())?;
         if self.async_settlement {
-            match self.persist_outbox(usage_log_id, reservation_key).await {
+            match self
+                .persist_outbox_with_facts(
+                    usage_log_id,
+                    reservation_key,
+                    usage.billing_token_facts().ok(),
+                )
+                .await
+            {
                 Ok(true) => return Ok(()),
                 Ok(false) => {}
                 Err(error) => {
@@ -1330,11 +1429,12 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                 price: Some(legacy_retail_price(&price_row.get::<Value, _>("price"))?),
                 frozen_plan: None,
                 frozen_plan_hash: None,
+                expression_identities: vec![],
                 multiplier,
                 accounting_settings,
             }
         };
-        let selected_price = snapshot.selected_price(usage)?;
+        let selected_price = snapshot.selected_leaf(usage)?;
         let RetailPricingSnapshot {
             version_id,
             reference,
@@ -1344,6 +1444,7 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             accounting_settings,
             frozen_plan,
             frozen_plan_hash,
+            expression_identities: _,
         } = snapshot;
         let Some(price) = selected_price else {
             return self
@@ -1359,17 +1460,46 @@ impl UsageChargeSettler for PgUsageChargeSettler {
                 )
                 .await;
         };
-        let base = compute_usage_cost_full(Some(usage), &price);
-        let accounting_amount = accounting_price_amount(
-            base.total * multiplier,
-            &price_currency,
-            &accounting_settings,
-        )?;
+        let (base_amount, items, price_unit) = match &price {
+            RetailPriceLeaf::Static(price) => {
+                let base = compute_usage_cost_full(Some(usage), price);
+                (base.total, base.items, price_currency.as_str())
+            }
+            RetailPriceLeaf::Expression(price) => {
+                let stored = sqlx::query_scalar::<
+                    _,
+                    Option<sqlx::types::Json<crate::usage_recovery::BillingTokenFacts>>,
+                >(
+                    "SELECT billing_token_facts FROM usage_charge_outbox WHERE usage_log_id=$1",
+                )
+                .bind(usage_log_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| error.to_string())?
+                .flatten();
+                let facts = match stored {
+                    Some(sqlx::types::Json(envelope)) => envelope.checked_token_facts()?,
+                    None => usage.new_api_token_facts()?,
+                };
+                (price.evaluate(facts)?, vec![], "USD")
+            }
+        };
+        let adjusted = base_amount
+            .checked_mul(multiplier)
+            .ok_or("retail project amount overflow")?;
+        let accounting_amount =
+            if price_unit == "USD" && matches!(&price, RetailPriceLeaf::Expression(_)) {
+                accounting_settings.real_to_accounting(adjusted, "USD")?
+            } else {
+                accounting_price_amount(adjusted, price_unit, &accounting_settings)?
+            };
         let amount = accounting_settings
             .accounting_to_credits(accounting_amount)?
             .round_dp(6);
         let currency = STATION_CREDIT_CODE.to_string();
-        let amount_micros = (amount * Decimal::from(1_000_000_i64))
+        let amount_micros = amount
+            .checked_mul(Decimal::from(1_000_000_i64))
+            .ok_or("retail credit micros overflow")?
             .round_dp(0)
             .to_i64()
             .ok_or_else(|| "retail charge does not fit i64 micros".to_string())?
@@ -1378,14 +1508,14 @@ impl UsageChargeSettler for PgUsageChargeSettler {
             json!({"project_id":project_id,"price_multiplier":multiplier.normalize().to_string()});
         let calculation = json!({
             "accounting_currency_code": accounting_settings.accounting_currency.clone(),
-            "price_book_unit": price_currency,
-            "base_price_amount": base.total.normalize().to_string(),
+            "price_book_unit": price_unit,
+            "base_price_amount": base_amount.normalize().to_string(),
             "accounting_amount": accounting_amount.normalize().to_string(),
             "final_credit_amount": amount.normalize().to_string(),
             "credit_ledger_key": STATION_CREDIT_CODE,
             "price_reference_id": reference,
             "accounting_settings": accounting_settings,
-            "items": base.items,
+            "items": items,
             "frozen_retail_plan_hash":frozen_plan_hash,
             "model_group_id":frozen_plan.as_ref().and_then(|p|p.model_group_id.as_deref()),
             "model_group_revision":frozen_plan.as_ref().and_then(|p|p.model_group_revision)
@@ -1882,7 +2012,7 @@ mod tests {
         assert_eq!(
             plan.maximum_estimated_charge(|price| Ok(compute_usage_cost_full(
                 Some(&estimate),
-                price
+                price.static_price().unwrap()
             )
             .total))
                 .unwrap(),
@@ -1896,6 +2026,7 @@ mod tests {
             price: None,
             frozen_plan: Some(plan),
             frozen_plan_hash: Some(hash.clone()),
+            expression_identities: vec![],
             multiplier: Decimal::from(2),
             accounting_settings: AccountingSettings::default(),
         };
@@ -1950,7 +2081,7 @@ mod tests {
             compute_usage_cost_full(Some(&usage), &original).total,
             Decimal::from(12)
         );
-        for price in [legacy, wrapped] {
+        for price in [legacy, wrapped.static_price().unwrap().clone()] {
             assert_eq!(price, original);
             assert_eq!(
                 compute_usage_cost_full(Some(&usage), &price).total,
@@ -1975,6 +2106,7 @@ mod tests {
             price: Some(price.clone()),
             frozen_plan: None,
             frozen_plan_hash: None,
+            expression_identities: vec![],
             multiplier: Decimal::from(2),
             accounting_settings: AccountingSettings::default(),
         };
@@ -3290,6 +3422,158 @@ mod tests {
         );
         assert!(sqlx::query_scalar::<_, i64>("SELECT credit_balance_micros-credit_reserved_micros FROM project_wallets WHERE id=$1")
             .bind(fixture.wallet_id).fetch_one(pool).await? >= 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_unreachable_expression_keeps_static_settlement_without_provider_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 1_000_000_000_000).await?;
+        let pool = &fixture.isolated.pool;
+        let group = "system-default";
+        let key = "reachable-static-only";
+        let static_price = json!({"items":[{"itemCode":"prompt_tokens","pricing":{"mode":"usage_per_unit","usagePerUnit":"2"}}]});
+        let raw = json!({
+            "schema":"group-conditional-price-v1","global":static_price,
+            "groups":[{"modelGroupID":group,"base":null,"rules":[{
+                "id":"never","label":"Never","condition":"hour < 0",
+                "price":{"kind":"NEW_API_EXPRESSION","profile":"conduit-newapi-token-v1","version":1,"expression":"p*10","multiplier":"1"}
+            }]}]
+        });
+        sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2")
+            .bind(raw)
+            .bind(fixture.target_model_id)
+            .execute(pool)
+            .await?;
+        let mut settler = PgUsageChargeSettler::new(pool.clone());
+        settler.enforcement.mode = BillingEnforcementMode::HardEnforce;
+        let admitted = settler
+            .reserve_request(&BillingAdmissionInput {
+                request_key: key.into(),
+                project_id: fixture.project_id.to_string(),
+                api_key_id: Some(fixture.api_key_id.to_string()),
+                public_model: fixture.target_model_key.clone(),
+                estimated_input_tokens: 1_000_000,
+                max_output_tokens: 16,
+                model_group_id: Some(group.into()),
+                model_group_revision: Some(1),
+            })
+            .await?;
+        assert_eq!(admitted.as_deref(), Some(key));
+        assert!(!reservation_requires_expression_usage(pool, key).await?);
+        let stored: Value = sqlx::query_scalar(
+            "SELECT pricing_snapshot FROM project_wallet_reservations WHERE request_id=$1",
+        )
+        .bind(key)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(stored["expression_identities"].as_array().unwrap().len(), 1);
+        let usage_id = fixture.insert_usage_log().await?;
+        let log = conduit_db::PgUsageRepo::new(pool.clone())
+            .find_by_id(usage_id)
+            .await?
+            .unwrap();
+        settler
+            .settle_usage(&log, &usage_from_row(&log), Some(key))
+            .await?;
+        let amount: Decimal =
+            sqlx::query_scalar("SELECT amount FROM customer_charge_events WHERE usage_log_id=$1")
+                .bind(usage_id)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(amount, Decimal::from(20_000));
+        fixture.isolated.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_expression_outbox_freezes_leaf_fx_and_project_factor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_llm::usage::{
+            BillingTokenCount as Count, BillingTokenFacts, BillingTokenProtocol,
+        };
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let fixture = ReservationFixture::new(&dsn, 1_000_000_000_000).await?;
+        let pool = &fixture.isolated.pool;
+        sqlx::query("INSERT INTO systems(key,value) VALUES('system_general_settings',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value")
+            .bind(json!({"exchange_rates":[{"currency":"USD","quotePerAccountingUnit":"0.5"}]}).to_string())
+            .execute(pool).await?;
+        sqlx::query("INSERT INTO project_price_adjustments(project_id,multiplier_ppm,source_type,status,created_at,updated_at) VALUES($1,1500000,'test','active',now(),now())")
+            .bind(fixture.project_id).execute(pool).await?;
+        let price = json!({"kind":"NEW_API_EXPRESSION","profile":"conduit-newapi-token-v1","version":1,"expression":"p * 2","multiplier":"1.5"});
+        sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2")
+            .bind(&price)
+            .bind(fixture.target_model_id)
+            .execute(pool)
+            .await?;
+        fixture.reserve_estimate("expression-replay").await?;
+        fixture.reserve_estimate("expression-missing-facts").await?;
+        let complete_log = fixture.insert_usage_log().await?;
+        let missing_log = fixture.insert_usage_log().await?;
+        let facts = BillingTokenFacts {
+            version: 1,
+            protocol: BillingTokenProtocol::OpenAiChat,
+            complete: true,
+            input: Count::Present(1_000_000),
+            output: Count::Present(0),
+            cache_read: Count::Present(0),
+            cache_write_total: Count::Present(0),
+            cache_write_1h: Count::SemanticZero,
+            cache_write_12h: Count::SemanticZero,
+        };
+        let old = PgUsageChargeSettler::new(pool.clone());
+        old.persist_outbox_with_facts(complete_log, Some("expression-replay"), Some(facts))
+            .await?;
+        old.persist_outbox(missing_log, Some("expression-missing-facts"))
+            .await?;
+        sqlx::query(
+            "UPDATE project_price_adjustments SET multiplier_ppm=5000000 WHERE project_id=$1",
+        )
+        .bind(fixture.project_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE systems SET value=$1 WHERE key='system_general_settings'")
+            .bind(json!({"exchange_rates":[{"currency":"USD","quotePerAccountingUnit":"1"}],"accounting_rate_version":2}).to_string())
+            .execute(pool).await?;
+        let mut changed = price;
+        changed["expression"] = json!("p * 20");
+        sqlx::query("UPDATE price_book_items SET price=$1 WHERE public_model_id=$2")
+            .bind(changed)
+            .bind(fixture.target_model_id)
+            .execute(pool)
+            .await?;
+        drop(old);
+
+        let restarted = PgUsageChargeSettler::new(pool.clone());
+        assert_eq!(restarted.reconcile_missing(10).await?, 1);
+        let amount: Decimal =
+            sqlx::query_scalar("SELECT amount FROM customer_charge_events WHERE usage_log_id=$1")
+                .bind(complete_log)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(amount, Decimal::from(90_000));
+        let missing: (String, Option<String>) = sqlx::query_as(
+            "SELECT status,last_error FROM usage_charge_outbox WHERE usage_log_id=$1",
+        )
+        .bind(missing_log)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(missing.0, "pending");
+        assert!(missing.1.is_some());
+        assert!(
+            !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM customer_charge_events WHERE usage_log_id=$1)"
+            )
+            .bind(missing_log)
+            .fetch_one(pool)
+            .await?
+        );
+        fixture.isolated.cleanup().await?;
         Ok(())
     }
 

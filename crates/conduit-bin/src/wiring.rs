@@ -531,6 +531,9 @@ async fn build_postgres_core_services(
     migrate_postgres_with_flag(&pool, config.db.disable_auto_migration)
         .await
         .map_err(|e| format!("failed to run PostgreSQL migrations: {e}"))?;
+    if let Err(error) = crate::wiring_postgres_groups::initialize_default_model_group(&pool).await {
+        tracing::warn!(%error, "Default model group initialization failed");
+    }
     if pools.read().is_some() {
         let read_version = pools.read_schema_version().await;
         let read_is_current = matches!(
@@ -890,6 +893,7 @@ async fn build_postgres_core_services(
         .data(Arc::new(ChannelExtraQueryAdapter {
             channel_repo: admin_channel_repo.clone(),
             price_repo: admin_price_repo,
+            pool: pool.clone(),
         }) as Arc<dyn ChannelExtraQueryServices>)
         .data(channel_crud.clone() as Arc<dyn ChannelQueryServices>)
         .data(channel_crud as Arc<dyn ChannelMutationServices>)
@@ -1228,6 +1232,7 @@ async fn build_postgres_proxy_service(
                 ),
             ])
             .with_attempt_observer(attempt_observer)
+            .with_provider_price_source(Arc::new(crate::usage_log_recorder::PgProviderPriceSource(pool.clone())))
             .with_outbound_registry(build_outbound_transformer_registry()?),
     );
     let orchestrator = Arc::new(
@@ -2632,6 +2637,7 @@ impl gql_system::SystemSettingsServices for SystemSettingsAdapter {
 /// GraphQL-facing [`ChannelExtraQueryServices`] adapter backed by the live
 /// [`ChannelRepo`].
 struct ChannelExtraQueryAdapter {
+    pool: sqlx::PgPool,
     channel_repo: Arc<dyn ChannelRepo>,
     price_repo: Arc<dyn ChannelModelPriceRepo>,
 }
@@ -2688,6 +2694,46 @@ impl ChannelExtraQueryAdapter {
 
 #[async_trait]
 impl ChannelExtraQueryServices for ChannelExtraQueryAdapter {
+    async fn public_model_bindings(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<conduit_admin_graphql::channel::ChannelPublicModelBinding>, String> {
+        use conduit_admin_graphql::{
+            channel::ChannelPublicModelBinding, commercialization::CommercialStatus,
+        };
+        let id = channel_id
+            .rsplit('/')
+            .next()
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or("invalid channel ID")?;
+        let rows = sqlx::query_as::<_, (i64, String, String, String)>(
+            "SELECT r.id,d.upstream_model_id,m.model_id,r.status FROM model_routes r \
+             JOIN upstream_model_deployments d ON d.id=r.deployment_id \
+             JOIN models m ON m.id=r.public_model_id \
+             WHERE d.channel_id=$1 AND m.deleted_at=0 ORDER BY r.id",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| "channel public model bindings unavailable")?;
+        rows.into_iter()
+            .map(|(id, upstream_model_id, public_model_key, status)| {
+                let status = match status.as_str() {
+                    "enabled" => CommercialStatus::Enabled,
+                    "disabled" => CommercialStatus::Disabled,
+                    "archived" => CommercialStatus::Archived,
+                    _ => return Err("invalid channel route status".into()),
+                };
+                Ok(ChannelPublicModelBinding {
+                    route_id: id.to_string().into(),
+                    upstream_model_id,
+                    public_model_key,
+                    status,
+                })
+            })
+            .collect()
+    }
+
     async fn channel_model_prices(
         &self,
         channel_id: &str,
@@ -3406,8 +3452,20 @@ pub(crate) fn price_row_to_gql(
     use conduit_admin_graphql::model_ext::ChannelModelPrice as GqlChannelModelPrice;
     use conduit_admin_graphql::scalars::TimeScalar;
 
-    let core_price: core_pricing::ModelPrice =
-        serde_json::from_value(row.price).unwrap_or_default();
+    let (price, billing_expression) = if row.price.get("kind").is_some() {
+        let expression: conduit_core::objects::newapi_price::NewApiPrice =
+            serde_json::from_value(row.price.clone()).map_err(|_| {
+                ModelExtError::SaveChannelModelPrices("invalid expression price".into())
+            })?;
+        expression
+            .compile()
+            .map_err(ModelExtError::SaveChannelModelPrices)?;
+        (None, Some(async_graphql::Json(row.price)))
+    } else {
+        let core_price: core_pricing::ModelPrice =
+            serde_json::from_value(row.price).unwrap_or_default();
+        (Some(crate::conv::model_price_core_to_gql(core_price)), None)
+    };
     Ok(GqlChannelModelPrice {
         id: format!("gid://conduit/ChannelModelPrice/{}", row.id).into(),
         created_at: TimeScalar(row.created_at),
@@ -3415,7 +3473,8 @@ pub(crate) fn price_row_to_gql(
         channel_id: format!("gid://conduit/Channel/{}", row.channel_id).into(),
         model_id: row.model_id,
         currency_code: row.currency_code,
-        price: crate::conv::model_price_core_to_gql(core_price),
+        price,
+        billing_expression,
         reference_id: row.reference_id,
     })
 }
@@ -6032,6 +6091,55 @@ mod postgres_runtime_boot_tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "explicit rehearsal against a disposable local U4 clone"]
+    async fn migrate_u4_rehearsal_clone_only() -> Result<(), String> {
+        const PREFIX: &str = "conduit_u4_clone_";
+        let expected = std::env::var("CONDUIT_REHEARSAL_DATABASE")
+            .map_err(|_| "CONDUIT_REHEARSAL_DATABASE is required")?;
+        if expected.len() <= PREFIX.len()
+            || expected.len() > 63
+            || !expected.starts_with(PREFIX)
+            || !expected
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err("refusing a non-rehearsal PostgreSQL database name".into());
+        }
+        let dsn = std::env::var("CONDUIT_REHEARSAL_POSTGRES_DSN")
+            .map_err(|_| "CONDUIT_REHEARSAL_POSTGRES_DSN is required")?;
+        let url = url::Url::parse(&dsn).map_err(|_| "invalid rehearsal DSN")?;
+        if !matches!(url.scheme(), "postgresql" | "postgres")
+            || url.host_str() != Some("127.0.0.1")
+            || url.port() != Some(15432)
+            || url.path().strip_prefix('/') != Some(expected.as_str())
+        {
+            return Err("refusing to connect outside the exact local rehearsal database".into());
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&dsn)
+            .await
+            .map_err(|_| "cannot open rehearsal PostgreSQL connection")?;
+        let identity: (String, String) =
+            sqlx::query_as("SELECT current_database()::text,current_schema()::text")
+                .fetch_one(&pool)
+                .await
+                .map_err(|_| "cannot verify rehearsal database identity")?;
+        if identity.0 != expected || identity.1 != "public" {
+            return Err("refusing to migrate a different database or schema".into());
+        }
+        migrate_postgres_with_flag(&pool, false)
+            .await
+            .map_err(|error| format!("rehearsal migration failed: {error}"))?;
+        crate::wiring_postgres_groups::initialize_default_model_group(&pool)
+            .await
+            .map_err(|error| format!("rehearsal Default group initialization failed: {error}"))?;
+        pool.close().await;
+        println!("Rehearsal migration and Default initialization completed for {expected}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn build_runtime_services_starts_postgres_core_when_dsn_is_provided() -> Result<(), String>
     {
         let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
@@ -6286,7 +6394,8 @@ mod postgres_accounting_currency_tests {
                     conduit_admin_graphql::model_ext::SaveChannelModelPriceInput {
                         model_id: "mock-chat".to_string(),
                         currency_code: "CNY".to_string(),
-                        price: conduit_admin_graphql::model_ext::ModelPriceInput {
+                        billing_expression: None,
+                        price: Some(conduit_admin_graphql::model_ext::ModelPriceInput {
                             items: [conduit_admin_graphql::request_usage::PriceItemCode::PromptTokens,conduit_admin_graphql::request_usage::PriceItemCode::CompletionTokens,conduit_admin_graphql::request_usage::PriceItemCode::PromptCachedTokens,conduit_admin_graphql::request_usage::PriceItemCode::PromptWriteCachedTokens].into_iter().map(|item_code| conduit_admin_graphql::model_ext::ModelPriceItemInput {
                                 item_code,
                                 pricing: conduit_admin_graphql::model_ext::PricingInput {
@@ -6301,7 +6410,7 @@ mod postgres_accounting_currency_tests {
                                 },
                                 prompt_write_cache_variants: None,
                             }).collect(),
-                        },
+                        }),
                     },
                 ],
             )
@@ -6547,6 +6656,306 @@ mod channel_id_filter_query_tests {
     use async_graphql::ID;
     use conduit_admin_graphql::channel::ChannelWhereInput;
     #[tokio::test]
+    async fn native_anthropic_http_preserves_expression_facts_after_bridging()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use conduit_llm::{ApiFormat, HttpClientBuilder, HttpRequest};
+        use conduit_orchestrator::outbound_stream::{
+            StreamChunkAggregator, TransformerStreamAggregator,
+        };
+        use conduit_pipeline::{
+            CancelToken, Pipeline, PipelineCandidate, middleware::PipelineContext,
+        };
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let native = MockServer::start().await;
+        let streaming = MockServer::start().await;
+        let usage = json!({"input_tokens":100,"output_tokens":8,"cache_read_input_tokens":20,"cache_creation_input_tokens":14,
+            "cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":10}});
+        let reply = json!({"id":"msg_test","type":"message","model":"native-model","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":usage});
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .mount(&native)
+            .await;
+        let mut start_usage = usage.clone();
+        start_usage["output_tokens"] = json!(0);
+        let chunks = [
+            json!({"type":"message_start","message":{"id":"msg_test","type":"message","model":"native-model","role":"assistant","content":[],"usage":start_usage}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}),
+            json!({"type":"message_stop"}),
+        ];
+        let body = chunks
+            .into_iter()
+            .map(|chunk| {
+                format!(
+                    "event: {}\ndata: {}\n\n",
+                    chunk["type"].as_str().unwrap(),
+                    chunk
+                )
+            })
+            .collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&streaming)
+            .await;
+        let inbound = Arc::new(conduit_transformers::OpenAiChatInbound::new());
+        let outbound = Arc::new(conduit_transformers::AnthropicOutboundTransformer::new(
+            conduit_transformers::AnthropicOutboundConfig {
+                platform: conduit_transformers::anthropic::PlatformType::Direct,
+                base_url: String::new(),
+                api_key: String::new(),
+                endpoint_path: Some("/v1/messages".into()),
+                project_id: None,
+                region: None,
+            },
+        ));
+        let executor = conduit_orchestrator::upstream_executor::UpstreamExecutor::new(
+            HttpClientBuilder::new().build()?,
+        )
+        .into_arc();
+        let pipeline = Pipeline::new(inbound.clone(), outbound, executor);
+        let request = |stream| HttpRequest {
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            content_type: Some("application/json".into()),
+            api_format: Some(ApiFormat::OpenAiChatCompletions),
+            json_body: Some(
+                json!({"model":"native-model","messages":[{"role":"user","content":"test"}],"stream":stream,"max_tokens":16}),
+            ),
+            ..Default::default()
+        };
+        let mut candidate = PipelineCandidate::from("7");
+        candidate.channel_type = "anthropic".into();
+        candidate.api_format = "anthropic/messages".into();
+        candidate.actual_model = Some("native-model".into());
+        candidate.credential = Some("native-test-key".into());
+        candidate.base_url = Some(native.uri());
+        let mut ctx = PipelineContext::new();
+        let (response, _) = pipeline
+            .process(
+                &mut ctx,
+                request(false),
+                &request(false),
+                std::slice::from_ref(&candidate),
+            )
+            .await?;
+        let facts = response
+            .usage
+            .ok_or("nonstream usage missing")?
+            .new_api_token_facts()?;
+        assert_eq!(
+            (
+                facts.input,
+                facts.output,
+                facts.cache_read,
+                facts.cache_write,
+                facts.cache_write_1h
+            ),
+            (100, 8, 20, 4, 10)
+        );
+
+        candidate.base_url = Some(streaming.uri());
+        let mut ctx = PipelineContext::new();
+        let mut live = pipeline
+            .stream_live(
+                &mut ctx,
+                request(true),
+                &request(true),
+                &[candidate],
+                CancelToken::new(),
+            )
+            .await?;
+        let mut stream_chunks = Vec::new();
+        while let Some(chunk) = live.upstream_rx.recv().await {
+            stream_chunks.push(chunk?);
+        }
+        let mut orchestrator = conduit_orchestrator::orchestrator::OrchestratorContext::new();
+        orchestrator.stream_billing_facts = Some(live.billing_facts.clone());
+        let rebuilt = TransformerStreamAggregator::new(inbound)
+            .aggregate(&orchestrator, &stream_chunks)
+            .await?;
+        let stream_facts = rebuilt
+            .usage
+            .ok_or("stream usage missing")?
+            .new_api_token_facts()?;
+        assert_eq!(stream_facts, facts);
+        let price: conduit_core::objects::newapi_price::NewApiPrice =
+            serde_json::from_value(json!({
+                "kind":"NEW_API_EXPRESSION","profile":"conduit-newapi-token-v1","version":1,
+                "expression":"p + c + cr * 2 + cc * 3 + cc1h * 4","multiplier":"1.5"
+            }))?;
+        assert_eq!(price.evaluate(facts)?, rust_decimal::Decimal::new(3, 4));
+        assert_eq!(price.evaluate(stream_facts)?, price.evaluate(facts)?);
+        assert_eq!(native.received_requests().await.unwrap().len(), 1);
+        assert_eq!(streaming.received_requests().await.unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_native_managed_channel_keeps_base_and_inventory_without_discovery()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use async_graphql::{Request, Variables};
+        use conduit_admin_graphql::channel::ChannelMutationServices;
+        use serde_json::json;
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        let repo = Arc::new(conduit_db::PgChannelRepo::new(db.pool.clone()));
+        let mutations = Arc::new(
+            crate::wiring_channel_crud::ChannelCrudAdapter::new(repo).with_pool(db.pool.clone()),
+        );
+        let schema = conduit_admin_graphql::admin_schema_builder()
+            .data(mutations as Arc<dyn ChannelMutationServices>)
+            .finish();
+        let variables = Variables::from_json(json!({"input":{
+            "type":"anthropic","name":"native-management","baseURL":"https://example.invalid/api/v1",
+            "websiteURL":"https://example.invalid/console","credentials":{"apiKeys":["test-native-key"],"newApiPat":"test-control","newApiUserID":"7"},
+            "supportedModels":["wire"],"defaultTestModel":"wire","autoSyncSupportedModels":true,
+            "settings":{"managementAdapter":"new_api"}
+        }}));
+        let result = schema.execute(Request::new("mutation($input:CreateChannelInput!){createChannel(input:$input){id baseURL websiteURL type}}").variables(variables)).await
+            .into_result().map_err(|error| format!("{error:?}"))?.data.into_json()?;
+        assert_eq!(
+            result["createChannel"]["baseURL"],
+            "https://example.invalid/api/v1"
+        );
+        assert_eq!(result["createChannel"]["type"], "anthropic");
+        let id = result["createChannel"]["id"].clone();
+        let variables = Variables::from_json(
+            json!({"id":id,"input":{"remark":"changed","autoSyncSupportedModels":true}}),
+        );
+        let updated=schema.execute(Request::new("mutation($id:ID!,$input:UpdateChannelInput!){updateChannel(id:$id,input:$input){baseURL websiteURL}}").variables(variables)).await
+            .into_result().map_err(|error| format!("{error:?}"))?.data.into_json()?;
+        assert_eq!(
+            updated["updateChannel"]["baseURL"],
+            result["createChannel"]["baseURL"]
+        );
+        assert_eq!(
+            updated["updateChannel"]["websiteURL"],
+            result["createChannel"]["websiteURL"]
+        );
+        let (auto,credentials,models):(bool,serde_json::Value,serde_json::Value)=sqlx::query_as("SELECT auto_sync_supported_models,credentials,supported_models FROM channels WHERE name='native-management'").fetch_one(&db.pool).await?;
+        assert!(!auto);
+        assert_eq!(credentials["apiKeys"], json!(["test-native-key"]));
+        assert_eq!(credentials["newApiPat"], "test-control");
+        assert_eq!(models, json!(["wire"]));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM channel_operation_receipts")
+                .fetch_one(&db.pool)
+                .await?,
+            0
+        );
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn channel_public_model_bindings_schema_writes_and_fences_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use async_graphql::{Request, Variables};
+        use conduit_admin_graphql::governance::{
+            GovernanceServices, UpdateGovernanceSettingsInput,
+        };
+        use conduit_admin_graphql::me::CurrentUser;
+        use conduit_auth::{Principal, RequestContext};
+        use serde_json::json;
+
+        let Ok(dsn) = std::env::var("CONDUIT_TEST_POSTGRES_DSN") else {
+            return Ok(());
+        };
+        let db = crate::postgres_test_support::IsolatedPostgres::new(&dsn).await?;
+        db.owners(&[7]).await?;
+        crate::wiring_governance::PgGovernanceAdapter::new(db.pool.clone())
+            .update_settings(
+                7,
+                UpdateGovernanceSettingsInput {
+                    enabled: true,
+                    review_kinds: vec![],
+                    allow_self_review: Some(true),
+                },
+                "0".into(),
+            )
+            .await?;
+        sqlx::query(r#"INSERT INTO models(developer,model_id,"type",name,icon,"group",model_card,settings,status)
+            VALUES('','live-sku','chat','Live','','','{}','{}','enabled')"#).execute(&db.pool).await?;
+
+        let repo = Arc::new(conduit_db::PgChannelRepo::new(db.pool.clone()));
+        let mutation = Arc::new(
+            crate::wiring_channel_crud::ChannelCrudAdapter::new(repo.clone())
+                .with_pool(db.pool.clone()),
+        );
+        let query = Arc::new(ChannelExtraQueryAdapter {
+            pool: db.pool.clone(),
+            channel_repo: repo,
+            price_repo: Arc::new(conduit_db::PgChannelModelPriceRepo::new(db.pool.clone())),
+        });
+        let schema = conduit_admin_graphql::admin_schema_builder()
+            .data(mutation as Arc<dyn conduit_admin_graphql::channel::ChannelMutationServices>)
+            .data(query as Arc<dyn ChannelExtraQueryServices>)
+            .finish();
+        let mut owner = RequestContext::new();
+        owner.set_principal(Principal::user("7").with_owner(true))?;
+        let input = json!({
+            "operationID":uuid::Uuid::new_v4().to_string(),
+            "type":"openai",
+            "name":"binding-schema",
+            "baseURL":"http://127.0.0.1:32123/provider/v1",
+            "websiteURL":"http://127.0.0.1:32124/console",
+            "credentials":{"apiKeys":["binding-schema-key"]},
+            "settings":{"managementAdapter":"new_api"},
+            "supportedModels":["wire-model"],
+            "defaultTestModel":"wire-model",
+            "publicModelBindings":{"upserts":[{"upstreamModelID":"wire-model","publicModelKey":"live-sku"}]}
+        });
+        let created = schema.execute(
+            Request::new("mutation($input: CreateChannelInput!) { createChannel(input:$input) { id baseURL websiteURL publicModelBindings { routeID upstreamModelID publicModelKey status } } }")
+                .variables(Variables::from_json(json!({"input":input}))).data(owner.clone()).data(CurrentUser { user_id:7 })
+        ).await.into_result().map_err(|errors| format!("{errors:?}"))?.data.into_json()?;
+        let created = &created["createChannel"];
+        assert_eq!(created["baseURL"], "http://127.0.0.1:32123/provider");
+        assert_eq!(created["websiteURL"], "http://127.0.0.1:32124/console");
+        let route = &created["publicModelBindings"][0];
+        assert_eq!(route["status"], "ENABLED");
+        assert_eq!(route["upstreamModelID"], "wire-model");
+        assert_eq!(route["publicModelKey"], "live-sku");
+        let updated = schema.execute(
+            Request::new("mutation($id:ID!, $input:UpdateChannelInput!) { updateChannel(id:$id,input:$input) { websiteURL publicModelBindings { status } } }")
+                .variables(Variables::from_json(json!({"id":created["id"],"input":{"remark":"edited","publicModelBindings":{"removeRouteIDs":[route["routeID"]]}}})))
+                .data(owner).data(CurrentUser { user_id:7 })
+        ).await.into_result().map_err(|errors| format!("{errors:?}"))?.data.into_json()?;
+        assert_eq!(
+            updated["updateChannel"]["websiteURL"],
+            created["websiteURL"]
+        );
+        assert_eq!(
+            updated["updateChannel"]["publicModelBindings"][0]["status"],
+            "DISABLED"
+        );
+
+        let mut member = RequestContext::new();
+        member.set_principal(Principal::user("8"))?;
+        let denied = schema.execute(Request::new(
+            "{ queryChannels(input:{first:1}) { edges { node { publicModelBindings { routeID } } } } }"
+        ).data(member)).await.into_result().map_err(|errors| format!("{errors:?}"))?.data.into_json()?;
+        assert_eq!(
+            denied["queryChannels"]["edges"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(denied["queryChannels"]["edges"][0]["node"]["publicModelBindings"].is_null());
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_first_one_resolves_each_channel_before_pagination()
     -> Result<(), Box<dyn std::error::Error>> {
         use conduit_admin_graphql::channel_queries::{
@@ -6561,6 +6970,7 @@ mod channel_id_filter_query_tests {
             ids.push(sqlx::query_scalar::<_,i64>("INSERT INTO channels(\"type\",name,status,credentials,supported_models,default_test_model,settings) VALUES('openai',$1,'enabled','{}','[]','','{}') RETURNING id").bind(name).fetch_one(&db.pool).await?);
         }
         let adapter = crate::wiring::ChannelExtraQueryAdapter {
+            pool: db.pool.clone(),
             channel_repo: Arc::new(conduit_db::PgChannelRepo::new(db.pool.clone())),
             price_repo: Arc::new(conduit_db::PgChannelModelPriceRepo::new(db.pool.clone())),
         };
@@ -6591,6 +7001,7 @@ mod channel_id_filter_query_tests {
             ));
             mutation
                 .update_channel(
+                    None,
                     node.id.as_str(),
                     UpdateChannelInput {
                         name: Some(format!("edited-{id}")),

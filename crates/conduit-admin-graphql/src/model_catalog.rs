@@ -55,7 +55,8 @@ pub struct MyCatalogPriceBranch {
     pub label: String,
     /// JSON encoded canonical condition input; never evaluated by the client.
     pub condition: Option<String>,
-    pub items: Vec<MyCatalogPriceItem>,
+    pub items: Option<Vec<MyCatalogPriceItem>>,
+    pub billing_expression: Option<async_graphql::Json<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -72,7 +73,8 @@ pub struct MyCatalogPriceScope {
 #[derive(Debug, Clone, SimpleObject)]
 pub struct MyCatalogPrice {
     pub status: MyCatalogPriceStatus,
-    pub items: Vec<MyCatalogPriceItem>,
+    pub items: Option<Vec<MyCatalogPriceItem>>,
+    pub billing_expression: Option<async_graphql::Json<serde_json::Value>>,
     pub branches: Vec<MyCatalogPriceBranch>,
     pub source: String,
     pub price_book_version: Option<String>,

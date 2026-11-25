@@ -100,7 +100,7 @@
     "args": [
       "test-id"
     ],
-    "query": "query ProviderEditBase($channelID: ID!) { providerPriceEditBase(channelID: $channelID) { channelID revision accountingCurrency accountingSettingsVersion prices { id modelID currencyCode price { items { itemCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } promptWriteCacheVariants { variantCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } } } } } } }",
+    "query": "query ProviderEditBase($channelID: ID!) { providerPriceEditBase(channelID: $channelID) { channelID revision accountingCurrency accountingSettingsVersion prices { id modelID currencyCode price { items { itemCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } promptWriteCacheVariants { variantCode pricing { mode flatFee usagePerUnit usageTiered { tiers { upTo pricePerUnit } } } } } } billingExpression } } }",
     "variables": {
       "channelID": "test-id"
     }

@@ -65,6 +65,7 @@ StatusSwitchCell.displayName = 'StatusSwitchCell';
 
 // Action Cell Component to handle hooks properly
 const ActionCell = memo(({ row }: { row: Row<Channel> }) => {
+  const { t } = useTranslation();
   const channel = row.original;
   const { setOpen, setCurrentRow } = useChannels();
   const testChannel = useTestChannel();
@@ -88,7 +89,7 @@ const ActionCell = memo(({ row }: { row: Row<Channel> }) => {
   return (
     <div className='flex flex-wrap items-center justify-center gap-1'>
       {channel.settings?.managementAdapter === 'new_api' && <NewApiChannelActions channel={channel} />}
-      <Button size='sm' variant='outline' className='h-8 w-8 p-0' onClick={handleEdit}>
+      <Button size='sm' variant='outline' className='h-8 w-8 p-0' aria-label={t('common.buttons.edit')} onClick={handleEdit}>
         <IconEdit className='h-3 w-3' />
       </Button>
       <Button size='sm' variant='outline' className='h-8 px-3' onClick={handleDefaultTest} disabled={testChannel.isPending}>

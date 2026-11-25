@@ -826,6 +826,7 @@ pub struct Pipeline {
     /// Host-owned observer for provider-attempt health events. The callback is
     /// synchronous and should enqueue work rather than perform I/O inline.
     attempt_observer: Option<Arc<dyn AttemptObserver>>,
+    provider_price_source: Option<Arc<dyn ProviderPriceSource>>,
 }
 
 /// Result of one real provider attempt, before retry/failover selection.
@@ -849,6 +850,73 @@ pub struct AttemptObservation {
 
 pub trait AttemptObserver: Send + Sync {
     fn observe(&self, observation: AttemptObservation);
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderPriceSnapshot {
+    pub channel_id: String,
+    pub upstream_model: String,
+    pub price: Result<Option<serde_json::Value>, String>,
+}
+impl std::fmt::Debug for ProviderPriceSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProviderPriceSnapshot")
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ProviderPriceSource: Send + Sync {
+    async fn capture(
+        &self,
+        channel: &str,
+        model: &str,
+        selected_format: &str,
+    ) -> Result<Option<serde_json::Value>, String>;
+}
+
+#[derive(Clone, Default)]
+pub struct StreamBillingFacts(Arc<std::sync::Mutex<Option<conduit_llm::usage::BillingTokenFacts>>>);
+
+impl std::fmt::Debug for StreamBillingFacts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StreamBillingFacts")
+    }
+}
+impl PartialEq for StreamBillingFacts {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for StreamBillingFacts {}
+impl StreamBillingFacts {
+    fn set(&self, facts: conduit_llm::usage::BillingTokenFacts) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(facts);
+        }
+    }
+    pub fn get(&self) -> Option<conduit_llm::usage::BillingTokenFacts> {
+        self.0.lock().ok().and_then(|slot| *slot)
+    }
+}
+
+fn native_billing_format(format: ApiFormat, outbound: &str) -> bool {
+    format == ApiFormat::AnthropicMessages && outbound == "anthropic"
+}
+
+fn attach_billing_facts(
+    usage: &mut Option<conduit_llm::Usage>,
+    facts: Option<conduit_llm::usage::BillingTokenFacts>,
+) {
+    if let Some(usage) = usage.as_mut() {
+        usage
+            .metadata
+            .remove(conduit_llm::usage::BILLING_TOKEN_FACTS_KEY);
+    }
+    if let Some(facts) = facts {
+        usage
+            .get_or_insert_with(Default::default)
+            .set_billing_token_facts(facts);
+    }
 }
 
 fn replace_channel_config_metadata(
@@ -888,6 +956,7 @@ impl Pipeline {
             customize_executor: None,
             outbound_registry: None,
             attempt_observer: None,
+            provider_price_source: None,
         }
     }
 
@@ -898,6 +967,47 @@ impl Pipeline {
     ) -> Self {
         self.outbound_registry = Some(registry);
         self
+    }
+
+    pub fn with_provider_price_source(mut self, source: Arc<dyn ProviderPriceSource>) -> Self {
+        self.provider_price_source = Some(source);
+        self
+    }
+
+    async fn capture_provider_price(
+        &self,
+        ctx: &mut PipelineContext,
+        target: &PipelineCandidate,
+        request: &HttpRequest,
+        fallback_model: Option<&str>,
+    ) {
+        ctx.provider_price_snapshot = None;
+        let Some(source) = &self.provider_price_source else {
+            return;
+        };
+        let Some(model) = request
+            .json_body
+            .as_ref()
+            .and_then(|body| body.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .or(fallback_model)
+        else {
+            return;
+        };
+        ctx.provider_price_snapshot = Some(ProviderPriceSnapshot {
+            channel_id: target.id.clone(),
+            upstream_model: model.to_owned(),
+            price: source
+                .capture(
+                    &target.id,
+                    model,
+                    request
+                        .api_format
+                        .map(ApiFormat::as_str)
+                        .unwrap_or(&target.api_format),
+                )
+                .await,
+        });
     }
 
     pub fn with_attempt_observer(mut self, observer: Arc<dyn AttemptObserver>) -> Self {
@@ -1577,6 +1687,8 @@ impl Pipeline {
         {
             map.insert("stream".to_string(), serde_json::Value::Bool(true));
         }
+        self.capture_provider_price(ctx, target, &http_req, attempt_request.model.as_deref())
+            .await;
         ctx.record_order("execute:StreamLive");
 
         // S13 — hand the executor the per-attempt cancel token so it can abort
@@ -1665,6 +1777,7 @@ impl Pipeline {
                 return Err(ctx.fail("execute:stream_live:empty", error));
             }
         };
+        let stream_billing_facts = StreamBillingFacts::default();
         let (prefetch_tx, prefetched_raw_rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             if prefetch_tx.send(Ok(first)).await.is_err() {
@@ -1692,7 +1805,13 @@ impl Pipeline {
         ) {
             passthrough_live_stream(raw_upstream_rx)
         } else {
-            transform_live_stream(outbound_arc, inbound, raw_upstream_rx)
+            transform_live_stream(
+                outbound_arc,
+                inbound,
+                raw_upstream_rx,
+                stream_billing_facts.clone(),
+                upstream_api_format,
+            )
         };
         let upstream_rx = rewrite_live_stream_errors(
             upstream_rx,
@@ -1713,6 +1832,7 @@ impl Pipeline {
         Ok(LiveStreamAttempt {
             upstream_rx,
             content_type: response_content_type,
+            billing_facts: stream_billing_facts,
             channel_id,
             sequence: 1,
             model_index: 0,
@@ -1843,6 +1963,9 @@ impl Pipeline {
             }
         };
 
+        self.capture_provider_price(ctx, target, &http_req, llm_request.model.as_deref())
+            .await;
+
         // RUST-P15-001 — executor customization (Go `ChannelCustomizedExecutor`,
         // `pipeline.go:381-384`). When a hook is wired, it runs once per attempt
         // AFTER the raw request middlewares and BEFORE execution. The returned
@@ -1907,7 +2030,7 @@ impl Pipeline {
                     // RUST-P8-001 S04 — stream established: run the stream-side
                     // middleware wrappers (Go `stream()`, `stream.go:295-394`).
                     Ok(events) => self
-                        .finish_stream_events(ctx, inbound, events, outbound)
+                        .finish_stream_events(ctx, inbound, events, outbound, upstream_api_format)
                         .map(|events| HttpResponse {
                             status: 200,
                             stream: events,
@@ -1951,7 +2074,13 @@ impl Pipeline {
                     // stream + inbound raw stream wrappers apply to the events
                     // being aggregated too; the aggregated response then gets
                     // the inbound raw RESPONSE hooks (`non_streaming.go:130`).
-                    Ok(events) => match self.finish_stream_events(ctx, inbound, events, outbound) {
+                    Ok(events) => match self.finish_stream_events(
+                        ctx,
+                        inbound,
+                        events,
+                        outbound,
+                        upstream_api_format,
+                    ) {
                         Err(err) => Err(err),
                         Ok(events) => {
                             // Go `non_streaming.go:105-108` — an auto-aggregated
@@ -2047,6 +2176,7 @@ impl Pipeline {
                             upstream_api_format,
                             outbound.name(),
                         ),
+                        upstream_api_format,
                         retry_policy.empty_response_detection,
                     ),
                     Err(err) => {
@@ -2087,6 +2217,7 @@ impl Pipeline {
         response: HttpResponse,
         outbound: &dyn OutboundTransformer,
         wire_compatible_passthrough: bool,
+        upstream_api_format: ApiFormat,
         empty_response_detection: bool,
     ) -> Result<HttpResponse, ConduitError> {
         // 1. Go `applyRawResponseMiddlewares` (`non_streaming.go:33`), REVERSE.
@@ -2116,6 +2247,7 @@ impl Pipeline {
                     ));
                 }
             };
+            attach_billing_facts(&mut response.usage, None);
             if response.body.is_none()
                 && let Some(json) = response.json_body.as_ref()
             {
@@ -2170,7 +2302,16 @@ impl Pipeline {
         // providers. The client-facing HTTP transformer serializes it into the
         // body but does not populate `HttpResponse.usage`; preserve it here so
         // request recording, token quotas and billing receive structured usage.
-        let unified_usage = llm_resp.usage.clone();
+        let mut unified_usage = llm_resp.usage.clone().or(provider_usage.clone());
+        let native = native_billing_format(upstream_api_format, outbound.name())
+            .then(|| {
+                llm_resp
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.billing_token_facts().ok())
+            })
+            .flatten();
+        attach_billing_facts(&mut unified_usage, native);
 
         // 4. Go `non_streaming.go:55-59` — empty-response detection on the
         // UNIFIED `LlmResponse` value (after outbound transform + LLM
@@ -2239,6 +2380,7 @@ impl Pipeline {
         inbound: &dyn InboundTransformer,
         events: Vec<StreamEvent>,
         outbound: &dyn OutboundTransformer,
+        upstream_format: ApiFormat,
     ) -> Result<Vec<StreamEvent>, ConduitError> {
         let stream: BoxEventStream = Box::new(events.into_iter());
 
@@ -2252,6 +2394,7 @@ impl Pipeline {
         };
 
         let raw_events: Vec<StreamEvent> = stream.collect();
+        let facts = StreamBillingFacts::default();
         let raw_event_count = raw_events.len();
         let terminal_events: Vec<StreamEvent> = raw_events
             .iter()
@@ -2283,7 +2426,18 @@ impl Pipeline {
 
         // 4. Go `Inbound.TransformStream` (`stream.go:374`): unified
         // LlmResponse stream → client-facing StreamEvent stream.
-        let stream = match inbound.transform_stream(llm_stream) {
+        let trusted_native = native_billing_format(upstream_format, outbound.name());
+        let facts_from_native = facts.clone();
+        let llm_stream = llm_stream.inspect(move |event| {
+            if trusted_native
+                && let Some(usage) = &event.usage
+                && let Ok(envelope) = usage.billing_token_facts()
+                && envelope.complete
+            {
+                facts_from_native.set(envelope);
+            }
+        });
+        let stream = match inbound.transform_stream(Box::new(llm_stream)) {
             Ok(s) => s,
             Err(err) => {
                 apply_raw_error_response_middlewares(&self.middlewares, ctx, &err);
@@ -2308,6 +2462,7 @@ impl Pipeline {
                 events.push(terminal);
             }
         }
+        ctx.completed_stream_billing_facts = facts.get();
         Ok(events)
     }
 
@@ -2317,8 +2472,12 @@ impl Pipeline {
     fn finish_aggregated_response(
         &self,
         ctx: &mut PipelineContext,
-        response: HttpResponse,
+        mut response: HttpResponse,
     ) -> Result<HttpResponse, ConduitError> {
+        attach_billing_facts(
+            &mut response.usage,
+            ctx.completed_stream_billing_facts.take(),
+        );
         match apply_inbound_raw_response_middlewares(&self.middlewares, ctx, response) {
             Ok(response) => Ok(response),
             Err(err) => {
@@ -2505,6 +2664,8 @@ fn transform_live_stream(
     outbound: Arc<dyn OutboundTransformer>,
     inbound: Arc<dyn InboundTransformer>,
     upstream_rx: tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>>,
+    billing_facts: StreamBillingFacts,
+    upstream_format: ApiFormat,
 ) -> tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, ConduitError>>(64);
 
@@ -2575,7 +2736,17 @@ fn transform_live_stream(
 
         // inbound.transform_stream: unified → client-native StreamEvent (e.g.
         // Anthropic message_start … message_stop).
-        let client_iter = match inbound.transform_stream(llm_iter) {
+        let trusted_native = native_billing_format(upstream_format, outbound.name());
+        let llm_iter = llm_iter.inspect(move |event| {
+            if trusted_native
+                && let Some(usage) = event.usage.as_ref()
+                && let Ok(facts) = usage.billing_token_facts()
+                && facts.complete
+            {
+                billing_facts.set(facts);
+            }
+        });
+        let client_iter = match inbound.transform_stream(Box::new(llm_iter)) {
             Ok(it) => it,
             Err(err) => {
                 let _ = out_tx.blocking_send(Err(err));
@@ -2781,6 +2952,7 @@ impl From<&str> for PipelineCandidate {
 /// type is `Result<StreamEvent, ConduitError>` (see [`Executor::execute_stream_live`]
 /// for the design-note on why `UpstreamItem` cannot be named here).
 pub struct LiveStreamAttempt {
+    pub billing_facts: StreamBillingFacts,
     /// Incremental provider events (`Ok`) / mid-stream failure (`Err`); the
     /// sender closes when the upstream ends.
     pub upstream_rx: tokio::sync::mpsc::Receiver<Result<StreamEvent, ConduitError>>,
@@ -8584,6 +8756,8 @@ mod tests {
             Arc::new(CrossProtocolChatOutbound),
             Arc::new(conduit_transformers::OpenAiResponsesInbound::new()),
             rx,
+            StreamBillingFacts::default(),
+            ApiFormat::OpenAiChatCompletions,
         );
         let mut saw_real_error = false;
         while let Some(item) = client.recv().await {

@@ -21,9 +21,13 @@ pub struct MeteredEvent {
     pub version: u8,
     pub event_key: String,
     pub reservation_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_token_facts: Option<BillingTokenFacts>,
     // This typed input contains only identity, time, structured usage and cost audit.
     pub usage: CreateUsageLogInput,
 }
+
+pub use conduit_llm::usage::BillingTokenFacts;
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
@@ -438,8 +442,8 @@ pub async fn handoff(
         .await
         .map_err(|e| e.to_string())?;
     let id: i64 = row.id.parse::<i64>().map_err(|e| e.to_string())?;
-    sqlx::query("INSERT INTO usage_charge_outbox(usage_log_id,reservation_key,status,available_at,created_at,updated_at) VALUES($1,$2,'pending',now(),now(),now()) ON CONFLICT DO NOTHING")
-        .bind(id).bind(&event.reservation_key).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    sqlx::query("INSERT INTO usage_charge_outbox(usage_log_id,reservation_key,billing_token_facts,status,available_at,created_at,updated_at) VALUES($1,$2,$3,'pending',now(),now(),now()) ON CONFLICT DO NOTHING")
+        .bind(id).bind(&event.reservation_key).bind(event.billing_token_facts.as_ref().map(sqlx::types::Json)).execute(&mut *tx).await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE usage_recovery_receipts SET usage_log_id=$2 WHERE event_key=$1")
         .bind(&event.event_key)
         .bind(id)
